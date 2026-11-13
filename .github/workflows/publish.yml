@@ -6,7 +6,7 @@
 #   testpypi -> upload to TestPyPI
 #   smoke   -> install the uploaded wheel from TestPyPI in a clean env (dependencies from PyPI),
 #              same bytes as built, import + version + CLI
-#   pypi    -> upload to PyPI (environment `pypi`: add a required reviewer for a final click)
+#   pypi    -> upload to PyPI (environment `pypi`; fully automatic, no approval step)
 #   release -> GitHub Release from the CHANGELOG section (pre-release for a / b / rc / dev)
 #
 # A manual run (Actions > publish > Run workflow) stops after the TestPyPI smoke test: a dry run.

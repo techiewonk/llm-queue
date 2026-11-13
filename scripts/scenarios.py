@@ -876,7 +876,10 @@ async def embeds_faulted(ctx: Ctx) -> None:
             done.set()
 
     await asyncio.gather(load(), faults())
-    bad = collections.Counter(k for k, _, _ in outcomes if k and k not in ON_TIME)
+    # See L4: an overloaded provider opens breakers, and retries after every deployment failed
+    # spend the retry budget (as in P7).
+    allowed = {*ON_TIME, "model_unavailable", "retry_budget_exhausted"}
+    bad = collections.Counter(k for k, _, _ in outcomes if k and k not in allowed)
     ctx.checks["embeddings: every call answered or refused on time"] = not bad and all(
         secs <= ctx.limit for _, secs, _ in outcomes
     )
@@ -1142,6 +1145,12 @@ SCENARIOS = [
         "every batch answered or refused on time; vectors in order",
         embeds_faulted,
         *ON_TIME,
+        # One fakellm process serves chat and the 288 x 1024-d embedding batches: at 100 % and
+        # above its chat answers pass attempt_timeout_secs (3 s), the breakers open (logged
+        # "breaker open" on both deployments) and calls get model_unavailable until a probe
+        # succeeds. That is the designed answer to a slow provider; the same faults without
+        # the embedding load (X1) pass at every load, and `after` must still be fully served.
+        "model_unavailable",
         settle=3,
         models={
             "cohere": {
@@ -1205,7 +1214,8 @@ def main() -> int:
     """Run the chosen scenarios under the chosen loads; exit 1 if any fails."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("ids", nargs="*", help="scenario ids (S4 P1 ...) or all")
-    parser.add_argument("--group", choices=sorted({s.group for s in SCENARIOS} | {"failover"}))
+    groups = sorted({s.group for s in SCENARIOS} | {"failover"})
+    parser.add_argument("--group", choices=groups, action="append", help="may repeat")
     parser.add_argument("--load", choices=sorted(LOADS), action="append")
     parser.add_argument("--profile", choices=sorted(PROFILES), default="fast")
     parser.add_argument("--jobs", type=int, default=4, help="runs at a time (1: one by one)")
@@ -1219,10 +1229,11 @@ def main() -> int:
         return 0
     setup_logging()
     ids = list(BY_ID) + list(FAILOVER) if args.ids == ["all"] else list(args.ids)
-    if args.group == "failover":
-        ids += list(FAILOVER)
-    elif args.group:
-        ids += [s.sid for s in SCENARIOS if s.group == args.group]
+    for group in args.group or []:  # --group may repeat
+        if group == "failover":
+            ids += list(FAILOVER)
+        else:
+            ids += [s.sid for s in SCENARIOS if s.group == group]
     unknown = [i for i in ids if i not in BY_ID and i not in FAILOVER]
     if unknown or not ids:
         parser.error(f"unknown or no scenario: {unknown}; see --list")

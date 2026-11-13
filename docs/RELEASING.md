@@ -16,7 +16,7 @@ git push origin v0.1.0b1
   testpypi  upload (skip-existing)
   smoke     download the wheel from TestPyPI (no deps), same SHA-256 as the build,
             install with dependencies from PyPI, import, version, `llm-queue --help`
-  pypi      upload (environment `pypi`: a required reviewer approves here)
+  pypi      upload (environment `pypi`, automatic: the checks above are the gate)
   release   GitHub Release with the CHANGELOG section and the files;
             pre-release when the version has a / b / rc / dev
 ```
@@ -26,9 +26,8 @@ git push origin v0.1.0b1
 1. On <https://test.pypi.org> and <https://pypi.org>: *Your account → Publishing → Add a new
    pending publisher*: project `llm-queue`, owner `techiewonk`, repository `llm-queue`,
    workflow `publish.yml`, environment `testpypi` (TestPyPI) / `pypi` (PyPI).
-2. GitHub *Settings → Environments*: `testpypi`, `pypi` (add yourself as a **required
-   reviewer** on `pypi`, so PyPI waits for one click), and `github-pages` (allow `main` and
-   tags `v*` to deploy).
+2. GitHub *Settings → Environments*: `testpypi`, `pypi` (no reviewers: a tag publishes on
+   its own once every check passes), and `github-pages` (allow `main` and tags `v*` to deploy).
 3. GitHub *Settings → Pages → Source: GitHub Actions*.
 4. Optional: protect tags `v*` (*Settings → Rules → Rulesets*) so only maintainers can push them.
 
@@ -53,8 +52,8 @@ git push origin v0.1.0b1
    git push origin v<version>
    ```
 
-6. Approve the `pypi` deployment when the workflow asks. A pre-release installs only with
-   `pip install --pre llm-queue` (or `llm-queue==<version>`).
+6. Nothing else: the workflow publishes to PyPI and creates the GitHub Release by itself. A
+   pre-release installs only with `pip install --pre llm-queue` (or `llm-queue==<version>`).
 
 A version number can be uploaded only once (PyPI never allows re-use, even after deleting it).
 If the workflow fails before `pypi`, fix it, delete the tag (`git push origin :v<version>`),

@@ -7,7 +7,7 @@ public API (see STABILITY.md).
 
 ## [Unreleased]
 
-## [0.1.0b1] - 2026-11-13
+## [0.1.0b1] - 2026-11-14
 
 First beta, for test runs (`pip install --pre llm-queue`).
 

@@ -486,19 +486,31 @@ class Engine:
         rid = call.pop("request_id", None) or new_id()
         key = self.keys.request(rid, "chunks")
         queue = self.chunks.open(key)
+        # The call's own deadline, as `call` computes it: the idle wait between chunks
+        # (stream_idle_secs, 30) once let a stream whose worker died answer after it (scenario
+        # L2 at 300 %: 38.8 s for a 15 s deadline).
+        timeout = float(call.get("timeout_secs") or view.value(alias, "timeout_secs"))
+        timeout = min(timeout, float(view.value(alias, "timeout_max_secs")))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout + self.settings.caller_margin_secs
         task = asyncio.create_task(self.call(model, params, stream=True, stream_id=rid, **call))
         expected, started = 1, False
         try:
             while True:
+                left = deadline - loop.time()
+                if left <= 0:
+                    raise CallFailed("deadline_exceeded", "no reply in time", request_id=rid)
                 getter = asyncio.ensure_future(queue.get())
                 finished = task.done()
                 done, _ = await asyncio.wait(
                     {getter} if finished else {getter, task},
-                    timeout=idle if started or finished else None,
+                    timeout=min(idle, left) if started or finished else left,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if getter not in done:
                     getter.cancel()
+                    if not done and deadline - loop.time() <= 0:  # the deadline, not idleness
+                        raise CallFailed("deadline_exceeded", "no reply in time", request_id=rid)
                     if task in done:
                         if not started:
                             # The store may be down too: then nothing can be replayed, and
@@ -1507,7 +1519,17 @@ class Engine:
             if not fell:
                 due = await self.health.disabled(alias)
                 wait = max(1.0, min(due.values()) - self.clock.now()) if due else 60.0
-                logger.error("model_unavailable", model=alias)
+                # Why no deployment was usable, per deployment: an operator needs to tell an
+                # open breaker from a disabled deployment (the bare line said neither).
+                why: dict[str, str] = {}
+                for dep in view.deployments(alias):
+                    with contextlib.suppress(*STORE_ERRORS):
+                        cb = await self.state.hgetall(self.keys.model(alias, f"cb:{dep.key}"))
+                        raw = (cb or {}).get(b"state", b"closed")
+                        state = raw.decode() if isinstance(raw, bytes) else str(raw)
+                        disabled = " (disabled)" if dep.key in due else ""
+                        why[dep.key] = f"breaker {state}{disabled}"
+                logger.error("model_unavailable", model=alias, deployments=why)
                 await self._finish_call(
                     held, "model_unavailable", "no usable deployment", retry_after=wait
                 )

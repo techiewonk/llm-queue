@@ -550,6 +550,11 @@ local function settle(alias, owner, rid, refund_r, refund_t, learn, outcome, lat
   end
   redis.call('ZREM', mk(alias, 'lease:' .. dep .. ':' .. cls), owner)
   redis.call('ZREM', mk(alias, 'inprog'), owner)
+  -- A breaker probe that ended without a verdict (cut, given back, throttled) frees the probe
+  -- at once: it blocked every call for breaker_probe_secs, and they waited it out (scenario L4).
+  if outcome ~= 'ok' and outcome ~= 'fail' and redis.call('HGET', mk(alias, 'cb:' .. dep), 'probe') == owner then
+    redis.call('HSET', mk(alias, 'cb:' .. dep), 'probe', '')
+  end
   redis.call('DEL', entry_key)
   if learn and row then
     local ac = mk(alias, 'ac:' .. dep)
@@ -675,7 +680,12 @@ for _, owner in ipairs(redis.call('ZRANGEBYSCORE', inprog, '-inf', now, 'LIMIT',
     if redis.call('HGET', entry_key, 'owner') == owner then
       local dep = redis.call('HGET', entry_key, 'dep')
       local cls = redis.call('HGET', entry_key, 'cls')
-      if dep then redis.call('ZREM', mk(req.alias, 'lease:' .. dep .. ':' .. cls), owner) end
+      if dep then
+        redis.call('ZREM', mk(req.alias, 'lease:' .. dep .. ':' .. cls), owner)
+        -- Its worker died mid-probe: free the probe (it blocked the breaker for 60 s).
+        local cb = mk(req.alias, 'cb:' .. dep)
+        if redis.call('HGET', cb, 'probe') == owner then redis.call('HSET', cb, 'probe', '') end
+      end
       redis.call('DEL', entry_key)
     end
   end

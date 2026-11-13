@@ -380,3 +380,42 @@ async def test_breaker_window_is_a_setting(store: redis.asyncio.Redis, prefix: s
     assert await store.hget(cb, "state") != b"open"  # the count started again
     await fail("f3")
     assert await store.hget(cb, "state") == b"open"
+
+
+async def test_a_probe_without_a_verdict_frees_the_breaker(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """Scenario L4 bug: a breaker probe that ended cut or given back (outcome "none") kept the
+    probe slot for breaker_probe_secs, so every call waited it out and was refused. The next
+    call now becomes the probe at once.
+    """
+    r = await rig(store, prefix)
+    one = [Candidate("aws-a/r1")]
+    cb = f"{prefix}:{{m:m}}:cb:aws-a/r1"
+    await store.hset(cb, mapping={"state": "open", "until": 0})  # cooled down: half-open
+    assert (await r.ask("probe", worker="w1", candidates=one)).kind == "granted"
+    assert (await r.ask("held", worker="w2", candidates=one)).reason == "probe"
+    await r.admission.finish(
+        "m", owner_token("probe", "w1", 1), "probe", refund_r=1, refund_t=0, outcome="none"
+    )
+    assert (await r.ask("next", worker="w2", candidates=one)).kind == "granted"
+
+
+async def test_a_dead_probe_is_freed_by_the_sweep(store: redis.asyncio.Redis, prefix: str) -> None:
+    """Scenario L4 bug: a worker killed during its breaker probe kept the probe slot for
+    breaker_probe_secs. The sweep that removes its lapsed grant now frees the probe too.
+    """
+    r = await rig(store, prefix, lease_secs=0.3)
+    one = [Candidate("aws-a/r1")]
+    cb = f"{prefix}:{{m:m}}:cb:aws-a/r1"
+    await store.hset(cb, mapping={"state": "open", "until": 0})
+    assert (await r.ask("probe", worker="w1", candidates=one)).kind == "granted"
+    removed = 0
+    for _ in range(100):  # until the probe's lease lapses and the sweep removes it
+        removed += await r.admission.sweep("m")
+        if removed:
+            break
+        await asyncio.sleep(0.05)
+    assert removed == 1
+    assert (await store.hget(cb, "probe")) == b""
+    assert (await r.ask("next", worker="w2", candidates=one)).kind == "granted"
