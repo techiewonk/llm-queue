@@ -45,7 +45,7 @@ dependencies = [
     # Structured key-value logs. The library never configures it; the app does (README).
     "structlog>=24.1,<27",
     # UUIDv7 ids (time-ordered), Rust: 0.49 us per id vs 2.4 us for uuid.uuid4().hex (measured).
-    "uuid-utils>=0.19,<1",
+    "uuid-utils>=1.2,<2",
 ]
 
 [project.scripts]
