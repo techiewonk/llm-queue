@@ -20,7 +20,7 @@ services:
 
   redis:
     # Redis 7.4 next to Valkey: every store test runs on both engines (plan E8). Port 6380.
-    image: redis:7.4-alpine
+    image: redis:8.10-alpine
     command: ["redis-server", "--requirepass", "localdev", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
     ports: ["6380:6379"]
     healthcheck:
