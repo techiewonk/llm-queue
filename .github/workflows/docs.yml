@@ -1,14 +1,14 @@
 # Docs site (Zensical) on GitHub Pages.
-# Every pull request builds it with --strict (a broken link fails). A published GitHub
-# release, or a manual run (Actions > Docs > Run workflow, any branch), deploys it.
+# Every pull request builds it with --strict (a broken link fails). A release tag (v*), or a
+# manual run (Actions > Docs > Run workflow), deploys it, so the site shows the latest release.
 # One-time owner setup: Settings > Pages > Source: GitHub Actions; and in Settings >
-# Environments > github-pages, allow the branch or tags that deploy.
+# Environments > github-pages, allow `main` and tags `v*` to deploy.
 name: Docs
 
 on:
   pull_request:
-  release:
-    types: [published]
+  push:
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:

@@ -272,8 +272,9 @@ CHANGELOG entries are plain sentences: what changed and, for a fix, what used to
 
 ## Releases
 
-Releases go out **only** through a GitHub release and `.github/workflows/publish.yml`, which
-re-runs CI, builds once and uploads with PyPI trusted publishing (OIDC, with provenance).
-Never upload with `twine` or by hand, and never store a PyPI token. A manual run of the
-workflow goes to TestPyPI for a trial install. The steps (version bump, CHANGELOG, local
-`make check-all`, TestPyPI, tag) are in [docs/RELEASING.md](https://github.com/techiewonk/llm-queue/blob/main/docs/RELEASING.md).
+Releases go out **only** by pushing a tag `v<version>`: `.github/workflows/publish.yml` checks
+that the tag matches `__version__`, is on `main` and has a CHANGELOG entry, re-runs CI, builds
+once, uploads to TestPyPI, smoke-tests that upload, uploads to PyPI with trusted publishing
+(OIDC, with provenance) and creates the GitHub Release. Never upload with `twine` or by hand,
+and never store a PyPI token. A manual run of the workflow is a dry run that stops after the
+TestPyPI smoke test. The steps are in [docs/RELEASING.md](https://github.com/techiewonk/llm-queue/blob/main/docs/RELEASING.md).
