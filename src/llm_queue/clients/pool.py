@@ -210,8 +210,7 @@ class ClientPool:
         if (client := self._openai.get(account.name)) is not None:
             return client
         try:
-            import httpx
-            from openai import AsyncOpenAI
+            from openai import AsyncOpenAI, Timeout
         except ImportError as exc:
             raise MissingExtra("an openai account", "openai") from exc
         key = self._secrets(account.api_key_ref) if account.api_key_ref else None
@@ -221,7 +220,8 @@ class ClientPool:
             api_key=key or "unused",
             base_url=account.base_url,
             max_retries=0,
-            timeout=httpx.Timeout(self._read, connect=self._connect),
+            # openai's own Timeout: openai 3.x ships its own HTTP types (not httpx's).
+            timeout=Timeout(self._read, connect=self._connect),
         )
         self._openai[account.name] = client
         return client

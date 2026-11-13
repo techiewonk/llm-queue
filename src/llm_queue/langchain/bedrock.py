@@ -12,7 +12,7 @@ import contextlib
 import os
 from collections.abc import Callable
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from langchain_aws import BedrockEmbeddings, ChatBedrockConverse
 from pydantic import Field, model_validator
@@ -130,7 +130,8 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
     model_alias: str | None = None
     allow_fallback: str = "all"
     priority: bool | None = None
-    service_tier: str | None = None
+    # langchain-aws 1.x types it as these values (0.2.x has no such field: ours adds it).
+    service_tier: Literal["priority", "default", "flex", "reserved"] | None = None
     queue_timeout_secs: float | None = None
 
     @model_validator(mode="before")
