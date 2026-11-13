@@ -1,0 +1,42 @@
+name: Bug report
+description: Something in llm-queue does not work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please remove credentials, account ids and prompts you cannot share.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: A minimal script or the queue settings and calls that show the problem.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and traceback
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: llm-queue version
+      placeholder: "0.3.0"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Python version, OS, Valkey / Redis version, provider (Bedrock, OpenAI-compatible).
+    validations:
+      required: true

@@ -1,0 +1,115 @@
+[project]
+site_name = "llm-queue"
+site_description = "LLM calls through a queue on Valkey or Redis, under RPM/TPM budgets"
+site_url = "https://techiewonk.github.io/llm-queue/"
+repo_url = "https://github.com/techiewonk/llm-queue"
+repo_name = "techiewonk/llm-queue"
+docs_dir = "docs"
+site_dir = "site"
+
+nav = [
+  { "Home" = "index.md" },
+  { "Get started" = [
+    { "Getting started" = "tutorials/getting-started.md" },
+  ] },
+  { "How-to guides" = [
+    { "Configure" = "how-to/configure.md" },
+    { "Tune" = "how-to/tune.md" },
+    { "Make calls" = "how-to/call.md" },
+    { "Operate" = "how-to/operate.md" },
+    { "Many services, one model" = "how-to/share-models.md" },
+    { "Test" = "how-to/test.md" },
+    { "Samples" = "how-to/samples.md" },
+  ] },
+  { "Explanation" = [
+    { "Architecture overview" = "explanation/architecture.md" },
+    { "The life of a call" = "explanation/call-lifecycle.md" },
+    { "Admission" = "explanation/admission.md" },
+    { "Attempts and retries" = "explanation/attempts.md" },
+    { "Failures and recovery" = "explanation/resilience.md" },
+    { "Streaming" = "explanation/streaming.md" },
+    { "Storage" = "explanation/storage.md" },
+    { "Background tasks" = "explanation/background.md" },
+    { "Performance" = "explanation/performance.md" },
+  ] },
+  { "Reference" = [
+    { "Configuration" = "reference/configuration.md" },
+    { "Errors" = "reference/errors.md" },
+    { "CLI and HTTP" = "reference/cli-http.md" },
+    { "Extension points" = "reference/extension-points.md" },
+    { "API" = "reference/api.md" },
+  ] },
+  { "Project" = [
+    { "Changelog" = "project/changelog.md" },
+    { "Stability" = "project/stability.md" },
+    { "Contributing" = "project/contributing.md" },
+    { "Security" = "project/security.md" },
+  ] },
+]
+
+# Internal docs: never published (ARCHITECTURE.md is a pointer page for GitHub readers).
+exclude_docs = """
+ACCOUNT_ROUTING_PLAN.md
+ACCOUNT_ROUTING_WALKTHROUGH.md
+ARCHITECTURE.md
+internal/
+RELEASING.md
+"""
+
+[project.theme]
+language = "en"
+features = [
+  "content.code.copy",
+  "content.code.annotate",
+  "navigation.tabs",
+  "navigation.sections",
+  "navigation.indexes",
+  "search.suggest",
+  "content.tabs.link",
+  "navigation.top",
+  "navigation.footer",
+  "navigation.instant",
+  "navigation.tracking",
+  "search.highlight",
+]
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to light mode"
+
+[project.plugins.mkdocstrings.handlers.python]
+paths = ["src"]
+inventories = ["https://docs.python.org/3/objects.inv"]
+
+[project.plugins.mkdocstrings.handlers.python.options]
+docstring_style = "google"
+show_source = false
+show_root_heading = true
+members_order = "source"
+filters = ["!^_"]
+show_signature_annotations = true
+separate_signature = true
+merge_init_into_class = true
+
+[project.markdown_extensions]
+admonition = {}
+attr_list = {}
+md_in_html = {}
+toc.permalink = true
+pymdownx.details = {}
+pymdownx.highlight.anchor_linenums = true
+pymdownx.inlinehilite = {}
+pymdownx.snippets.base_path = ["."]
+pymdownx.snippets.check_paths = true
+pymdownx.superfences.custom_fences = [
+  { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" },
+]
+pymdownx.tabbed.alternate_style = true

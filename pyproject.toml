@@ -1,0 +1,183 @@
+[project]
+name = "llm-queue"
+description = "LLM calls through a queue on Valkey / Redis: RPM and TPM budgets per account and region, balancing, fallback, health and status."
+readme = "README.md"
+requires-python = ">=3.11"
+dynamic = ["version"]
+# PEP 639 licence expression; NOTICE credits the projects the queue design builds on.
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "The llm-queue authors" }]
+keywords = [
+    "valkey", "redis", "llm", "bedrock", "openai", "queue", "rate-limit", "langchain", "langgraph",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Distributed Computing",
+    "Typing :: Typed",
+]
+
+# Ranges, not pins: a library that pins exact versions locks every user into one botocore
+# patch window. Exact versions live only in the consuming app's lockfile.
+dependencies = [
+    # Async Bedrock (and S3 offload) client. aiobotocore pins a narrow botocore window.
+    # Upper bound: the pool reads aiobotocore internals (refreshable credentials).
+    "aiobotocore>=2.23,<4",
+    # Queues, budgets, registry and results on any Redis-protocol store (Valkey, Redis).
+    "redis>=5.0.1,<9",
+    # C RESP parser, picked up by redis-py: Lua array replies and stream reads parse 39-75x
+    # faster than redis-py's pure-Python parser (measured 2026-11-13).
+    "hiredis>=3,<4",
+    "pydantic>=2.10,<3",
+    # JSON on every hot path (envelopes, params, provider bodies): an EMF line 0.8 us vs 6.2 us,
+    # a 200 KB request round trip 0.38 ms vs 0.95 ms with stdlib json (measured 2026-11-13).
+    "orjson>=3.10,<4",
+    # Structured key-value logs. The library never configures it; the app does (README).
+    "structlog>=24.1,<27",
+    # UUIDv7 ids (time-ordered), Rust: 0.49 us per id vs 2.4 us for uuid.uuid4().hex (measured).
+    "uuid-utils>=0.19,<1",
+]
+
+[project.scripts]
+llm-queue = "llm_queue.engine.cli:main"
+
+[project.optional-dependencies]
+openai = ["openai>=1.40,<4", "httpx>=0.27,<1"]
+# Both LangChain lines are supported: 0.3 and 1.x (the adapters are tested on each).
+langchain-aws = ["langchain-aws>=0.2.24,<2", "langchain-core>=0.3.68,<2"]
+langchain-openai = ["langchain-openai>=0.3.26,<2", "langchain-core>=0.3.68,<2"]
+metrics = ["prometheus-client>=0.20,<1"]
+# Status / registry / health routes for a FastAPI app (`LLMQueue.http_router`).
+# 0.115.3+: Starlette with the multipart DoS fixes (CVE-2024-47874).
+http = ["fastapi>=0.115.3,<1"]
+
+[project.urls]
+Homepage = "https://github.com/techiewonk/llm-queue"
+Documentation = "https://techiewonk.github.io/llm-queue/"
+Source = "https://github.com/techiewonk/llm-queue"
+Issues = "https://github.com/techiewonk/llm-queue/issues"
+Changelog = "https://github.com/techiewonk/llm-queue/blob/main/CHANGELOG.md"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "types-aiobotocore[s3,bedrock-runtime,sts]",
+    "moto[server]>=5",
+    "fakeredis>=2.26",
+    # extras installed for development and tests of the provider/adapter layers
+    # The dev env stays on the LangChain 0.3 line; the 1.x line is checked in CI / a scratch venv.
+    "openai>=1.40,<4",
+    "httpx>=0.27,<1",
+    "langchain-aws>=0.2.24,<0.3",
+    "langchain-openai>=0.3.26,<0.4",
+    "langchain-core>=0.3.68,<0.4",
+    "langgraph>=0.2",
+    "fastapi>=0.115.3,<1",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]  # PEP 639 license-files
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/llm_queue/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llm_queue"]
+
+[tool.hatch.build.targets.sdist]
+# Allow-list: secrets (.env, .pypirc) and local tooling can never reach the sdist.
+# The design plan, walkthrough and release / test plans are internal: never in the sdist.
+include = ["src/", "README.md", "LICENSE", "NOTICE", "CHANGELOG.md", "STABILITY.md", "SECURITY.md"]
+
+[tool.ruff]
+# target-version comes from project.requires-python.
+line-length = 100
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["ASYNC", "B", "C4", "D", "E", "F", "I", "PIE", "PT", "RET", "RUF", "SIM", "UP", "W"]
+ignore = ["D105"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]
+"samples/*" = ["D103"]  # samples read top to bottom; the module docstring says it all
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+files = ["src", "tests", "tools", "scripts", "samples"]
+# Test folders have no __init__.py (several conftest.py files): map modules from paths.
+explicit_package_bases = true
+mypy_path = ["src", "tools/fakellm"]
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+
+[[tool.mypy.overrides]]
+module = ["moto.*", "fastapi", "fastapi.*"]
+ignore_missing_imports = true
+
+# FastAPI is an optional extra: its decorators are untyped when it is not installed.
+[[tool.mypy.overrides]]
+module = ["llm_queue.engine.http"]
+disallow_untyped_decorators = false
+
+# Test helpers are imported by bare name (pytest puts their folder on sys.path); the helper
+# files themselves are still type-checked as part of `files`.
+[[tool.mypy.overrides]]
+module = ["fakellm_testkit", "providers_fake", "clients_testkit", "engine_testkit", "gates_fleet", "failover", "gates"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "8"
+# -ra: a short summary of every non-passing outcome (scripts/check.py passes -rA on top).
+addopts = ["-ra", "--strict-config", "--strict-markers"]
+xfail_strict = true
+log_level = "INFO"
+filterwarnings = [
+    "error",
+]
+pythonpath = ["src"]
+testpaths = ["tests/unit"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: needs the Docker stack (docker/compose.yaml)",
+]
+
+[tool.repo-review]
+ignore = [
+    # PY007 (nox/tox): scripts/check.py is the task runner (CONTRIBUTING.md); it also drives the
+    # Docker stack steps, which nox/tox would only wrap.
+    "PY007",
+    # GH200 (Dependabot): dependency updates come from Renovate (Renovate app on the repo);
+    # Dependabot as well would open duplicate update PRs.
+    "GH200",
+    # PC140 (mypy hook): strict mypy needs the full locked env (extras, stubs, plugin);
+    # scripts/check.py and CI run it.
+    "PC140",
+    # PC160 / PC180 (spell checker, Markdown formatter): not adopted yet; follow-up.
+    "PC160",
+    "PC180",
+    # PC901-PC903: pre-commit.ci is not used; CI runs scripts/check.py's steps.
+    "PC901",
+    "PC902",
+    "PC903",
+]
