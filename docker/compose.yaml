@@ -9,7 +9,7 @@ name: llmq-test
 services:
   valkey:
     # Prod runs Valkey 8.x on ElastiCache; password required, TLS off locally (the app's VALKEY_SSL=false).
-    image: valkey/valkey:8.1-alpine
+    image: valkey/valkey:9.2-alpine
     command: ["valkey-server", "--requirepass", "localdev", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
     ports: ["6379:6379"]
     healthcheck:
