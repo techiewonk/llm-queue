@@ -2,6 +2,23 @@
 
 Measured numbers, with where each comes from. Nothing here is an estimate unless it says so.
 
+```mermaid
+flowchart LR
+  subgraph caller["Caller"]
+    c1["REGISTER"] --> c2["SEND + doorbell"] --> c3["CONFIRM"]
+    c4["RESULT_TAKE"]
+  end
+  subgraph worker["Worker"]
+    w1["RECEIVE (batched)"] --> w2["CALLERS_ALIVE"] --> w3["PICK_TAKE<br/>p99 0.94 ms, 600 deployments"]
+    w3 --> w4["provider call"] --> w5["FINISH"] --> w6["RESULT_PUT + PUBLISH"] --> w7["STATUS_SET, ACK"]
+  end
+  c3 -. "wake: one doorbell token" .-> w1
+  w6 -. "wake: pub/sub" .-> c4
+  note["11.6 store scripts per call (B19)<br/>+0-15 ms p95 over a direct call (B34)<br/>290 calls/s on 4 workers"]
+```
+
+Every step above is one store round trip; the measured numbers below say what each costs.
+
 Numbers from the CHANGELOG "Performance" section and [plan §13](https://github.com/techiewonk/llm-queue/blob/main/docs/ACCOUNT_ROUTING_PLAN.md) (2026-11-13, Python 3.12, fakellm, worker
 processes as pods on one machine).
 
