@@ -21,6 +21,7 @@ from aiohttp.test_utils import TestServer
 
 from llm_queue import Tuning
 from llm_queue.clients import ClientHub, ClientPool, OpenAIOptions, Providers, Route, Timing
+from llm_queue.clients.timing import first
 from llm_queue.errors import ErrorKind
 from llm_queue.providers import classify_openai, is_connection_reset
 from llm_queue.registry import Account
@@ -167,9 +168,6 @@ async def test_a_cancelled_call_closes_its_connection(http: str, mid_stream: boo
     provider = Providers(pool).get("openai")
     task = asyncio.create_task(provider.call("chat", {"messages": MESSAGES}, route, Timing(9, 9)))
     await asyncio.wait_for(opened.wait(), 5)
-    # Let the first chunk land: on Python 3.11 a cancel in the same loop turn as a finished
-    # read is lost by `asyncio.wait_for` (timing.first; fixed in 3.12).
-    await asyncio.sleep(0.2)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -177,6 +175,17 @@ async def test_a_cancelled_call_closes_its_connection(http: str, mid_stream: boo
     await pool.aclose()
     raw.close()
     await raw.wait_closed()
+
+
+async def test_a_cancel_in_the_same_turn_as_the_result_is_not_lost() -> None:
+    """Python 3.11's `wait_for` returned the result and dropped the cancel (timing.first)."""
+    read: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+    task = asyncio.create_task(first(read, 5, "chunk"))
+    await asyncio.sleep(0)  # the task now waits on the read
+    read.set_result(1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 def _refused_url() -> str:
