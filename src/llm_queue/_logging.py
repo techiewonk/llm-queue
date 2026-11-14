@@ -25,17 +25,29 @@ def _to_stdlib(
     event = str(event_dict.pop("event", ""))
     kwargs: dict[str, Any] = {k: event_dict.pop(k) for k in _PASSTHROUGH if k in event_dict}
     fields: Mapping[str, Any] = dict(event_dict)
-    message = " ".join([event, *(f"{k}={v}" for k, v in fields.items())])
+    message = " ".join([event, *(f"{k}={_value(v)}" for k, v in fields.items())])
     kwargs["extra"] = {"llmq": {"event": event, **fields}}
     kwargs["stacklevel"] = 4  # point %(funcName)s/%(lineno)d at the library call site
     return (message,), kwargs
+
+
+def _value(value: Any) -> str:
+    """A field value for the message line; `repr()` when it holds a control character.
+
+    `error=str(exc)` with a newline in it forged a second log line (CO-22), the risk
+    `check_actor` guards against for the audit actor.
+    """
+    text = str(value)
+    return repr(text) if any(ord(c) < 32 or 127 <= ord(c) < 160 for c in text) else text
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:
     """Key-value logger bound to `logging.getLogger(name)`; used by every library module."""
     return structlog.wrap_logger(  # type: ignore[no-any-return]
         logging.getLogger(name),
-        processors=[_to_stdlib],
+        # The level check first: a disabled call built its whole message before the stdlib
+        # logger dropped it (CO-22).
+        processors=[structlog.stdlib.filter_by_level, _to_stdlib],
         wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
     )
