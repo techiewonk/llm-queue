@@ -31,12 +31,16 @@ except CallFailed as exc:                # exc.kind: rate_limited, model_unavail
 await llmq.stop()
 ```
 
+Start one `LLMQueue` per process, after any fork. With `LLMQ_ENVIRONMENT` unset the process is
+strict (TLS store, `LLMQ_ID_HASH_SALT`); set `LLMQ_ENVIRONMENT=dev` on a laptop. Every variable:
+[Environment variables](https://techiewonk.github.io/llm-queue/reference/environment/).
+
 ## Documentation
 
 Full documentation: **https://techiewonk.github.io/llm-queue/**
 
 - [Getting started](https://techiewonk.github.io/llm-queue/tutorials/getting-started/): install, local stack, a registry, the first call
-- [How-to guides](https://techiewonk.github.io/llm-queue/how-to/configure/): configure, tune, call, operate, share models across services, test
+- [How-to guides](https://techiewonk.github.io/llm-queue/how-to/configure/): configure, Bedrock IAM, tune, call, operate, share models across services, secure, test
 - [Explanation](https://techiewonk.github.io/llm-queue/explanation/architecture/): architecture, the life of a call, admission, failures and recovery
 - [Reference](https://techiewonk.github.io/llm-queue/reference/configuration/): settings, error kinds, CLI and HTTP, the Python API
 
