@@ -31,6 +31,7 @@ answer; they never skip silently. Engine tests run on both Valkey and Redis.
 | Step | Covers | Tests |
 |---|---|---|
 | `a0` | fakellm (accounts, TPM, pacing, hang, streaming) | `tests/unit/fakellm` |
+| `tools` | test tooling: provider error table, budget properties, 200-way contention | `tests/unit/providers`, `test_budget_properties.py`, `test_contention.py` |
 | `a1`, `a2` | registry schema / validation / resolve; store (version rule, edits, audit, rollback) | `tests/unit/registry`, `tests/integration/registry` |
 | `a3` | clients, providers, timers | `tests/unit/clients` |
 | `a4`, `a5`, `a6` | request records; stream queue; admission scripts | `tests/integration/engine/test_requests.py`, `test_queue.py`, `test_admission.py` |
@@ -43,6 +44,11 @@ answer; they never skip silently. Engine tests run on both Valkey and Redis.
 | `samples` | `scripts/samples.py`: the nine samples on fakellm (`--live` real Bedrock, `--store env` a TLS store) | |
 | `scenarios` | `scripts/scenarios.py`: fault scenarios x 3 loads, plus the Docker failover drills | |
 | `soak3` / `soak10` / `soak20` | `scripts/soak.py --minutes N` (not in `all`) | |
+| `bench` | `scripts/bench.py`, not gating: it prints numbers and never fails the run | |
+
+pytest fails a test after 120 s (pytest-timeout) and CI requires 89 % branch coverage.
+Scripts that start queues on the local stack set `LLMQ_ENVIRONMENT=test`, since an unset
+environment is strict and refuses the plain-TCP store.
 
 ## Fault scenarios
 
@@ -65,6 +71,7 @@ python scripts/check.py scenarios --quick            # every scenario, one load 
 | `--profile` | `fast` (default: short leases, visibility, deadlines and lifetimes; 10-40 s a scenario), `prod` (production timers) |
 | `--jobs` | runs at a time (default 4; 1 runs them one by one) |
 | `--group` | `worker`, `store`, `provider`, `registry`, `caller`, `pairs`, `failover` |
+| `--seed` | seed of every random choice (printed at the start; the same in `gates.py` and `soak.py`), to replay a run |
 
 | Group | Scenarios |
 |---|---|
@@ -88,6 +95,63 @@ chaos event:
 | `soak20` | ~84,000 | every 120 s, block 20 s | before a release |
 
 `--live` runs it on real Bedrock at 10 RPM.
+
+## Gates and the perf baseline
+
+`scripts/gates.py` runs the plan's load and chaos gates on worker processes. Gate B34 compares
+the queue's p95 and ceiling with `scripts/baselines/perf.json` (p95 within 25 % + 10 ms,
+ceiling at least 80 %) and fails when no baseline exists, so record one per machine first:
+
+```bash
+python scripts/gates.py B34 --record-baseline   # store this machine's B34 numbers
+python scripts/gates.py B34 --seed 7            # replay a run
+```
+
+## Benchmark
+
+`scripts/bench.py` measures pod start, the cold first call, the first call after an idle
+spell, steady and stream overhead and store round trips per call, with the public API only,
+so every release is measured the same way. See [Performance](../explanation/performance.md).
+
+```bash
+python scripts/bench.py                         # everything: 5 reps, 60 s idle
+python scripts/bench.py --reps 10 --idle 300 --out bench.json
+python scripts/bench.py --only start steady roundtrips
+```
+
+## fakellm
+
+fakellm's behaviour is set per model x target key in a scenario (YAML or JSON at boot,
+`PUT /admin/scenario`) or patched mid-test (`PATCH /admin/models/{key}`); `POST /admin/reset`
+clears the counters and `GET /admin/stats` reads them. Besides latency, RPM / TPM, concurrency,
+throttle / 5xx / timeout rates and `hang`, a key can set:
+
+| Field | Effect |
+|---|---|
+| `force_error` | every call returns that `ERRORS` row; the rows include the auth errors (`UnrecognizedClientException`, `InvalidSignatureException`, `InvalidSignatureClockSkew`, `ExpiredTokenException`) and the quota error (`ServiceQuotaExceededException`, OpenAI `insufficient_quota`) |
+| `force_message` | replaces every error's message (to test classification by message) |
+| `cut_after_chunks`, `cut_with` | a stream ends after that many text chunks, with an in-stream exception, `stall` (no more bytes, socket open) or `close` (socket dropped) |
+| `tail_rate`, `tail_ms` | a heavy latency tail; `latency_per_1k_input_ms` makes latency grow with the prompt |
+| `reasoning` | reasoning blocks (`text`, `redacted`, `both`), gpt-oss style |
+| `cache_read_tokens`, `cache_write_tokens` | prompt-cache usage in the reply |
+
+Per key, `/admin/stats` also counts calls per wall-clock minute (`by_minute`, to check a
+fixed-window budget at the provider) and `duplicates` (a request body seen twice since the
+reset: a call that ran twice).
+
+## Property tests
+
+Hypothesis tests check the budget math: `tests/unit/engine/test_budget_properties.py` (token
+estimate, used tokens, refunds) and `tests/integration/engine/test_budget_clock.py`, which
+runs the admission scripts' fixed and smooth RPM windows at chosen times and compares them
+grant by grant with a Python model. `Admission(clock_ms=...)` (tests only) replaces the
+store's clock for this.
+
+## Nightly
+
+`.github/workflows/nightly.yml` (02:17 UTC, or run by hand) runs what CI cannot run on every
+push: `scenarios.py all --load under`, `gates.py --quick` and a 10-minute soak, on fakellm
+and the Docker stack, and keeps `reports/` as an artifact for 7 days.
 
 ## Logs
 

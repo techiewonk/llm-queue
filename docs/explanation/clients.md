@@ -64,14 +64,14 @@ sequenceDiagram
 - **Warm connections.** After a Bedrock client is built, two unsigned `HEAD` requests open
   connections to its endpoint (no model is invoked, nothing is billed). They repeat every 10 s,
   below the provider's ~20 s idle close and the 15 s keep-alive, so the first call after start
-  or after an idle spell does not pay for a TLS handshake. `WarmOptions(connections=0)` turns it
-  off.
+  or after an idle spell does not pay for a TLS handshake. Set it with
+  `Tuning(warm=WarmOptions(...))` (defaults `connections=2`, `refresh_secs=10.0`,
+  `keepalive_secs=15.0`); `connections=0` turns it off, `refresh_secs=0` keeps the first
+  warm-up but stops the repeats.
 - **Pool size from the registry.** Each client's connection pool is the sum of the concurrency
   slots routed to its account and region, at least 10 and at most 200, instead of a fixed 100.
 - **Credentials.** Assumed-role sessions and `credentials=` values that carry an expiry are
   refreshed about 5 minutes before they expire, so no call waits on STS.
-
-<!-- verify after merge: WarmOptions defaults (connections 2, refresh_secs 10, keepalive_secs 15) and pool floor / cap (10 / 200) in clients/hub.py; measured start / first-call numbers go to performance.md (PLAN E6). -->
 
 On Linux and macOS, the optional `uvloop` extra gives a faster event loop:
 `pip install 'llm-queue[uvloop]'` and run the app with `llm_queue.run(main())` (it uses uvloop when

@@ -95,6 +95,7 @@ service does not answer; they never skip silently.
 | Steps | What they cover |
 |---|---|
 | `a0` | fakellm itself (accounts, TPM, speed, hangs, streaming) |
+| `tools` | test tooling: the provider error table, budget property tests, 200-way contention |
 | `a1`-`a2` | registry: schema, settings, validation; store, live edits, audit, rollback |
 | `a3` | clients per account and region, providers, attempt timers |
 | `a4`-`a6` | keys, message format, stream queue, admission (Lua) |
@@ -105,6 +106,7 @@ service does not answer; they never skip silently.
 | `gates` | `scripts/gates.py`: the plan's load and chaos gates on worker processes (~20 min) |
 | `soak3` / `soak10` / `soak20` (not in `all`) | `scripts/soak.py --minutes N`: 8 worker processes, chaos (kill, store block, live edit, restart), leak and drift checks; `soak20` before a release |
 | `samples` | `scripts/samples.py`: every file in `samples/` run as app code on fakellm |
+| `bench` (not gating) | `scripts/bench.py`: prints its numbers; a failure never fails the run |
 
 **No test calls a real LLM.** Unit tests use fakes, stack tests and drills use fakellm. The
 only path to a real model is `python scripts/samples.py --live` (real Bedrock, AWS keys read
@@ -113,8 +115,12 @@ points the samples at the env file's store; the run touches only its own key pre
 deletes it afterwards.
 
 CI (`.github/workflows/ci.yml`) runs ruff, format, mypy and the unit tests on Python
-3.11-3.14, the unit tests on the lowest allowed versions (`--resolution lowest-direct`), the
-LangChain 1.x adapters, and unit plus integration tests against the same Docker stack.
+3.11-3.14, the unit tests on Windows and on the lowest allowed versions
+(`--resolution lowest-direct`), the LangChain 0.3 adapters, and unit plus integration tests
+against the same Docker stack on Python 3.11, 3.12 and 3.14 (with coverage on 3.12). The
+nightly workflow (`.github/workflows/nightly.yml`, 02:17 UTC or by hand) runs the slow
+drills CI cannot run on every push: `scenarios.py all --load under`, `gates.py --quick` and
+a 10-minute soak, all on fakellm, and keeps `reports/` for 7 days.
 
 ### Adding a check step
 
@@ -207,6 +213,44 @@ Rules:
   `--strict-config`), and an `xfail` that passes fails (`xfail_strict`). Fix a new warning
   at its source; add a narrow `ignore:` filter, with a comment, only for a warning a
   third-party library raises. Register any new marker under `markers`.
+
+### Test tooling
+
+- **fakellm knobs and counters.** fakellm's behaviour is set per model x target key in a
+  scenario (YAML or JSON at boot, `PUT /admin/scenario`) or patched mid-test (`PATCH /admin/models/{key}`); `POST /admin/reset`
+  clears the counters and `GET /admin/stats` reads them. Besides latency, RPM / TPM, concurrency,
+  throttle / 5xx / timeout rates and `hang`, a key can set:
+
+  | Field | Effect |
+  |---|---|
+  | `force_error` | every call returns that `ERRORS` row; the rows include the auth errors (`UnrecognizedClientException`, `InvalidSignatureException`, `InvalidSignatureClockSkew`, `ExpiredTokenException`) and the quota error (`ServiceQuotaExceededException`, OpenAI `insufficient_quota`) |
+  | `force_message` | replaces every error's message (to test classification by message) |
+  | `cut_after_chunks`, `cut_with` | a stream ends after that many text chunks, with an in-stream exception, `stall` (no more bytes, socket open) or `close` (socket dropped) |
+  | `tail_rate`, `tail_ms` | a heavy latency tail; `latency_per_1k_input_ms` makes latency grow with the prompt |
+  | `reasoning` | reasoning blocks (`text`, `redacted`, `both`), gpt-oss style |
+  | `cache_read_tokens`, `cache_write_tokens` | prompt-cache usage in the reply |
+
+  Per key, `/admin/stats` also counts calls per wall-clock minute (`by_minute`, to check a
+  fixed-window budget at the provider) and `duplicates` (a request body seen twice since the
+  reset: a call that ran twice).
+- **Seeds.** `scripts/scenarios.py`, `scripts/gates.py` and `scripts/soak.py` seed every random
+  choice and print the seed at the start; `--seed N` replays a run.
+- **Perf baseline.** Gate B34 compares the queue's p95 and ceiling with
+  `scripts/baselines/perf.json` (within 25 % + 10 ms, ceiling at least 80 %) and fails when
+  there is none. Record one per machine with `python scripts/gates.py B34 --record-baseline`.
+- **Benchmark.** `python scripts/bench.py` measures pod start, the cold first call, the first
+  call after `--idle` seconds, steady and stream overhead and store round trips per call, with
+  the public API only (`--reps`, `--only PHASE...`, `--out FILE.json`). The 0.1.0b1 numbers are
+  in `scripts/baselines/bench-0.1.0b1.json`; compare only runs made back to back on one machine.
+- **Property tests (Hypothesis).** `tests/unit/engine/test_budget_properties.py` checks the
+  token estimate, used tokens and refunds; `tests/integration/engine/test_budget_clock.py`
+  checks the admission scripts' fixed and smooth RPM windows grant by grant against a Python
+  model, at chosen times: `Admission(clock_ms=...)` (tests only) replaces the store's clock.
+- **Environment.** Scripts that start queues on the local stack set `LLMQ_ENVIRONMENT=test`
+  (a plain-TCP store and no salt are refused otherwise, since unset is strict).
+- **Timeouts and coverage.** pytest-timeout fails a test after 120 s (`timeout` in
+  `pyproject.toml`) instead of stalling CI; branch coverage must stay at or above 89 %
+  (`fail_under`), measured by the Python 3.12 integration job.
 
 ## Lua scripts
 

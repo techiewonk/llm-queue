@@ -138,17 +138,15 @@ job_id = await llmq.send_job("index_documents", {"ids": ids, "texts": texts})
 Jobs run at least once, on processes in `both` or `worker` mode. They have no LLM budget of
 their own; the LLM calls inside them do.
 
-- **`timeout_secs`**: a run longer than this is cancelled and counts as a failure (retried, then
+- **`timeout_secs`** (`register_job(name, fn, *, timeout_secs=None)`): a run longer than this is cancelled and counts as a failure (retried, then
   dead-lettered after 5 failures). Without it a hung job holds a worker slot for good.
-- **Queue limit**: a jobs queue holds at most 10,000 waiting jobs; `send_job` beyond that fails
-  instead of filling the store.
+- **Queue limit**: a jobs queue holds at most 10,000 waiting jobs; `send_job` beyond that raises
+  `CallFailed("queue_full")` with `retry_after_secs` 5 instead of filling the store.
 - **No consumer**: `send_job` to a name no running process has registered still queues the job,
   but logs `job_no_consumer` (once a minute per name) and counts `llmq_jobs_no_consumer_total`,
   so a typo or a missing worker deployment shows up at once.
 - **Shutdown**: a job still running when the drain ends is returned to the queue, not failed.
   A job whose acknowledgement failed after it finished is logged as a duplicate run.
-
-<!-- verify after merge: LLMQueue.register_job (core.py) forwards timeout_secs to JobRunner.register; at 84c979d it took only (name, fn). Also the exception send_job raises at the 10,000 limit. -->
 
 ## Request context
 

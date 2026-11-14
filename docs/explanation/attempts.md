@@ -76,7 +76,8 @@ sequenceDiagram
 
 - **Shared window.** The deployment is out for every pod until
   `max(Retry-After, backoff)`. The backoff is jittered and grows per throttle in a row:
-  1-2 s, doubling up to 30 s; a success ends the streak.
+  1-2 s, doubling up to 30 s; a success ends the streak (`Tuning.engine.throttle_base_ms`
+  1000 and `throttle_max_ms` 30000).
 - **Calls move or wait.** Admission skips a throttled deployment; with another usable one the
   call moves at once, with none left it waits for the window within its deadline.
 - **Budget.** Every throttle refunds the request and its tokens and cuts the learned
@@ -85,14 +86,13 @@ sequenceDiagram
 - **Alert.** `quota_above_observed` turns on when throttles come while the deployment still had
   registry budget: the real quota is below the registry's number.
 
-<!-- verify after merge: throttle backoff numbers (THROTTLE_BASE_MS 1000, THROTTLE_MAX_MS 30000, jitter range) in engine/admission.py and _admission_lua.py. -->
-
 ## Token estimates
 
 The estimate is characters / 4 of every text in the request. Binary blocks (`image`,
 `document`, `video`, `audio`, and OpenAI `image_url` / `input_audio` / `file`) are not read as
-text: their base64 would count as tens of thousands of tokens; each costs a fixed charge instead,
-and the real usage corrects the budget after the call.
+text: their base64 would count as tens of thousands of tokens; each costs a fixed 1,000 tokens
+instead (a starting value: a ~1 MP image is about 1,300 tokens on Claude), and the real usage
+corrects the budget after the call.
 
 Characters / 4 fits English. Indic (Hindi, Tamil, ...) and CJK scripts take more tokens per
 character, so the estimate is low and a deployment may be admitted past its TPM until the
@@ -120,5 +120,3 @@ register_token_estimator("hindi", estimate)
 The setting is per model (or per deployment); other models keep characters / 4. A name that is
 not registered in the process falls back to characters / 4, so register it in every process
 that makes calls. Keep the estimator fast: it runs on every call before admission.
-
-<!-- verify after merge: BINARY_BLOCK_TOKENS (1000 per block, an unverified starting value) in engine/tokens.py. -->

@@ -17,17 +17,26 @@ Passed as `LLMQueue.from_env(tuning=Tuning(...))`. Defaults:
 |---|---|
 | `StoreOptions` (`tuning.store`) | `retries` (3), `connect_timeout_secs` (5), `read_timeout_secs` (15), `health_check_secs` (30), `pool_wait_secs` (10) |
 | `BedrockOptions` (`tuning.bedrock`) | `read_timeout_secs` (300), `connect_timeout_secs` (10), `max_pool_connections` (100: used only until the registry sizes the pool, see below), `role_session_secs` (3600) |
-| `EngineTimings` (`tuning.engine`) | `idle_poll_secs` (0.05), `idle_slow_secs` (1), `idle_after_empty` (20), `result_recheck_secs` (60), `health_probe_secs` (3), `stream_read_block_ms` (100), `admission_probe_wait_ms` (200), `admission_slot_wait_ms` (50), `admission_slot_jitter_ms` (150), `admission_wait_ms` (100), `limiter_cut_ms` (1000), `limiter_cut_factor` (0.7), `budget_key_ms` (180000) |
+| `EngineTimings` (`tuning.engine`) | `idle_poll_secs` (0.05), `idle_slow_secs` (1), `idle_after_empty` (20), `result_recheck_secs` (60), `health_probe_secs` (3), `stream_read_block_ms` (100), `admission_probe_wait_ms` (200), `admission_slot_wait_ms` (50), `admission_slot_jitter_ms` (150), `admission_wait_ms` (100), `limiter_cut_ms` (1000), `limiter_cut_factor` (0.7), `budget_key_ms` (180000), `throttle_base_ms` (1000), `throttle_max_ms` (30000), `slow_stale_ms` (300000), `job_ttl_ms` (3600000) |
 | `RegistryOptions` (`tuning.registry`) | `history_size` (20), `edit_retries` (3) |
+| `OpenAIOptions` (`tuning.openai`) | `read_timeout_secs` (300), `connect_timeout_secs` (10), `max_connections` (100), `max_keepalive_connections` (20), `keepalive_secs` (15) |
+| `WarmOptions` (`tuning.warm`) | `connections` (2; 0 = off), `refresh_secs` (10; 0 = warm once, no repeats), `keepalive_secs` (15) |
 
 What each field does and the start-up checks are in [Tune](../how-to/tune.md).
 
 Bedrock connection pools are sized from the registry: each (account, region) client gets the sum
 of the concurrency slots routed to it, at least 10 and at most 200 connections. `WarmOptions`
 (2 warm connections per client, refreshed every 10 s, kept idle 15 s) controls the warm
-connections; see [Clients and connections](../explanation/clients.md).
+connections; see [Clients and connections](../explanation/clients.md). Both are importable
+from `llm_queue` and passed like the other parts:
 
-<!-- verify after merge: how WarmOptions and OpenAIOptions are passed (they were exported but not wired into from_env / Tuning on the client-hub branch). -->
+```python
+from llm_queue import LLMQueue, OpenAIOptions, Tuning, WarmOptions
+
+queue = LLMQueue.from_env(
+    tuning=Tuning(openai=OpenAIOptions(read_timeout_secs=120), warm=WarmOptions(connections=4))
+)
+```
 
 ## Registry settings
 
@@ -51,8 +60,6 @@ Settings added or changed in 0.1.0b2:
 | `alerts` | | | Only `quota_used_pct` (1-100, default 90; `quota_near_limit` now checks TPM too) and `dlq_messages` (1 or more, default 1). `quota_used_mins`, `spill_pct`, `spill_window_secs` and `waiting_age_secs` did nothing and were removed |
 | `live_edit` (top level) | document | unset | The document's live-edit mode (deploy-only) |
 | `min_lib_version` (top level) | document | unset | Now a version such as `0.1.0b2`; checked against the running library |
-
-<!-- verify after merge: `converse_api` — registry/settings.py allows "converse" | "stream", but clients/providers.py compares "converse_stream" and runtime.py never passes Timing.attempt_secs (dev/0.1.0b2 at 84c979d). -->
 
 Validation added in 0.1.0b2 (each refused with its path): a TPM below one call's reservation
 (`max output x tpm_output_weight`); a `model_fallback` to another provider; a fallback cycle of

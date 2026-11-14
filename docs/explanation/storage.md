@@ -99,12 +99,10 @@ model's `queue.name`) and `...-priority`; jobs use `jobs-<name>`. Hash tags grou
 
 | Requirement | Why | What the library does |
 |---|---|---|
-| `maxmemory-policy noeviction` (recommended) | Any evicting policy lets a full store drop queue messages, budgets and results: lost calls and overspent budgets | Reads the policy at `start()` (`CONFIG GET`, else `INFO memory` where `CONFIG` is disabled, as on ElastiCache); logs `store_eviction_policy` with a warning when it is not `noeviction`, and reports the policy in health |
+| `maxmemory-policy noeviction` (recommended) | Any evicting policy lets a full store drop queue messages, budgets and results: lost calls and overspent budgets | Reads the policy at `start()` (`CONFIG GET`, else `INFO memory` where `CONFIG` is disabled, as on ElastiCache); logs `store_eviction_policy` with a warning when it is not `noeviction`, and reports it in `health()`: `eviction_policy` for the state store (`unknown` when unreadable), `queue_eviction_policy` only when the queue store is a separate one |
 | One primary (with replicas), **not cluster mode** | One admission script touches keys of several hash tags | `start()` refuses a cluster-mode store with a `ConfigError` (`INFO cluster`) instead of failing at the first call |
 | Lua scripts, pub/sub, blocking list reads (`BLPOP`) | Admission, result wake-ups and the queue doorbell | ElastiCache for Valkey / Redis OSS allows all three |
 | A store that is out of memory | `noeviction` refuses writes when full | Calls fail `queue_unavailable` ("out of memory"), admin operations `StoreUnavailable`; nothing is lost silently |
-
-<!-- verify after merge: the name of the health field that carries the eviction policy (store_checks.check_store returns it; where Health exposes it). -->
 
 Tested versions: Valkey 8.1 and Redis 7.4 (the `docker/compose.yaml` stack every integration
 test, scenario and gate runs on); Valkey 8 and Redis 7.2+ are supported. The client is redis-py

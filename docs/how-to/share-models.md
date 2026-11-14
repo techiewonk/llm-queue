@@ -47,8 +47,11 @@ of every service pick it up on their next reload (`LLMQ_CFG_RELOAD_SECS`, 30 s).
 What a service on an older document gets from a newer stored one:
 
 - **Changed settings and deployments** of models it knows: used at the next reload.
-- **New models**: running pods start a receive loop for them at the next reload, so their calls
-  are served; the service's own code can call them by alias once it knows the name.
+- **New models**: after the next reload, running pods start a receive loop for each new model on
+  their next heartbeat (every `LLMQ_LEASE_SECS` / 3), so their calls are served; the service's
+  own code can call them by alias once it knows the name.
+- **Removed models**: the model's receive loop ends by itself; it starts again if a later
+  registry brings the model back.
 - **Settings it does not know** (written by a newer library): read as warnings and ignored by
   this pod; the newer pods apply them.
 - **A `min_lib_version` above its library**: the pod stays up on its own registry, never
@@ -56,8 +59,6 @@ What a service on an older document gets from a newer stored one:
 
 Emergency routing blocks (`llm-queue block`) and the kill switch are carried into every publish:
 a deploy never undoes them; only an explicit unblock does.
-
-<!-- verify after merge: running pods start receive loops for models added by a newer registry (RESCAN R3); behaviour for removed models. -->
 
 ```mermaid
 flowchart TD
@@ -88,12 +89,11 @@ To keep latency-sensitive callers moving:
 ## Library versions
 
 Services may run different llm-queue versions for a while. Queue messages carry a format
-version; a worker that gets a message newer than it understands passes it on to the queue,
-never drops it (and does not spin on it), so a newer worker can take it. Set the registry's
+version; a worker that gets a message newer than it understands returns it to the queue for
+15 s with no failure counted, never drops it, so a newer worker can take it. Each one counts
+`llmq_newer_messages_total`, with one warning a minute. Set the registry's
 `min_lib_version` when a registry change needs a newer library: older pods then stay up but
 never publish over that registry. See the [stability policy](../project/stability.md).
-
-<!-- verify after merge: "does not spin on it" — PLAN C5: newer-envelope messages are passed on without the 5 s hot loop. -->
 
 Each service also needs its own process settings right: the same `LLMQ_ENVIRONMENT` class
 (strict or dev) everywhere, since a strict process refuses plain-TCP stores and a missing salt

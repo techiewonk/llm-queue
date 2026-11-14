@@ -50,6 +50,7 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 - CLI: `dlq purge`, `dlq redrive`, `drain` and `registry gc` need `--yes` (or `--dry-run`);
   `registry gc` also removes the queues of removed models.
 - Safe live-edit mode also protects `model_fallback` and `inference.extra`.
+- Performance: <!-- filled at release -->
 
 ### Added
 
@@ -57,7 +58,9 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   process, shared by every queue and the sync path, reference-counted; clients for every
   deployment built concurrently at start; warm connections (unsigned `HEAD` requests, refreshed
   every 10 s); pool size per client from the registry's concurrency slots (10 to 200);
-  credentials refreshed 5 minutes before expiry; `WarmOptions`, `OpenAIOptions`.
+  credentials refreshed 5 minutes before expiry; `Tuning(openai=OpenAIOptions(...),
+  warm=WarmOptions(...))`, both importable from `llm_queue` (`warm.connections` or
+  `warm.refresh_secs` 0 turns warming or its repeats off).
 - **One `LLMQueue` per process guards:** a second started queue logs `second_llm_queue_started`
   (the first stays the LangChain default); calls from a forked child or another event loop
   raise a clear `LLMQueueError`. Sync calls run on the started queue's loop, else on one private
@@ -68,15 +71,20 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 - **Shared throttle window** per deployment: `max(Retry-After, jittered backoff 1-2 s doubling to
   30 s)`, skipped by every pod; calls wait for it when no other deployment is left.
 - **Store checks at start:** cluster mode refused; a `maxmemory-policy` other than `noeviction`
-  warned about.
+  warned about; `health()` fields `eviction_policy` (state store, `unknown` when unreadable)
+  and `queue_eviction_policy` (only with a separate queue store).
 - **Registry:** a top-level `live_edit` field (the document's live-edit mode); publishes keep
   live routing blocks and the kill switch; strict checks on the paths a live edit adds (typos
   refused); an invalid or newer stored registry no longer stops a pod (it runs on its own
-  document); `min_lib_version` keeps older pods up and off the stored registry; new models get a
-  receive loop on reload.
+  document); `min_lib_version` keeps older pods up and off the stored registry; a model added by a newer
+  registry gets a receive loop on the next heartbeat (every lease / 3), a removed model's loop
+  ends; gauges `llmq_registry_invalid_reads`, `llmq_registry_stored_refused`,
+  `llmq_registry_lib_too_old` and `llmq_registry_on_own_config` on every worker pod (every
+  30 s).
 - **Embeddings:** `embed(partial=True)` and `EmbedResult.errors`; one request id per batch
   (`X:n`); empty texts refused; at most 16 batches in flight.
-- **Jobs:** `timeout_secs` per job, a 10,000-job queue limit, a `job_no_consumer` warning and
+- **Jobs:** `register_job(name, fn, *, timeout_secs=None)`, a 10,000-job queue limit
+  (`send_job` then raises `CallFailed("queue_full")`, retry after 5 s), a `job_no_consumer` warning and
   metric, acks retried apart from the job, a job stopped by shutdown returned instead of failed.
 - **Errors:** kinds `invalid_request`, `context_length_exceeded`, `worker_shutdown`;
   `RegistryConflict` and `LiveEditRefused` exported. The OpenAI HTTP transport maps request
@@ -84,8 +92,8 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 - **Health and metrics:** readiness from a cached background store probe (every 5 s; refusals
   are `down`, never a 500); liveness false when a background loop died or the heartbeat stalled;
   typed `health()` / `status()` results; status rows show `account_enabled` and `blocked`;
-  `llmq_grants_lost_total`, `llmq_retries_total`, `llmq_store_errors_total` and per-deployment
-  gauges.
+  `llmq_grants_lost_total`, `llmq_retries_total`, `llmq_store_errors_total`,
+  `llmq_newer_messages_total` and per-deployment gauges.
 - **S3 offload:** keys `{prefix}{key_prefix}/{sha256(id)}-{uuid}`, objects deleted after a
   successful read, `sse` / `kms_key_id` / `expected_bucket_owner` options, foreign references
   refused, one client per loop.
@@ -93,6 +101,9 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 - Docs: environment variables, clients and connections, Bedrock APIs and IAM, securing a
   deployment, throttling, shutdown on Kubernetes, multimodal calls, token estimators for Indic
   and CJK text; `scripts/bench.py` with the 0.1.0b1 baseline.
+- Tests: fakellm fault knobs and counters, `--seed` for scenarios, gates and soak, a gates
+  perf baseline (`--record-baseline`), Hypothesis property tests for admission, a nightly
+  workflow, pytest-timeout and a coverage floor of 89 %.
 
 ### Fixed
 
@@ -125,6 +136,16 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   errors; the Prometheus sink could be registered twice.
 - The sweeper stopped with an interval below 1 s; bad messages used default queue settings.
 - Cancel keys are re-checked on pub/sub reconnect and every heartbeat.
+- A message from a newer library was taken again every 5 s with a log line each time; it now
+  goes back for 15 s with no failure counted, a metric and one warning a minute.
+- The message size cap is checked in the engine, so sync calls, streams, embeddings, jobs and
+  the LangChain adapters all meet it; `converse_stream` on an embedding model raises
+  `ConfigError`.
+- A stream's open and its first event share one first-response budget (a slow open gave the
+  first event a whole budget again); a Bedrock stream cut mid-body (`ClientPayloadError`)
+  counts as a connection reset.
+- `result_dedupe_secs > 0` with an S3 offload that deletes on read is refused (`ConfigError`):
+  the second reader found the object gone.
 - Docs: eight statements that did not match the code (readiness probe, invalid stored registry,
   older services, the `all` live-edit mode, account kinds, `ConfigError` timing, the exception
   tree).
@@ -147,8 +168,6 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   options.
 - Dead letters (which hold prompts) are trimmed; tenant ids hashed in logs; the id salt hidden
   from `repr()`; release build tools pinned.
-
-<!-- verify after merge: every Fixed / Added line against the merged dev/0.1.0b2 (written from PLAN_0.1.0b2.md, RESCAN_2026-11-14.md, the coordinator's list and the branch commit messages; "new models get a receive loop on reload", "at most 16 batches in flight" and the plain-Converse default in particular). -->
 
 ## [0.1.0b1] - 2026-11-14
 

@@ -105,5 +105,3 @@ flowchart LR
 | Variable | Meaning |
 |---|---|
 | `LLMQ_BEDROCK_ENDPOINT_URL`, `LLMQ_STS_ENDPOINT_URL` | Point Bedrock / STS at fakes (fakellm, moto) |
-
-<!-- verify after merge: no new LLMQ_* variable was added by the 0.1.0b2 code branches (checked against engine/settings.py on the settings branch; max_message_bytes and converse_api are registry settings, not variables). -->

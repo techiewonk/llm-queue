@@ -34,7 +34,7 @@ class CallFailed(LLMQueueError):
 | Kind | Meaning | What a caller should do |
 |---|---|---|
 | `rate_limited` | No budget before `max_wait_secs` or the deadline, the provider kept throttling past `throttle_retry_attempts` (or the retry budget ran out with no untried deployment left), or a fallback model was busy | Retry after `retry_after_secs`, or tell the user to wait |
-| `queue_full` | The model's queue already holds `max_waiting` (50,000) calls; `retry_after_secs` is 5 | Retry later; shed load |
+| `queue_full` | The model's queue already holds `max_waiting` (50,000) calls, or `send_job` found 10,000 jobs of that name waiting; `retry_after_secs` is 5 | Retry later; shed load |
 | `deadline_exceeded` | No reply within the call's timeout (also: the store did not answer in time, or retries ran out of time) | Retry once, or raise `timeout_secs` for long answers |
 | `invalid_request` | The request itself is wrong: the message is above `max_message_bytes` (4 MB), an embedding text is empty, the provider refused the request as invalid, or `on_exceed: reject` refused its inference values | Fix the request; retrying will not help |
 | `context_length_exceeded` | The input does not fit the model's context window | Shorten the input |
@@ -54,8 +54,6 @@ class CallFailed(LLMQueueError):
 | `cancelled` | The call was cancelled (`cancel()`, or its caller process was gone) | Nothing, unless you did not cancel it |
 | `rejected` | The app's `admission` hook rejected the call before it was sent | Handle as your hook intends |
 
-<!-- verify after merge: `invalid_request`, `context_length_exceeded` and `worker_shutdown` are raised in dev/0.1.0b2 (84c979d) but are missing from `llm_queue.KINDS` (engine/errors.py); `worker_shutdown` has no entry in http_transport._STATUS (falls to 500). -->
-
 The set of kinds is `llm_queue.KINDS`. Over the OpenAI-compatible HTTP transport the LangChain
 OpenAI adapters use, kinds map to status codes. Only the request's own faults are 4xx; failures
 after the queue gave up are 5xx (with `retry-after` when known), so the SDK and LangChain treat
@@ -67,7 +65,7 @@ them as server-side, not as a bad request:
 | 403 / 404 / 409 / 410 / 499 | `rejected` / `model_disabled` / `request_id_conflict` / `result_expired` / `cancelled` |
 | 429 | `rate_limited`, `queue_full` |
 | 502 | `provider_error`, `worker_lost`, `dead_lettered` |
-| 503 | `retry_budget_exhausted`, `no_deployment`, `queue_unavailable`, `model_unavailable`, `credentials_unavailable` |
+| 503 | `retry_budget_exhausted`, `no_deployment`, `queue_unavailable`, `model_unavailable`, `credentials_unavailable`, `worker_shutdown` |
 | 504 | `deadline_exceeded` |
 | 500 | any other kind |
 
@@ -88,13 +86,11 @@ call; retrying will not help. The message lists every problem at once. It is rai
 - by an admin action: a refused registry edit or publish, `http_router(allow_writes=True)`
   without `dependencies`, an empty or malformed audit `actor`;
 - by a call, before anything is queued: a model name not in the registry (`UnknownModel`), a
-  streaming call to a model that cannot stream, a feature whose extra is missing
+  streaming call to an embedding model, a feature whose extra is missing
   (`MissingExtra`).
 
 A call that was accepted never ends in a `ConfigError`; whatever goes wrong after that is a
 `CallFailed`.
-
-<!-- verify after merge: "a streaming call to a model that cannot stream" raises ConfigError (RESCAN S11, runtime.py stream path). -->
 
 Subclasses:
 

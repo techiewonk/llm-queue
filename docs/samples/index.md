@@ -87,7 +87,7 @@ An app sets the same environment the runner sets, from its own secrets:
 
 | Variable | Runner value | In an app |
 |---|---|---|
-| `LLMQ_ENVIRONMENT` | `dev` | unset or your environment's name (strict) |
+| `LLMQ_ENVIRONMENT` | `test` with the local Valkey; unset with `--store env` | unset or your environment's name (strict) |
 | `LLMQ_ID_HASH_SALT` | | from your secrets (required when strict) |
 | `LLMQ_STORE_URL` | `redis://:localdev@127.0.0.1:6379/0` | `rediss://...` of the ElastiCache Valkey |
 | `LLMQ_KEY_PREFIX`, `LLMQ_QUEUE_PREFIX` | per run | per environment, e.g. `llmq:prod` |
@@ -108,8 +108,6 @@ async def lifespan(app):
 
 Unless `LLMQ_ENVIRONMENT` is `dev`, `local`, `test` or `ci` (unset counts as strict),
 `LLMQ_STORE_URL` must be `rediss://` and `LLMQ_ID_HASH_SALT` must be set.
-
-<!-- verify after merge: scripts/samples.py sets LLMQ_ENVIRONMENT=dev (or a salt) for fakellm / local runs; with the 0.1.0b2 strict default it otherwise fails at from_env. -->
 
 ## Measured on real Bedrock
 

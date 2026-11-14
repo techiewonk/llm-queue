@@ -43,7 +43,8 @@ call tools. Non-stream calls now use plain Converse by default.
   connection and never answers is given up quickly, while a long healthy answer is never cut.
   Use it for long answers, or when you want hung regions found fast.
 
-<!-- verify after merge: in dev/0.1.0b2 (84c979d) the setting value is "stream" (registry/settings.py) but clients/providers.py compares "converse_stream", and runtime.py never sets Timing.attempt_secs, so every non-stream call still takes ConverseStream; the plain-Converse default documented here needs that wiring. -->
+`converse_stream` calls always use ConverseStream, whatever `converse_api` says. The setting is
+set per model or in `defaults`.
 
 ## IAM policy
 
