@@ -62,25 +62,65 @@ async def embed(
     input_type: str | None = None,
     **call: Any,
 ) -> list[list[float]]:
-    """One vector per text, in order; the batches run through the queue concurrently."""
+    """One vector per text, in order; the batches run through the queue concurrently.
+
+    All or nothing: the first failed batch cancels the rest and raises (`embed_partial` keeps
+    what succeeded).
+    """
+    vectors, _ = await embed_partial(
+        engine,
+        model,
+        texts,
+        priority=priority,
+        timeout_secs=timeout_secs,
+        concurrency=concurrency,
+        input_type=input_type,
+        partial=False,
+        **call,
+    )
+    return vectors
+
+
+async def embed_partial(
+    engine: Engine,
+    model: str,
+    texts: Sequence[str],
+    *,
+    priority: bool = False,
+    timeout_secs: float | None = None,
+    concurrency: int = 16,
+    input_type: str | None = None,
+    partial: bool = True,
+    request_id: str | None = None,
+    **call: Any,
+) -> tuple[list[list[float]], dict[int, CallFailed]]:
+    """Vectors in order, and the error of each text whose batch failed (its vector is `[]`).
+
+    Empty texts fail the whole call first (`invalid_request`); at most `concurrency` batches
+    exist at once (100,000 texts no longer made every task up front). With `request_id`, batch
+    n is `<request_id>:<n>`: one id for every batch had each later batch rejected as a
+    duplicate (A1). `partial=False` raises the first failure instead.
+    """
+    for index, text in enumerate(texts):
+        if not text.strip():
+            raise CallFailed("invalid_request", f"text {index} is empty", request_id=request_id)
     if not texts:
-        return []
+        return [], {}
     view = engine.registry.current
     alias = view.registry.alias_of(model)
     entry = view.registry.models[alias]
     size = batch_size(entry.provider, entry.model_id, int(view.value(alias, "embed_batch_size")))
     groups = list(batches(list(texts), size))
-    gate = asyncio.Semaphore(concurrency)
 
-    async def one(group: list[str]) -> list[list[float]]:
-        async with gate:
-            reply = await engine.call(
-                alias,
-                request_for(entry.provider, entry.model_id, group, input_type),
-                priority=priority,
-                timeout_secs=timeout_secs,
-                **call,
-            )
+    async def one(n: int, group: list[str]) -> list[list[float]]:
+        reply = await engine.call(
+            alias,
+            request_for(entry.provider, entry.model_id, group, input_type),
+            priority=priority,
+            timeout_secs=timeout_secs,
+            request_id=f"{request_id}:{n}" if request_id else None,
+            **call,
+        )
         if reply.response is None:
             raise CallFailed(
                 "provider_error", f"{alias}: no embedding body", request_id=reply.request_id
@@ -91,13 +131,39 @@ async def embed(
             raise CallFailed("provider_error", message, request_id=reply.request_id)
         return vectors
 
-    tasks = [asyncio.ensure_future(one(group)) for group in groups]
+    results: list[list[list[float]] | CallFailed | None] = [None] * len(groups)
+    running: dict[asyncio.Task[list[list[float]]], int] = {}
+    pending = iter(enumerate(groups))
     try:
-        results = await asyncio.gather(*tasks)
+        while True:
+            while len(running) < max(1, concurrency):  # a window, not every batch up front
+                if (item := next(pending, None)) is None:
+                    break
+                running[asyncio.ensure_future(one(*item))] = item[0]
+            if not running:
+                break
+            done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                n = running.pop(task)
+                exc = task.exception()
+                if exc is None:
+                    results[n] = task.result()
+                elif partial and isinstance(exc, CallFailed):
+                    results[n] = exc
+                else:
+                    raise exc
     except BaseException:
         # One batch failed: stop the rest, which would only spend budget on a lost result.
-        for task in tasks:
+        for task in running:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*running, return_exceptions=True)
         raise
-    return [vector for group in results for vector in group]
+    vectors: list[list[float]] = []
+    errors: dict[int, CallFailed] = {}
+    for group, result in zip(groups, results, strict=True):
+        if isinstance(result, CallFailed):
+            errors.update({len(vectors) + i: result for i in range(len(group))})
+            vectors.extend([] for _ in group)
+        else:
+            vectors.extend(result or [])
+    return vectors, errors

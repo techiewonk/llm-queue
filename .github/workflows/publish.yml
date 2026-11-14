@@ -89,8 +89,13 @@ jobs:
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
         with:
           enable-cache: false  # release builds never restore a cache (cache poisoning)
-      - run: uv build --no-sources
-      - run: uvx twine check --strict dist/*
+      # Exact build and check tools: a new hatchling or twine release cannot change (or pass)
+      # what is uploaded. Bump them here on purpose, with a dry run (workflow_dispatch).
+      - name: Build (pinned hatchling)
+        run: |
+          echo "hatchling==1.33.0" > "$RUNNER_TEMP/build-constraints.txt"
+          uv build --no-sources --build-constraints "$RUNNER_TEMP/build-constraints.txt"
+      - run: uvx twine==7.0.0 check --strict dist/*
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
         with:
           name: dist

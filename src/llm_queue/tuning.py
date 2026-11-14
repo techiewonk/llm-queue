@@ -93,6 +93,19 @@ class Tuning:
         store read timeout must be above it.
         """
         out: list[str] = []
+        parts = {
+            "store": StoreOptions,
+            "bedrock": BedrockOptions,
+            "engine": EngineTimings,
+            "registry": RegistryOptions,
+        }
+        wrong = [
+            f"{name} must be {kind.__name__}(...), not {type(getattr(self, name)).__name__}"
+            for name, kind in parts.items()
+            if type(getattr(self, name)) is not kind
+        ]
+        if wrong:  # `Tuning(store=None)`: nothing below can be read
+            return wrong
         for part in (self.store, self.bedrock, self.engine, self.registry):
             out += _check_part(part)
         # Each combination is checked once its own fields are valid (a bad field is already

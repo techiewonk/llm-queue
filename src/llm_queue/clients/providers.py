@@ -1,14 +1,17 @@
 """Providers on routes: one attempt of an operation, its usage, and error classification.
 
-Chat runs on the provider's streaming API under the hood and is assembled into the plain reply
-shape (Converse body, chat.completion), so the attempt timers apply to every chat call; the
-caller still gets a normal reply. `register_provider` adds a provider for a custom account kind.
+Bedrock chat uses plain Converse unless the caller streams or the model asks for
+ConverseStream (`converse_api`, plan P7); OpenAI-compatible chat always streams underneath and is
+assembled into a chat.completion, so the attempt timers apply. A stream that ends without its
+end marker is `StreamTruncated` (retryable). A dropped connection gets one quick retry inside
+the attempt when nothing reached the caller (C7). `register_provider` adds a custom kind.
 """
 
 from __future__ import annotations
 
 import base64
 import contextlib
+import inspect
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -19,14 +22,23 @@ import orjson
 from llm_queue.clients.pool import ClientPool, Route
 from llm_queue.clients.timing import Timing, first, paced
 from llm_queue.errors import ConfigError, ErrorInfo
-from llm_queue.providers.classify import classify_bedrock, classify_openai
+from llm_queue.providers.classify import (
+    StreamTruncated,
+    classify_bedrock,
+    classify_openai,
+    is_connection_reset,
+)
 
 _TOKEN_HEADER = "x-amzn-bedrock-input-token-count"
 
 
 @dataclass(frozen=True, slots=True)
 class Usage:
-    """Tokens of one attempt as the provider reported them; None when it reported nothing."""
+    """Tokens of one attempt as the provider reported them; None when it reported nothing.
+
+    `input_tokens` excludes cache reads (Bedrock's meaning; OpenAI's `prompt_tokens` include
+    them, so they are subtracted there), so `cache_read_tokens` is never counted twice.
+    """
 
     input_tokens: int | None = None
     output_tokens: int | None = None
@@ -58,8 +70,13 @@ class Provider(Protocol):
         route: Route,
         timing: Timing,
         sink: Sink | None = None,
+        *,
+        converse_api: str = "converse",
     ) -> Result:
-        """Run one attempt; chat operations pass each streamed event to `sink`."""
+        """Run one attempt; chat operations pass each streamed event to `sink`.
+
+        `converse_api` is the model's setting: `converse` or `converse_stream` (Bedrock only).
+        """
         ...
 
     def classify(self, exc: BaseException) -> ErrorInfo:
@@ -67,15 +84,45 @@ class Provider(Protocol):
         ...
 
 
+async def _reset_retry(
+    attempt: Callable[[Sink | None], Awaitable[Result]], sink: Sink | None
+) -> Result:
+    """Run `attempt`; on a dropped connection with nothing sent to `sink`, run it once more.
+
+    The first failure never reaches the worker, so it charges no breaker and no retry budget;
+    the second one is classified as usual.
+    """
+    sent = False
+
+    async def forward(event: Any) -> None:
+        nonlocal sent
+        sent = True
+        assert sink is not None
+        await sink(event)
+
+    try:
+        return await attempt(forward if sink is not None else None)
+    except Exception as exc:
+        if sent or not is_connection_reset(exc):
+            raise
+    return await attempt(forward if sink is not None else None)
+
+
 # ------------------------------------------------------------------------------- Bedrock
 
 
 def _converse_body(events: list[Mapping[str, Any]]) -> dict[str, Any]:
-    """Assemble ConverseStream events into the body `converse` returns."""
+    """Assemble ConverseStream events into the body `converse` returns.
+
+    Keeps reasoning (text, signature, redacted bytes) and citations; raises `StreamTruncated`
+    when the stream ended without `messageStop`.
+    """
     role = "assistant"
     blocks: dict[int, dict[str, Any]] = {}
     tool_input: dict[int, str] = {}
+    citations: dict[int, list[Any]] = {}
     body: dict[str, Any] = {}
+    stopped = False
     for event in events:
         if "messageStart" in event:
             role = event["messageStart"].get("role", role)
@@ -95,14 +142,22 @@ def _converse_body(events: list[Mapping[str, Any]]) -> dict[str, Any]:
                 tool_input[index] = tool_input.get(index, "") + delta["toolUse"].get("input", "")
                 blocks.setdefault(index, {"toolUse": {}})
             elif "reasoningContent" in delta:
-                block = blocks.setdefault(index, {"reasoningContent": {"reasoningText": {}}})
-                reasoning = block["reasoningContent"].setdefault("reasoningText", {})
+                content = blocks.setdefault(index, {"reasoningContent": {}})["reasoningContent"]
                 part = delta["reasoningContent"]
-                if "text" in part:
-                    reasoning["text"] = reasoning.get("text", "") + part["text"]
-                if "signature" in part:
-                    reasoning["signature"] = part["signature"]
+                if "redactedContent" in part:
+                    content["redactedContent"] = (
+                        content.get("redactedContent", b"") + part["redactedContent"]
+                    )
+                if "text" in part or "signature" in part:
+                    reasoning = content.setdefault("reasoningText", {})
+                    if "text" in part:
+                        reasoning["text"] = reasoning.get("text", "") + part["text"]
+                    if "signature" in part:
+                        reasoning["signature"] = part["signature"]
+            elif "citation" in delta:
+                citations.setdefault(index, []).append(delta["citation"])
         elif "messageStop" in event:
+            stopped = True
             body["stopReason"] = event["messageStop"].get("stopReason")
             extra = event["messageStop"].get("additionalModelResponseFields")
             if extra is not None:
@@ -111,8 +166,13 @@ def _converse_body(events: list[Mapping[str, Any]]) -> dict[str, Any]:
             for key in ("usage", "metrics", "trace"):
                 if key in event["metadata"]:
                     body[key] = event["metadata"][key]
+    if not stopped:
+        raise StreamTruncated("the Bedrock stream ended before messageStop")
     for index, text in tool_input.items():
         blocks[index]["toolUse"]["input"] = orjson.loads(text) if text else {}
+    for index, cited in citations.items():  # the non-streamed Converse shape of a cited answer
+        text = blocks.get(index, {}).get("text", "")
+        blocks[index] = {"citationsContent": {"content": [{"text": text}], "citations": cited}}
     content = [blocks[i] for i in sorted(blocks)]
     return {"output": {"message": {"role": role, "content": content}}, **body}
 
@@ -129,7 +189,7 @@ def _bedrock_usage(usage: Mapping[str, Any] | None) -> Usage:
 
 
 class BedrockProvider:
-    """Bedrock runtime: `converse` (over ConverseStream) and `invoke_model` (embeddings)."""
+    """Bedrock runtime: `converse` (plain or over ConverseStream) and `invoke_model`."""
 
     name = "bedrock"
 
@@ -163,36 +223,64 @@ class BedrockProvider:
         route: Route,
         timing: Timing,
         sink: Sink | None = None,
+        *,
+        converse_api: str = "converse",
     ) -> Result:
-        """Run one `converse` or `invoke_model` attempt."""
+        """Run one `converse` or `invoke_model` attempt.
+
+        Plain Converse (IAM `bedrock:InvokeModel` only) when nothing streams to a `sink`,
+        `converse_api` is `converse` and `timing.attempt_secs` bounds the whole answer; else
+        ConverseStream with the first-response and idle timers (a caller that sets no attempt
+        timer keeps the stream's hung-region detection).
+        """
         if op == "converse":
-            events = []
-            async for event in self.stream(params, route, timing):
-                events.append(event)
-                if sink is not None:
-                    await sink(event)
-            body = _converse_body(events)
-            return Result(body, _bedrock_usage(body.get("usage")))
-        if op == "invoke_model":
-            client = await self._pool.bedrock(route)
-            request = {**params, "modelId": route.model_id}
-            if isinstance(request.get("body"), Mapping | list):
-                request["body"] = orjson.dumps(request["body"])
-            request.setdefault("contentType", "application/json")
-            request.setdefault("accept", "application/json")
-            raw = await first(
-                client.invoke_model(**request), timing.first_response_secs, "first response"
+            plain = converse_api != "converse_stream" and timing.attempt_secs is not None
+            if sink is None and plain:
+                return await _reset_retry(lambda _: self._converse(params, route, timing), None)
+            return await _reset_retry(
+                lambda s: self._converse_stream(params, route, timing, s), sink
             )
-            async with raw["body"] as stream:
-                data = await first(stream.read(), timing.idle_secs, "body")
-            headers = raw.get("ResponseMetadata", {}).get("HTTPHeaders", {})
-            counted = headers.get(_TOKEN_HEADER)
-            response = {
-                "body_b64": base64.b64encode(data).decode("ascii"),
-                "contentType": raw.get("contentType", ""),
-            }
-            return Result(response, Usage(input_tokens=int(counted) if counted else None))
+        if op == "invoke_model":
+            return await _reset_retry(lambda _: self._invoke(params, route, timing), None)
         raise ValueError(f"Bedrock does not support op {op!r}")
+
+    async def _converse(self, params: Mapping[str, Any], route: Route, timing: Timing) -> Result:
+        client = await self._pool.bedrock(route)
+        pending = client.converse(**{**params, "modelId": route.model_id})
+        reply = await first(pending, timing.attempt_secs or timing.first_response_secs, "response")
+        body: dict[str, Any] = {k: v for k, v in reply.items() if k != "ResponseMetadata"}
+        return Result(body, _bedrock_usage(body.get("usage")))
+
+    async def _converse_stream(
+        self, params: Mapping[str, Any], route: Route, timing: Timing, sink: Sink | None
+    ) -> Result:
+        events = []
+        async for event in self.stream(params, route, timing):
+            events.append(event)
+            if sink is not None:
+                await sink(event)
+        body = _converse_body(events)
+        return Result(body, _bedrock_usage(body.get("usage")))
+
+    async def _invoke(self, params: Mapping[str, Any], route: Route, timing: Timing) -> Result:
+        client = await self._pool.bedrock(route)
+        request = {**params, "modelId": route.model_id}
+        if isinstance(request.get("body"), Mapping | list):
+            request["body"] = orjson.dumps(request["body"])
+        request.setdefault("contentType", "application/json")
+        request.setdefault("accept", "application/json")
+        raw = await first(
+            client.invoke_model(**request), timing.first_response_secs, "first response"
+        )
+        async with raw["body"] as stream:
+            data = await first(stream.read(), timing.idle_secs, "body")
+        headers = raw.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+        counted = headers.get(_TOKEN_HEADER)
+        response = {
+            "body_b64": base64.b64encode(data).decode("ascii"),
+            "contentType": raw.get("contentType", ""),
+        }
+        return Result(response, Usage(input_tokens=int(counted) if counted else None))
 
     def classify(self, exc: BaseException) -> ErrorInfo:
         """By Bedrock error family (`classify_bedrock`)."""
@@ -209,12 +297,51 @@ def decode_invoke_body(response: Mapping[str, Any]) -> Any:
 
 # ------------------------------------------------------------------------------- OpenAI
 
+# Keyword names each SDK method accepts, read once per resource class (plan P1).
+_ACCEPTED: dict[Any, frozenset[str]] = {}
+
+
+def split_params(method: Callable[..., Any], params: Mapping[str, Any]) -> dict[str, Any]:
+    """`params` with every key `method` does not take moved into `extra_body` (plan P1).
+
+    Servers like vLLM take `top_k`, `chat_template_kwargs`, `guided_json`, ...: passed as
+    keywords they raised `TypeError`; in `extra_body` the SDK sends them in the JSON body. An
+    `extra_body` already in `params` wins over a moved key of the same name.
+    """
+    owner = getattr(method, "__func__", method)
+    accepted = _ACCEPTED.get(owner)
+    if accepted is None:
+        accepted = _ACCEPTED[owner] = frozenset(inspect.signature(method).parameters)
+    out = {k: v for k, v in params.items() if k in accepted}
+    moved = {k: v for k, v in params.items() if k not in accepted}
+    if moved:
+        out["extra_body"] = {**moved, **(params.get("extra_body") or {})}
+    return out
+
+
+def _choice_body(slot: dict[str, Any]) -> dict[str, Any]:
+    message: dict[str, Any] = {"role": "assistant", "content": "".join(slot["text"]) or None}
+    if slot["reasoning"]:
+        message["reasoning_content"] = "".join(slot["reasoning"])
+    if slot["refusal"]:
+        message["refusal"] = "".join(slot["refusal"])
+    if slot["calls"]:
+        message["tool_calls"] = [slot["calls"][i] for i in sorted(slot["calls"])]
+    return {
+        "index": slot["index"],
+        "message": message,
+        "finish_reason": slot["finish"],
+        "logprobs": slot["logprobs"],
+    }
+
 
 def _chat_body(chunks: list[Any]) -> dict[str, Any]:
-    """Assemble chat.completion.chunk objects into one chat.completion body."""
-    text: list[str] = []
-    calls: dict[int, dict[str, Any]] = {}
-    finish = None
+    """Assemble chat.completion.chunk objects into one chat.completion body.
+
+    Every choice (`n` > 1) separately, with reasoning, refusal and logprobs; raises
+    `StreamTruncated` when a choice never got its `finish_reason` (the stream was cut).
+    """
+    slots: dict[int, dict[str, Any]] = {}
     usage = None
     ident, model, created = "", "", int(time.time())
     for chunk in chunks:
@@ -222,30 +349,51 @@ def _chat_body(chunks: list[Any]) -> dict[str, Any]:
         if chunk.usage is not None:
             usage = chunk.usage.model_dump(mode="json", exclude_none=True)
         for choice in chunk.choices or []:
+            slot = slots.get(choice.index)
+            if slot is None:
+                slot = slots[choice.index] = {
+                    "index": choice.index,
+                    "text": [],
+                    "reasoning": [],
+                    "refusal": [],
+                    "calls": {},
+                    "logprobs": None,
+                    "finish": None,
+                }
             delta = choice.delta
             if delta.content:
-                text.append(delta.content)
+                slot["text"].append(delta.content)
+            extra = getattr(delta, "model_extra", None) or {}
+            reasoning = extra.get("reasoning_content") or extra.get("reasoning")
+            if reasoning:  # vLLM / DeepSeek-style servers: not an SDK field
+                slot["reasoning"].append(reasoning)
+            if getattr(delta, "refusal", None):
+                slot["refusal"].append(delta.refusal)
             for call in delta.tool_calls or []:
-                slot = calls.setdefault(
+                tool = slot["calls"].setdefault(
                     call.index,
                     {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
                 )
                 if call.id:
-                    slot["id"] = call.id
+                    tool["id"] = call.id
                 if call.function is not None:
-                    slot["function"]["name"] += call.function.name or ""
-                    slot["function"]["arguments"] += call.function.arguments or ""
+                    tool["function"]["name"] += call.function.name or ""
+                    tool["function"]["arguments"] += call.function.arguments or ""
+            if getattr(choice, "logprobs", None) is not None:
+                part = choice.logprobs.model_dump(mode="json", exclude_none=True)
+                merged = slot["logprobs"] = slot["logprobs"] or {}
+                for key, items in part.items():
+                    merged.setdefault(key, []).extend(items or [])
             if choice.finish_reason:
-                finish = choice.finish_reason
-    message: dict[str, Any] = {"role": "assistant", "content": "".join(text) or None}
-    if calls:
-        message["tool_calls"] = [calls[i] for i in sorted(calls)]
+                slot["finish"] = choice.finish_reason
+    if not slots or any(slot["finish"] is None for slot in slots.values()):
+        raise StreamTruncated("the chat stream ended before finish_reason")
     body: dict[str, Any] = {
         "id": ident,
         "object": "chat.completion",
         "created": created,
         "model": model,
-        "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+        "choices": [_choice_body(slots[i]) for i in sorted(slots)],
     }
     if usage is not None:
         body["usage"] = usage
@@ -255,11 +403,14 @@ def _chat_body(chunks: list[Any]) -> dict[str, Any]:
 def _openai_usage(usage: Mapping[str, Any] | None) -> Usage:
     if not usage:
         return Usage()
-    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+    cached = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+    prompt = usage.get("prompt_tokens")
     return Usage(
-        input_tokens=usage.get("prompt_tokens"),
+        # `prompt_tokens` include the cached ones: without the subtraction they counted twice
+        # under `tpm_count_cached` and once too often without it.
+        input_tokens=None if prompt is None else max(0, int(prompt) - cached),
         output_tokens=usage.get("completion_tokens", 0),
-        cache_read_tokens=int(cached),
+        cache_read_tokens=cached,
     )
 
 
@@ -277,15 +428,17 @@ class OpenAIProvider:
     ) -> AsyncIterator[Any]:
         """Chat completion chunks of one attempt, each within the attempt timers."""
         client = self._pool.openai(route)
-        request = {
-            **params,
-            "model": route.model_id,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        reply = await first(
-            client.chat.completions.create(**request), timing.first_response_secs, "first response"
+        create = client.chat.completions.create
+        request = split_params(
+            create,
+            {
+                **params,
+                "model": route.model_id,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
         )
+        reply = await first(create(**request), timing.first_response_secs, "first response")
         try:
             async for chunk in paced(reply, timing, started=False):
                 yield chunk
@@ -300,26 +453,36 @@ class OpenAIProvider:
         route: Route,
         timing: Timing,
         sink: Sink | None = None,
+        *,
+        converse_api: str = "converse",
     ) -> Result:
-        """Run one `chat` or `embeddings` attempt."""
+        """Run one `chat` or `embeddings` attempt (`converse_api` is Bedrock's; ignored)."""
         if op == "chat":
-            chunks = []
-            async for chunk in self.stream(params, route, timing):
-                chunks.append(chunk)
-                if sink is not None:
-                    await sink(chunk)
-            body = _chat_body(chunks)
-            return Result(body, _openai_usage(body.get("usage")))
+            return await _reset_retry(lambda s: self._chat(params, route, timing, s), sink)
         if op == "embeddings":
-            client = self._pool.openai(route)
-            reply = await first(
-                client.embeddings.create(**{**params, "model": route.model_id}),
-                timing.first_response_secs,
-                "response",
-            )
-            body = reply.model_dump(mode="json", exclude_unset=True)
-            return Result(body, _openai_usage(body.get("usage")))
+            return await _reset_retry(lambda _: self._embeddings(params, route, timing), None)
         raise ValueError(f"OpenAI-compatible provider does not support op {op!r}")
+
+    async def _chat(
+        self, params: Mapping[str, Any], route: Route, timing: Timing, sink: Sink | None
+    ) -> Result:
+        chunks = []
+        async for chunk in self.stream(params, route, timing):
+            chunks.append(chunk)
+            if sink is not None:
+                await sink(chunk)
+        body = _chat_body(chunks)
+        return Result(body, _openai_usage(body.get("usage")))
+
+    async def _embeddings(self, params: Mapping[str, Any], route: Route, timing: Timing) -> Result:
+        create = self._pool.openai(route).embeddings.create
+        reply = await first(
+            create(**split_params(create, {**params, "model": route.model_id})),
+            timing.first_response_secs,
+            "response",
+        )
+        body = reply.model_dump(mode="json", exclude_unset=True)
+        return Result(body, _openai_usage(body.get("usage")))
 
     def classify(self, exc: BaseException) -> ErrorInfo:
         """By HTTP status (`classify_openai`)."""

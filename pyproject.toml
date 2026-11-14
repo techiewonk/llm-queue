@@ -34,7 +34,9 @@ dependencies = [
     # Upper bound: the pool reads aiobotocore internals (refreshable credentials).
     "aiobotocore>=2.23,<4",
     # Queues, budgets, registry and results on any Redis-protocol store (Valkey, Redis).
-    "redis>=5.0.1,<9",
+    # 6+: TLS connections check the host name by default (off before), and the URL parser
+    # the settings check uses matches the client's.
+    "redis>=6,<9",
     # C RESP parser, picked up by redis-py: Lua array replies and stream reads parse 39-75x
     # faster than redis-py's pure-Python parser (measured 2026-11-13).
     "hiredis>=3,<4",
@@ -60,6 +62,8 @@ metrics = ["prometheus-client>=0.20,<1"]
 # Status / registry / health routes for a FastAPI app (`LLMQueue.http_router`).
 # 0.115.3+: Starlette with the multipart DoS fixes (CVE-2024-47874).
 http = ["fastapi>=0.115.3,<1"]
+# A faster event loop on Linux / macOS (`llm_queue.run(main)` picks it up); no Windows build.
+uvloop = ["uvloop>=0.21; sys_platform != 'win32'"]
 
 [project.urls]
 Homepage = "https://github.com/techiewonk/llm-queue"
@@ -131,7 +135,7 @@ warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 
 [[tool.mypy.overrides]]
-module = ["moto.*", "fastapi", "fastapi.*"]
+module = ["moto.*", "fastapi", "fastapi.*", "uvloop"]
 ignore_missing_imports = true
 
 # FastAPI is an optional extra: its decorators are untyped when it is not installed.

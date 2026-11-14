@@ -32,6 +32,8 @@ _CHAT_OPENAI = (
     "seed",
     "frequency_penalty",
     "presence_penalty",
+    # Not a chat.completions argument: the provider moves it into `extra_body` (plan P1).
+    "top_k",
 )
 
 

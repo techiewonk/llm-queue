@@ -45,7 +45,22 @@ def _queued_client_values(values: Any) -> Any:
     return values
 
 
-class QueuedChatOpenAI(ChatOpenAI):
+class _ClosesClients:
+    """`close()` / `aclose()` for the two httpx clients each queued adapter owns."""
+
+    def close(self) -> None:
+        """Close the sync httpx client (the async one needs `aclose()`); safe to repeat."""
+        if (client := getattr(self, "http_client", None)) is not None:
+            client.close()
+
+    async def aclose(self) -> None:
+        """Close both httpx clients; safe to repeat."""
+        self.close()
+        if (client := getattr(self, "http_async_client", None)) is not None:
+            await client.aclose()
+
+
+class QueuedChatOpenAI(_ClosesClients, ChatOpenAI):
     """`ChatOpenAI` whose HTTP calls are answered by the LLM queue's `chat` op.
 
     `model_alias` is the queue alias; when unset, the request's `model` (this class's `model`)
@@ -83,7 +98,7 @@ class QueuedChatOpenAI(ChatOpenAI):
         return result
 
 
-class QueuedOpenAIEmbeddings(OpenAIEmbeddings):
+class QueuedOpenAIEmbeddings(_ClosesClients, OpenAIEmbeddings):
     """`OpenAIEmbeddings` whose HTTP calls are answered by the LLM queue's `embed` op.
 
     `check_embedding_ctx_length` defaults to False because the queue embeds text, not tokens,

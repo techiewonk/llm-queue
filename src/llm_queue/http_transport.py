@@ -29,19 +29,29 @@ if TYPE_CHECKING:
 QUEUED_BASE_URL = "http://llmq.invalid/v1"
 # Extra key of a queued chat completion body: how the call was served.
 META_KEY = "llmq_meta"
-# Error kind -> (HTTP status, OpenAI error type).
+# Every `CallFailed` kind -> (HTTP status, OpenAI error type) (plan P8). Only the request's own
+# faults are 4xx; failures after the queue gave up retrying are 502 / 503 (with `retry-after`
+# when known), so the SDK and LangChain treat them as server-side, not as a bad request.
 _STATUS = {
+    "invalid_request": (400, "invalid_request_error"),
+    "context_length_exceeded": (400, "invalid_request_error"),
+    "request_too_large": (400, "invalid_request_error"),  # as OpenAI answers an oversize body
+    "rejected": (403, "permission_error"),
+    "model_disabled": (404, "invalid_request_error"),
+    "request_id_conflict": (409, "invalid_request_error"),
+    "result_expired": (410, "invalid_request_error"),
+    "cancelled": (499, "cancelled"),
     "rate_limited": (429, "rate_limit_error"),
     "queue_full": (429, "rate_limit_error"),
-    "retry_budget_exhausted": (429, "rate_limit_error"),
-    "deadline_exceeded": (504, "timeout"),
+    "provider_error": (502, "server_error"),
+    "worker_lost": (502, "server_error"),
+    "dead_lettered": (502, "server_error"),
+    "retry_budget_exhausted": (503, "service_unavailable"),
+    "no_deployment": (503, "service_unavailable"),
     "queue_unavailable": (503, "service_unavailable"),
     "model_unavailable": (503, "service_unavailable"),
     "credentials_unavailable": (503, "service_unavailable"),
-    "model_disabled": (404, "invalid_request_error"),
-    "cancelled": (499, "cancelled"),
-    "worker_lost": (502, "server_error"),
-    "dead_lettered": (500, "server_error"),
+    "deadline_exceeded": (504, "timeout"),
 }
 
 
@@ -197,7 +207,7 @@ def _error_response(request: httpx.Request, exc: Exception) -> httpx.Response:
     if isinstance(exc, _RequestRejected):
         status, err_type, code = exc.status, "invalid_request_error", exc.code
     elif isinstance(exc, CallFailed):
-        status, err_type = _STATUS.get(exc.kind, (400, "invalid_request_error"))
+        status, err_type = _STATUS.get(exc.kind, (500, "server_error"))
         code = exc.kind
         headers["x-llmq-error"] = exc.kind
         if exc.retry_after_secs is not None:

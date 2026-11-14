@@ -29,7 +29,11 @@ def registry_doc(fake_url: str) -> dict[str, Any]:
         "accounts": {
             "aws-a": {"kind": "aws"},
             "aws-b": {"kind": "aws"},
-            "vllm": {"kind": "openai", "base_url": f"{fake_url}/v1", "api_key_ref": "VLLM_KEY"},
+            "vllm": {
+                "kind": "openai",
+                "base_url": f"{fake_url}/v1",
+                "api_key_ref": "LLMQ_ACCOUNT_VLLM_KEY",
+            },
         },
         "models": {
             "gpt120b": {

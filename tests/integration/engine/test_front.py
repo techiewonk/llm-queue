@@ -26,7 +26,11 @@ pytestmark = pytest.mark.integration
 
 def _doc(url: str) -> dict[str, Any]:
     doc: dict[str, Any] = registry()
-    doc["accounts"]["vllm"] = {"kind": "openai", "base_url": f"{url}/v1", "api_key_ref": "VLLM_KEY"}
+    doc["accounts"]["vllm"] = {
+        "kind": "openai",
+        "base_url": f"{url}/v1",
+        "api_key_ref": "LLMQ_ACCOUNT_VLLM_KEY",
+    }
     doc["models"]["local"] = {
         "type": "chat",
         "provider": "openai",
@@ -51,6 +55,7 @@ async def llmq(store: redis.asyncio.Redis, prefix: str) -> AsyncIterator[LLMQueu
     port = store.connection_pool.connection_kwargs["port"]
     env = {
         "LLMQ_STORE_URL": f"redis://:localdev@127.0.0.1:{port}/0",
+        "LLMQ_ENVIRONMENT": "test",
         "LLMQ_KEY_PREFIX": prefix,
         "LLMQ_REGISTRY": json.dumps(_doc(url)),
         "LLMQ_BEDROCK_ENDPOINT_URL": url,
@@ -58,7 +63,7 @@ async def llmq(store: redis.asyncio.Redis, prefix: str) -> AsyncIterator[LLMQueu
     }
     queue = LLMQueue.from_env(
         env,
-        secrets={"VLLM_KEY": "key-v"}.get,
+        secrets={"LLMQ_ACCOUNT_VLLM_KEY": "key-v"}.get,
         credentials=lambda account: {
             "aws_access_key_id": account.name,
             "aws_secret_access_key": "x",

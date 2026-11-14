@@ -1,15 +1,19 @@
 """The registry in the state store: publish by version, live edits, audit, rollback, reload.
 
 Every write is one Lua call that stores the document, its version record, an audit entry (path
-diffs, secrets redacted) and each model's resolved numbers together; a live edit is a
-compare-and-set on the change counter. Readers keep the last good registry when the stored one is
-unreadable, and the reload loop republishes the config when the stored registry was lost.
+diffs, secrets redacted) and each model's resolved numbers together; publishes and live edits
+are compare-and-set on the change counter. Routing blocks and the kill switch set live survive
+a publish. Readers keep the last good registry when the stored one is unreadable, invalid or
+needs a newer library; a pod that has none runs on its own document. The reload loop
+republishes the config when the stored registry was lost or invalid (and not newer).
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
+import socket
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -18,20 +22,27 @@ import orjson
 from redis.exceptions import RedisError
 
 from llm_queue._logging import get_logger
+from llm_queue._version import __version__
 from llm_queue.engine.store_guard import store_op
 from llm_queue.errors import ConfigError
 from llm_queue.registry import _lua
 from llm_queue.registry.resolve import ResolvedRegistry
+from llm_queue.registry.schema import LIVE_EDIT_MODES, needs_newer_lib
 from llm_queue.registry.validate import RegistryError, check
 
 if TYPE_CHECKING:
     import redis.asyncio
 
+    from llm_queue.registry.schema import Registry
+
 logger = get_logger(__name__)
 
 AUDIT_RETENTION_DAYS = 90
-LIVE_EDIT_MODES = ("safe", "all", "off")
 _SECRET_FIELDS = frozenset({"role_arn", "external_id_ref", "api_key_ref"})
+_ACTOR_MAX = 200
+# Live routing switches a publish carries over from the stored document (an emergency block must
+# not be undone by the next deploy; only a live unblock lifts it).
+_CARRIED_LISTS = ("blocked_regions", "blocked_accounts")
 # Settings whose value goes into a model's resolved numbers (read by the admission script).
 ADMISSION_SETTINGS = (
     "enabled",
@@ -117,7 +128,7 @@ def audit_diff(before: Mapping[str, Any], after: Mapping[str, Any]) -> list[dict
 
 def _deploy_only(path: Path) -> str | None:
     """Why a changed path needs a deploy (a new `registry_version`), or None."""
-    if path[:1] in (("registry_version",), ("min_lib_version",)):
+    if path[:1] in (("registry_version",), ("min_lib_version",), ("live_edit",)):
         return "changes with a deploy"
     if path[:1] == ("models",) and len(path) == 2:
         return "adding or removing a model needs a new registry_version"
@@ -137,6 +148,10 @@ def _protected(path: Path) -> str | None:
         return "residency changes only with a deploy"
     if path[-1:] == ("debug_capture",):
         return "debug_capture (stores prompt text) changes only with a deploy"
+    if "model_fallback" in path:
+        return "model_fallback (where calls may go) changes only with a deploy"
+    if "inference" in path and path[path.index("inference") + 1 :][:1] == ("extra",):
+        return "inference.extra (fields sent to the provider) changes only with a deploy"
     if path[:1] == ("accounts",):
         if len(path) == 2:
             return "adding or removing an account changes only with a deploy"
@@ -173,6 +188,67 @@ def refused_edits(before: Mapping[str, Any], after: Mapping[str, Any], mode: str
         if why:
             reasons.append(f"{'.'.join(path)}: {why}")
     return reasons
+
+
+def check_actor(actor: str) -> str:
+    """The audit actor, refused (`ConfigError`) when empty, too long or holding control codes.
+
+    Audit rows and log lines print it as given; a newline or escape sequence there could forge
+    a second entry or rewrite a terminal.
+    """
+    if not actor.strip() or len(actor) > _ACTOR_MAX:
+        raise ConfigError(f"the audit actor must be 1 to {_ACTOR_MAX} characters")
+    if any(ord(c) < 32 or 127 <= ord(c) < 160 for c in actor):
+        raise ConfigError("the audit actor must not contain control characters")
+    return actor
+
+
+def process_actor(op: str) -> str:
+    """The actor of a write the process makes itself: `boot@host:pid`, `restore@host:pid`."""
+    return f"{op}@{socket.gethostname()}:{os.getpid()}"
+
+
+def carry_routing(stored: Mapping[str, Any] | None, doc: Mapping[str, Any]) -> dict[str, Any]:
+    """`doc` with the stored document's live blocks and kill switch added (R5).
+
+    Blocked regions and accounts are the union of both (stored first), and the kill switch is on
+    when either has it on. Malformed stored values are skipped (the stored document may be the
+    invalid one being replaced).
+    """
+    out = dict(doc)
+    old = stored.get("routing") if isinstance(stored, Mapping) else None
+    if not isinstance(old, Mapping):
+        return out
+    routing = dict(out.get("routing") or {})
+    for name in _CARRIED_LISTS:
+        before = old.get(name)
+        if isinstance(before, list) and all(isinstance(v, str) for v in before):
+            own = routing.get(name, [])
+            mine = own if isinstance(own, list) else []
+            routing[name] = [*before, *(v for v in mine if v not in before)]
+    if old.get("kill_switch") is True:
+        routing["kill_switch"] = True
+    if routing:
+        out["routing"] = routing
+    return out
+
+
+def _new_path_errors(before: Mapping[str, Any], after: Mapping[str, Any], hosts: Any) -> list[str]:
+    """Strict-mode problems at paths a live edit adds or changes (R2).
+
+    A stored document is read leniently (an older pod skips names a newer one wrote), but an
+    edit's own new names must be known: a typo such as `rmp` was accepted and did nothing.
+    """
+    registry, errors, _ = check(after, strict=True, allowed_hosts=hosts)
+    if registry is not None:
+        return []
+    changed = [".".join(path) for path, _, _ in diff(dict(before), dict(after))]
+    found = []
+    for error in errors:
+        where = error.split(": ", 1)[0]
+        if any(where == path or where.startswith(path + ".") for path in changed):
+            found.append(error)
+    return found
 
 
 def _set_path(doc: dict[str, Any], path: Sequence[str], value: Any) -> None:
@@ -245,7 +321,10 @@ class RegistryStore:
     """The registry of one environment (key prefix) in the state store.
 
     `current` is the last good `ResolvedRegistry`; hot paths read it without I/O. `config` is
-    this process's own document, used by `boot()` and to restore a lost registry.
+    this process's own document, used by `boot()` and to restore a lost registry. For metrics:
+    `invalid_count` counts refused reads, `stored_refused` is True while the stored document is
+    refused (invalid or needing a newer library), `lib_too_old` while it needs a newer library
+    (this pod never publishes over it), `on_own_config` while the pod runs on its own document.
     """
 
     def __init__(
@@ -279,7 +358,11 @@ class RegistryStore:
         self._changes = -1
         self._version = 0
         self.invalid_count = 0
+        self.stored_refused = False
+        self.lib_too_old = False
+        self.on_own_config = False
         self._warned: set[str] = set()
+        self._loading: asyncio.Future[ResolvedRegistry | None] | None = None
 
     # ---------------------------------------------------------------- keys
 
@@ -322,7 +405,9 @@ class RegistryStore:
         return self._changes
 
     async def _read(self) -> tuple[dict[str, Any] | None, dict[str, str]]:
-        async with self._client.pipeline(transaction=False) as pipe:
+        # One transaction: a publish between the two reads paired a document with another
+        # document's change counter (a torn read).
+        async with self._client.pipeline(transaction=True) as pipe:
             pipe.get(self.doc_key)
             pipe.hgetall(self.meta_key)
             raw, meta = await pipe.execute()
@@ -333,31 +418,64 @@ class RegistryStore:
             doc = orjson.loads(raw)
         except orjson.JSONDecodeError:
             return {"__invalid__": _text(raw)[:200]}, meta_text
+        if not isinstance(doc, dict):
+            return {"__invalid__": _text(raw)[:200]}, meta_text
         return doc, meta_text
 
-    def _accept(self, doc: Mapping[str, Any], meta: Mapping[str, str]) -> bool:
+    def _readable(self, doc: Mapping[str, Any]) -> Registry | None:
+        """The stored document as a registry, or None (logged once) when this pod refuses it."""
         registry, errors, _ = check(doc, strict=False, allowed_hosts=self._hosts)
+        if registry is not None and needs_newer_lib(registry.min_lib_version):
+            errors = [
+                f"min_lib_version: needs llm-queue {registry.min_lib_version} or later "
+                f"(this is {__version__}); this pod keeps its registry and never publishes"
+            ]
+            registry = None
         if registry is None:
-            self.invalid_count += 1
             key = "|".join(errors)
             if key not in self._warned:
                 self._warned.add(key)
                 logger.warning("registry_invalid", problems=errors[:20], count=len(errors))
+        return registry
+
+    def _accept(self, doc: Mapping[str, Any], meta: Mapping[str, str]) -> bool:
+        registry = self._readable(doc)
+        # Admission reads the numbers stored with this counter whatever the pod thinks of the
+        # document: keeping an older counter made every call loop on `stale_config` (R1).
+        self._changes = int(meta.get("changes", "0"))
+        if registry is None:
+            self.invalid_count += 1
+            self.stored_refused = True
+            self.lib_too_old = isinstance(doc.get("min_lib_version"), str) and needs_newer_lib(
+                doc["min_lib_version"]
+            )
             return False
         for warning in registry.warnings:
             if warning not in self._warned:
                 self._warned.add(warning)
                 logger.warning("registry_warning", warning=warning)
         self._current = ResolvedRegistry(registry)
-        self._changes = int(meta.get("changes", "0"))
         self._version = registry.version
+        self.stored_refused = self.lib_too_old = self.on_own_config = False
         return True
 
+    def live_edit_mode(self, doc: Mapping[str, Any]) -> str:
+        """The live-edit mode of a stored document: its `live_edit`, else the process setting."""
+        mode = doc.get("live_edit")
+        return mode if mode in LIVE_EDIT_MODES else self.live_edit
+
     async def load(self) -> ResolvedRegistry | None:
-        """Read the stored registry; keep the last good one when it is unreadable or invalid.
+        """Read the stored registry; keep the last good one when it is unreadable or refused.
 
         Returns None when there is no stored registry (nothing published yet, or it was lost).
+        Concurrent calls share one read: every call that saw `stale_config` used to reload.
         """
+        pending = self._loading
+        if pending is None or pending.done():
+            pending = self._loading = asyncio.ensure_future(self._load())
+        return await asyncio.shield(pending)
+
+    async def _load(self) -> ResolvedRegistry | None:
         try:
             doc, meta = await self._read()
         except (RedisError, OSError) as exc:
@@ -378,53 +496,95 @@ class RegistryStore:
 
     @store_op
     async def publish(self, doc: Mapping[str, Any], *, actor: str) -> PublishResult:
-        """Publish a document by the version rule; raise `RegistryError` when it is invalid."""
+        """Publish a document by the version rule; raise `RegistryError` when it is invalid.
+
+        The stored document's routing blocks and kill switch are carried over (R5). A stored
+        document this library cannot read is treated as missing when its version is not above
+        `doc`'s (R1); one that needs a newer library is never replaced (`lib_too_old`, C5).
+        """
+        check_actor(actor)
         registry, errors, warnings = check(doc, strict=True, allowed_hosts=self._hosts)
         if registry is None:
             raise RegistryError(errors, warnings)
-        view = ResolvedRegistry(registry)
-        stored, _ = await self._read()
-        changes = orjson.dumps(audit_diff(stored or {}, doc)).decode()
-        keys, values = self._numbers(view)
-        reply = await self._publish(
-            [self.doc_key, self.meta_key, self.audit_key, self.history_key, *keys],
-            [
-                orjson.dumps(doc).decode(),
-                registry.version,
-                content_hash(doc),
-                actor,
-                changes,
-                self._retention_ms,
-                self._history_size,
-                *values,
-            ],
-        )
-        action, version = _text(reply[0]), int(reply[1])
-        if action == "not_bumped":
-            logger.warning("registry_version_not_bumped", version=version)
-        elif action == "ignored":
-            logger.info("registry_older_ignored", stored=version, config=registry.version)
-        elif action == "published":
-            logger.info("registry_published", version=version, actor=actor)
-            logger.info("llmq_registry_audit", actor=actor, op="publish", diff=changes)
-        await self.load()
-        return PublishResult(action, version)
+        for _ in range(self._edit_retries + 2):
+            stored, meta = await self._read()
+            replace = False
+            if stored is not None:
+                min_lib = stored.get("min_lib_version")
+                if isinstance(min_lib, str) and needs_newer_lib(min_lib):
+                    self.lib_too_old = True
+                    stored_version = int(meta.get("version", "0"))
+                    logger.warning("registry_needs_newer_library", needs=min_lib, have=__version__)
+                    await self._load()
+                    return PublishResult("lib_too_old", stored_version)
+                replace = self._readable(stored) is None
+            merged = carry_routing(None if replace else stored, doc)
+            merged_registry, errors, warnings = check(
+                merged, strict=True, allowed_hosts=self._hosts
+            )
+            if merged_registry is None:  # cannot happen for valid routing; never publish it
+                raise RegistryError(errors, warnings)
+            changes = orjson.dumps(audit_diff(stored or {}, merged)).decode()
+            keys, values = self._numbers(ResolvedRegistry(merged_registry))
+            reply = await self._publish(
+                [self.doc_key, self.meta_key, self.audit_key, self.history_key, *keys],
+                [
+                    orjson.dumps(merged).decode(),
+                    registry.version,
+                    content_hash(doc),  # of the config as given: a redeploy of it is `kept`
+                    actor,
+                    changes,
+                    self._retention_ms,
+                    self._history_size,
+                    int(meta.get("changes", "0")),
+                    "1" if replace else "0",
+                    *values,
+                ],
+            )
+            action, version = _text(reply[0]), int(reply[1])
+            if action == "conflict":
+                continue
+            if action == "not_bumped":
+                logger.warning("registry_version_not_bumped", version=version)
+            elif action == "ignored":
+                logger.info("registry_older_ignored", stored=version, config=registry.version)
+            elif action == "published":
+                if replace:
+                    logger.error("registry_invalid_replaced", version=version, actor=actor)
+                logger.info("registry_published", version=version, actor=actor)
+                logger.info("llmq_registry_audit", actor=actor, op="publish", diff=changes)
+            await self._load()  # a fresh read, never one that started before the write
+            return PublishResult(action, version)
+        raise RegistryConflict("the registry kept changing during a publish; try again")
 
-    async def boot(self, *, actor: str = "boot") -> ResolvedRegistry:
+    def _run_on_config(self) -> ResolvedRegistry:
+        """Run on this process's own document (the stored one is unreachable or refused)."""
+        assert self.config is not None
+        registry, errors, warnings = check(self.config, allowed_hosts=self._hosts)
+        if registry is None:
+            raise RegistryError(errors, warnings)
+        self._current = ResolvedRegistry(registry)
+        self._version = registry.version
+        self.on_own_config = True
+        return self._current
+
+    async def boot(self, *, actor: str | None = None) -> ResolvedRegistry:
         """Publish this process's config by the version rule, then load what is live.
 
-        When the store cannot be reached the process starts on its own config (plan §3.18).
+        When the store cannot be reached, or the live document is one this pod refuses (invalid
+        and newer, or needing a newer library), the process starts on its own config (plan
+        §3.18, R1). The audit actor defaults to `boot@host:pid`.
         """
         if self.config is None:
             raise ConfigError("RegistryStore.boot needs the process's own registry (config)")
         try:
-            await self.publish(self.config, actor=actor)
+            await self.publish(self.config, actor=actor or process_actor("boot"))
         except (RedisError, OSError) as exc:
             logger.warning("registry_store_unreachable_at_boot", error=str(exc))
-            registry, errors, warnings = check(self.config, allowed_hosts=self._hosts)
-            if registry is None:
-                raise RegistryError(errors, warnings) from exc
-            self._current = ResolvedRegistry(registry)
+            return self._run_on_config()
+        if self._current is None:
+            logger.error("registry_stored_refused_running_on_config", lib_too_old=self.lib_too_old)
+            return self._run_on_config()
         return self.current
 
     # ---------------------------------------------------------------- live edits
@@ -438,19 +598,28 @@ class RegistryStore:
         Compare-and-set on the change counter; on a race the document is read again and the
         change re-applied (up to three times).
         """
+        check_actor(actor)
         for _ in range(self._edit_retries):
             doc, meta = await self._read()
             if doc is None:
                 raise ConfigError("no registry is stored; publish one first")
+            min_lib = doc.get("min_lib_version")
+            if isinstance(min_lib, str) and needs_newer_lib(min_lib):
+                raise ConfigError(
+                    f"the registry needs llm-queue {min_lib} or later (this is {__version__}); "
+                    "edit it from a newer version"
+                )
             after = orjson.loads(orjson.dumps(doc))
             change(after)
-            reasons = refused_edits(doc, after, self.live_edit)
+            reasons = refused_edits(doc, after, self.live_edit_mode(doc))
             if reasons:
                 logger.warning("registry_edit_refused", actor=actor, reasons=reasons)
                 raise LiveEditRefused("; ".join(reasons))
             registry, errors, warnings = check(after, strict=False, allowed_hosts=self._hosts)
             if registry is None:
                 raise RegistryError(errors, warnings)
+            if new_errors := _new_path_errors(doc, after, self._hosts):
+                raise RegistryError(new_errors, warnings)
             changes = orjson.dumps(audit_diff(doc, after)).decode()
             keys, values = self._numbers(ResolvedRegistry(registry))
             reply = await self._edit(
@@ -466,7 +635,7 @@ class RegistryStore:
             )
             if _text(reply[0]) == "ok":
                 logger.info("llmq_registry_audit", actor=actor, op="edit", diff=changes)
-                loaded = await self.load()
+                loaded = await self._load()
                 assert loaded is not None
                 return loaded
         raise RegistryConflict("the registry kept changing; try again")
@@ -585,19 +754,28 @@ class RegistryStore:
 
         A missing or older stored registry while this process holds a newer one means the store
         was flushed or failed over: republish by the boot rule and alert (live edits are lost).
+        A stored registry this pod refuses as invalid counts as missing when the pod's own
+        version is not below it (R1); one that needs a newer library is left alone (C5).
         """
         held = self._version
-        loaded = await self.load()
-        if self.config is None:
-            return loaded
         try:
             doc, meta = await self._read()
-        except (RedisError, OSError):
+        except (RedisError, OSError) as exc:
+            logger.warning("registry_unreachable", error=str(exc))
             return self._current
+        if doc is not None:
+            self._accept(doc, meta)
+        if self.config is None:
+            return self._current if doc is not None else None
         stored = int(meta.get("version", "0")) if doc is not None else 0
-        if doc is None or stored < held:
+        own = self.config.get("registry_version")
+        own_version = own if isinstance(own, int) else 0
+        if doc is None or (not self.stored_refused and stored < held):
             logger.error("registry_reset_live_edits_lost", stored=stored, held=held)
-            await self.publish(self.config, actor="restore")
+            await self.publish(self.config, actor=process_actor("restore"))
+        elif self.stored_refused and not self.lib_too_old and own_version >= stored:
+            logger.error("registry_invalid_restoring_config", stored=stored, own=own_version)
+            await self.publish(self.config, actor=process_actor("restore"))
         return self._current
 
     async def run(self, interval_secs: float) -> None:
