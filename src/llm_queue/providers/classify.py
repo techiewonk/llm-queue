@@ -93,6 +93,10 @@ _AUTH_FAMILIES = (
     "authentication",
     "invalidapikey",
     "requestexpired",
+    # botocore found no (or half of the) credentials: the client is rebuilt so keys that
+    # appear later (IRSA, IMDS, a rotated secret) are read; before, it kept failing (CL-7).
+    "nocredentials",
+    "partialcredentials",
 )
 _AUTH_MESSAGE = re.compile(
     r"signature expired|security token included in the request is (?:invalid|expired)"

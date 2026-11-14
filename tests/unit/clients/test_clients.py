@@ -17,6 +17,7 @@ from clients_testkit import StartFake, registry_doc
 from llm_queue.clients import (
     AttemptTimeout,
     ClientPool,
+    CredentialsUnavailable,
     OpenAIOptions,
     Providers,
     Route,
@@ -210,7 +211,7 @@ async def test_openai_key_and_errors(setup: Any) -> None:
         "m",
         "x/dc1",
     )
-    with pytest.raises(ConfigError, match="NOPE is not set"):
+    with pytest.raises(CredentialsUnavailable, match="NOPE is not set"):  # CL-6: fails over
         providers.pool.openai(missing)
 
 
