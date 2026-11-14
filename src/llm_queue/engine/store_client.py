@@ -54,12 +54,12 @@ def store_client(
         # (measured: a half-open store hung a command 60 s with the default, 15 s without).
         # A connection reset mid-reply is retried too, and the script may already have run
         # (EN-5). Scripts with a receipt or owner check are safe to replay (ACK, RETURN,
-        # EXTEND, FAIL, which ends its receipt, the admission scripts, REGISTER_SEND). Two are
-        # not: a replayed RECEIVE takes a second batch (the first stays hidden for the
-        # visibility time and is charged one failure when it lapses, within max_receives), and
-        # a replayed plain SEND appends twice (jobs run at least once; a call's duplicate finds
-        # its request id claimed). Both are rare and bounded; removing them needs a retry-free
-        # connection or a per-call token write on every RECEIVE (not done: unmeasured).
+        # EXTEND, FAIL, which ends its receipt, the admission scripts, REGISTER_SEND). The
+        # worker's RECEIVE_FIRST is too: it records its batch under a nonce in a per-loop claim,
+        # a replay hands back the same batch, and a receive whose reply never came is reclaimed
+        # (S11). Still not: a plain RECEIVE (jobs, tools) takes a second batch on replay, and a
+        # plain SEND appends twice (jobs run at least once; a call's duplicate finds its request
+        # id claimed); both rare and bounded.
         "retry": Retry(
             EqualJitterBackoff(cap=1.0, base=0.05),
             opts.retries,
