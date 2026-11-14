@@ -8,12 +8,14 @@ request ids, the waiting limit and an unusable model. No real LLM is called.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import json
 from typing import Any
 
 import pytest
 import redis.asyncio
-from engine_testkit import CHAT, GPT, SMALL, Make, stats
+from engine_testkit import CHAT, GPT, SMALL, Make, away_from_minute_end, stats
 
 from llm_queue.clients import CredentialsUnavailable
 from llm_queue.engine.errors import CallFailed
@@ -22,13 +24,6 @@ from llm_queue.engine.queue import QueueSettings
 pytestmark = pytest.mark.integration
 
 _stats = stats
-
-
-async def _away_from_minute_end(engine: Any, margin_secs: float = 15.0) -> None:
-    """Start a fixed-window test with `margin_secs` left in the minute (no budget reset)."""
-    left = 60 - engine.clock.now() % 60
-    if left < margin_secs:
-        await asyncio.sleep(left + 0.1)
 
 
 async def test_chat_round_trip(make: Make) -> None:
@@ -47,23 +42,23 @@ async def test_chat_round_trip(make: Make) -> None:
 
 async def test_embeddings_with_inference_defaults(make: Make) -> None:
     engine, _ = await make()
+    """The model's `inference.dimensions` (256) reaches the provider body and the vector."""
     reply = await engine.call("titan", {"body": {"inputText": "a b c"}})
     assert reply.response is not None
-    assert reply.meta.tokens_in is not None
+    body = json.loads(base64.b64decode(reply.response["body_b64"]))
+    assert len(body["embedding"]) == 256  # fakellm's default is 1024
+    assert reply.meta.tokens_in == body["inputTextTokenCount"]
 
 
 async def test_rpm_budget_and_expiry(make: Make) -> None:
     engine, fake = await make({"big": {"rpm": 3, "max_wait_secs": 1, "priority_reserve": 0}})
-    minute = engine.clock.now() // 60
+    await away_from_minute_end(engine.clock.now)  # a fixed window resets on the minute
     results = await asyncio.gather(
         *[engine.call("big", CHAT, timeout_secs=5) for _ in range(8)], return_exceptions=True
     )
     ok = [r for r in results if not isinstance(r, BaseException)]
     failed = [r for r in results if isinstance(r, CallFailed)]
-    if engine.clock.now() // 60 == minute:  # a fixed window resets at the minute boundary
-        assert len(ok) == 6  # 3 per minute on each of r1 and r2
-    else:
-        assert 6 <= len(ok) <= 8
+    assert len(ok) == 6  # 3 per minute on each of r1 and r2
     assert {f.kind for f in failed} <= {"rate_limited"}
     calls = _stats(fake, f"{GPT}@r1").get("calls", 0) + _stats(fake, f"{GPT}@r2").get("calls", 0)
     assert calls == len(ok)  # nothing above the budget reached the provider
@@ -224,7 +219,7 @@ async def test_fallback_only_for_listed_causes(make: Make) -> None:
             }
         }
     )
-    await _away_from_minute_end(engine)  # rpm 1 per fixed minute: stay in one minute
+    await away_from_minute_end(engine.clock.now)  # rpm 1 per fixed minute: stay in one minute
     await engine.call("big", CHAT)
     await engine.call("big", CHAT)
     with pytest.raises(CallFailed) as info:  # exhausted is not a listed cause: no spill to r3
@@ -292,13 +287,12 @@ async def test_kill_switch_runs_direct_with_budgets(make: Make) -> None:
         ),
         actor="t",
     )
-    minute = engine.clock.now() // 60
+    await away_from_minute_end(engine.clock.now)
     results = await asyncio.gather(
         *[engine.call("big", CHAT, timeout_secs=3) for _ in range(4)], return_exceptions=True
     )
     ok = [r for r in results if not isinstance(r, BaseException)]
-    if engine.clock.now() // 60 == minute:
-        assert len(ok) == 2
+    assert len(ok) == 2
     depth = await engine.queues.depth(engine._queue_name(engine.registry.current, "big", False))
     assert depth == (0, 0, 0)  # nothing went through the queue
     assert _stats(fake, f"{GPT}@r1")["calls"] == len(ok)

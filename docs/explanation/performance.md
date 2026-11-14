@@ -34,3 +34,28 @@ processes as pods on one machine).
 | Recovery | Waiter pod killed: next waiter within 1.3 s smooth, 0.02 s after the minute fixed (B94); first call after idle 125 ms (B92) |
 | Memory | Bulk Cohere embedding (300 x 96 texts): store +23 MB at peak, +582 MB before deleting results on first read (B97; CHANGELOG states 31 MB vs 587 MB). Process memory: **unverified** |
 | CPU per call | botocore parameter validation off: 8.5 to 3.5 ms per attempt at 218 KB; no deep copy (1.86 ms saved); envelope encode 342 to 57 us; UUIDv7 0.49 us; `hiredis` parsing 39-75x faster |
+| Message size check | One orjson pass for `max_message_bytes`: 0.22 ms at 240 KB (2026-11-14, Python 3.12) |
+
+## Client start-up and per-call overhead: 0.1.0b1 baseline
+
+`scripts/bench.py` measures pod start, the cold first call, the first call after an idle spell,
+steady overhead and stream overhead on the local stack (fakellm with a fixed 5 ms latency), using
+only the public API, so every release is measured the same way. The 0.1.0b1 run is the "before"
+for the 0.1.0b2 client hub, warm connections and round-trip folding
+(`scripts/baselines/bench-0.1.0b1.json`, 2026-11-14, Python 3.12, Windows, 6 deployments).
+
+| What (p50 / p95, ms) | 0.1.0b1 |
+|---|---|
+| Pod start (`from_env` to `start()`) | 145 / 336 |
+| Cold first call | 3,010 / 3,435 |
+| First call after 60 s idle | 360 / 640 |
+| Queue overhead, sequential priority calls | 125 / 425 |
+| Queue overhead, 20 concurrent | 774 / 1,593 |
+| Stream overhead to the first event | 123 / 366 |
+| Store round trips per call, `converse` / `converse_stream` (median) | 18.6 / 30.9 |
+
+!!! note "Indicative"
+    Other test processes may have been running on the host; compare only runs made back to
+    back on the same machine.
+
+<!-- verify after merge: add the 0.1.0b2 "after" column from `python scripts/bench.py`, run back to back with the baseline on one machine (PLAN B, E6). -->

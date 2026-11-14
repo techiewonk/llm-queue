@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 import redis.asyncio
-from engine_testkit import CHAT, Make
+from engine_testkit import CHAT, Make, away_from_minute_end
 
 from llm_queue.engine import cli
 from llm_queue.engine.errors import CallFailed
@@ -32,7 +32,7 @@ async def test_status_of_model_and_request(make: Make) -> None:
         {"big": {"rpm": 50}},
         {"defaults": {"latency_ms": {"p50": 600, "p95": 600}}},
     )
-    minute = engine.clock.now() // 60
+    await away_from_minute_end(engine.clock.now)  # the counters are per calendar minute
     task = asyncio.create_task(engine.call("big", CHAT, request_id="r-status"))
     for _ in range(100):  # until it runs (not a fixed sleep: client start-up time varies)
         running = await engine.request_status("r-status")
@@ -46,10 +46,7 @@ async def test_status_of_model_and_request(make: Make) -> None:
     assert done["state"] == "done"
     status = await engine.status("big")
     dep = next(d for d in status["deployments"] if d["name"] == "aws-a/r1")
-    if engine.clock.now() // 60 == minute:  # the counters are per calendar minute
-        assert dep["rpm"] == {"limit": 50, "used": 1, "left": 49}
-    else:
-        assert dep["rpm"]["used"] + dep["rpm"]["left"] == 50
+    assert dep["rpm"] == {"limit": 50, "used": 1, "left": 49}
     assert dep["healthy"]
     assert dep["breaker"] == "closed"
     assert dep["concurrency"]["in_use"] == 0

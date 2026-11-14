@@ -89,7 +89,8 @@ the store keeps a marker. One `llmq_call_finished` log record per call (ids hash
 
 ## Direct path
 
-Used for sync calls (`converse_sync`, `embed_sync`, on a private event loop and caller-only engine),
+Used for sync calls (`converse_sync`, `embed_sync`: on the started queue's loop, else on one private
+loop per process with a caller-only engine; see [Clients and connections](clients.md#sync-calls)),
 the kill switch, `queue_pct`, a separate queue store that failed for `LLMQ_QUEUE_FAILOVER_SECS` (5),
 and an unreplicated send. It registers and confirms the same record, then admits with the same
 `PICK_TAKE` and waiter order (position = the store's time at registration; one registered waiter per

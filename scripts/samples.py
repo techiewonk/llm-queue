@@ -34,7 +34,10 @@ from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parent.parent
 SAMPLES = ROOT / "samples"
-PY = str(ROOT / ".venv" / ("Scripts" if os.name == "nt" else "bin") / "python")
+_VENV_PY = ROOT / ".venv" / ("Scripts" if os.name == "nt" else "bin") / "python"
+# The project venv, else the interpreter running this script.
+_FOUND = _VENV_PY.with_suffix(".exe" if os.name == "nt" else "").exists()
+PY = str(_VENV_PY) if _FOUND else sys.executable
 LOCAL_STORE_URL = "redis://:localdev@127.0.0.1:6379/0"
 FAKELLM_URL = "http://127.0.0.1:8080"
 AWS_KEYS = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN")
@@ -91,8 +94,12 @@ def environment(live: bool, env_file: Path, prefix: str, store: str) -> dict[str
             "LLMQ_REGISTRY": registry(region),
             "LLMQ_METRICS_SINK": "none",
             "PYTHONIOENCODING": "utf-8",
+            # This checkout's library, even when the venv's editable install points elsewhere.
+            "PYTHONPATH": os.pathsep.join(filter(None, [str(ROOT / "src"), env.get("PYTHONPATH")])),
         }
     )
+    if store == LOCAL_STORE_URL:  # no TLS, no salt: only allowed in a test environment
+        env["LLMQ_ENVIRONMENT"] = "test"
     where = "local Valkey" if store == LOCAL_STORE_URL else "the env file's store (TLS)"
     if store.startswith("redis://") and store != LOCAL_STORE_URL:
         where = "the env file's store (no TLS)"

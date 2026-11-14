@@ -9,7 +9,9 @@ Each run is one scenario x one load (`under` 50 % of the budget, `at` 100 %, `bu
 Common pass rule: `before` and `after` calls all succeed (a burst may refuse calls on time,
 as `rate_limited` or `deadline_exceeded`, in any phase); `during` fails only with the kinds
 the scenario allows; no answer arrives after its deadline; nothing is left in progress at the
-end. Some scenarios add checks (the provider never called again, one run for two callers ...).
+end (no lease, waiter, held or queued message, nothing in progress); the provider saw no more
+calls than were sent plus the retry budget and the calls in flight when a fault hit. Some
+scenarios add checks (a faulted region serves again, one run for two callers ...).
 
     python scripts/scenarios.py --list
     python scripts/scenarios.py S4 P1            # these, under every load
@@ -18,11 +20,13 @@ end. Some scenarios add checks (the provider never called again, one run for two
     python scripts/scenarios.py all              # every scenario and pair, every load
     python scripts/scenarios.py S4 --profile prod  # production timers (slower)
     python scripts/scenarios.py all --jobs 4     # 4 runs at a time (default; 1: one by one)
+    python scripts/scenarios.py S1 --seed 7      # replay the random choices of a run
 
-In parallel, each run is its own process with its own fakellm and store-proxy ports and its
-own log (`reports/scenarios-<time>/<id>-<load>.log`, worker logs beside it). Runs that change
-something shared run alone, after the others: S9 (the store's memory limit) and the Docker
-failover drills (fixed ports).
+Every random choice is seeded (`--seed`, printed at the start). In parallel, each run is its own
+process with its own fakellm and store-proxy ports (free ports picked per run) and its own log
+(`reports/scenarios-<time>/<id>-<load>.log`, worker logs beside it). Runs that change something
+shared run alone, after the others: S9 (the store's memory limit) and the Docker failover
+drills (fixed container names).
 
 Profiles: `fast` (default) shortens the timers so faults resolve in seconds (lease 3 s,
 visibility 2 s, caller TTL 5 s, deadline 10 s, attempt 3 s, wait 8 s); `prod` keeps the
@@ -36,6 +40,7 @@ import asyncio
 import collections
 import dataclasses
 import json
+import math
 import os
 import random
 import subprocess
@@ -56,20 +61,24 @@ from gates_fleet import (
     FAKE_PORT,
     PY,
     ROOT,
+    free_port,
     log_dir,
     log_file,
     setup_logging,
 )
 
-from llm_queue import CallFailed, LLMQueue, StoreUnavailable
+from llm_queue import CallFailed, LLMQueue, RegistryError, StoreUnavailable
 
-PROXY_PORT = int(os.environ.get("LLMQ_SCENARIO_PROXY_PORT", "6389"))  # one per parallel run
-QUEUE_PROXY_PORT = PROXY_PORT + 100  # a separate queue store (LLMQ_QUEUE_STORE_URL), L3
+PROXY_PORT = int(os.environ.get("LLMQ_SCENARIO_PROXY_PORT") or free_port())
+QUEUE_PROXY_PORT = free_port()  # a separate queue store (LLMQ_QUEUE_STORE_URL), L3
 REGIONS = ("us-east-1", "us-east-2")  # gates_fleet.registry's first two
 RPM = 600  # per deployment: 2 deployments, 20 chat calls a second of budget
 BURST = int(RPM * 0.1)  # rate_burst's default: the smooth bucket holds a tenth of the minute
 STREAM_ID = "openai.gpt-oss-120b-1:0"  # the streaming model (its own fakellm keys), L2
 PHASE_CALLS = {"before": 30, "during": 60, "after": 30}
+SLOW_ID = "openai.slow-1:0"  # C1's calls: their own fakellm keys, apart from the phase traffic
+ORPHAN_ID = "openai.orphan-1:0"  # C2's calls
+RECOVERY_SECS = 30.0  # a faulted region must serve again within this after the fault
 LOADS = {"under": 0.5, "at": 1.0, "burst": 3.0}
 
 
@@ -194,6 +203,9 @@ class Ctx:
     queue_proxy: FaultProxy | None = None  # the separate queue store's proxy (L3)
     notes: list[str] = dataclasses.field(default_factory=list)
     checks: dict[str, bool] = dataclasses.field(default_factory=dict)
+    extra_sent: int = 0  # chat calls sent outside `run` (client pods, C3)
+    in_flight: int = 0  # provider calls in flight when faults began / ended (may run again)
+    marks: dict[str, float] = dataclasses.field(default_factory=dict)  # run times of events
 
     def fake(self, method: str, path: str, body: Any = None) -> Any:
         """Call fakellm's admin API (blocking: run it in a thread)."""
@@ -209,11 +221,23 @@ class Ctx:
         """Change the fake provider's behaviour in one region (`{}` keys reset it)."""
         await asyncio.to_thread(self.fake, "PATCH", f"/admin/models/{CHAT_ID}@{region}", behaviour)
 
-    async def provider_calls(self, region: str) -> int:
-        """Calls fakellm received in one region so far."""
+    async def provider_calls(self, region: str, model_id: str = CHAT_ID) -> int:
+        """Calls fakellm received for one model in one region so far."""
+        return int((await self.provider_stats(model_id, region)).get("calls", 0) or 0)
+
+    async def provider_stats(self, model_id: str, region: str) -> dict[str, Any]:
+        """The fakellm counters of one model in one region (empty before its first call)."""
         stats = await asyncio.to_thread(self.fake, "GET", "/admin/stats")
-        entry = stats.get("models", {}).get(f"{CHAT_ID}@{region}") or {}
-        return int(entry.get("calls", 0) or 0)
+        return dict(stats.get("models", {}).get(f"{model_id}@{region}") or {})
+
+    async def provider_in_flight(self) -> int:
+        """Provider calls running now, over every key (they may run again after a fault)."""
+        stats = await asyncio.to_thread(self.fake, "GET", "/admin/stats")
+        return sum(int(m.get("concurrent", 0)) for m in stats.get("models", {}).values())
+
+    def now(self) -> float:
+        """Seconds on the run's clock (`Result.sent`)."""
+        return time.monotonic() - float(self.run.t0)
 
     async def edit(self, values: dict[str, Any], *, model: str | None = "chat") -> None:
         """A live registry edit."""
@@ -244,6 +268,7 @@ class Scenario:
     fake: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)  # by model id
     share: float = 1.0  # of the load sent by `during` here (client processes send the rest)
     queue_proxy: bool = False  # LLMQ_QUEUE_STORE_URL through its own proxy
+    recovers: bool = False  # the faulted region (REGIONS[0]) must serve again after the fault
 
 
 async def phase(
@@ -273,6 +298,7 @@ async def run_one(scenario: Scenario, load: str, profile_name: str) -> bool:
     proxy = FaultProxy()
     serving = [asyncio.create_task(serve(proxy))]
     scenario_doc = {
+        "seed": random.randrange(2**31),  # fakellm's rolls follow the run's seed
         "defaults": {"latency_ms": {"p50": 150, "p95": 250}},
         "models": {f"{CHAT_ID}@{r}": {} for r in REGIONS}
         | {f"{mid}@{r}": dict(b) for mid, b in scenario.fake.items() for r in REGIONS},
@@ -297,9 +323,11 @@ async def run_one(scenario: Scenario, load: str, profile_name: str) -> bool:
             ended = asyncio.Event()
 
             async def fault() -> None:
+                ctx.in_flight += await ctx.provider_in_flight()
                 try:
                     await scenario.fault(ctx)
                 finally:
+                    ctx.in_flight += await ctx.provider_in_flight()
                     ended.set()
 
             during_calls = max(10, round(PHASE_CALLS["during"] * scenario.share))
@@ -310,21 +338,32 @@ async def run_one(scenario: Scenario, load: str, profile_name: str) -> bool:
             phases["during"] = await during
             await asyncio.sleep(scenario.settle_secs)
             phases["after"] = await phase(ctx, "after", rate, PHASE_CALLS["after"], None)
+            if scenario.recovers:
+                await serves_again(ctx, phases["after"])
             if scenario.extra is not None:
                 await scenario.extra(ctx)
-            # Nothing left in progress: a killed worker's lease ends and the sweep clears it.
-            keys = [f"{gate.prefix}:{{m:{alias}}}:inprog" for alias in doc["models"]]
+            # Nothing left: a killed worker's lease ends and the sweep clears it.
             for _ in range(60):
-                inprog = sum(gate.store.client.zcard(key) for key in keys)
-                if not inprog:
+                left = leftovers(gate, list(doc["models"]))
+                if not any(left.values()):
                     break
                 await asyncio.sleep(0.5)
+            provider = sum([await ctx.provider_calls(r) for r in REGIONS])
     finally:
         for task in serving:
             task.cancel()
     secs = time.monotonic() - started
     # Three times the budget: refusing on time (no budget, or no time left) is the right answer.
     allow_everywhere = {"rate_limited", "deadline_exceeded"} if load == "burst" else set()
+    # Every chat call the provider saw was sent, retried within the retry budget (20 % of first
+    # attempts, at least 10 a minute), or in flight when a fault hit (it may run again).
+    sent = len(ctx.run.results) + ctx.extra_sent
+    retries = math.ceil(0.2 * sent) + 10 * math.ceil(secs / 60 + 1)
+    calls_bound = sent + retries + ctx.in_flight
+    ctx.notes.append(
+        f"provider calls {provider} <= sent {sent} + retry budget {retries} "
+        f"+ in flight at faults {ctx.in_flight}"
+    )
     bad = {
         name: collections.Counter(
             r.kind
@@ -336,14 +375,25 @@ async def run_one(scenario: Scenario, load: str, profile_name: str) -> bool:
         for name, results in phases.items()
     }
     late = [r for results in phases.values() for r in results if r.total_secs > limit]
+    floors = {}
+    if load == "burst":  # refusals are fine, but the budget's share must still be served
+        for name in ("before", "after"):
+            served, wanted = budget_floor(phases[name], len(REGIONS))
+            floors[f"{name}: >= 0.9 x the budget's share served ({served}/{wanted:.0f})"] = (
+                served >= 0.9 * wanted
+            )
     checks = {
         "before: all served": not bad["before"],
         f"during: failures only {sorted(scenario.allowed | allow_everywhere) or 'none'}": not bad[
             "during"
         ],
         "after: all served": not bad["after"],
+        **floors,
         "no answer after its deadline": not late,
-        "nothing in progress at the end": not inprog,
+        f"nothing left at the end {dict(left) if any(left.values()) else ''}".rstrip(): not any(
+            left.values()
+        ),
+        "provider calls <= sent + retry budget + in flight at faults": provider <= calls_bound,
         **ctx.checks,
     }
     counts = {
@@ -377,6 +427,54 @@ async def run_one(scenario: Scenario, load: str, profile_name: str) -> bool:
             print(f"    {name}: {r.kind} sent at {r.sent:.1f}s, answered after {r.total_secs:.1f}s")
     print(f"{'PASS' if passed else 'FAIL'}  {scenario.sid} {load}", flush=True)
     return passed
+
+
+def leftovers(gate: Gate, aliases: list[str]) -> dict[str, int]:
+    """What a finished run must not leave: calls in progress, leases, waiters, messages.
+
+    Leases are the concurrency slots; a message held by a worker is the stream's pending entry
+    (this queue's XPENDING); a queued message nobody will receive is a lost call.
+    """
+    client = gate.store.client
+    left = collections.Counter[str]()
+    for alias in aliases:
+        base = f"{gate.prefix}:{{m:{alias}}}:"
+        left["in progress"] += client.zcard(base + "inprog")
+        left["waiters"] += client.zcard(base + "wait:p") + client.zcard(base + "wait:n")
+        for key in client.scan_iter(match=base + "lease:*", count=500):
+            left["leases"] += client.zcard(key)
+    for key in client.scan_iter(match=f"{gate.prefix}:{{q:*}}:s", count=500):
+        left["queued messages"] += client.xlen(key)
+    for key in client.scan_iter(match=f"{gate.prefix}:{{q:*}}:st", count=500):
+        left["held messages"] += sum(1 for v in client.hvals(key) if v == b"h")
+    return dict(left)
+
+
+def budget_floor(results: list[Result], deployments: int) -> tuple[int, float]:
+    """Calls served, and the budget's share of the phase: what the rate allows while it ran.
+
+    The bucket's burst is left out, so this is a floor: a run that refuses everything fails it.
+    """
+    if not results:
+        return 0, 0.0
+    span = max(r.sent for r in results) - min(r.sent for r in results) + 1.0
+    wanted = min(len(results), RPM / 60 * deployments * span)
+    return sum(r.ok for r in results), wanted
+
+
+async def serves_again(ctx: Ctx, after: list[Result]) -> None:
+    """The faulted region serves calls again (it may wait out a breaker or a health probe)."""
+    region = f"/{REGIONS[0]}"
+    t0 = time.monotonic()
+    served = any(r.ok and r.deployment.endswith(region) for r in after)
+    while not served and time.monotonic() - t0 < RECOVERY_SECS:
+        more = await phase(ctx, "recovery", ctx.rate, max(5, round(ctx.rate)), None)
+        served = any(r.ok and r.deployment.endswith(region) for r in more)
+    ctx.checks[f"{REGIONS[0]} serves again within {RECOVERY_SECS:.0f}s"] = served
+    ctx.notes.append(
+        f"{REGIONS[0]} served again "
+        + (f"{time.monotonic() - t0:.1f}s after `after`" if served else "never")
+    )
 
 
 # ------------------------------------------------------------------------------ faults
@@ -481,8 +579,17 @@ async def provider_both_down(ctx: Ctx) -> None:
 async def rpm_cut(ctx: Ctx) -> None:
     """The budget cut to a quarter, live, then put back."""
     await ctx.edit({"rpm": RPM // 4})
+    await asyncio.sleep(1.5)  # LLMQ_CFG_RELOAD_SECS 1: every process has the new budget
+    stop = asyncio.Event()
+    sampler = asyncio.create_task(_budget_samples(ctx, stop))
     await _hold(ctx)
+    stop.set()
+    samples = await sampler
     await ctx.edit({"rpm": RPM})
+    # The bucket may still hold the old burst; after that, the quarter rate.
+    excess = _over_budget(samples, RPM // 4, burst=BURST)
+    ctx.checks["provider calls within the cut budget"] = excess <= 0
+    ctx.notes.append(f"cut budget: worst stretch {excess:+.1f} calls (rpm {RPM // 4})")
 
 
 async def deployment_off(ctx: Ctx) -> None:
@@ -496,8 +603,18 @@ async def deployment_off(ctx: Ctx) -> None:
 async def kill_switch(ctx: Ctx) -> None:
     """The kill switch: every call runs direct (no queue), same budgets."""
     await ctx.edit({"routing.kill_switch": True}, model=None)
+    await asyncio.sleep(1.5)  # LLMQ_CFG_RELOAD_SECS 1: both callers see the switch
+    on = ctx.now()
     await _hold(ctx)
+    off = ctx.now()
     await ctx.edit({"routing.kill_switch": False}, model=None)
+    callers = {q.engine.worker_id for q in ctx.queues}
+    switched = [r for r in ctx.run.results if on <= r.sent <= off and r.ok]
+    queued = [r for r in switched if r.worker not in callers]
+    ctx.checks["calls ran direct (in the caller) while the switch was on"] = (
+        bool(switched) and not queued
+    )
+    ctx.notes.append(f"kill switch: {len(switched)} calls served, {len(queued)} by a worker")
 
 
 async def bad_edit(ctx: Ctx) -> None:
@@ -506,7 +623,7 @@ async def bad_edit(ctx: Ctx) -> None:
     try:
         await ctx.edit({"rpm": -5})
         ctx.checks["bad edit refused"] = False
-    except Exception:  # the refusal
+    except RegistryError:  # the refusal; anything else is a bug and fails the run
         ctx.checks["bad edit refused"] = True
     await asyncio.sleep(1)
     ctx.checks["version unchanged"] = ctx.queues[0].registry.current.registry.version == version
@@ -515,13 +632,20 @@ async def bad_edit(ctx: Ctx) -> None:
 
 async def caller_cancel(ctx: Ctx) -> None:
     """Half of 40 slow calls cancelled by their caller; the rest served."""
-    await ctx.provider(REGIONS[0], latency_ms={"p50": 2000, "p95": 2000})
-    await ctx.provider(REGIONS[1], latency_ms={"p50": 2000, "p95": 2000})
-    tasks = [asyncio.create_task(ctx.queues[0].converse("chat", chat())) for _ in range(40)]
+    tasks = [asyncio.create_task(ctx.queues[0].converse("slow", chat())) for _ in range(40)]
     await asyncio.sleep(0.5)
     for task in tasks[:20]:
         task.cancel()
     results = await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.sleep(3)  # every attempt still running has ended
+    stats = [await ctx.provider_stats(SLOW_ID, r) for r in REGIONS]
+    calls, done = sum(s.get("calls", 0) for s in stats), sum(s.get("ok", 0) for s in stats)
+    kept = sum(1 for r in results[20:] if not isinstance(r, BaseException))
+    # A cancelled call stops: never more provider calls than calls, and no cancelled call's
+    # attempt runs to the end (fakellm counts `ok` only for an answer it finished sending).
+    ctx.checks["provider: at most one call per caller call"] = calls <= 40
+    ctx.checks["provider: no cancelled call answered"] = done <= kept
+    ctx.notes.append(f"slow model: {calls} provider calls, {done} answered, {kept} kept served")
     # Cancelling some must not cancel the others: each kept call is served, or (under a
     # burst, competing with three times the budget) refused on time, never `cancelled`.
     on_time = {"rate_limited", "deadline_exceeded"}
@@ -530,14 +654,12 @@ async def caller_cancel(ctx: Ctx) -> None:
         for r in results[20:]
     )
     ctx.checks["uncancelled calls served or refused on time"] = kept_ok
-    for region in REGIONS:
-        await ctx.provider(region, latency_ms=None)
 
 
 async def caller_dies(ctx: Ctx) -> None:
     """A caller process with 100 calls waiting is killed; its calls must not stay held."""
     proc = subprocess.Popen(  # noqa: ASYNC220  # one process, started once
-        [PY, str(Path(__file__).parent / "gates_fleet.py"), "caller", "100", "chat"],
+        [PY, str(Path(__file__).parent / "gates_fleet.py"), "caller", "100", "orphan"],
         env={**ctx.gate.env, "LLMQ_MODE": "caller"},
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -551,10 +673,24 @@ async def caller_dies(ctx: Ctx) -> None:
     await asyncio.sleep(1)
     proc.kill()
     await _hold(ctx)
+    # Its waiting calls must never reach the provider: once its liveness key has expired
+    # (caller TTL) and running attempts ended, the provider count stops growing.
+    ttl = float(ctx.gate.env.get("LLMQ_CALLER_TTL_SECS", "30"))
+    await asyncio.sleep(max(0.0, ttl + 4 - ctx.profile.fault_secs))
+    first = sum([await ctx.provider_calls(r, ORPHAN_ID) for r in REGIONS])
+    await asyncio.sleep(4)
+    last = sum([await ctx.provider_calls(r, ORPHAN_ID) for r in REGIONS])
+    ctx.checks["provider: the dead caller's calls stopped"] = last == first
+    ctx.checks["provider: fewer calls than the dead caller sent"] = last < 100
+    ctx.notes.append(f"dead caller: {last} of its 100 calls reached the provider")
 
 
 async def duplicate_id(ctx: Ctx) -> None:
-    """Two callers, one request id, at once: one provider call, the same reply for both."""
+    """Two callers, one request id, at once: one provider call, the same reply for both.
+
+    Run after `after`, when no other call is in flight, so the provider count is exact.
+    """
+    await asyncio.sleep(1)  # the last phase's attempts have ended
     before = sum([await ctx.provider_calls(r) for r in REGIONS])
     rid = f"dup-{random.randrange(10**9)}"
     a, b = await asyncio.gather(
@@ -562,6 +698,8 @@ async def duplicate_id(ctx: Ctx) -> None:
         ctx.queues[1].converse("chat", chat(), request_id=rid),
         return_exceptions=True,
     )
+    ctx.extra_sent += 1  # one logical call
+    await asyncio.sleep(1)
     after = sum([await ctx.provider_calls(r) for r in REGIONS])
     same = (
         not isinstance(a, BaseException)
@@ -569,8 +707,8 @@ async def duplicate_id(ctx: Ctx) -> None:
         and a.response == b.response
     )
     ctx.checks["both callers got the same reply"] = same
-    ctx.notes.append(f"provider calls for the shared id: {after - before} (other traffic included)")
-    await _hold(ctx)
+    ctx.checks["exactly one provider call for the shared id"] = after - before == 1
+    ctx.notes.append(f"provider calls for the shared id: {after - before}")
 
 
 def pair(
@@ -653,6 +791,9 @@ async def clients(ctx: Ctx, pods: list[Client], *, during: Awaitable[None] | Non
             await asyncio.gather(during, *waits)
         else:
             await asyncio.gather(*waits)
+        ctx.extra_sent += sum(
+            len(pod.report["results"]) for pod in pods if pod.spec["model"] == "chat"
+        )
     finally:
         for pod in pods:
             pod.kill()
@@ -661,15 +802,18 @@ async def clients(ctx: Ctx, pods: list[Client], *, during: Awaitable[None] | Non
 def judge_clients(
     ctx: Ctx, pods: list[Client], allowed: set[str], *, partial_ok: bool = False
 ) -> list[dict[str, Any]]:
-    """The checks every client scenario shares; returns every call of every pod."""
+    """The checks every client scenario shares; returns every call of every pod.
+
+    A stream cut after some text (`partial`) is fine with `partial_ok`, but only with a kind
+    in `allowed`: a partial answer never excuses an unexpected error.
+    """
     on_time = {"rate_limited", "deadline_exceeded"} if ctx.rate > 25 else set()
     calls = [r for pod in pods for r in pod.report["results"]]
     unexpected = collections.Counter(
-        r["kind"]
+        r["kind"] + (" (partial)" if r.get("partial") else "")
         for r in calls
         if not r["ok"]
-        and r["kind"] not in on_time | allowed
-        and not (partial_ok and r.get("partial"))
+        and (r["kind"] not in on_time | allowed or (r.get("partial") and not partial_ok))
     )
     mixed = [r["marker"] for r in calls if r["ok"] and not r.get("own_reply")]
     late = [r["secs"] for r in calls if r["secs"] > ctx.limit]
@@ -715,16 +859,18 @@ async def _budget_samples(ctx: Ctx, stop: asyncio.Event) -> list[tuple[float, li
         await asyncio.sleep(0.5)
 
 
-def _over_budget(samples: list[tuple[float, list[int]]]) -> float:
+def _over_budget(
+    samples: list[tuple[float, list[int]]], rpm: int = RPM, burst: int = BURST
+) -> float:
     """The largest excess over the budget of any stretch between two samples (<= 0: none).
 
-    The smooth window is a bucket: `BURST` calls at once, then RPM / 60 a second, per
+    The smooth window is a bucket: `burst` calls at once, then rpm / 60 a second, per
     deployment. A half second of sampling slack is allowed at the rate.
     """
     worst = float("-inf")
     for i, (t1, c1) in enumerate(samples):
         for t2, c2 in samples[i + 1 :]:
-            allowed = BURST + RPM / 60 * (t2 - t1 + 0.5)
+            allowed = burst + rpm / 60 * (t2 - t1 + 0.5)
             worst = max(worst, *(b - a - allowed for a, b in zip(c1, c2, strict=True)))
     return worst
 
@@ -830,7 +976,7 @@ async def queue_store_block(ctx: Ctx) -> None:
     await asyncio.sleep(2)  # the calls sent while blocked come back
     caller_ids = {q.engine.worker_id for q in ctx.queues}
     direct = [r for r in ctx.run.results[sent:] if r.ok and r.worker in caller_ids]
-    ctx.checks["calls ran direct while the queue store was down"] = bool(direct)
+    ctx.checks["calls ran direct while the queue store was down (more than one)"] = len(direct) > 1
     ctx.notes.append(f"{len(direct)} calls ran direct (in the caller) during the block")
 
 
@@ -967,8 +1113,9 @@ SCENARIOS = [
         "P1",
         "provider",
         "region throttled (429)",
-        "other region serves",
+        "other region serves; it serves again after",
         _provider_fault(force_error="ThrottlingException"),
+        recovers=True,
     ),
     _s(
         "P2",
@@ -976,9 +1123,15 @@ SCENARIOS = [
         "region failing (5xx)",
         "other region serves; breaker opens and recovers",
         _provider_fault(force_error="InternalServerException"),
+        recovers=True,
     ),
     _s(
-        "P3", "provider", "region hangs", "attempt timeout, next region", _provider_fault(hang=True)
+        "P3",
+        "provider",
+        "region hangs",
+        "attempt timeout, next region; it serves again after",
+        _provider_fault(hang=True),
+        recovers=True,
     ),
     _s(
         "P4",
@@ -991,8 +1144,9 @@ SCENARIOS = [
         "P5",
         "provider",
         "bad credentials in a region",
-        "other region serves",
+        "other region serves; it serves again after",
         _provider_fault(force_error="UnrecognizedClientException"),
+        recovers=True,
     ),
     _s(
         "P7",
@@ -1018,12 +1172,42 @@ SCENARIOS = [
         "rate_limited",
         "deadline_exceeded",
     ),
-    _s("R2", "registry", "region disabled, live", "other region serves", deployment_off),
+    _s(
+        "R2",
+        "registry",
+        "region disabled, live",
+        "other region serves; it serves again once enabled",
+        deployment_off,
+        recovers=True,
+    ),
     _s("R3", "registry", "kill switch on", "direct path, same budgets", kill_switch),
     _s("R4", "registry", "bad live edit", "refused; version unchanged", bad_edit),
-    _s("C1", "caller", "callers cancel", "cancelled stop; others served", caller_cancel),
-    _s("C2", "caller", "caller process dies", "its calls dropped; nothing held", caller_dies),
-    _s("C3", "caller", "duplicate request id", "one run; same reply for both", duplicate_id),
+    _s(
+        "C1",
+        "caller",
+        "callers cancel",
+        "cancelled stop at the provider; others served",
+        caller_cancel,
+        models={"slow": {"model_id": SLOW_ID, "rpm": RPM, "worker_slots": 50}},
+        fake={SLOW_ID: {"latency_ms": {"p50": 2000, "p95": 2000}}},
+    ),
+    _s(
+        "C2",
+        "caller",
+        "caller process dies",
+        "its waiting calls never reach the provider; nothing held",
+        caller_dies,
+        # A small budget: most of its 100 calls are still waiting when it dies.
+        models={"orphan": {"model_id": ORPHAN_ID, "rpm": 60, "worker_slots": 50}},
+    ),
+    _s(
+        "C3",
+        "caller",
+        "duplicate request id",
+        "one provider call; same reply for both",
+        _hold,
+        extra=duplicate_id,
+    ),
     _s(
         "X1",
         "pairs",
@@ -1164,12 +1348,15 @@ SCENARIOS = [
     ),
 ]
 BY_ID = {s.sid: s for s in SCENARIOS}
+PORT_VARS = ("LLMQ_FAKE_PORT", "LLMQ_SCENARIO_PROXY_PORT")
 ALONE = {"S9"}  # changes the shared store's memory limit: never next to another run
 # Store failover on two Docker nodes: run by failover.py's drill (its own pass marks).
 FAILOVER = {"S6": "failover", "S7": "slowdns", "S11": "restart"}
 
 
-async def parallel(units: list[tuple[str, str]], profile: str, jobs: int) -> dict[str, bool]:
+async def parallel(
+    units: list[tuple[str, str]], profile: str, jobs: int, seed: int
+) -> dict[str, bool]:
     """Run each (scenario, load) as its own process, `jobs` at a time, on its own ports."""
     folder = ROOT / "reports" / f"scenarios-{time.strftime('%Y%m%d-%H%M%S')}"
     folder.mkdir(parents=True, exist_ok=True)
@@ -1182,14 +1369,13 @@ async def parallel(units: list[tuple[str, str]], profile: str, jobs: int) -> dic
     async def one(sid: str, load: str) -> None:
         slot = await slots.get()
         name = f"{sid}-{load}"
-        env = {
-            **os.environ,
+        env = {  # each child picks free ports for its fakellm and store proxy
+            **{k: v for k, v in os.environ.items() if k not in PORT_VARS},
             "PYTHONUNBUFFERED": "1",
-            "LLMQ_FAKE_PORT": str(8100 + slot),
-            "LLMQ_SCENARIO_PROXY_PORT": str(6400 + slot),
             "LLMQ_DRILL_LOG_DIR": str(folder / f"{name}-processes"),
         }
         cmd = [PY, __file__, sid, "--load", load, "--profile", profile, "--jobs", "1"]
+        cmd += ["--seed", str(seed)]
         try:
             with (folder / f"{name}.log").open("w", encoding="utf-8") as log:
                 proc = await asyncio.create_subprocess_exec(*cmd, env=env, stdout=log, stderr=log)
@@ -1220,6 +1406,7 @@ def main() -> int:
     parser.add_argument("--profile", choices=sorted(PROFILES), default="fast")
     parser.add_argument("--jobs", type=int, default=4, help="runs at a time (1: one by one)")
     parser.add_argument("--list", action="store_true")
+    parser.add_argument("--seed", type=int, help="seed of every random choice (default: new)")
     args = parser.parse_args()
     if args.list:
         for s in SCENARIOS:
@@ -1228,6 +1415,8 @@ def main() -> int:
             print(f"{sid:4} failover  Docker failover drill `{name}` (failover.py)")
         return 0
     setup_logging()
+    seed = args.seed if args.seed is not None else random.randrange(2**31)
+    print(f"  seed {seed} (replay with --seed {seed})", flush=True)
     ids = list(BY_ID) + list(FAILOVER) if args.ids == ["all"] else list(args.ids)
     for group in args.group or []:  # --group may repeat
         if group == "failover":
@@ -1244,12 +1433,13 @@ def main() -> int:
     shared = [(sid, load) for sid in ids if sid in BY_ID and sid not in ALONE for load in loads]
     alone = [(sid, load) for sid in ids if sid in ALONE for load in loads]
     if args.jobs > 1 and len(shared) > 1:
-        results.update(asyncio.run(parallel(shared, args.profile, args.jobs)))
+        results.update(asyncio.run(parallel(shared, args.profile, args.jobs, seed)))
     else:
         alone = shared + alone
     if alone:
         print(f"  logs of worker processes: {log_dir()}", flush=True)
     for sid, load in alone:
+        random.seed(f"{seed}:{sid}:{load}")  # the same choices for a unit, alone or in parallel
         results[f"{sid} {load}"] = asyncio.run(run_one(BY_ID[sid], load, args.profile))
     for sid in [i for i in ids if i in FAILOVER]:
 

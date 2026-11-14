@@ -26,10 +26,12 @@ nav = [
   ] },
   { "How-to guides" = [
     { "Configure" = "how-to/configure.md" },
+    { "Bedrock APIs and IAM" = "how-to/bedrock.md" },
     { "Tune" = "how-to/tune.md" },
     { "Make calls" = "how-to/call.md" },
     { "Operate" = "how-to/operate.md" },
     { "Many services, one model" = "how-to/share-models.md" },
+    { "Secure a deployment" = "how-to/secure.md" },
     { "Test" = "how-to/test.md" },
   ] },
   { "Explanation" = [
@@ -41,9 +43,11 @@ nav = [
     { "Streaming" = "explanation/streaming.md" },
     { "Storage" = "explanation/storage.md" },
     { "Background tasks" = "explanation/background.md" },
+    { "Clients and connections" = "explanation/clients.md" },
     { "Performance" = "explanation/performance.md" },
   ] },
   { "Reference" = [
+    { "Environment variables" = "reference/environment.md" },
     { "Configuration" = "reference/configuration.md" },
     { "Errors" = "reference/errors.md" },
     { "CLI and HTTP" = "reference/cli-http.md" },

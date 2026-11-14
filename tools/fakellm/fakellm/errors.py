@@ -2,6 +2,7 @@
 
 One row per Bedrock error name (TESTING.md "Error fidelity"), with the HTTP status and
 the OpenAI-shaped equivalent, so a scenario names an error once and both fronts agree.
+Messages are the real services' texts, since classification reads some of them.
 """
 
 from __future__ import annotations
@@ -11,13 +12,24 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class ErrorSpec:
-    """How one named error is rendered by the Bedrock and the OpenAI fronts."""
+    """How one named error is rendered by the Bedrock and the OpenAI fronts.
+
+    `code` is the wire error type when it differs from the row name (two rows can share one
+    AWS code with different messages, e.g. signature mismatch and clock skew);
+    `openai_message` is the OpenAI front's text when it differs from the Bedrock one.
+    """
 
     status: int
     message: str
     openai_status: int
     openai_type: str
     openai_code: str
+    code: str | None = None
+    openai_message: str | None = None
+
+    def wire_code(self, name: str) -> str:
+        """The `x-amzn-ErrorType` sent for the row called `name`."""
+        return self.code or name
 
 
 ERRORS: dict[str, ErrorSpec] = {
@@ -91,6 +103,53 @@ ERRORS: dict[str, ErrorSpec] = {
         "invalid_request_error",
         "invalid_api_key",
     ),
+    "InvalidSignatureException": ErrorSpec(
+        403,
+        "The request signature we calculated does not match the signature you provided. "
+        "Check your AWS Secret Access Key and signing method. "
+        "Consult the service documentation for details.",
+        401,
+        "invalid_request_error",
+        "invalid_api_key",
+    ),
+    "InvalidSignatureClockSkew": ErrorSpec(
+        403,
+        "Signature expired: 20261114T100000Z is now earlier than 20261114T100600Z "
+        "(20261114T101100Z - 5 min.)",
+        401,
+        "invalid_request_error",
+        "invalid_api_key",
+        code="InvalidSignatureException",
+    ),
+    "ExpiredTokenException": ErrorSpec(
+        403,
+        "The security token included in the request is expired",
+        401,
+        "invalid_request_error",
+        "invalid_api_key",
+    ),
+    "ServiceQuotaExceededException": ErrorSpec(
+        400,
+        "Your request exceeds the service quota for your account. You can view your quotas at "
+        "https://docs.aws.amazon.com/servicequotas/latest/userguide/gs-request-quota.html. "
+        "You can resubmit your request later.",
+        429,
+        "insufficient_quota",
+        "insufficient_quota",
+        openai_message="You exceeded your current quota, please check your plan and billing "
+        "details. For more information on this error, read the docs: "
+        "https://platform.openai.com/docs/guides/error-codes/api-errors.",
+    ),
+}
+
+# In-stream exception names (ConverseStream) -> the error row used for their message and for
+# the OpenAI front's mid-stream `{"error": ...}` event.
+STREAM_ERROR_ROWS = {
+    "modelStreamErrorException": "ModelErrorException",
+    "throttlingException": "ThrottlingException",
+    "internalServerException": "InternalServerException",
+    "serviceUnavailableException": "ServiceUnavailableException",
+    "validationException": "ValidationException",
 }
 
 # Errors counted as "throttled" in the stats rather than "errors".

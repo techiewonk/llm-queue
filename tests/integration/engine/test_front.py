@@ -95,11 +95,20 @@ async def test_converse_with_request_context(llmq: LLMQueue) -> None:
 
 
 async def test_converse_stream(llmq: LLMQueue) -> None:
+    """Every event in order; the streamed text and usage equal the non-stream reply."""
     request = {"messages": [{"role": "user", "content": [{"text": "hi"}]}]}
     with request_context(priority=True):
         events = [e async for e in llmq.converse_stream("big", request)]
-    assert "messageStart" in events[0]
-    assert "metadata" in events[-1]
+    whole = await llmq.converse("big", request)
+    assert whole.response is not None
+    kinds = [next(iter(e)) for e in events]
+    assert kinds[0] == "messageStart"
+    assert kinds[-3:] == ["contentBlockStop", "messageStop", "metadata"]
+    assert set(kinds[1:-3]) == {"contentBlockDelta"}
+    text = "".join(e["contentBlockDelta"]["delta"]["text"] for e in events[1:-3])
+    assert text == whole.response["output"]["message"]["content"][0]["text"]
+    assert events[-2]["messageStop"]["stopReason"] == "end_turn"
+    assert events[-1]["metadata"]["usage"] == whole.response["usage"]
 
 
 async def test_embed_and_jobs(llmq: LLMQueue) -> None:
@@ -113,12 +122,31 @@ async def test_embed_and_jobs(llmq: LLMQueue) -> None:
     assert llmq.seen == [{"payload": {"texts": ["x", "y"]}, "vectors": 2}]  # type: ignore[attr-defined]
 
 
-async def test_sync_calls_run_direct(llmq: LLMQueue) -> None:
+async def test_sync_calls_run_direct(llmq: LLMQueue, store: redis.asyncio.Redis) -> None:
+    """Sync calls never go through the queue: no message is added to the model's streams."""
     request = {"messages": [{"role": "user", "content": [{"text": "sync"}]}]}
+    assert (await llmq.converse("big", request)).ok  # queued: creates the streams
+    queued = await _messages_sent(llmq, store, "big")
+    assert queued >= 1  # the counter sees the queued call
     reply = await asyncio.to_thread(llmq.converse_sync, "big", request)
     assert reply.ok
     vectors = await asyncio.to_thread(llmq.embed_sync, "titan", ["one"])
     assert len(vectors.vectors) == 1
+    assert await _messages_sent(llmq, store, "big") == queued
+    assert await _messages_sent(llmq, store, "titan") == 0
+
+
+async def _messages_sent(llmq: LLMQueue, store: redis.asyncio.Redis, alias: str) -> int:
+    """Messages ever added to a model's normal and priority streams (XINFO entries-added)."""
+    engine = llmq.engine
+    total = 0
+    for priority in (False, True):
+        name = engine._queue_name(engine.registry.current, alias, priority)
+        key = engine.keys.queue(name, "s")
+        if await store.exists(key):
+            info: dict[Any, Any] = await store.xinfo_stream(key)
+            total += int(info.get("entries-added", info.get(b"entries-added", 0)))
+    return total
 
 
 async def test_langchain_bedrock_chat_and_tools(llmq: LLMQueue) -> None:

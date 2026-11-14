@@ -9,6 +9,7 @@ starts and settled to the real usage when it ends, as Bedrock does.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 from typing import Any
@@ -18,7 +19,8 @@ from aiohttp import web
 
 from fakellm import eventstream
 from fakellm.behaviour import Engine, Outcome
-from fakellm.errors import ERRORS
+from fakellm.errors import ERRORS, STREAM_ERROR_ROWS
+from fakellm.scenario import Behaviour
 from fakellm.state import ENGINE
 from fakellm.synth import (
     collect_text,
@@ -51,7 +53,7 @@ def bedrock_error(name: str, message: str | None = None) -> web.Response:
     return web.json_response(
         {"message": message or spec.message},
         status=spec.status,
-        headers={"x-amzn-ErrorType": name},
+        headers={"x-amzn-ErrorType": spec.wire_code(name)},
     )
 
 
@@ -96,8 +98,38 @@ def _converse_content(body: dict[str, Any], tool_mode: str) -> tuple[list[Any], 
     return [{"text": text}], "end_turn", text
 
 
+def _reasoning_blocks(body: dict[str, Any], mode: str) -> list[dict[str, Any]]:
+    """gpt-oss / Claude style reasoning blocks placed before the answer (`reasoning` knob)."""
+    seed = digest({k: body.get(k) for k in ("messages", "system")})
+    blocks: list[dict[str, Any]] = []
+    if mode in ("text", "both"):
+        text = f"fakellm reasoning {seed[:16]}: the user asked something; answer it briefly."
+        signature = f"sig-{seed[:12]}"
+        blocks.append(
+            {"reasoningContent": {"reasoningText": {"text": text, "signature": signature}}}
+        )
+    if mode in ("redacted", "both"):
+        blocks.append({"reasoningContent": {"redactedContent": f"redacted-{seed[:24]}".encode()}})
+    return blocks
+
+
+def _json_blocks(content: list[Any]) -> list[Any]:
+    """Content as JSON: `redactedContent` bytes become base64, as the service sends blobs."""
+    out = []
+    for block in content:
+        redacted = (block.get("reasoningContent") or {}).get("redactedContent")
+        if isinstance(redacted, bytes):
+            block = {"reasoningContent": {"redactedContent": base64.b64encode(redacted).decode()}}
+        out.append(block)
+    return out
+
+
 def _reply(body: dict[str, Any], outcome: Outcome) -> tuple[list[Any], str, str, int, int]:
-    """Content blocks, stop reason, output text and token counts of one Converse reply."""
+    """Content blocks, stop reason, output text and token counts of one Converse reply.
+
+    Reasoning blocks (if any) come first; `out_text` is the answer only, but the reasoning
+    text counts in the output tokens.
+    """
     behaviour = outcome.behaviour
     content, stop_reason, out_text = _converse_content(body, behaviour.tool_calls)
     if behaviour.output_tokens and stop_reason == "end_turn":
@@ -111,7 +143,10 @@ def _reply(body: dict[str, Any], outcome: Outcome) -> tuple[list[Any], str, str,
         out_text = out_text[: max(1, max_tokens) * 4]
         content = [{"text": out_text}]
         stop_reason, output_tokens = "max_tokens", max_tokens
-    return content, stop_reason, out_text, input_tokens, output_tokens
+    reasoning = _reasoning_blocks(body, behaviour.reasoning)
+    for block in reasoning:
+        output_tokens += count_tokens(collect_text(block))
+    return reasoning + content, stop_reason, out_text, input_tokens, output_tokens
 
 
 def _reserve(body: dict[str, Any]) -> int:
@@ -121,13 +156,15 @@ def _reserve(body: dict[str, Any]) -> int:
     return inputs + (max_tokens if isinstance(max_tokens, int) else 0)
 
 
-def _usage(input_tokens: int, output_tokens: int) -> dict[str, int]:
+def _usage(input_tokens: int, output_tokens: int, behaviour: Behaviour) -> dict[str, int]:
+    """Bedrock usage: `inputTokens` is the uncached part; the total adds the cache tokens."""
+    read, write = behaviour.cache_read_tokens, behaviour.cache_write_tokens
     return {
         "inputTokens": input_tokens,
         "outputTokens": output_tokens,
-        "totalTokens": input_tokens + output_tokens,
-        "cacheReadInputTokens": 0,
-        "cacheWriteInputTokens": 0,
+        "totalTokens": input_tokens + output_tokens + read + write,
+        "cacheReadInputTokens": read,
+        "cacheWriteInputTokens": write,
     }
 
 
@@ -142,9 +179,10 @@ async def _start(
         engine.record_error(key)
         error = bedrock_error("ValidationException", "messages must be a non-empty list")
         return engine, key, {}, error
-    outcome = await engine.call(key, _reserve(body))
+    inputs = count_tokens(collect_text([body.get("system"), messages]))
+    outcome = await engine.call(key, _reserve(body), inputs, await request.read())
     if outcome.error:
-        return engine, key, body, bedrock_error(outcome.error)
+        return engine, key, body, bedrock_error(outcome.error, outcome.behaviour.force_message)
     return engine, key, body, outcome
 
 
@@ -159,12 +197,12 @@ async def converse(request: web.Request) -> web.Response:
         await asyncio.sleep(output_tokens / speed)
     engine.settle(key, outcome, input_tokens + output_tokens)
     reply: dict[str, Any] = {
-        "output": {"message": {"role": "assistant", "content": content}},
+        "output": {"message": {"role": "assistant", "content": _json_blocks(content)}},
         "stopReason": stop_reason,
         "metrics": {"latencyMs": outcome.latency_ms},
     }
     if not outcome.behaviour.usage_missing:
-        reply["usage"] = _usage(input_tokens, output_tokens)
+        reply["usage"] = _usage(input_tokens, output_tokens, outcome.behaviour)
     return web.json_response(reply)
 
 
@@ -172,49 +210,85 @@ async def converse_stream(request: web.Request) -> web.StreamResponse:
     """Bedrock ConverseStream: the same reply as Converse, as paced event-stream chunks.
 
     The first event goes out after the latency (time to first response); text then follows at
-    `tokens_per_s`, 8 tokens per chunk. Usage arrives in the final `metadata` event.
+    `tokens_per_s`, 8 tokens per chunk, tool input in 16-character pieces. Usage arrives in the
+    final `metadata` event. `cut_after_chunks` ends the stream early (see `_cut`).
     """
     engine, key, body, outcome = await _start(request)
     if isinstance(outcome, web.Response):
         return outcome
-    content, stop_reason, out_text, input_tokens, output_tokens = _reply(body, outcome)
+    content, stop_reason, _, input_tokens, output_tokens = _reply(body, outcome)
+    behaviour = outcome.behaviour
     response = web.StreamResponse(headers={"Content-Type": eventstream.CONTENT_TYPE})
     await response.prepare(request)
     await response.write(eventstream.event("messageStart", {"role": "assistant"}))
-    speed = outcome.behaviour.tokens_per_s
-    if "toolUse" in content[0]:
-        tool = content[0]["toolUse"]
-        start = {"toolUse": {"toolUseId": tool["toolUseId"], "name": tool["name"]}}
-        await response.write(
-            eventstream.event("contentBlockStart", {"contentBlockIndex": 0, "start": start})
-        )
-        delta = {"toolUse": {"input": json.dumps(tool["input"])}}
-        await response.write(
-            eventstream.event("contentBlockDelta", {"contentBlockIndex": 0, "delta": delta})
-        )
-    else:
-        chunk_chars = 32  # 8 tokens of 4 characters
-        cut = outcome.behaviour.cut_after_chunks
-        for n, i in enumerate(range(0, len(out_text), chunk_chars)):
-            if cut is not None and n >= cut:
-                await response.write(
-                    eventstream.exception("modelStreamErrorException", "the stream was cut")
-                )
-                engine.settle(key, outcome, input_tokens)
-                await response.write_eof()
-                return response
-            piece = out_text[i : i + chunk_chars]
-            chunk: dict[str, Any] = {"contentBlockIndex": 0, "delta": {"text": piece}}
-            await response.write(eventstream.event("contentBlockDelta", chunk))
-            if speed > 0:
-                await asyncio.sleep(count_tokens(piece) / speed)
-    await response.write(eventstream.event("contentBlockStop", {"contentBlockIndex": 0}))
+    chunks = 0
+    for index, block in enumerate(content):
+        for event_type, payload in _block_events(index, block):
+            if event_type == "contentBlockDelta" and "text" in payload["delta"]:
+                if behaviour.cut_after_chunks is not None and chunks >= behaviour.cut_after_chunks:
+                    engine.settle(key, outcome, input_tokens)
+                    return await _cut(request, response, behaviour)
+                chunks += 1
+            await response.write(eventstream.event(event_type, payload))
+            text = payload.get("delta", {}).get("text")
+            if text and behaviour.tokens_per_s > 0:
+                await asyncio.sleep(count_tokens(text) / behaviour.tokens_per_s)
     await response.write(eventstream.event("messageStop", {"stopReason": stop_reason}))
     metadata: dict[str, Any] = {"metrics": {"latencyMs": outcome.latency_ms}}
-    if not outcome.behaviour.usage_missing:
-        metadata["usage"] = _usage(input_tokens, output_tokens)
+    if not behaviour.usage_missing:
+        metadata["usage"] = _usage(input_tokens, output_tokens, behaviour)
     await response.write(eventstream.event("metadata", metadata))
     engine.settle(key, outcome, input_tokens + output_tokens)
+    await response.write_eof()
+    return response
+
+
+def _block_events(index: int, block: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Stream events of one content block: start (tool use only), deltas, stop."""
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    def delta(value: dict[str, Any]) -> None:
+        events.append(("contentBlockDelta", {"contentBlockIndex": index, "delta": value}))
+
+    if "toolUse" in block:
+        tool = block["toolUse"]
+        start = {"toolUse": {"toolUseId": tool["toolUseId"], "name": tool["name"]}}
+        events.append(("contentBlockStart", {"contentBlockIndex": index, "start": start}))
+        raw = json.dumps(tool["input"])
+        for i in range(0, len(raw), 16):  # the service splits tool input across deltas
+            delta({"toolUse": {"input": raw[i : i + 16]}})
+    elif "reasoningContent" in block:
+        part = block["reasoningContent"]
+        if "redactedContent" in part:
+            blob = base64.b64encode(part["redactedContent"]).decode()
+            delta({"reasoningContent": {"redactedContent": blob}})
+        else:
+            text = part["reasoningText"]["text"]
+            for i in range(0, len(text), 32):
+                delta({"reasoningContent": {"text": text[i : i + 32]}})
+            delta({"reasoningContent": {"signature": part["reasoningText"]["signature"]}})
+    else:
+        text = block["text"]
+        for i in range(0, len(text), 32):  # 8 tokens of 4 characters
+            delta({"text": text[i : i + 32]})
+    events.append(("contentBlockStop", {"contentBlockIndex": index}))
+    return events
+
+
+async def _cut(
+    request: web.Request, response: web.StreamResponse, behaviour: Behaviour
+) -> web.StreamResponse:
+    """End a stream early: an in-stream exception, a stall (never another byte) or a close."""
+    if behaviour.cut_with == "stall":
+        await asyncio.Event().wait()  # the client's idle timer has to notice
+    if behaviour.cut_with == "close":
+        if request.transport is not None:
+            request.transport.abort()  # no end of the chunked body: a broken connection
+        return response
+    row = ERRORS[STREAM_ERROR_ROWS[behaviour.cut_with]]
+    await response.write(
+        eventstream.exception(behaviour.cut_with, behaviour.force_message or row.message)
+    )
     await response.write_eof()
     return response
 
@@ -246,9 +320,9 @@ async def invoke(request: web.Request) -> web.Response:
         engine.record_error(key)
         return bedrock_error("ValidationException", problem)
     assert isinstance(body, dict)  # narrowed by the checks above
-    outcome = await engine.call(key, count_tokens(collect_text(body)))
+    outcome = await engine.call(key, count_tokens(collect_text(body)), 0, await request.read())
     if outcome.error:
-        return bedrock_error(outcome.error)
+        return bedrock_error(outcome.error, outcome.behaviour.force_message)
     if "inputText" in body:
         text = body["inputText"]
         tokens = count_tokens(text)

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import sys
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -66,6 +68,19 @@ def registry(models: dict[str, Any] | None = None) -> dict[str, Any]:
 Make = Callable[..., Awaitable[tuple[Engine, FakeEngine]]]
 
 
+async def away_from_minute_end(
+    now: Callable[[], float] = time.time, margin_secs: float = 15.0
+) -> None:
+    """Wait for the next minute when fewer than `margin_secs` are left in this one.
+
+    Fixed-window budgets reset on the calendar minute; a test that counts grants starts here
+    so its assertions never straddle a reset (RESCAN T6).
+    """
+    left = 60 - now() % 60
+    if left < margin_secs:
+        await asyncio.sleep(left + 0.1)
+
+
 def stats(fake: FakeEngine, key: str) -> dict[str, int]:
     """fakellm counters of one key (empty when it was never called)."""
     models = fake.snapshot()["models"]
@@ -81,6 +96,7 @@ __all__ = [
     "FakeEngine",
     "Make",
     "Scenario",
+    "away_from_minute_end",
     "create_app",
     "registry",
     "stats",

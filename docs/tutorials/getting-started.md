@@ -32,7 +32,8 @@ python scripts/stack.py status    # which services answer
 | Redis 7.4 | 6380 | a second store engine for tests |
 | fakellm | 8080 | a fake Bedrock / OpenAI-compatible server |
 
-Any Valkey 8 or Redis 7.2+ works as the store. It must allow Lua scripts, pub/sub and blocking
+Any Valkey 8 or Redis 7.2+ works as the store, as one primary (not cluster mode), ideally with
+`maxmemory-policy noeviction`. It must allow Lua scripts, pub/sub and blocking
 list reads; cluster mode is not supported.
 
 ## 3. Write a registry
@@ -69,6 +70,7 @@ The library reads its process settings from `LLMQ_*` variables. For the local st
 fakellm:
 
 ```bash
+export LLMQ_ENVIRONMENT="dev"                              # relaxed checks for a laptop
 export LLMQ_STORE_URL="redis://:localdev@127.0.0.1:6379/0"
 export LLMQ_REGISTRY_FILE="registry.json"
 export LLMQ_METRICS_SINK="none"
@@ -76,9 +78,10 @@ export LLMQ_BEDROCK_ENDPOINT_URL="http://127.0.0.1:8080"   # fakellm; tests only
 export AWS_ACCESS_KEY_ID="aws-main" AWS_SECRET_ACCESS_KEY="fake"
 ```
 
-The environment defaults to `dev`. Outside `dev` / `local` / `test` / `ci`, `LLMQ_STORE_URL` must
-be `rediss://` with the certificate checked, and `LLMQ_ID_HASH_SALT` must be set. Every setting
-is in [Configuration](../reference/configuration.md).
+`LLMQ_ENVIRONMENT=dev` relaxes the production checks. Without it (unset), or with any name other
+than `dev` / `local` / `test` / `ci`, the process is strict: `LLMQ_STORE_URL` must be `rediss://`
+with the certificate checked, and `LLMQ_ID_HASH_SALT` must be set. Every variable is in
+[Environment variables](../reference/environment.md).
 
 ## 5. Make a first call
 

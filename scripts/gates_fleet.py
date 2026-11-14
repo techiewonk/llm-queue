@@ -17,6 +17,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -27,7 +28,17 @@ sys.path.insert(0, str(ROOT / "src"))
 
 PY = sys.executable
 STORE = "redis://:localdev@127.0.0.1:6379/0"
-FAKE_PORT = int(os.environ.get("LLMQ_FAKE_PORT", "8099"))  # one per parallel run
+
+
+def free_port() -> int:
+    """A TCP port nothing listens on now, so parallel runs never share fixed ports."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+# A fresh port per run unless the caller fixes one (workers read the URL from their env).
+FAKE_PORT = int(os.environ.get("LLMQ_FAKE_PORT") or free_port())
 CHAT_ID = "openai.gpt-oss-20b-1:0"
 EMBED_ID = "cohere.embed-english-v3"
 TITAN_ID = "amazon.titan-embed-text-v2:0"
@@ -74,6 +85,7 @@ def environment(prefix: str, doc: dict[str, Any], **extra: str) -> dict[str, str
             "LLMQ_QUEUE_PREFIX": prefix.replace(":", "-") + "-",
             "LLMQ_REGISTRY": json.dumps(doc),
             "LLMQ_METRICS_SINK": "none",
+            "LLMQ_ENVIRONMENT": "test",  # local store without TLS or a salt
             "LLMQ_BEDROCK_ENDPOINT_URL": f"http://127.0.0.1:{FAKE_PORT}",
             "AWS_ACCESS_KEY_ID": "gates",
             "AWS_SECRET_ACCESS_KEY": "fake",
@@ -83,6 +95,27 @@ def environment(prefix: str, doc: dict[str, Any], **extra: str) -> dict[str, str
         }
     )
     return env
+
+
+def account_keys(account: Any) -> dict[str, str]:
+    """Fake AWS keys named after the registry account, so fakellm keys calls per deployment.
+
+    fakellm reads the account from the SigV4 access key id: `<model>@<account>/<region>`
+    scenario keys then count each deployment on its own (B17).
+    """
+    return {"aws_access_key_id": str(account.name), "aws_secret_access_key": "fake"}
+
+
+def process_stats() -> dict[str, float]:
+    """This process: RSS, open asyncio tasks and threads (the soak's leak samples)."""
+    import psutil
+
+    return {
+        "pid": os.getpid(),
+        "rss_mb": psutil.Process().memory_info().rss / 1e6,
+        "tasks": len(asyncio.all_tasks()),
+        "threads": threading.active_count(),
+    }
 
 
 LOG_FORMAT = "%(asctime)s %(process)d %(levelname)s %(name)s: %(message)s"
@@ -148,6 +181,19 @@ class FakeLLM:
                 time.sleep(0.1)
         raise RuntimeError("fakellm did not start")
 
+    @property
+    def url(self) -> str:
+        """Its base URL (`LLMQ_BEDROCK_ENDPOINT_URL`)."""
+        return f"http://127.0.0.1:{FAKE_PORT}"
+
+    def stats(self) -> dict[str, dict[str, Any]]:
+        """Per-key counters (`GET /admin/stats`): calls, ok, by_minute, duplicates ..."""
+        import urllib.request
+
+        url = f"{self.url}/admin/stats"
+        with urllib.request.urlopen(url, timeout=10) as reply:
+            return dict(json.loads(reply.read())["models"])
+
     def stop(self) -> None:
         """Stop the process."""
         if self.proc is not None:
@@ -170,6 +216,7 @@ class Worker:
         )
         log.close()
         self.worker_id = ""  # the engine's id (`meta.worker` of the calls it serves)
+        self._lock = asyncio.Lock()  # one stdin request at a time
 
     async def ready(self) -> None:
         """Until the worker printed `ready <worker id>`."""
@@ -179,12 +226,26 @@ class Worker:
             raise RuntimeError(f"worker did not start: {line!r}")
         self.worker_id = line.decode().split()[1] if len(line.split()) > 1 else ""
 
+    async def stats(self) -> dict[str, float] | None:
+        """Its `process_stats()` (the debug hook of this harness), or None once it is gone."""
+        async with self._lock:
+            if self.proc.poll() is not None or self.proc.stdin is None or not self.proc.stdout:
+                return None
+            try:
+                self.proc.stdin.write(b"stats\n")
+                self.proc.stdin.flush()
+                line = await asyncio.wait_for(asyncio.to_thread(self.proc.stdout.readline), 10)
+            except (OSError, TimeoutError):
+                return None
+            return dict(json.loads(line)) if line.startswith(b"{") else None
+
     async def stop(self) -> None:
         """Graceful: pause, drain, stop."""
-        if self.proc.poll() is None and self.proc.stdin is not None:
-            self.proc.stdin.write(b"stop\n")
-            self.proc.stdin.flush()
-            await asyncio.to_thread(self.proc.wait, 60)
+        async with self._lock:
+            if self.proc.poll() is None and self.proc.stdin is not None:
+                self.proc.stdin.write(b"stop\n")
+                self.proc.stdin.flush()
+                await asyncio.to_thread(self.proc.wait, 60)
 
     def kill(self) -> None:
         """At once, no cleanup (a crashed pod)."""
@@ -230,6 +291,10 @@ class Store:
         """p99 server time of EVALSHA since the last reset (INFO latencystats, exact)."""
         stats = self.client.info("latencystats").get("latency_percentiles_usec_evalsha", {})
         return float(stats.get("p99", 0.0)) / 1000.0
+
+    def connections(self, name: str) -> int:
+        """Open store connections whose client name is `name` (CLIENT LIST)."""
+        return sum(1 for c in self.client.client_list() if c.get("name") == name)
 
     def memory_mb(self) -> float:
         """Used memory."""
@@ -287,7 +352,7 @@ async def _worker_main() -> None:
 
     setup_logging()
     sink = MetricsToStore(os.environ["LLMQ_KEY_PREFIX"])
-    llmq = LLMQueue.from_env(metrics=sink)
+    llmq = LLMQueue.from_env(metrics=sink, credentials=account_keys)
     await llmq.start()
     client = redis.asyncio.Redis.from_url(STORE)
 
@@ -298,7 +363,11 @@ async def _worker_main() -> None:
 
     task = asyncio.create_task(flusher())
     print(f"ready {llmq.engine.worker_id}", flush=True)
-    await asyncio.to_thread(sys.stdin.readline)  # "stop", or EOF when the driver exits
+    while True:  # "stats" (the soak's debug hook) until "stop", or EOF when the driver exits
+        line = await asyncio.to_thread(sys.stdin.readline)
+        if line.strip() != "stats":
+            break
+        print(json.dumps(process_stats()), flush=True)
     llmq.pause_receiving()
     await llmq.stop(drain_secs=30)
     task.cancel()
@@ -310,7 +379,7 @@ async def _caller_main(calls: int, model: str) -> None:
     """A caller process: run `calls` calls at once, print the outcome counts as JSON."""
     from llm_queue import CallFailed, LLMQueue
 
-    llmq = LLMQueue.from_env()
+    llmq = LLMQueue.from_env(credentials=account_keys)
     await llmq.start()
     print("ready", flush=True)
     await asyncio.to_thread(sys.stdin.readline)  # "go"
@@ -368,7 +437,7 @@ async def _client_main(spec: dict[str, Any]) -> None:
     events = _Events()
     logging.getLogger("llm_queue").addHandler(events)
     logging.getLogger("llm_queue").setLevel(logging.INFO)  # the registry events are INFO
-    llmq = LLMQueue.from_env()
+    llmq = LLMQueue.from_env(credentials=account_keys)
     await llmq.start()
     view = llmq.registry.current
     model = str(spec["model"])

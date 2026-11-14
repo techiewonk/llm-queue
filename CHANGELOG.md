@@ -7,6 +7,149 @@ public API (see STABILITY.md).
 
 ## [Unreleased]
 
+## [0.1.0b2] - unreleased
+
+Fixes from three code reviews and a six-part rescan of 0.1.0b1, a process-level client hub, and
+behaviour decisions for production. No backward compatibility is kept with 0.1.0b1 (beta).
+
+### Changed (behaviour)
+
+- **`LLMQ_ENVIRONMENT` unset is strict.** Only `dev`, `local`, `test` and `ci` relax the checks;
+  unset (reported as `unset`) or any other name requires TLS stores, `LLMQ_ID_HASH_SALT`,
+  `LLMQ_BASE_URL_ALLOWED_HOSTS` when the registry has an `openai` account, and refuses debug
+  capture. Set `LLMQ_ENVIRONMENT=dev` on laptops and in CI.
+- **Non-stream `converse` uses plain Bedrock Converse** (IAM `bedrock:InvokeModel`) by default.
+  The model setting `converse_api: "stream"` keeps ConverseStream underneath
+  (`bedrock:InvokeModelWithResponseStream`) for its first-response timer. Streaming calls always
+  need `InvokeModelWithResponseStream`.
+- **Drain is 25 s** (`LLMQ_DRAIN_SECS`, was 45), inside the Kubernetes default grace period of
+  30 s. A call still running when the drain ends is given back (grants refunded, message
+  returned) instead of cancelled, with no failure counted; a stream that already sent chunks ends
+  `worker_shutdown`.
+- **`api_key_ref` / `external_id_ref` must start with `LLMQ_ACCOUNT_`** (upper case). Any other
+  name is refused, so a registry cannot name a process secret.
+- **`http_router(allow_writes=True)` needs `dependencies=`** (else `ConfigError`); write routes
+  take JSON bodies (`POST /registry/block` no longer takes query parameters) and need the
+  `X-LLMQ-Admin` header.
+- **`redis>=6,<9`** (was `>=5.0.1`): TLS host-name checks by default, and the settings check
+  reads URLs with the client's own parser.
+- The first attempt's timer is `min(attempt_timeout_secs, time left)`, no longer half the time
+  left; any attempt timeout counts against the breaker, so a hung region trips it. Keep
+  `attempt_timeout_secs` below `timeout_secs` for failover within one call.
+- Throttles count in the retry budget; the retry budget is a sliding minute.
+- `LLMQ_CALLER_TTL_SECS` must be at least `LLMQ_LEASE_SECS / 3 + max(5, LLMQ_LEASE_SECS / 6)`.
+- Registry: residency that leaves a model with no deployment is an error (was a warning); a TPM
+  below one call's reservation, fallback models across providers, fallback cycles of any length
+  (unless every step requires headroom), fallback targets outside the source's residency and
+  `breaker_probe_secs` below `attempt_timeout_secs` are refused; `queue.retention_secs` and
+  `dlq_retention_secs` are capped at 14 days; `inference.extra` takes an allow-listed set of
+  names only; `min_lib_version` must be a version.
+- Alert settings `quota_used_mins`, `spill_pct`, `spill_window_secs` and `waiting_age_secs` are
+  removed (they did nothing); `quota_used_pct` is 1-100 and also checks TPM; `dlq_messages` is
+  at least 1.
+- CLI: `dlq purge`, `dlq redrive`, `drain` and `registry gc` need `--yes` (or `--dry-run`);
+  `registry gc` also removes the queues of removed models.
+- Safe live-edit mode also protects `model_fallback` and `inference.extra`.
+
+### Added
+
+- **Client hub:** one SDK client per (event loop, credential identity, region, options) per
+  process, shared by every queue and the sync path, reference-counted; clients for every
+  deployment built concurrently at start; warm connections (unsigned `HEAD` requests, refreshed
+  every 10 s); pool size per client from the registry's concurrency slots (10 to 200);
+  credentials refreshed 5 minutes before expiry; `WarmOptions`, `OpenAIOptions`.
+- **One `LLMQueue` per process guards:** a second started queue logs `second_llm_queue_started`
+  (the first stays the LangChain default); calls from a forked child or another event loop
+  raise a clear `LLMQueueError`. Sync calls run on the started queue's loop, else on one private
+  loop per process with a 20-connection store pool.
+- **Images and documents** in Converse messages (bytes travel encoded in the message), the
+  `max_message_bytes` setting (4 MiB) and `CallFailed("invalid_request")` above it; binary
+  blocks cost a fixed 1,000 tokens in the estimate.
+- **Shared throttle window** per deployment: `max(Retry-After, jittered backoff 1-2 s doubling to
+  30 s)`, skipped by every pod; calls wait for it when no other deployment is left.
+- **Store checks at start:** cluster mode refused; a `maxmemory-policy` other than `noeviction`
+  warned about.
+- **Registry:** a top-level `live_edit` field (the document's live-edit mode); publishes keep
+  live routing blocks and the kill switch; strict checks on the paths a live edit adds (typos
+  refused); an invalid or newer stored registry no longer stops a pod (it runs on its own
+  document); `min_lib_version` keeps older pods up and off the stored registry; new models get a
+  receive loop on reload.
+- **Embeddings:** `embed(partial=True)` and `EmbedResult.errors`; one request id per batch
+  (`X:n`); empty texts refused; at most 16 batches in flight.
+- **Jobs:** `timeout_secs` per job, a 10,000-job queue limit, a `job_no_consumer` warning and
+  metric, acks retried apart from the job, a job stopped by shutdown returned instead of failed.
+- **Errors:** kinds `invalid_request`, `context_length_exceeded`, `worker_shutdown`;
+  `RegistryConflict` and `LiveEditRefused` exported. The OpenAI HTTP transport maps request
+  faults to 400 and exhausted retries to 502 / 503 with `retry-after`.
+- **Health and metrics:** readiness from a cached background store probe (every 5 s; refusals
+  are `down`, never a 500); liveness false when a background loop died or the heartbeat stalled;
+  typed `health()` / `status()` results; status rows show `account_enabled` and `blocked`;
+  `llmq_grants_lost_total`, `llmq_retries_total`, `llmq_store_errors_total` and per-deployment
+  gauges.
+- **S3 offload:** keys `{prefix}{key_prefix}/{sha256(id)}-{uuid}`, objects deleted after a
+  successful read, `sse` / `kms_key_id` / `expected_bucket_owner` options, foreign references
+  refused, one client per loop.
+- Optional `uvloop` extra and `llm_queue.run(main)`.
+- Docs: environment variables, clients and connections, Bedrock APIs and IAM, securing a
+  deployment, throttling, shutdown on Kubernetes, multimodal calls, token estimators for Indic
+  and CJK text; `scripts/bench.py` with the 0.1.0b1 baseline.
+
+### Fixed
+
+- A redelivery to the pod already running a call started a second run and leaked its slot.
+- After a store reset only the first pod re-registered its calls; `RENEW` losses went unnoticed.
+- The per-minute retries key had no TTL on a minute without a retry.
+- Refunds were not capped at the charge, and used the current config row instead of the grant's.
+- A deployment marked slow never recovered; an in-flight success closed an open breaker early;
+  expired waiters blocked model fallback; a dead owner's breaker probe stayed set.
+- A live-edit typo was accepted and did nothing; models added by a newer registry got no worker
+  loop on running pods; reload storms on `stale_config`; a torn registry read.
+- OpenAI-compatible calls with unknown params raised `TypeError` (now sent as `extra_body`);
+  `n > 1`, reasoning and logprobs were lost; cached tokens were counted twice.
+- Throttles retried at once and ignored Retry-After; a hung region never tripped its breaker;
+  `on_exceed: reject` looped the message to the dead-letter queue; a mid-stream OpenAI error was
+  fatal; request and store errors charged the provider's breaker.
+- A stream could end "ok" with chunks missing after a failed flush; a slow consumer got
+  `deadline_exceeded` on data already buffered; read streams stayed for minutes; one bad entry
+  stopped the shared reader.
+- An offloaded result was deleted before its S3 read; the `callers` set and the job claim had no
+  TTL.
+- Jobs: shutdown counted as a failure; a successful job re-ran when its ack failed; no timeout;
+  unbounded queues for unregistered names.
+- `embed(request_id=X)` rejected every batch after the first as a duplicate; one failed batch
+  lost all; 100,000 texts created every task up front.
+- Bytes in Converse messages broke the message encoding and were estimated by their base64 size.
+- Credential backoff never reset after a success; signature and clock-skew errors were not
+  treated as credential errors; a dropped connection charged the breaker.
+- Readiness could answer 500 and take up to 3 s; liveness was always true; `health()` raised raw
+  errors; the Prometheus sink could be registered twice.
+- The sweeper stopped with an interval below 1 s; bad messages used default queue settings.
+- Cancel keys are re-checked on pub/sub reconnect and every heartbeat.
+- Docs: eight statements that did not match the code (readiness probe, invalid stored registry,
+  older services, the `all` live-edit mode, account kinds, `ConfigError` timing, the exception
+  tree).
+
+### Security
+
+- Strict mode by default (see Changed); debug capture refused in every non-dev environment.
+- TLS check bypass with repeated URL parameters closed; certificate and host-name checks written
+  into the store URL explicitly.
+- `base_url`: user info and keys in the URL refused; IPs read in every form a resolver accepts;
+  link-local, `fd00:ec2::/32`, unspecified and multicast addresses refused; allowed hosts
+  required when strict.
+- Account secret references limited to the `LLMQ_ACCOUNT_` prefix.
+- HTTP write routes: app auth required, JSON bodies and the `X-LLMQ-Admin` header (no cross-site
+  posts); audit actors checked for length and control characters.
+- Safe mode protects `model_fallback` (residency could be routed around) and `inference.extra`
+  (an allow-list replaces any field, such as `store: true`).
+- Cached clients follow account changes in the registry (keyed on the account's fields).
+- S3 offload keys hashed and namespaced, objects deleted after read, KMS and bucket-owner
+  options.
+- Dead letters (which hold prompts) are trimmed; tenant ids hashed in logs; the id salt hidden
+  from `repr()`; release build tools pinned.
+
+<!-- verify after merge: every Fixed / Added line against the merged dev/0.1.0b2 (written from PLAN_0.1.0b2.md, RESCAN_2026-11-14.md, the coordinator's list and the branch commit messages; "new models get a receive loop on reload", "at most 16 batches in flight" and the plain-Converse default in particular). -->
+
 ## [0.1.0b1] - 2026-11-14
 
 First beta, for test runs (`pip install --pre llm-queue`).
@@ -62,5 +205,6 @@ First beta, for test runs (`pip install --pre llm-queue`).
 - **Docs site** (Zensical on GitHub Pages): tutorial, how-to guides, explanation with
   diagrams, an API reference from the docstrings.
 
-[Unreleased]: https://github.com/techiewonk/llm-queue/compare/v0.1.0b1...HEAD
+[Unreleased]: https://github.com/techiewonk/llm-queue/compare/v0.1.0b2...HEAD
+[0.1.0b2]: https://github.com/techiewonk/llm-queue/compare/v0.1.0b1...v0.1.0b2
 [0.1.0b1]: https://github.com/techiewonk/llm-queue/releases/tag/v0.1.0b1

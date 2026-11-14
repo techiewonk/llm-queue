@@ -2,7 +2,8 @@
 
 `llmq.http_router()` returns an `APIRouter` (extra `http`). `/health/live` and `/health/ready`
 take no auth (Kubernetes probes); every other route runs the app's admin dependencies. Writes
-(live registry edits, region / account blocks) stay off unless `allow_writes=True`. A preStop
+(live registry edits, region / account blocks) stay off unless `allow_writes=True`; they take a
+JSON body and need the `X-LLMQ-Admin` header (a browser cannot send it cross-site). A preStop
 hook calls `llmq.pause_receiving()`: readiness fails and no new queued work starts.
 
 Here the app is called in process (httpx's ASGI transport), so no port is opened; in the app
@@ -58,6 +59,7 @@ async def drain() -> dict[str, bool]:
 
 async def main() -> None:
     admin = {"x-admin-token": "sample-admin"}
+    writer = {**admin, "X-LLMQ-Admin": "1"}  # write routes need this header too
     transport = httpx.ASGITransport(app=app)
     async with (
         app.router.lifespan_context(app),
@@ -84,11 +86,17 @@ async def main() -> None:
         for dep in status["deployments"]:
             print(f"  {dep['name']}: rpm {dep['rpm']['used']}/{dep['rpm']['limit']}")
 
+        no_header = await client.post(
+            "/llm-queue/registry", params={"model": "gpt20b"}, json={"rpm": 50}, headers=admin
+        )
+        print(f"POST /registry without X-LLMQ-Admin -> {no_header.status_code}")
+        assert no_header.status_code == 403
+
         edit = await client.post(
             "/llm-queue/registry",
             params={"model": "gpt20b"},
             json={"rpm": 50},
-            headers=admin,
+            headers=writer,
         )
         print(f"POST /registry rpm=50 -> {edit.json()['diff']}")
         assert edit.status_code == 200
@@ -96,8 +104,16 @@ async def main() -> None:
             "/llm-queue/registry",
             params={"model": "gpt20b"},
             json={"rpm": 60},
-            headers=admin,
+            headers=writer,
         )  # put the sample value back
+
+        region = status["deployments"][0]["name"].split("/")[-1]
+        for on in (True, False):  # an emergency block of a region, then lifted
+            block = await client.post(
+                "/llm-queue/registry/block", json={"region": region, "on": on}, headers=writer
+            )
+            print(f"POST /registry/block {region} on={on} -> {block.status_code}")
+            assert block.status_code == 200
 
         await client.post("/drain")
         after = await client.get("/llm-queue/health/ready")

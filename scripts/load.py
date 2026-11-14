@@ -1,7 +1,9 @@
 """Load drill on fakellm: many concurrent calls over three workers, and a budget under pressure.
 
-Gate `throughput`: 2,000 calls, 200 at a time, three worker processes' engines sharing one
-store; every call must succeed, each worker must serve some, and nothing may stay held.
+Gate `throughput`: 2,000 calls (`--calls`), 200 at a time, three worker processes' engines
+sharing one store; every call must succeed, each worker must serve some, nothing may stay held,
+and at least `--min-rate` calls a second must be served (default 40; measured 68/s for 2,000
+calls on a busy dev machine, 2026-11-14; a short run spends more of its time ramping up).
 Gate `rate_limit`: 300 calls at once against a 600 RPM model (smooth window, 10% burst);
 in the first 10 s at most burst + 10 s of rate may be served (60 + 100), the rest are refused
 as `rate_limited` (or, for at most 1 %, `deadline_exceeded`: a call granted just before its
@@ -10,10 +12,12 @@ its deadline, and nothing stays held.
 
     python scripts/load.py                 # both gates
     python scripts/load.py rate_limit      # one
+    python scripts/load.py --calls 500     # a short throughput run (CI)
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import collections
 import json
@@ -48,6 +52,7 @@ def environment(prefix: str, rpm: int) -> dict[str, str]:
         "LLMQ_QUEUE_PREFIX": prefix.replace(":", "-") + "-",
         "LLMQ_REGISTRY": json.dumps(doc),
         "LLMQ_METRICS_SINK": "none",
+        "LLMQ_ENVIRONMENT": "test",  # local store without TLS or a salt
         "LLMQ_BEDROCK_ENDPOINT_URL": "http://127.0.0.1:8080",
     }
 
@@ -83,8 +88,8 @@ async def cleanup(prefix: str) -> None:
     await client.aclose()
 
 
-async def throughput(calls: int = 2000, concurrency: int = 200) -> bool:
-    """Every call succeeds across three workers; no call stays held."""
+async def throughput(calls: int = 2000, min_rate: float = 40.0, concurrency: int = 200) -> bool:
+    """Every call succeeds across three workers at `min_rate` a second or more; none held."""
     prefix = f"llmqload:{uuid.uuid4().hex[:6]}"
     queues = await workers(environment(prefix, rpm=1_000_000), 3)
     gate = asyncio.Semaphore(concurrency)
@@ -111,7 +116,8 @@ async def throughput(calls: int = 2000, concurrency: int = 200) -> bool:
     ok = sum(served.values())
     print(f"  {ok}/{calls} ok in {secs:.1f}s ({ok / secs:.0f}/s); errors {dict(errors) or 0}")
     print(f"  served per worker: {sorted(served.values())}; still held: {held}")
-    passed = ok == calls and len(served) == 3 and held == 0
+    passed = ok == calls and len(served) == 3 and held == 0 and ok / secs >= min_rate
+    print(f"  throughput floor {min_rate:.0f}/s")
     print(f"{'PASS' if passed else 'FAIL'}  throughput")
     return passed
 
@@ -164,10 +170,20 @@ def main() -> int:
     """Run the chosen gates; exit 1 if any fails."""
     os.environ.update({"AWS_ACCESS_KEY_ID": "aws-main", "AWS_SECRET_ACCESS_KEY": "fake"})
     os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
-    gates: dict[str, Any] = {"throughput": throughput, "rate_limit": rate_limit}
-    chosen = sys.argv[1:] or list(gates)
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("gates", nargs="*", help="throughput, rate_limit (default: both)")
+    parser.add_argument("--calls", type=int, default=2000, help="throughput: calls to send")
+    parser.add_argument("--min-rate", type=float, default=40.0, help="throughput: calls/s floor")
+    args = parser.parse_args()
+    gates: dict[str, Any] = {
+        "throughput": lambda: throughput(args.calls, args.min_rate),
+        "rate_limit": rate_limit,
+    }
+    unknown = set(args.gates) - set(gates)
+    if unknown:
+        parser.error(f"unknown gate(s) {sorted(unknown)}; have {sorted(gates)}")
     results = []
-    for name in chosen:
+    for name in args.gates or list(gates):
         print(f"[{name}]")
         results.append(asyncio.run(gates[name]()))
     print("ALL PASS" if all(results) else "FAILED")

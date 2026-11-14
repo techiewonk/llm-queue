@@ -60,7 +60,8 @@ model's `queue.name`) and `...-priority`; jobs use `jobs-<name>`. Hash tags grou
 
 ## Store usage
 
-- **Single primary only** (with replicas). Cluster mode is not supported: the scripts build key
+- **Single primary only** (with replicas). Cluster mode is not supported (`start()` refuses it,
+  see [Store requirements](#store-requirements)): the scripts build key
   names inside Lua from the prefix rather than taking them in `KEYS`, and one script touches several
   tags (`PICK_TAKE` writes `{m:}`, `{r:}` and `{a:}` keys; `SEND` pushes the doorbell, which is not in
   `KEYS` and has no tag). Two stores are possible: the queue store holds only queues and doorbells.
@@ -73,16 +74,39 @@ model's `queue.name`) and `...-priority`; jobs use `jobs-<name>`. Hash tags grou
   and reaches the new primary after a failover (before, every write failed until a restart).
   `valkey://` / `valkeys://` are accepted. Store passwords can come from `from_env(secrets=)`, read on
   every new connection.
-- **Readiness** (`health_check`): ready means registry loaded and not draining; each store is probed
-  with a bounded (1 s) write and reported `ok`, `read_only` or `down`, but never makes the process
-  unready.
+- **Readiness** (`health_check`): ready means registry loaded and not draining. A background task
+  probes each store every 5 s with a short write bounded by `EngineTimings.health_probe_secs`
+  (3 s) and caches the answer, so a readiness probe answers at once. Each store is reported `ok`,
+  `read_only` or `down` (a refused write, such as out of memory, is `down`); the stores' state is
+  reported but never makes the process unready, and a store error never turns into a 500.
+  Liveness is false when a background loop died or the heartbeat stopped for a lease.
 - **`NOSCRIPT`**: a pipelined `SEND` + `WAIT` that meets a node without the script cached is run once
   more (pipelines load scripts only when they start); plain script calls rely on redis-py's reload.
 - **Queue store failover**: `LLMQ_QUEUE_FAILOVER_SECS` (5) of send errors before a call runs direct;
   `LLMQ_QUEUE_WAIT_REPLICAS` / `LLMQ_QUEUE_WAIT_MS` (0 / 100) make a send wait for replicas.
-- **Store reset**: a missing `P:epoch` (restart without data, failover to an empty node) is detected
-  by the heartbeat: running grants are put back (`REREGISTER`), a fixed window holds until the next
-  minute, and the reload loop republishes the registry (live edits are lost and logged).
-- **TLS**: outside `LLMQ_ENVIRONMENT` `dev` / `local` / `test` / `ci`, store URLs must be `rediss://`
-  with certificate and host-name checks on (a localhost URL is allowed), and `LLMQ_ID_HASH_SALT` is
-  required.
+- **Store reset**: a missing or changed `P:epoch` (restart without data, failover to an empty node)
+  is detected by every pod's heartbeat (each remembers the epoch it saw): each pod puts its own
+  running grants back (`REREGISTER`), and grants `RENEW` reports as lost are registered again. A
+  fixed window holds until the next minute, and the reload loop republishes the registry (live
+  edits and live blocks are lost with the store's data, and logged).
+- **TLS**: unless `LLMQ_ENVIRONMENT` is `dev` / `local` / `test` / `ci` (unset counts as strict),
+  store URLs must be `rediss://` with certificate and host-name checks on (a localhost URL is
+  allowed), and `LLMQ_ID_HASH_SALT` is required. The URL is read with redis-py's own parser, a
+  repeated query parameter is refused, and `ssl_cert_reqs=required` / `ssl_check_hostname=true`
+  are written into the URL explicitly. See [Environment variables](../reference/environment.md).
+
+## Store requirements
+
+| Requirement | Why | What the library does |
+|---|---|---|
+| `maxmemory-policy noeviction` (recommended) | Any evicting policy lets a full store drop queue messages, budgets and results: lost calls and overspent budgets | Reads the policy at `start()` (`CONFIG GET`, else `INFO memory` where `CONFIG` is disabled, as on ElastiCache); logs `store_eviction_policy` with a warning when it is not `noeviction`, and reports the policy in health |
+| One primary (with replicas), **not cluster mode** | One admission script touches keys of several hash tags | `start()` refuses a cluster-mode store with a `ConfigError` (`INFO cluster`) instead of failing at the first call |
+| Lua scripts, pub/sub, blocking list reads (`BLPOP`) | Admission, result wake-ups and the queue doorbell | ElastiCache for Valkey / Redis OSS allows all three |
+| A store that is out of memory | `noeviction` refuses writes when full | Calls fail `queue_unavailable` ("out of memory"), admin operations `StoreUnavailable`; nothing is lost silently |
+
+<!-- verify after merge: the name of the health field that carries the eviction policy (store_checks.check_store returns it; where Health exposes it). -->
+
+Tested versions: Valkey 8.1 and Redis 7.4 (the `docker/compose.yaml` stack every integration
+test, scenario and gate runs on); Valkey 8 and Redis 7.2+ are supported. The client is redis-py
+6 or later (`redis>=6,<9`): from 6 on, TLS connections check the host name by default, and the
+URL parser the settings check uses is the one the client uses.
