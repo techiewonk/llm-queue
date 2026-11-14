@@ -15,7 +15,7 @@ import hashlib
 import hmac
 import random
 import time
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -381,6 +381,8 @@ class Engine:
             task = self._model_tasks.get(alias)
             if task is not None and not task.done():
                 continue
+            if task is not None and not task.cancelled() and task.exception() is not None:
+                logger.error("model_loop_died", model=alias, error=repr(task.exception()))
             if alias not in self._slots:
                 self._slots[alias] = asyncio.Semaphore(int(view.value(alias, "worker_slots")))
             self._model_tasks[alias] = asyncio.create_task(self._model_loop(alias))
@@ -1276,6 +1278,13 @@ class Engine:
                         rung = await self.queues.wait_bell(list(names), pause)
                     except STORE_ERRORS:
                         self._store_trouble("bell")  # (was swallowed unseen)
+                    except RedisError as exc:
+                        # `UNBLOCKED ... (master -> replica?)`: a failover ends the blocked
+                        # BLPOP with a plain error reply. It ended this loop, so the model took
+                        # no calls until the heartbeat restarted it (failover drills).
+                        logger.warning("bell_failed", model=alias, error=str(exc))
+                        self._store_trouble("bell")
+                        await asyncio.sleep(pause)
                 wake.clear()
 
     async def _receive_once(self, alias: str) -> bool | None:
@@ -2280,19 +2289,24 @@ class Engine:
         # The caller first: its result, with the final status in the same script. Then the
         # grant and the message are settled together (four round trips one after another
         # before the caller was woken, before).
-        await self.requests.put_result(
-            reply,
-            final_state="done",
-            status={
-                "deployment": dep_key,
-                "served_model": alias,
-                "attempts": attempt,
-                "tokens_in": result.usage.input_tokens,
-                "tokens_out": result.usage.output_tokens,
-            },
+        # Result and ack through a store outage: the answer is in hand, and a failed write
+        # released the message, which ran a second time once it showed again (failover drills:
+        # 1 call run twice, 61 s). Held meanwhile, so the heartbeat keeps its grant and message.
+        await self._through_outage(
+            lambda: self.requests.put_result(
+                reply,
+                final_state="done",
+                status={
+                    "deployment": dep_key,
+                    "served_model": alias,
+                    "attempts": attempt,
+                    "tokens_in": result.usage.input_tokens,
+                    "tokens_out": result.usage.output_tokens,
+                },
+            )
         )
         await asyncio.gather(
-            self.admission.finish(
+            self.admission.finish(  # skipped on a store error: SWEEP frees its slot
                 alias,
                 owner,
                 env.request_id,
@@ -2301,7 +2315,7 @@ class Engine:
                 outcome="ok",
                 latency_ms=latency,
             ),
-            self._ack(held),
+            self._through_outage(lambda: self._ack(held)),
         )
         held.grants.discard((alias, owner))  # settled: a failure below must not renew it
         await self._count_target_errors(held, succeeded=True)
@@ -2670,12 +2684,36 @@ class Engine:
             )
 
     async def _release(self, held: _Held, delay_secs: float = 0.0) -> None:
-        """Let go of a call after an unexpected error: grants back, not held, message returned."""
+        """Let go of a call after an unexpected error: grants back, not held, message returned.
+
+        The return waits out a store outage: one that failed left the message hidden for its
+        whole visibility timeout (60 s), and its caller waited that long.
+        """
         await self._give_back(held)
         self._drop(held)
-        if held.message is not None:
+        message = held.message
+        if message is not None:
             with contextlib.suppress(Exception):
-                await self.queues.return_(held.message, delay_secs=delay_secs)
+                await self._through_outage(
+                    lambda: self.queues.return_(message, delay_secs=delay_secs)
+                )
+
+    async def _through_outage(self, write: Callable[[], Awaitable[object]]) -> None:
+        """Run a store write that must land, again every 0.5 s while the store is out of reach.
+
+        Gives up (raises) once the outage outlasts a lease: past that the grant may be swept.
+        Only for writes that are safe to run twice (each checks its own receipt or key).
+        """
+        give_up = time.monotonic() + self.settings.lease_secs
+        while True:
+            try:
+                await write()
+                return
+            except STORE_ERRORS:
+                self._store_trouble("settle")
+                if time.monotonic() >= give_up:
+                    raise
+                await asyncio.sleep(0.5)
 
     # ================================================================ background
 
