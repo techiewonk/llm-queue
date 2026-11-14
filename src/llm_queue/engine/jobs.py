@@ -29,6 +29,10 @@ JobFn = Callable[[dict[str, Any]], Awaitable[Any]]
 JOBS_MAX_WAITING = 10_000
 CONSUMER_TTL_SECS = 30  # a consuming process marks its job queues every third of this
 ACK_TRIES = 3
+# An idle job loop blocks this long on its doorbell. Kept under 1 s: tuning.py only checks the
+# store read timeout against the model loops' BLPOP (`idle_slow_secs`), and a BLPOP longer than
+# the read timeout fails. 2 BLPOPs/s idle, against ~7 RECEIVE scripts/s before (unverified).
+_BELL_WAIT_SECS = 0.5
 
 
 class JobRunner:
@@ -115,11 +119,21 @@ class JobRunner:
         self._stop.set()
         if self._running:
             await asyncio.wait(set(self._running), timeout=drain_secs)
-        for task in [*self._tasks, *self._running]:
+        if self._tasks:
+            # Let the loops end by themselves: cancelling one inside its RECEIVE, after the
+            # store took a message, hid that message for the visibility time and charged it a
+            # failure when the hold lapsed (EN-8). A loop waits at most `_BELL_WAIT_SECS`.
+            await asyncio.wait(set(self._tasks), timeout=_BELL_WAIT_SECS + 0.5)
+        tasks = [*self._tasks, *self._running]
+        for task in tasks:
             task.cancel()
-        for task in [*self._tasks, *self._running]:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+        # gather, not `suppress(CancelledError)` around each await: that also swallowed the
+        # cancellation of `stop()` itself (a shutdown timeout), and hid errors unlogged (EN-7).
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning("job_task_failed", error=str(result), kind=type(result).__name__)
+        self._tasks.clear()
 
     async def _upkeep(self, name: str) -> None:
         """Mark this process as the queue's consumer; drop dead letters past their retention."""
@@ -140,15 +154,20 @@ class JobRunner:
                     marked = time.monotonic()
                 except Exception as exc:
                     logger.warning("job_upkeep_failed", job=name, error=str(exc))
+            await gate.acquire()
+            held = True
             try:
-                await gate.acquire()
-                messages, dead = await self.queues.receive_wait(
-                    self.queue(name), 1, self.settings, wait_secs=1.0
-                )
+                messages, dead = await self.queues.receive(self.queue(name), 1, self.settings)
                 for letter in dead:
                     logger.error("job_dead_lettered", job=name, message=letter.id)
                 if not messages:
                     gate.release()
+                    held = False
+                    if not dead and not self._stop.is_set():
+                        # Sleep on the doorbell every send rings, as the model loops do: the
+                        # receive poll ran ~7 scripts/s per job name per idle process (EN-29).
+                        # The timeout still picks up delayed retries, which ring no bell.
+                        await self.queues.wait_bell([self.queue(name)], _BELL_WAIT_SECS)
                     continue
                 if self._stop.is_set():  # stopped while receiving: back at once, not run (S5)
                     for message in messages:
@@ -156,10 +175,12 @@ class JobRunner:
                     gate.release()
                     return
                 task = asyncio.create_task(self._run(name, messages[0], gate))
+                held = False  # the job releases it
                 self._running.add(task)
                 task.add_done_callback(self._running.discard)
             except Exception as exc:  # a store blip must not end the loop
-                gate.release()
+                if held:
+                    gate.release()
                 logger.warning("job_receive_failed", job=name, error=str(exc))
                 await asyncio.sleep(1)
 
@@ -207,6 +228,9 @@ class JobRunner:
             else:
                 logger.warning("job_duplicate_run", job=name, id=ident)
             return
+        # Every try failed: the job runs again once its hold lapses. Say so once (EN-32).
+        logger.error("job_ack_gave_up", job=name, id=ident, tries=ACK_TRIES)
+        self.metrics.count("llmq_job_ack_failed_total", job=name)
 
     async def _keep_visible(self, message: Message) -> None:
         """Keep a running job hidden; a store blip must not end it (the job would run twice)."""

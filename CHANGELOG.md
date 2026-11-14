@@ -189,6 +189,12 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 - An embedding reply the parser cannot read is a `CallFailed("provider_error")`; a raw
   `KeyError` / `ValueError` aborted every batch of `embed_partial` and reached the app outside
   `LLMQueueError` (EN-6).
+- Job runner: `stop()` lets each loop finish a receive in flight before cancelling it (a cancel
+  inside RECEIVE hid the message it took for the visibility time and charged it a failure,
+  EN-8); a cancelled `stop()` now raises `CancelledError` instead of returning normally, and
+  task errors are logged (EN-7); an idle loop sleeps on the jobs queue's doorbell instead of
+  polling RECEIVE about 7 times a second (EN-29); a job whose ack failed every try logs
+  `job_ack_gave_up` and counts `llmq_job_ack_failed_total` (EN-32).
 
 ### Security
 
