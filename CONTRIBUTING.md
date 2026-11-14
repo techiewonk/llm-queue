@@ -143,7 +143,9 @@ and **strict mypy** over `src`, `tests`, `tools`, `scripts` and `samples` must p
 - **Names carry units**: `_secs` (float seconds), `_ms` (int milliseconds), `_bytes`;
   counts are bare; booleans are positive (`enabled`, not `disabled`).
 - **No side effects at import**: no clients, network, file reads, threads or logging
-  configuration. The app configures structlog; the library only logs.
+  configuration. The app configures structlog; the library only logs. The one exception is
+  `os.register_at_fork` in `core.py` (the fork guard): it must be in place before any fork,
+  and it only marks the process's queues in a forked child.
 - **Optional dependencies are imported lazily**, at the point of use, and a missing one
   raises `MissingExtra(feature, extra)`, which names the extra to install.
 - **One error family.** Everything raised to callers is an `LLMQueueError`. Bad config is
