@@ -58,7 +58,7 @@ class OpenAIOptions:
     max_connections: int = 100
     max_keepalive_connections: int = 20
     keepalive_secs: float = 15.0
-    http: Literal["httpx", "aiohttp"] = "httpx"
+    http: Literal["httpx", "aiohttp"] = "aiohttp"
 
 
 @dataclass(frozen=True)

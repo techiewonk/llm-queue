@@ -109,10 +109,13 @@ async def test_aiohttp_client_gets_limits_keepalive_and_timeouts(server: Server)
     assert connector.closed
 
 
-async def test_httpx_is_the_default_and_the_fallback(
+async def test_aiohttp_is_the_default_and_httpx_the_fallback(
     server: Server, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pool, route = _pool(server.url)
+    assert type(pool.openai(route)._client) is openai.DefaultAioHttpClient
+    await pool.aclose()
+    pool, route = _pool(server.url, http="httpx")
     assert type(pool.openai(route)._client) is openai.DefaultAsyncHttpxClient
     await pool.aclose()
 
