@@ -41,11 +41,11 @@ from gates_fleet import (  # needs the sys.path entry
     REGIONS,
     TITAN_ID,
     FakeLLM,
+    FaultProxy,
     Store,
     Worker,
     account_keys,
     environment,
-    free_port,
     log_dir,
     new_prefix,
     registry,
@@ -513,29 +513,11 @@ async def b95() -> bool:
     Pass: none dropped as `caller_gone`;
     all served.
     """
-    import failover
-
-    class StoreProxy(failover.Proxy):  # type: ignore[misc]  # failover is a script module
-        """The drill's proxy, in front of the stack's Valkey (not the drill's nodes)."""
-
-        async def handle(self, client_r: Any, client_w: Any) -> None:
-            if self.refuse:
-                client_w.close()
-                return
-            try:
-                node_r, node_w = await asyncio.open_connection("127.0.0.1", 6379)
-            except OSError:
-                client_w.close()
-                return
-            self.open += [client_w, node_w]
-            await asyncio.gather(self._pipe(client_r, node_w), self._pipe(node_r, client_w))
-
     doc = registry({"chat": {"rpm": 600}}, accounts=1, regions=1)
-    proxy = StoreProxy()
-    proxy_port = free_port()
-    server = await asyncio.start_server(proxy.handle, "127.0.0.1", proxy_port)
+    proxy = FaultProxy()  # in front of the stack's Valkey, its own process (CO-2)
+    await asyncio.to_thread(proxy.start)
     try:
-        async with Gate(doc, LLMQ_STORE_URL=f"redis://:localdev@127.0.0.1:{proxy_port}/0") as gate:
+        async with Gate(doc, LLMQ_STORE_URL=f"redis://:localdev@127.0.0.1:{proxy.port}/0") as gate:
             await gate.workers(4)
             queues = await gate.callers(2)
             run = Run()
@@ -548,11 +530,13 @@ async def b95() -> bool:
             await asyncio.sleep(5)
             proxy.refuse = True
             proxy.drop_all()
-            await asyncio.sleep(45)
-            proxy.refuse = False
+            try:
+                await asyncio.sleep(45)
+            finally:
+                proxy.refuse = False
             await asyncio.gather(*tasks)
     finally:
-        server.close()
+        await asyncio.to_thread(proxy.stop)
     kinds = run.kinds()
     return verdict(
         "B95",
@@ -839,11 +823,11 @@ async def b23() -> bool:
     losses: dict[str, int] = {}
     dups: dict[str, int] = {}
     for wait in (0, 1):
-        failover.nodes_up()
-        proxy = failover.Proxy()
-        server = await asyncio.start_server(proxy.handle, "127.0.0.1", failover.PROXY_PORT)
+        proxy = failover.Proxy()  # its own process (CO-2)
         doc = registry({"chat": {"rpm": 1_000_000}}, accounts=1, regions=1)
-        try:
+        try:  # the nodes and the proxy go even if starting them fails (CO-17)
+            failover.nodes_up()
+            await asyncio.to_thread(proxy.start)
             async with Gate(
                 doc,
                 LLMQ_QUEUE_STORE_URL=f"redis://127.0.0.1:{failover.PROXY_PORT}/0",
@@ -884,8 +868,10 @@ async def b23() -> bool:
                 await asyncio.gather(load, chaos())
                 provider = await asyncio.to_thread(gate.fake.stats)
         finally:
-            server.close()
-            failover.nodes_down()
+            try:
+                await asyncio.to_thread(proxy.stop)
+            finally:
+                failover.nodes_down()
         lost = sum(1 for r in run.results if not r.ok and r.kind == "deadline_exceeded")
         losses["on" if wait else "off"] = lost
         dups["on" if wait else "off"] = sum(int(m.get("duplicates", 0)) for m in provider.values())

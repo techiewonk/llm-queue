@@ -61,7 +61,9 @@ from gates_fleet import (
     FAKE_PORT,
     PY,
     ROOT,
+    FaultProxy,
     free_port,
+    lag_note,
     log_dir,
     log_file,
     setup_logging,
@@ -127,63 +129,10 @@ CALLER_MARGIN_SECS = 5.0  # EngineSettings.caller_margin_secs
 # ------------------------------------------------------------------------------ the store
 
 
-class FaultProxy(failover.Proxy):  # type: ignore[misc]  # failover is a script module
-    """The store as the processes see it, in front of the stack's Valkey.
-
-    It can refuse new connections (`refuse`), drop open ones (`drop_all`), swallow traffic
-    without closing anything (`freeze`: a half-open connection) or add latency (`delay_secs`).
-    """
-
-    def __init__(self) -> None:
-        """Forwarding normally."""
-        super().__init__()
-        self.freeze = False
-        self.delay_secs = 0.0
-
-    async def _pipe(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
-            while data := await reader.read(65536):
-                if self.freeze:
-                    continue  # swallowed: the sender waits for a reply that never comes
-                if self.delay_secs:
-                    await asyncio.sleep(self.delay_secs)
-                writer.write(data)
-                await writer.drain()
-        except OSError:
-            pass
-        finally:
-            writer.close()
-
-    async def handle(self, client_r: Any, client_w: Any) -> None:
-        """Forward one connection to the stack's Valkey (or refuse it)."""
-        if self.refuse:
-            client_w.close()
-            return
-        try:
-            node_r, node_w = await asyncio.open_connection("127.0.0.1", 6379)
-        except OSError:
-            client_w.close()
-            return
-        self.open += [client_w, node_w]
-        await asyncio.gather(self._pipe(client_r, node_w), self._pipe(node_r, client_w))
-
-
-async def serve(proxy: FaultProxy, port: int = PROXY_PORT) -> None:
-    """Keep the proxy listening, re-opening it if asyncio closed it.
-
-    On Windows a failed accept (WinError 64: a client gave up mid-accept while the store was
-    blocked) makes asyncio close the listening socket for good, and the store then looked
-    down forever (scenario X1, a harness fault).
-    """
-    server = await asyncio.start_server(proxy.handle, "127.0.0.1", port)
-    try:
-        while True:
-            await asyncio.sleep(0.2)
-            if all(sock.fileno() == -1 for sock in server.sockets):
-                server.close()
-                server = await asyncio.start_server(proxy.handle, "127.0.0.1", port)
-    finally:
-        server.close()
+# The store as the processes see it: `fault_proxy.FaultProxy` in front of the stack's Valkey,
+# in its own process (CO-2). It refuses new connections (`refuse`), drops open ones
+# (`drop_all`), holds traffic without closing anything (`freeze`: a half-open connection) or
+# adds latency (`delay_secs`), and re-listens if Windows closed its socket (X1).
 
 
 # ------------------------------------------------------------------------------ one run
@@ -295,8 +244,9 @@ async def run_one(scenario: Scenario, load: str, profile_name: str) -> bool:
         regions=len(REGIONS),
         defaults=profile.defaults,
     )
-    proxy = FaultProxy()
-    serving = [asyncio.create_task(serve(proxy))]
+    proxy = FaultProxy(PROXY_PORT)
+    serving = [proxy]
+    await asyncio.to_thread(proxy.start)
     scenario_doc = {
         "seed": random.randrange(2**31),  # fakellm's rolls follow the run's seed
         "defaults": {"latency_ms": {"p50": 150, "p95": 250}},
@@ -309,11 +259,12 @@ async def run_one(scenario: Scenario, load: str, profile_name: str) -> bool:
     phases: dict[str, list[Result]] = {}
     env = {**profile.env, **scenario.env}
     queue_proxy = None
-    if scenario.queue_proxy:
-        queue_proxy = FaultProxy()
-        serving.append(asyncio.create_task(serve(queue_proxy, QUEUE_PROXY_PORT)))
-        env["LLMQ_QUEUE_STORE_URL"] = f"redis://:localdev@127.0.0.1:{QUEUE_PROXY_PORT}/0"
     try:
+        if scenario.queue_proxy:
+            queue_proxy = FaultProxy(QUEUE_PROXY_PORT)
+            serving.append(queue_proxy)
+            await asyncio.to_thread(queue_proxy.start)
+            env["LLMQ_QUEUE_STORE_URL"] = f"redis://:localdev@127.0.0.1:{QUEUE_PROXY_PORT}/0"
         store = f"redis://:localdev@127.0.0.1:{PROXY_PORT}/0"
         async with Gate(doc, scenario_doc, LLMQ_STORE_URL=store, **env) as gate:
             await gate.workers(3)
@@ -350,8 +301,9 @@ async def run_one(scenario: Scenario, load: str, profile_name: str) -> bool:
                 await asyncio.sleep(0.5)
             provider = sum([await ctx.provider_calls(r) for r in REGIONS])
     finally:
-        for task in serving:
-            task.cancel()
+        for server in serving:
+            await asyncio.to_thread(server.stop)
+    ctx.notes.append(lag_note(*serving))
     secs = time.monotonic() - started
     # Three times the budget: refusing on time (no budget, or no time left) is the right answer.
     allow_everywhere = {"rate_limited", "deadline_exceeded"} if load == "burst" else set()
