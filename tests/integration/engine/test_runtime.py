@@ -484,7 +484,7 @@ async def test_assume_role_failure_is_a_credential_failure(make: Make) -> None:
     async def refuse(route: Any) -> Any:
         raise CredentialsUnavailable(f"account {route.account.name}: AssumeRole failed: denied")
 
-    engine.providers.pool.bedrock = refuse
+    engine.providers.pool._bedrock_lease = refuse  # every call borrows through the lease (CL-3)
     with pytest.raises(CallFailed) as info:
         await engine.call("small", CHAT)
     assert info.value.kind == "credentials_unavailable"
