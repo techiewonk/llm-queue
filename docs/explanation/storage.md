@@ -28,7 +28,7 @@ flowchart LR
   end
   PICK(["PICK_TAKE"]) --> model & acct & req
   SEND(["SEND"]) --> queue
-  REG(["REGISTER / RESULT_PUT"]) --> req
+  REG(["REGISTER_SEND / RESULT_PUT"]) --> req & queue
 ```
 
 `P` is `LLMQ_KEY_PREFIX`; each box is one hash tag. One admission script touches several
@@ -47,16 +47,16 @@ model's `queue.name`) and `...-priority`; jobs use `jobs-<name>`. Hash tags grou
 | `P:{m:A}:cfg` | hash | `numbers` (resolved admission settings per deployment), `changes` | until `registry gc` |
 | `P:{m:A}:rate:DEP` | hash | `rpm_tat`, `tpm_tat`, class clocks `p_/n_rpm_tat`, `p_/n_tpm_tat` (or `*_win` / `*_n` when fixed); `seen_win`, `seen_calls`, `seen_tokens`, `seen_n` | 180 s, refreshed on write |
 | `P:{a:ACCT}:rate` | hash | Account budget clocks / counters | 180 s |
-| `P:{m:A}:wait:p`, `:wait:n`, `:waitinfo` | zset, zset, hash | Waiters by queue position; their cost, usable deployments, expiry | entries expire after 2 s unless refreshed |
+| `P:{m:A}:wait:p`, `:wait:n`, `:waitinfo`, `:waitexp` | zset, zset, hash, zset | Waiters by queue position; their cost, usable deployments, expiry; waiters by expiry (so `PICK_TAKE` touches only expired ones) | entries expire after 2 s unless refreshed |
 | `P:{m:A}:ac:DEP`, `:lease:DEP:p`, `:lease:DEP:n`, `:cb:DEP` | hash, zsets, hash | Learned concurrency (`limit`, `cut_at`); slots in use (owner to lease expiry); breaker (`state`, `failures`, `until`, `probe`, `probe_at`) | no TTL (leases expire by score) |
 | `P:{m:A}:inprog`, `:inprog:ID` | zset, hash | Calls in progress (owner to lease expiry); the grant (owner, worker, dep, cls, minute, cost, account, started) | entry 2 x lease, renewed |
 | `P:{m:A}:health`, `:terr:DEP`, `:thr:DEP:MIN` | hash, zset, counter | fields `DEP\|until`, `DEP\|wait`, `DEP\|since`, `DEP\|lat` (latency EWMA, ms), `DEP\|n`; target errors by request id; throttles this minute | window; 180 s |
-| `P:{m:A}:rot`, `:sticky:HASH`, `:retries:MIN` | hash, string, hash | Rotation; a session's deployment; retries and first attempts this minute | none; `sticky.idle_ttl_secs` (1800); 120 s |
+| `P:{m:A}:rot`, `:sticky:HASH`, `:retries:MIN` | hash, string, hash | Rotation; a session's deployment; retries and first attempts this minute (first attempts counted by `PICK_TAKE` at grant) | none; `sticky.idle_ttl_secs` (1800); 180 s |
 | `P:{r:ID}:job`, `:callers`, `:status`, `:res`, `:cancel`, `:chunks`, `:debug` | hash, set, hash, string, string, stream, string | Claim; calling processes; status (`state`, `model`, `priority`, `<state>_at`, ...); result; cancel flag; stream; `debug_capture` text | job and callers: deadline + status TTL; status: `LLMQ_STATUS_TTL_SECS` (1800); res: `LLMQ_RESULT_TTL_SECS` (300), deleted on first read for a library id; cancel: status TTL; chunks: result TTL + timeout; debug: 1 h |
 | `P:{q:NAME}:s`, `:vis`, `:gen`, `:fails`, `:st`, `:dlq`, `:meta` | stream, zset, hashes, stream, hash | Messages; hidden until; generation; failures; held / returned; dead letters (`body, src, fails`); the receive cursor | stream `MINID` 4 days (`retention_secs`); DLQ 1 day |
 | `P:bell:NAME` | list | Doorbell tokens (at most 64) | 60 s |
-| `P:caller:WORKER`, `P:done:WORKER`, `P:cancel` | string, channel, channel | Process liveness; result wake-ups; cancels | `LLMQ_CALLER_TTL_SECS` (30) |
-| `P:epoch`, `P:reset_minute`, `P:lock:{sweep,alerts,probe:A}`, `P:alert:*`, `P:health:WORKER` | strings | Store-reset detector; locks for one-process tasks; alert state; readiness probe | locks 5-25 s; alerts 1 day; probe 5 s |
+| `P:caller:WORKER`, `P:done:WORKER`, `P:cancel`, `P:chunkwake:WORKER` | string, channel, channel, stream | Process liveness; result wake-ups; cancels; wakes the process's shared chunk reader when a new stream opens | `LLMQ_CALLER_TTL_SECS` (30); chunkwake trimmed |
+| `P:epoch`, `P:reset_minute`, `P:lock:{sweep,alerts,probe}`, `P:alert:*`, `P:health:WORKER` | strings | Store-reset detector; locks for one-process tasks; alert state; readiness probe | locks 5-25 s; alerts 1 day; probe 5 s |
 
 ## Store usage
 

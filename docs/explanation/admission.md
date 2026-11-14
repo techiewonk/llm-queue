@@ -22,14 +22,18 @@ flowchart TD
   H -- no --> K([wait: register as waiter,<br/>shortest wait and its reason])
 ```
 
-One loop per model. It reads the priority queue first, up to `min(free worker_slots, 10)`
-messages (`RECEIVE`: due returned messages and new ones, oldest first; each taken message is hidden
+One loop per model. One script (`RECEIVE_FIRST`) reads the priority queue first, then the normal
+one, up to `min(free worker_slots, 10)` messages, and returns the store's time, so `queue_wait_ms`
+is measured on the store clock (`RECEIVE` semantics: due returned messages and new ones, oldest first; each taken message is hidden
 for `queue.visibility_secs`, its generation goes up; a hold that lapsed counts one failure and the
 tenth goes to the dead-letter stream). Idle, the loop blocks on both doorbells (`BLPOP`) for 50 ms,
-then for 1 s after 20 empty polls; a send wakes exactly one blocked worker.
+then for 1 s after 20 empty polls; a send wakes exactly one blocked worker. A worker woken with no
+free slot, or for a class it is holding, pushes the token back so another pod wakes instead.
 
-For each message: parse (a newer envelope version is returned in 5 s, never dropped); check that a
-caller is alive (`CALLERS_ALIVE`; dead callers mean `cancelled` / `caller_gone`); then admission.
+For each message: parse (a newer envelope version is returned after 15 s with no failure counted, never dropped);
+then admission. `PICK_TAKE` itself checks, on a call's first admission, that a caller is alive
+(dead callers mean `caller_gone`), counts the first attempt for the retry budget, and reports a
+stream call's chunk-stream length, so none of these is a separate round trip.
 
 **`PICK_TAKE`** (one script, all or nothing) does, in order:
 
