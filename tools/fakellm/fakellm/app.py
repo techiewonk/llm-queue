@@ -17,7 +17,11 @@ def create_app(
     scenario: Scenario | None = None, *, engine: Engine | None = None
 ) -> web.Application:
     """Build the fakellm aiohttp app from a scenario (or a prepared engine for tests)."""
-    app = web.Application(client_max_size=_MAX_BODY_BYTES)
+    # A client that hangs up cancels its handler (aiohttp's default leaves it running), so a
+    # call aborted mid-latency never counts as `ok`: `python -m fakellm` behaves like TestServer.
+    app = web.Application(
+        client_max_size=_MAX_BODY_BYTES, handler_args={"handler_cancellation": True}
+    )
     app[ENGINE] = engine or Engine(scenario or Scenario())
     bedrock.add_routes(app)
     openai_api.add_routes(app)
