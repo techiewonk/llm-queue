@@ -16,6 +16,7 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -185,6 +186,7 @@ class FakeLLM:
                     return
             except OSError:
                 time.sleep(0.1)
+        self.stop()  # a process that never listened must not keep running (CO-3)
         raise RuntimeError("fakellm did not start")
 
     @property
@@ -201,10 +203,13 @@ class FakeLLM:
             return dict(json.loads(reply.read())["models"])
 
     def stop(self) -> None:
-        """Stop the process."""
-        if self.proc is not None:
-            self.proc.kill()
-            self.proc.wait(10)
+        """Stop the process and remove its scenario folder (a temp folder per run leaked)."""
+        try:
+            if self.proc is not None and self.proc.poll() is None:
+                self.proc.kill()
+                self.proc.wait(10)
+        finally:
+            shutil.rmtree(self.file.parent, ignore_errors=True)
 
 
 class Worker:
@@ -246,29 +251,49 @@ class Worker:
             return dict(json.loads(line)) if line.startswith(b"{") else None
 
     async def stop(self) -> None:
-        """Graceful: pause, drain, stop."""
+        """Graceful: pause, drain, stop; killed if it has not stopped within 60 s.
+
+        A stuck worker used to raise `TimeoutExpired` here and stay alive, and the gate's
+        teardown skipped fakellm and the key cleanup after it (CO-3).
+        """
         async with self._lock:
             if self.proc.poll() is None and self.proc.stdin is not None:
-                self.proc.stdin.write(b"stop\n")
-                self.proc.stdin.flush()
-                await asyncio.to_thread(self.proc.wait, 60)
+                try:
+                    self.proc.stdin.write(b"stop\n")
+                    self.proc.stdin.flush()
+                    await asyncio.to_thread(self.proc.wait, 60)
+                except (OSError, subprocess.TimeoutExpired):  # gone already, or stuck
+                    self.kill()
 
     def kill(self) -> None:
         """At once, no cleanup (a crashed pod)."""
-        self.proc.kill()
+        if self.proc.poll() is None:
+            self.proc.kill()
         self.proc.wait(10)
 
 
 async def workers(env: dict[str, str], count: int) -> list[Worker]:
-    """`count` started worker processes."""
+    """`count` started worker processes (all killed if one fails to start)."""
     fleet = [Worker(env) for _ in range(count)]
-    await asyncio.gather(*(w.ready() for w in fleet))
+    try:
+        await asyncio.gather(*(w.ready() for w in fleet))
+    except BaseException:  # the caller never sees this fleet, so nobody else would stop it
+        for worker in fleet:
+            worker.kill()
+        raise
     return fleet
 
 
 async def stop_all(fleet: list[Worker]) -> None:
-    """Stop every worker still alive."""
-    await asyncio.gather(*(w.stop() for w in fleet if w.proc.poll() is None))
+    """Stop every worker still alive; any left (a stop that raised) is killed."""
+    try:
+        await asyncio.gather(
+            *(w.stop() for w in fleet if w.proc.poll() is None), return_exceptions=True
+        )
+    finally:
+        for worker in fleet:
+            if worker.proc.poll() is None:
+                worker.kill()
 
 
 class Store:
@@ -318,6 +343,10 @@ class Store:
             keys = list(self.client.scan_iter(match=pattern, count=1000))
             for i in range(0, len(keys), 500):
                 self.client.delete(*keys[i : i + 500])
+
+    def close(self) -> None:
+        """Close the client's connections (it was never closed)."""
+        self.client.close()
 
 
 STACK_STORE_PORT = 6379  # the stack's Valkey, behind STORE

@@ -184,7 +184,11 @@ class Gate:
         self.queues: list[LLMQueue] = []
 
     async def __aenter__(self) -> Gate:
-        await asyncio.to_thread(self.fake.start)
+        try:
+            await asyncio.to_thread(self.fake.start)
+        except BaseException:
+            self.store.close()
+            raise
         return self
 
     async def workers(self, count: int) -> list[Worker]:
@@ -200,12 +204,23 @@ class Gate:
         return more
 
     async def __aexit__(self, *exc: object) -> None:
-        for queue in self.queues:
-            with contextlib.suppress(Exception):
-                await queue.stop(drain_secs=1)
-        await stop_all(self.fleet)
-        self.fake.stop()
-        self.store.cleanup(self.prefix)
+        # Every step runs even when one before it raised: a stuck worker used to leave the
+        # workers, fakellm (its port still bound) and every key of the run behind (CO-3).
+        try:
+            for queue in self.queues:
+                with contextlib.suppress(Exception):
+                    await queue.stop(drain_secs=1)
+        finally:
+            try:
+                await stop_all(self.fleet)
+            finally:
+                try:
+                    self.fake.stop()
+                finally:
+                    try:
+                        self.store.cleanup(self.prefix)
+                    finally:
+                        self.store.close()
 
 
 def verdict(name: str, checks: dict[str, bool], lines: list[str]) -> bool:
