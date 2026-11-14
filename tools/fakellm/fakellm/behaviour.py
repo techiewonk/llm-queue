@@ -82,6 +82,8 @@ class Engine:
         """Clear counters, restart the phase clock and reseed every per-key RNG."""
         self.stats: dict[str, KeyStats] = {}
         self._rngs: dict[str, random.Random] = {}
+        # The heavy tail rolls on its own RNG so enabling it never shifts the main sequence.
+        self._tail_rngs: dict[str, random.Random] = {}
         self._started = self._clock()
 
     def replace_scenario(self, scenario: Scenario) -> None:
@@ -144,10 +146,11 @@ class Engine:
         sigma = math.log(b.latency_p95_ms / b.latency_p50_ms) / _Z95
         return min(b.latency_p50_ms * math.exp(sigma * rng.gauss(0.0, 1.0)), 4 * b.latency_p95_ms)
 
-    async def call(self, key: str, reserve_tokens: int = 0) -> Outcome:
+    async def call(self, key: str, reserve_tokens: int = 0, input_tokens: int = 0) -> Outcome:
         """Admit or reject one call for `key`, sleep its latency and roll late failures.
 
-        `reserve_tokens` (input + max_tokens) is held against `tpm` until `settle`.
+        `reserve_tokens` (input + max_tokens) is held against `tpm` until `settle`;
+        `input_tokens` stretches the latency by `latency_per_1k_input_ms`.
         """
         b = self.behaviour(key)
         stats = self._key_stats(key)
@@ -156,6 +159,11 @@ class Engine:
         # Always draw the same number of values so one knob never shifts another's sequence.
         throttle_roll, timeout_roll, error_roll, which_5xx = (rng.random() for _ in range(4))
         latency_ms = self._latency_ms(rng, b)
+        latency_ms += b.latency_per_1k_input_ms * input_tokens / 1000.0
+        if b.tail_rate > 0:
+            tail = self._tail_rngs.setdefault(key, random.Random(f"{self.seed}:{key}:tail"))
+            if tail.random() < b.tail_rate:
+                latency_ms = max(latency_ms, b.tail_ms)
         error: str | None = None
         if b.force_error is not None:
             error = b.force_error

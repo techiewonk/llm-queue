@@ -15,6 +15,19 @@ from typing import Any
 from fakellm.errors import ERRORS
 
 _TOOL_MODES = frozenset({"echo", "none"})
+_REASONING_MODES = frozenset({"none", "text", "redacted", "both"})
+# How a cut stream ends: one of these in-stream exceptions, a stall (no more bytes, socket kept
+# open) or an abrupt close (socket dropped without the end of the HTTP body).
+STREAM_EXCEPTIONS = frozenset(
+    {
+        "modelStreamErrorException",
+        "throttlingException",
+        "internalServerException",
+        "serviceUnavailableException",
+        "validationException",
+    }
+)
+_CUT_MODES = STREAM_EXCEPTIONS | {"stall", "close"}
 _RATE_FIELDS = ("throttle_rate", "error_rate_5xx", "timeout_rate")
 _FIELDS = frozenset(
     {
@@ -32,6 +45,14 @@ _FIELDS = frozenset(
         "usage_missing",
         "hang",
         "cut_after_chunks",
+        "cut_with",
+        "force_message",
+        "reasoning",
+        "tail_rate",
+        "tail_ms",
+        "latency_per_1k_input_ms",
+        "cache_read_tokens",
+        "cache_write_tokens",
     }
 )
 
@@ -48,8 +69,11 @@ class Behaviour:
     entry returned on every call. `tpm` reserves input + max_tokens at the start and settles to
     the real usage at the end, like Bedrock. `tokens_per_s` paces the output (0 = instant),
     `output_tokens` fixes the reply length, `usage_missing` drops usage, `hang` never answers;
-    `cut_after_chunks` ends a Bedrock stream with `modelStreamErrorException` after that many
-    text chunks.
+    `cut_after_chunks` ends a stream after that many text chunks the way `cut_with` says (an
+    in-stream exception, `stall` or `close`); `force_message` replaces every error's message.
+    `reasoning` adds reasoning blocks (gpt-oss style), `tail_rate` / `tail_ms` give a heavy
+    latency tail, `latency_per_1k_input_ms` makes latency grow with the prompt, and the cache
+    token fields report prompt-cache usage.
     """
 
     latency_p50_ms: float = 0.0
@@ -69,6 +93,14 @@ class Behaviour:
     usage_missing: bool = False
     hang: bool = False
     cut_after_chunks: int | None = None
+    cut_with: str = "modelStreamErrorException"
+    force_message: str | None = None
+    reasoning: str = "none"
+    tail_rate: float = 0.0
+    tail_ms: float = 0.0
+    latency_per_1k_input_ms: float = 0.0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
 
 
 def _positive_int(name: str, value: Any, *, nullable: bool) -> int | None:
@@ -113,6 +145,15 @@ def build_behaviour(block: dict[str, Any]) -> Behaviour:
     if force_error is not None and force_error not in ERRORS:
         raise ScenarioError(f"force_error must be one of {sorted(ERRORS)}, got {force_error!r}")
     rates = {name: _number(name, block.get(name, 0.0), upper=1.0) for name in _RATE_FIELDS}
+    cut_with = block.get("cut_with", "modelStreamErrorException")
+    if cut_with not in _CUT_MODES:
+        raise ScenarioError(f"cut_with must be one of {sorted(_CUT_MODES)}, got {cut_with!r}")
+    reasoning = block.get("reasoning", "none")
+    if reasoning not in _REASONING_MODES:
+        raise ScenarioError(f"reasoning must be one of {sorted(_REASONING_MODES)}")
+    force_message = block.get("force_message")
+    if force_message is not None and not isinstance(force_message, str):
+        raise ScenarioError(f"force_message must be a string, got {force_message!r}")
     return Behaviour(
         latency_p50_ms=p50,
         latency_p95_ms=max(p50, p95),
@@ -132,6 +173,16 @@ def build_behaviour(block: dict[str, Any]) -> Behaviour:
         cut_after_chunks=_positive_int(
             "cut_after_chunks", block.get("cut_after_chunks"), nullable=True
         ),
+        cut_with=str(cut_with),
+        force_message=force_message,
+        reasoning=str(reasoning),
+        tail_rate=_number("tail_rate", block.get("tail_rate", 0.0), upper=1.0),
+        tail_ms=_number("tail_ms", block.get("tail_ms", 0.0)),
+        latency_per_1k_input_ms=_number(
+            "latency_per_1k_input_ms", block.get("latency_per_1k_input_ms", 0.0)
+        ),
+        cache_read_tokens=int(_number("cache_read_tokens", block.get("cache_read_tokens", 0))),
+        cache_write_tokens=int(_number("cache_write_tokens", block.get("cache_write_tokens", 0))),
         **rates,
     )
 

@@ -18,7 +18,8 @@ from typing import Any
 
 from aiohttp import web
 
-from fakellm.errors import ERRORS
+from fakellm.errors import ERRORS, STREAM_ERROR_ROWS
+from fakellm.scenario import Behaviour
 from fakellm.state import ENGINE
 from fakellm.synth import collect_text, count_tokens, digest, embedding, reply_text, tool_arguments
 
@@ -27,7 +28,7 @@ def openai_error(name: str, message: str | None = None, retry_after_s: float = 1
     """OpenAI-shaped error `{"error": {message, type, code, param}}` for a named error."""
     spec = ERRORS[name]
     headers: dict[str, str] = {}
-    if spec.openai_status == 429:
+    if spec.openai_status == 429 and spec.openai_type != "insufficient_quota":
         headers = {
             "Retry-After": str(max(1, math.ceil(retry_after_s))),
             "retry-after-ms": str(round(retry_after_s * 1000)),
@@ -38,15 +39,19 @@ def openai_error(name: str, message: str | None = None, retry_after_s: float = 1
             "x-ratelimit-remaining-tokens": "0",
             "x-ratelimit-reset-tokens": f"{retry_after_s:g}s",
         }
-    body = {
-        "error": {
-            "message": message or spec.message,
-            "type": spec.openai_type,
-            "code": spec.openai_code,
-            "param": None,
-        }
-    }
+    body = {"error": _error_body(name, message)}
     return web.json_response(body, status=spec.openai_status, headers=headers)
+
+
+def _error_body(name: str, message: str | None) -> dict[str, Any]:
+    """The `{message, type, code, param}` object of an OpenAI error (HTTP or mid-stream)."""
+    spec = ERRORS[name]
+    return {
+        "message": message or spec.openai_message or spec.message,
+        "type": spec.openai_type,
+        "code": spec.openai_code,
+        "param": None,
+    }
 
 
 def _key(request: web.Request, model: str) -> str:
@@ -97,20 +102,25 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
         return openai_error("ValidationException", "messages must be a non-empty list")
     prompt_tokens = count_tokens(collect_text(messages))
     max_tokens = body.get("max_tokens") or body.get("max_completion_tokens") or 0
-    outcome = await engine.call(key, prompt_tokens + int(max_tokens))
+    outcome = await engine.call(key, prompt_tokens + int(max_tokens), prompt_tokens)
+    b = outcome.behaviour
     if outcome.error:
-        return openai_error(outcome.error, retry_after_s=outcome.behaviour.retry_after_s)
+        return openai_error(outcome.error, b.force_message, b.retry_after_s)
     message, finish, out_text = _chat_message(body, outcome.behaviour.tool_calls)
     wanted = outcome.behaviour.output_tokens
     if wanted and message.get("content"):
         out_text = ((out_text + " ") * (wanted * 4 // (len(out_text) + 1) + 1))[: wanted * 4]
         message = {"role": "assistant", "content": out_text}
     completion_tokens = count_tokens(out_text)
-    usage = {
-        "prompt_tokens": prompt_tokens,
+    # OpenAI counts cached prompt tokens inside prompt_tokens and repeats them in the details.
+    cached = b.cache_read_tokens
+    usage: dict[str, Any] = {
+        "prompt_tokens": prompt_tokens + cached,
         "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
+        "total_tokens": prompt_tokens + cached + completion_tokens,
     }
+    if cached:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached}
     ident = f"chatcmpl-{digest(body)[:24]}"
     speed = outcome.behaviour.tokens_per_s
     if body.get("stream"):
@@ -137,11 +147,16 @@ async def _stream(
     model: str,
     message: dict[str, Any],
     finish: str,
-    usage: dict[str, int],
+    usage: dict[str, Any],
     speed: float,
     outcome: Any,
 ) -> web.StreamResponse:
-    """Server-sent events: a role chunk, content in 8-token pieces, the finish, usage, [DONE]."""
+    """Server-sent events: a role chunk, content in 8-token pieces, the finish, usage, [DONE].
+
+    Tool calls arrive as the API sends them: id and name first, then the arguments in
+    16-character pieces. `cut_after_chunks` ends the stream early: an `{"error": ...}` event
+    for an exception name, `stall` or `close`.
+    """
     response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
     await response.prepare(request)
 
@@ -157,13 +172,21 @@ async def _stream(
 
     await send({"role": "assistant", "content": ""})
     content = message.get("content") or ""
-    for i in range(0, len(content), 32):
+    behaviour = outcome.behaviour
+    for n, i in enumerate(range(0, len(content), 32)):
+        if behaviour.cut_after_chunks is not None and n >= behaviour.cut_after_chunks:
+            request.app[ENGINE].settle(_key(request, model), outcome, usage["prompt_tokens"])
+            return await _cut(request, response, behaviour)
         await send({"content": content[i : i + 32]})
         if speed > 0:
             await asyncio.sleep(count_tokens(content[i : i + 32]) / speed)
-    if message.get("tool_calls"):
-        calls = [{"index": 0, **call} for call in message["tool_calls"]]
-        await send({"tool_calls": calls})
+    for index, call in enumerate(message.get("tool_calls") or []):
+        head = {**call, "function": {"name": call["function"]["name"], "arguments": ""}}
+        await send({"tool_calls": [{"index": index, **head}]})
+        args = call["function"]["arguments"]
+        for i in range(0, len(args), 16):
+            piece = {"index": index, "function": {"arguments": args[i : i + 16]}}
+            await send({"tool_calls": [piece]})
     await send({}, finish)
     include = (body.get("stream_options") or {}).get("include_usage")
     if include and not outcome.behaviour.usage_missing:
@@ -182,6 +205,22 @@ async def _stream(
     return response
 
 
+async def _cut(
+    request: web.Request, response: web.StreamResponse, behaviour: Behaviour
+) -> web.StreamResponse:
+    """End an SSE stream early: an `{"error": ...}` event, a stall or an abrupt close."""
+    if behaviour.cut_with == "stall":
+        await asyncio.Event().wait()  # the client's read timeout has to notice
+    if behaviour.cut_with == "close":
+        if request.transport is not None:
+            request.transport.abort()
+        return response
+    error = _error_body(STREAM_ERROR_ROWS[behaviour.cut_with], behaviour.force_message)
+    await response.write(f"data: {json.dumps({'error': error})}\n\n".encode())
+    await response.write_eof()
+    return response
+
+
 async def embeddings(request: web.Request) -> web.Response:
     """OpenAI embeddings; honours `dimensions` and `encoding_format` (the SDK asks base64)."""
     engine = request.app[ENGINE]
@@ -196,7 +235,8 @@ async def embeddings(request: web.Request) -> web.Response:
     texts = [t if isinstance(t, str) else json.dumps(t) for t in inputs]
     outcome = await engine.call(key, sum(count_tokens(t) for t in texts))
     if outcome.error:
-        return openai_error(outcome.error, retry_after_s=outcome.behaviour.retry_after_s)
+        b = outcome.behaviour
+        return openai_error(outcome.error, b.force_message, b.retry_after_s)
     dims = body.get("dimensions") or outcome.behaviour.dims
     as_base64 = body.get("encoding_format") == "base64"
     data = []

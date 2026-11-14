@@ -188,7 +188,7 @@ async def test_every_error_parses_in_botocore(
     with pytest.raises(ClientError) as info:
         await client.converse(modelId=GPT, messages=MSGS)
     error = info.value.response
-    assert error["Error"]["Code"] == name
+    assert error["Error"]["Code"] == ERRORS[name].wire_code(name)
     assert error["Error"]["Message"] == ERRORS[name].message
     assert error["ResponseMetadata"]["HTTPStatusCode"] == ERRORS[name].status
 
