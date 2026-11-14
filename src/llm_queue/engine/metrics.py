@@ -7,6 +7,7 @@ metric; `PrometheusSink` keeps `prometheus_client` metrics for a `/metrics` endp
 
 from __future__ import annotations
 
+import atexit
 import queue
 import sys
 import threading
@@ -78,6 +79,8 @@ class _StdoutWriter:
                         target=self._run, name="llmq-emf-writer", daemon=True
                     )
                     self._thread.start()
+                    # Lines still queued at exit would be lost with the daemon thread.
+                    atexit.register(self.flush)
         try:
             self._lines.put_nowait(line)
         except queue.Full:

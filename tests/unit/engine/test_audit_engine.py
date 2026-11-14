@@ -226,6 +226,27 @@ async def test_en6_unreadable_embedding_body_is_a_call_failure() -> None:
         await embed.embed(engine, "e", ["a", "b"])
 
 
+class OddBodyEngine(FakeEmbedEngine):
+    """Answers "b" with a body whose items are not objects (`{"data": [1]}`)."""
+
+    async def call(self, _alias: str, request: dict[str, Any], **kw: Any) -> Any:
+        from llm_queue.engine.envelope import Reply
+
+        if request["input"][0] == "b":
+            return Reply(request_id="b", ok=True, response={"data": [1]})
+        return await super().call(_alias, request, **kw)
+
+
+async def test_en6_non_object_items_are_a_call_failure_too() -> None:
+    """EN-6 (verify pass): `{"data": [1]}` raised a raw AttributeError past the parse guard."""
+    from llm_queue.engine import embed
+
+    engine: Any = OddBodyEngine(set())
+    vectors, errors = await embed.embed_partial(engine, "e", ["a", "b", "c"])
+    assert vectors == [[1.0], [], [1.0]]
+    assert errors[1].kind == "provider_error"
+
+
 class CountingOffload:
     """An offload that counts writes; `fail_put` makes every write raise."""
 

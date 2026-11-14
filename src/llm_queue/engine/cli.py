@@ -329,7 +329,10 @@ class Cli:
             if not _confirmed(args, "dlq redrive sends dead letters back to the queue"):
                 _, _, dead = await self.queues.depth(queue)
                 return {"would_redrive": min(dead, args.count), "queue": queue}
-            return {"redriven": await self.queues.redrive(queue, args.count)}
+            # The model's own stream retention: the redrive trims like a send (EN-12), and the
+            # 4-day default cut a queue that keeps more.
+            keep = int(view.value(view.registry.alias_of(args.model), "queue")["retention_secs"])
+            return {"redriven": await self.queues.redrive(queue, args.count, keep)}
         if not _confirmed(args, "dlq purge deletes every dead letter"):
             _, _, dead = await self.queues.depth(queue)
             return {"would_purge": dead, "queue": queue}

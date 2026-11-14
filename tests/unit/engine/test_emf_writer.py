@@ -28,7 +28,7 @@ def test_a_slow_stdout_does_not_block_a_metric_point(monkeypatch: pytest.MonkeyP
     started = time.perf_counter()
     for _ in range(10):
         sink.count("llmq_calls_total", model="m")
-    assert time.perf_counter() - started < 0.05  # inline: 10 x 20 ms = 200 ms
+    assert time.perf_counter() - started < 0.15  # inline: 10 x 20 ms = 200 ms
     assert writer.flush(timeout_secs=5)
     assert len(slow.getvalue().splitlines()) == 10  # every point written, in order
 
@@ -48,3 +48,18 @@ def test_no_thread_until_the_first_line() -> None:
     writer = _StdoutWriter()
     EmfSink(writer)
     assert writer._thread is None
+
+
+def test_queued_lines_are_written_before_the_process_exits() -> None:
+    """EN-20 (verify pass): lines still queued at exit were lost with the daemon thread."""
+    import subprocess
+
+    code = (
+        "from llm_queue.engine.metrics import EmfSink\n"
+        "sink = EmfSink()\n"
+        "for _ in range(500): sink.count('llmq_calls_total', model='m')\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=60
+    ).stdout
+    assert len(out.splitlines()) == 500

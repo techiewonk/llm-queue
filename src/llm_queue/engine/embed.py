@@ -127,7 +127,7 @@ async def embed_partial(
             )
         try:
             vectors = vectors_of(entry.provider, reply.response)
-        except (KeyError, ValueError, TypeError, IndexError) as exc:
+        except (KeyError, ValueError, TypeError, IndexError, AttributeError) as exc:
             # A raw parse error is not a `CallFailed`: with `partial` it aborted every batch,
             # and the app got an exception outside `LLMQueueError` (EN-6).
             raise CallFailed(
