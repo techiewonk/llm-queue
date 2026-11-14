@@ -115,7 +115,15 @@ class PrometheusSink:
                 "observe": self._prom.Histogram,
                 "gauge": self._prom.Gauge,
             }[kind]
-            self._made[name] = cls(name, name, sorted(labels), registry=self._registry)
+            try:
+                self._made[name] = cls(name, name, sorted(labels), registry=self._registry)
+            except ValueError:
+                # Already registered by another sink in this process (the sync path's engine
+                # made a second one): use that collector instead of failing the call (O5).
+                found = getattr(self._registry, "_names_to_collectors", {}).get(name)
+                if found is None:
+                    raise
+                self._made[name] = found
         metric = self._made[name]
         return metric.labels(**labels) if labels else metric
 
@@ -132,10 +140,20 @@ class PrometheusSink:
         self._metric("gauge", name, labels).set(value)
 
 
+_SINKS: dict[str, Metrics] = {}
+
+
 def sink_for(name: str) -> Metrics:
-    """The sink named by the `metrics_sink` setting: `emf`, `prometheus` or `none`."""
-    if name == "prometheus":
-        return PrometheusSink()
-    if name == "none":
-        return NullSink()
-    return EmfSink()
+    """The process's sink named by the `metrics_sink` setting: `emf`, `prometheus` or `none`.
+
+    One per name per process: every engine (async queue, sync calls, a second queue) shares it.
+    """
+    if (sink := _SINKS.get(name)) is None:
+        if name == "prometheus":
+            sink = PrometheusSink()
+        elif name == "none":
+            sink = NullSink()
+        else:
+            sink = EmfSink()
+        sink = _SINKS.setdefault(name, sink)
+    return sink

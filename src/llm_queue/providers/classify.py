@@ -2,7 +2,9 @@
 
 Decisions use error *families*, not exact class names or codes, because real services and
 fakes spell the same failure differently (`ThrottlingException`, `Throttling`, `throttled`).
-Used by `BedrockProvider.classify` and `OpenAICompatProvider.classify`; never imports an SDK.
+Used by `BedrockProvider.classify` and `OpenAIProvider.classify`; never imports an SDK.
+`is_auth_error`, `request_error_kind` and `is_connection_reset` refine a FATAL / transport
+error for the worker (try elsewhere, which `CallFailed` kind, one quick retry).
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ from collections.abc import Mapping
 from email.utils import parsedate_to_datetime
 from typing import Any
 
-from llm_queue.errors import ErrorInfo, ErrorKind
+from llm_queue.errors import ErrorInfo, ErrorKind, LLMQueueError
 
 # Prefixes of normalised codes (lower-case letters only, "exception"/"error" suffix dropped).
 _THROTTLE_PREFIXES = (
@@ -75,6 +77,48 @@ _REQUEST_MESSAGE = re.compile(
     r"|maximum (?:input|context|token)|malformed",
     re.IGNORECASE,
 )
+# Credentials refused, expired or signed with a skewed clock: the account (or this pod's clock)
+# is the problem, not the request or the model, so the worker drops the client and tries the
+# next target (plan C7). `invalidsignature` / `signaturedoesnotmatch` include "Signature
+# expired" (clock skew over 5 minutes).
+_AUTH_FAMILIES = (
+    "unrecognizedclient",
+    "expiredtoken",
+    "invalidclienttokenid",
+    "invalidsignature",
+    "signaturedoesnotmatch",
+    "incompletesignature",
+    "missingauthenticationtoken",
+    "authfailure",
+    "authentication",
+    "invalidapikey",
+    "requestexpired",
+)
+_AUTH_MESSAGE = re.compile(
+    r"signature expired|security token included in the request is (?:invalid|expired)"
+    r"|request signature we calculated does not match|incorrect api key|invalid api key",
+    re.IGNORECASE,
+)
+# Request-fatal: the input does not fit the model's context window, on any target.
+_CONTEXT_MESSAGE = re.compile(
+    r"too many (?:input )?tokens|input is too long|prompt is too long|context.length"
+    r"|context window|maximum context|maximum input",
+    re.IGNORECASE,
+)
+# Connection dropped by the peer (keep-alive socket closed by the server, NAT reset): one quick
+# retry on a new connection, without charging the breaker (plan C7). Timeouts are not here.
+_RESET_TYPES: dict[str, tuple[str, ...]] = {
+    "aiohttp": ("ServerDisconnectedError", "ClientConnectionResetError", "ClientOSError"),
+    "botocore.exceptions": ("ConnectionClosedError",),
+    "httpx": ("RemoteProtocolError", "ReadError"),
+    "httpx2": ("RemoteProtocolError", "ReadError"),
+}
+
+
+class StreamTruncated(LLMQueueError):
+    """A provider stream ended without its end marker (messageStop, finish_reason): retryable."""
+
+
 # Built lazily from whichever modules are already imported; an SDK that was never imported
 # cannot have raised the exception being classified.
 _TRANSPORT_TYPES: dict[str, tuple[str, ...]] = {
@@ -87,6 +131,7 @@ _TRANSPORT_TYPES: dict[str, tuple[str, ...]] = {
     ),
     "aiohttp": ("ClientError",),
     "httpx": ("TransportError",),
+    "httpx2": ("TransportError",),
     "openai": ("APITimeoutError", "APIConnectionError"),
 }
 
@@ -165,9 +210,13 @@ def parse_retry_after(
 
 def is_transport_error(exc: BaseException) -> bool:
     """True for timeouts and connection failures from asyncio, botocore, aiohttp, httpx, openai."""
-    if isinstance(exc, TimeoutError | ConnectionError):
+    if isinstance(exc, TimeoutError | ConnectionError | StreamTruncated):
         return True
-    for module_name, names in _TRANSPORT_TYPES.items():
+    return _is_any(exc, _TRANSPORT_TYPES)
+
+
+def _is_any(exc: BaseException, table: Mapping[str, tuple[str, ...]]) -> bool:
+    for module_name, names in table.items():
         module = sys.modules.get(module_name)
         if module is None:
             continue
@@ -175,6 +224,52 @@ def is_transport_error(exc: BaseException) -> bool:
         if types and isinstance(exc, types):
             return True
     return False
+
+
+def is_connection_reset(exc: BaseException) -> bool:
+    """True when the peer dropped the connection (not a timeout): worth one immediate retry.
+
+    Looks at the error and its cause / context, since SDKs wrap the socket error (openai's
+    `APIConnectionError` around httpx's `RemoteProtocolError`).
+    """
+    for err in (exc, exc.__cause__, exc.__context__):
+        if err is None or isinstance(err, TimeoutError):
+            continue
+        if isinstance(err, ConnectionResetError | BrokenPipeError) or _is_any(err, _RESET_TYPES):
+            return True
+    return False
+
+
+def is_auth_error(exc: BaseException, info: ErrorInfo) -> bool:
+    """Credentials refused or expired, or a signature off by clock skew (plan C7).
+
+    The worker drops the account's client (credentials are read again) and tries the next
+    target instead of failing the call; an OpenAI-compatible 401 counts too.
+    """
+    if info.kind is not ErrorKind.FATAL:
+        return False
+    if error_family(info.code).startswith(_AUTH_FAMILIES) or _error_status(exc) == 401:
+        return True
+    return bool(_AUTH_MESSAGE.search(_error_message(exc)))
+
+
+def request_error_kind(exc: BaseException, info: ErrorInfo) -> str | None:
+    """The `CallFailed` kind of a FATAL error about the request itself, else None.
+
+    `context_length_exceeded` when the input does not fit the model (Bedrock "too many tokens"
+    / "Input is too long", OpenAI `context_length_exceeded`); `invalid_request` for any other
+    validation / bad-request error. Target and credentials errors return None.
+    """
+    if info.kind is not ErrorKind.FATAL or is_auth_error(exc, info):
+        return None
+    if info.code == "context_length_exceeded" or _CONTEXT_MESSAGE.search(_error_message(exc)):
+        return "context_length_exceeded"
+    if is_target_error(exc, info):
+        return None
+    family = error_family(info.code)
+    if family.startswith(("validation", "badrequest", "invalidrequest", "unprocessable")):
+        return "invalid_request"
+    return "invalid_request" if _error_status(exc) in (400, 413, 422) else None
 
 
 def is_target_error(exc: BaseException, info: ErrorInfo) -> bool:
@@ -241,6 +336,13 @@ def classify_openai(exc: BaseException) -> ErrorInfo:
         return ErrorInfo(kind=ErrorKind.RETRYABLE, code=type(exc).__name__)
     status = getattr(exc, "status_code", None)
     if not isinstance(status, int):
+        openai = sys.modules.get("openai")
+        if openai is not None and isinstance(exc, openai.APIError):
+            # An `error` event inside a stream (no HTTP status): the server failed mid-answer.
+            # Retryable; the worker never retries once chunks reached the caller (plan P5).
+            code = str(getattr(exc, "code", None) or "stream_error")
+            kind = ErrorKind.FATAL if code == "context_length_exceeded" else ErrorKind.RETRYABLE
+            return ErrorInfo(kind=kind, code=code)
         return ErrorInfo(kind=ErrorKind.FATAL, code=type(exc).__name__)
     code = str(getattr(exc, "code", None) or getattr(exc, "type", None) or type(exc).__name__)
     response = getattr(exc, "response", None)

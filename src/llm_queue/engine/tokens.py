@@ -3,7 +3,13 @@
 The estimate is characters / 4 of every text in the request (tool definitions included) plus
 the output reservation (`max_tokens`, as Bedrock reserves it). After the call the budget is
 corrected to the real usage; a throttled attempt gives everything back; a failed one keeps its
-input. `register_token_estimator` replaces the character count with a real tokenizer.
+input. Binary blocks (images, documents, video, audio) are not read as text: each costs a fixed
+`BINARY_BLOCK_TOKENS`, and the real usage corrects it after the call.
+
+Characters / 4 fits English; Indic and CJK scripts take more tokens per character, so a model
+serving them is better estimated by its own tokenizer: `register_token_estimator("name", fn)`
+once at import, then set the model's `token_estimator` setting to "name" (per model, or per
+deployment). The default is unchanged (plan C8).
 """
 
 from __future__ import annotations
@@ -20,34 +26,48 @@ Estimator = Callable[[str, Mapping[str, Any]], int]
 _ESTIMATORS: dict[str, Estimator] = {}
 # Request fields that carry numbers or switches, not text the model reads.
 _SKIP = frozenset({"inferenceConfig", "modelId", "max_tokens", "temperature", "top_p", "seed"})
+# Content blocks that carry binary data (Converse) or a data URL (OpenAI): their base64 text is
+# not tokens. Unverified starting value: a ~1 MP image is about 1,300 tokens on Claude.
+_BINARY = frozenset({"image", "document", "video", "audio", "image_url", "input_audio", "file"})
+BINARY_BLOCK_TOKENS = 1000
 
 
 def register_token_estimator(name: str, fn: Estimator) -> None:
-    """Add an estimator chosen by the `token_estimator` setting: fn(op, params) -> input tokens."""
+    """Add an estimator chosen by the `token_estimator` setting: fn(op, params) -> input tokens.
+
+    The setting is per model (or deployment), so one model can use a real tokenizer (e.g. for
+    Indic or CJK text) while the others keep characters / 4.
+    """
     if not name or not callable(fn):
         raise ConfigError("register_token_estimator needs a name and a callable")
     _ESTIMATORS[name] = fn
 
 
-def _texts(node: Any, out: list[str]) -> None:
+def _count(node: Any, totals: list[int]) -> None:
+    """Add characters (`totals[0]`) and binary blocks (`totals[1]`) under `node`."""
     if isinstance(node, str):
-        out.append(node)
+        totals[0] += len(node)
     elif isinstance(node, Mapping):
         for key, value in node.items():
-            if key not in _SKIP:
-                _texts(value, out)
+            if key in _BINARY and isinstance(value, Mapping):
+                totals[1] += 1
+            elif key not in _SKIP:
+                _count(value, totals)
     elif isinstance(node, list | tuple):
         for value in node:
-            _texts(value, out)
+            _count(value, totals)
 
 
 def input_tokens(op: str, params: Mapping[str, Any], estimator: str | None = None) -> int:
-    """Estimated input tokens of a request (every text, tool schemas included)."""
+    """Estimated input tokens of a request (every text, tool schemas included).
+
+    Binary blocks count `BINARY_BLOCK_TOKENS` each instead of their encoded size.
+    """
     if estimator and estimator in _ESTIMATORS:
         return max(1, int(_ESTIMATORS[estimator](op, params)))
-    found: list[str] = []
-    _texts(params, found)
-    return max(1, math.ceil(sum(len(t) for t in found) / 4))
+    totals = [0, 0]
+    _count(params, totals)
+    return max(1, math.ceil(totals[0] / 4) + totals[1] * BINARY_BLOCK_TOKENS)
 
 
 def max_tokens_of(op: str, params: Mapping[str, Any]) -> int | None:
