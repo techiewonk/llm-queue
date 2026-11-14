@@ -180,7 +180,7 @@ async def _start(
         error = bedrock_error("ValidationException", "messages must be a non-empty list")
         return engine, key, {}, error
     inputs = count_tokens(collect_text([body.get("system"), messages]))
-    outcome = await engine.call(key, _reserve(body), inputs)
+    outcome = await engine.call(key, _reserve(body), inputs, await request.read())
     if outcome.error:
         return engine, key, body, bedrock_error(outcome.error, outcome.behaviour.force_message)
     return engine, key, body, outcome
@@ -320,7 +320,7 @@ async def invoke(request: web.Request) -> web.Response:
         engine.record_error(key)
         return bedrock_error("ValidationException", problem)
     assert isinstance(body, dict)  # narrowed by the checks above
-    outcome = await engine.call(key, count_tokens(collect_text(body)))
+    outcome = await engine.call(key, count_tokens(collect_text(body)), 0, await request.read())
     if outcome.error:
         return bedrock_error(outcome.error, outcome.behaviour.force_message)
     if "inputText" in body:

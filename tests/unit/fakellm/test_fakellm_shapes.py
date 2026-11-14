@@ -73,7 +73,10 @@ async def _bedrock(stack: AsyncExitStack, fake: Fake, read_timeout: float = 60) 
 
 async def _events(client: BedrockRuntimeClient, **kwargs: Any) -> list[dict[str, Any]]:
     reply = await client.converse_stream(modelId=GPT, messages=MSGS, **kwargs)
-    return [dict(event) async for event in reply["stream"]]
+    try:
+        return [dict(event) async for event in reply["stream"]]
+    finally:
+        reply["stream"].close()  # a failed stream must not leave its connection to the GC
 
 
 async def test_converse_reasoning_blocks(start_fake: StartFake, make_bedrock: MakeBedrock) -> None:

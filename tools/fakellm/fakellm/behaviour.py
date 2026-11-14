@@ -8,12 +8,14 @@ RNG per key so a run with the same seed and request order is reproducible.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import random
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
+from typing import Any
 
 from fakellm.errors import THROTTLE_ERRORS
 from fakellm.scenario import Behaviour, Scenario
@@ -23,7 +25,12 @@ _Z95 = 1.6448536269514722  # standard normal 95th percentile
 
 @dataclass(slots=True)
 class KeyStats:
-    """Counters for one model x target key (served by /admin/stats and /metrics)."""
+    """Counters for one model x target key (served by /admin/stats and /metrics).
+
+    `by_minute` counts calls per wall-clock minute (epoch seconds // 60), so a harness can check
+    a fixed-window budget at the provider; `duplicates` counts calls whose request body was
+    already seen since the last reset (a call that ran twice, when bodies carry a marker).
+    """
 
     calls: int = 0
     ok: int = 0
@@ -32,14 +39,17 @@ class KeyStats:
     throttled: int = 0
     errors: int = 0
     tokens: int = 0
+    duplicates: int = 0
+    by_minute: dict[int, int] = field(default_factory=dict)
+    seen: set[bytes] = field(default_factory=set, repr=False)
     window: deque[float] = field(default_factory=deque, repr=False)
     token_window: deque[list[float]] = field(default_factory=deque, repr=False)
 
-    def public(self) -> dict[str, int]:
-        """Counters without the private rpm / tpm windows."""
+    def public(self) -> dict[str, Any]:
+        """Counters without the private rpm / tpm windows and seen bodies."""
         data = asdict(self)
-        del data["window"]
-        del data["token_window"]
+        for private in ("window", "token_window", "seen"):
+            del data[private]
         return data
 
 
@@ -63,11 +73,13 @@ class Engine:
         seed: int | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        wall: Callable[[], float] = time.time,
     ) -> None:
-        """Create an engine; `seed` overrides the scenario's, clock/sleep are injectable."""
+        """Create an engine; `seed` overrides the scenario's; clocks and sleep are injectable."""
         self.scenario = scenario
         self.seed_override = seed
         self._clock = clock
+        self._wall = wall
         self._sleep = sleep
         self.reset()
 
@@ -146,15 +158,25 @@ class Engine:
         sigma = math.log(b.latency_p95_ms / b.latency_p50_ms) / _Z95
         return min(b.latency_p50_ms * math.exp(sigma * rng.gauss(0.0, 1.0)), 4 * b.latency_p95_ms)
 
-    async def call(self, key: str, reserve_tokens: int = 0, input_tokens: int = 0) -> Outcome:
+    async def call(
+        self, key: str, reserve_tokens: int = 0, input_tokens: int = 0, body: bytes = b""
+    ) -> Outcome:
         """Admit or reject one call for `key`, sleep its latency and roll late failures.
 
         `reserve_tokens` (input + max_tokens) is held against `tpm` until `settle`;
-        `input_tokens` stretches the latency by `latency_per_1k_input_ms`.
+        `input_tokens` stretches the latency by `latency_per_1k_input_ms`; `body` (the raw
+        request) counts `duplicates`.
         """
         b = self.behaviour(key)
         stats = self._key_stats(key)
         stats.calls += 1
+        minute = int(self._wall() // 60)
+        stats.by_minute[minute] = stats.by_minute.get(minute, 0) + 1
+        if body:
+            fingerprint = hashlib.sha256(body).digest()[:16]
+            if fingerprint in stats.seen:
+                stats.duplicates += 1
+            stats.seen.add(fingerprint)
         rng = self._rngs.setdefault(key, random.Random(f"{self.seed}:{key}"))
         # Always draw the same number of values so one knob never shifts another's sequence.
         throttle_roll, timeout_roll, error_roll, which_5xx = (rng.random() for _ in range(4))

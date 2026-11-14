@@ -102,7 +102,9 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
         return openai_error("ValidationException", "messages must be a non-empty list")
     prompt_tokens = count_tokens(collect_text(messages))
     max_tokens = body.get("max_tokens") or body.get("max_completion_tokens") or 0
-    outcome = await engine.call(key, prompt_tokens + int(max_tokens), prompt_tokens)
+    outcome = await engine.call(
+        key, prompt_tokens + int(max_tokens), prompt_tokens, await request.read()
+    )
     b = outcome.behaviour
     if outcome.error:
         return openai_error(outcome.error, b.force_message, b.retry_after_s)
@@ -233,7 +235,8 @@ async def embeddings(request: web.Request) -> web.Response:
         engine.record_error(key)
         return openai_error("ValidationException", "input must be a string or non-empty list")
     texts = [t if isinstance(t, str) else json.dumps(t) for t in inputs]
-    outcome = await engine.call(key, sum(count_tokens(t) for t in texts))
+    tokens_in = sum(count_tokens(t) for t in texts)
+    outcome = await engine.call(key, tokens_in, 0, await request.read())
     if outcome.error:
         b = outcome.behaviour
         return openai_error(outcome.error, b.force_message, b.retry_after_s)
