@@ -154,6 +154,49 @@ async def test_send_whose_reply_was_lost_runs_once(
     assert counts.get("duplicates", 0) == 0
 
 
+async def test_paused_calls_share_one_store_probe(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scenarios X1 / L2 / L4: every call paused on `store_down` pinged the store each second.
+
+    N paused calls made N pings a second, each a new connection while the store was refusing
+    them (about 600 connects a second through the scenario's store proxy at 300 % load), and
+    each new call tried the store first. One probe per process serves them all, calls that
+    come while others wait join them, and every call is still served once the store is back.
+    """
+    engine, _ = await make({"small": {"store_down": "pause"}})
+    real_send, real_ping = engine.requests.register_send, engine.state.ping
+    outage = {"until": time.monotonic() + 2.5}
+    pings = {"n": 0}
+    tried = {"n": 0}
+
+    async def send(*args: Any, **kwargs: Any) -> Any:
+        if time.monotonic() < outage["until"]:
+            tried["n"] += 1
+            raise StoreConnectionError("Connection closed by server.")
+        return await real_send(*args, **kwargs)
+
+    async def ping(**kwargs: Any) -> Any:
+        pings["n"] += 1
+        if time.monotonic() < outage["until"]:
+            raise StoreConnectionError("Connection closed by server.")
+        return await real_ping(**kwargs)
+
+    monkeypatch.setattr(engine.requests, "register_send", send)
+    monkeypatch.setattr(engine.state, "ping", ping)
+    first = asyncio.create_task(engine.call("small", CHAT))
+    for _ in range(100):  # until it waits for the store
+        if engine._store_waiting:
+            break
+        await asyncio.sleep(0.01)
+    later = [asyncio.create_task(engine.call("small", CHAT)) for _ in range(19)]
+    replies = await asyncio.gather(first, *later)
+    assert all(r.ok for r in replies)
+    assert pings["n"] <= 5  # one probe a second for the process (57 before: 19 calls x 3 s)
+    assert tried["n"] == 1  # the later calls joined the paused one (19 more tries before)
+    assert engine._store_waiting == 0
+
+
 @pytest.mark.parametrize(
     "refusal",
     [StoreConnectionError("Connection closed by server."), ResponseError("OOM command")],

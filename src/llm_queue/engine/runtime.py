@@ -301,6 +301,8 @@ class Engine:
         self._wake: dict[str, asyncio.Event] = {}  # model -> wakes its receive loop
         self._beat_ok_at = time.monotonic()  # last heartbeat that reached the store
         self._store_trouble_at = -1e9  # monotonic time this process last saw the store fail
+        self._store_ping: asyncio.Task[bool] | None = None  # pings for paused calls
+        self._store_waiting = 0  # calls paused on the store_down path, waiting on the probe
         self._results_exist = state.register_script(_RESULTS_EXIST)
         self.ready = False
         self._direct_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -430,7 +432,14 @@ class Engine:
             self._idle.clear()
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._idle.wait(), max(0.0, until - loop.time()))
-        tasks = [*self._tasks, *self._model_tasks.values(), *self._running, *self._tails]
+        tasks: list[asyncio.Task[Any]] = [
+            *self._tasks,
+            *self._model_tasks.values(),
+            *self._running,
+            *self._tails,
+        ]
+        if self._store_ping is not None:
+            tasks.append(self._store_ping)
         for task in tasks:
             task.cancel()
         for task in tasks:
@@ -541,6 +550,17 @@ class Engine:
         deadline = asyncio.get_running_loop().time() + timeout + self.settings.caller_margin_secs
         try:
             async with asyncio.timeout_at(deadline):
+                if (
+                    self._store_waiting
+                    and not stream
+                    and view.value(alias, "store_down") == "pause"
+                ):
+                    # Calls here already wait for the store to come back: this one joins them
+                    # instead of trying first. Each try opened up to four connections to a
+                    # store that refused them (redis-py's retries), the rest of the storm.
+                    return await self._store_down(
+                        view, alias, envelope, None, deadline, direct=direct
+                    )
                 try:
                     return await self._call_routed(
                         view, alias, envelope, params, priority, timeout, request_id, direct
@@ -1007,7 +1027,7 @@ class Engine:
         view: ResolvedRegistry,
         alias: str,
         envelope: Envelope,
-        exc: BaseException,
+        exc: BaseException | None,
         deadline: float,
         *,
         direct: bool = False,
@@ -1016,10 +1036,12 @@ class Engine:
 
         `deadline` is the call's own (loop time, margin included): `pause` waits only until
         then, never a fresh timeout from the moment the store failed. `direct` is the call's
-        own route, kept for the retry.
+        own route, kept for the retry. `exc` None: a `pause` call that joined calls already
+        waiting for the store, without trying it (not logged: it saw no error).
         """
         mode = view.value(alias, "store_down")
-        logger.warning("store_down", model=alias, mode=mode, error=str(exc))
+        if exc is not None:
+            logger.warning("store_down", model=alias, mode=mode, error=str(exc))
         if mode == "static_cap":
             return await self._static_cap(view, alias, envelope)
         if mode == "pause":
@@ -1027,11 +1049,8 @@ class Engine:
             until = deadline - self.settings.caller_margin_secs
             app_id = envelope.request_id if envelope.app_request_id else None
             while loop.time() < until:
-                await asyncio.sleep(1.0)
-                try:
-                    await self.state.ping()
-                except STORE_ERRORS:
-                    continue
+                if not await self._store_back(until - loop.time()):
+                    break
                 left = until - loop.time()
                 if left <= 0:
                     break
@@ -1053,6 +1072,41 @@ class Engine:
                         "queue_unavailable", _refusal(refused), request_id=retry.request_id
                     ) from refused
         raise CallFailed("queue_unavailable", "the state store is unreachable") from exc
+
+    async def _store_back(self, secs: float) -> bool:
+        """True once the state store answers again; False when `secs` pass first.
+
+        Every call paused on the `store_down` path waits on one probe of this process (a ping
+        a second). A ping per paused call made N pings a second, each a new connection while
+        the store refused them: at 300 % load (scenario X1) about 600 connects a second through
+        the store proxy, half of them these pings, and the pool's connections went to them.
+        `asyncio.wait`: a probe stopped with the engine is "not back", never a cancel raised in
+        a caller's task.
+        """
+        probe = self._store_ping
+        if probe is None or probe.done():
+            probe = self._store_ping = asyncio.create_task(self._ping_until_back())
+        self._store_waiting += 1
+        try:
+            await asyncio.wait({probe}, timeout=max(0.0, secs))
+        finally:
+            self._store_waiting -= 1
+        return probe.done() and not probe.cancelled() and probe.result()
+
+    async def _ping_until_back(self) -> bool:
+        """Ping every second until the store answers (True) or no paused call waits (False).
+
+        A store that answers with an error (loading, auth) is not back either.
+        """
+        while True:
+            await asyncio.sleep(1.0)
+            if not self._store_waiting:
+                return False
+            try:
+                await self.state.ping()
+            except (*STORE_ERRORS, RedisError):
+                continue
+            return True
 
     async def _static_cap(self, view: ResolvedRegistry, alias: str, envelope: Envelope) -> Reply:
         """Run without the store: at most `local_limit_cap` calls per process and model."""
