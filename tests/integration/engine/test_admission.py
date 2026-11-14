@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 import redis.asyncio
+from engine_testkit import away_from_minute_end
 
 from llm_queue.engine.admission import Admission, Ask, Candidate, owner_token
 from llm_queue.engine.keys import Keys
@@ -102,6 +103,7 @@ async def rig(
         doc["accounts"]["aws-a"]["settings"] = account
     store = RegistryStore(client, prefix, config=doc)
     await store.boot()
+    await away_from_minute_end(margin_secs=5)  # fixed-window counts must not cross a reset
     admission = Admission(
         client, Keys(prefix), lease_secs=lease_secs, waiter_secs=waiter_secs, timings=timings
     )
