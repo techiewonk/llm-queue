@@ -159,13 +159,13 @@ async def test_calls_after_stop_get_a_clear_error() -> None:
     queue = _queue(_Engine())
     await queue.start()
     await queue.stop()
-    with pytest.raises(LLMQueueError, match="stopping or stopped"):
+    with pytest.raises(LLMQueueError, match="is stopped"):
         await queue.converse("m", {"messages": []})
-    with pytest.raises(LLMQueueError, match="stopping or stopped"):
+    with pytest.raises(LLMQueueError, match="is stopped"):
         await queue.embed("m", ["x"])
-    with pytest.raises(LLMQueueError, match="stopping or stopped"):
+    with pytest.raises(LLMQueueError, match="is stopped"):
         await queue.send_job("j", {})
-    with pytest.raises(LLMQueueError, match="stopping or stopped"):
+    with pytest.raises(LLMQueueError, match="is stopped"):
         async for _ in queue.converse_stream("m", {"messages": []}):
             pass
 
@@ -189,7 +189,7 @@ async def test_sync_call_after_stop_builds_no_new_engine() -> None:
     def call() -> None:
         queue.converse_sync("m", {"messages": []})
 
-    with pytest.raises(LLMQueueError, match="stopping or stopped"):
+    with pytest.raises(LLMQueueError, match="is stopped"):
         await asyncio.to_thread(call)
     assert queue._sync is None
     assert built == []
@@ -339,3 +339,39 @@ def test_wait_on_loop_reraises_a_timeout_raised_by_the_call(
         loop.call_soon_threadsafe(loop.stop)
         thread.join(5)
         loop.close()
+
+
+async def test_calls_during_the_drain_are_served() -> None:
+    """NB-1: stop() refused calls from its first line, before the jobs and calls drained.
+
+    A job still running in the drain got `LLMQueueError("stopping or stopped")` on its next
+    `converse`, and so did an app's follow-up call during a graceful shutdown. Calls made in
+    the jobs drain and in the engine drain are served; a call after the drain is refused.
+    """
+    engine = _Engine()
+    queue = _queue(engine, mode="both")
+    await queue.start()
+    outcome: list[str] = []
+
+    async def call(step: str) -> None:
+        try:
+            await queue.converse("m", {"messages": []})
+            outcome.append(f"{step}: served")
+        except LLMQueueError as exc:
+            outcome.append(f"{step}: {exc}")
+
+    async def jobs_stop(drain_secs: float = 0) -> None:
+        await call("jobs")
+
+    engine_stop = engine.stop
+
+    async def stop_engine(**kw: Any) -> None:
+        await call("engine")
+        await engine_stop(**kw)
+
+    queue.jobs.stop = jobs_stop  # type: ignore[method-assign]
+    engine.stop = stop_engine  # type: ignore[method-assign]
+    await queue.stop()
+    assert outcome == ["jobs: served", "engine: served"]
+    with pytest.raises(LLMQueueError, match="is stopped"):
+        await queue.converse("m", {"messages": []})

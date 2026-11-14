@@ -178,7 +178,8 @@ class LLMQueue:
         self._sync_lock = threading.Lock()
         self._start_lock: asyncio.Lock | None = None  # made on the first start(), on its loop
         self.started = False
-        self._stopped = False
+        self._stopped = False  # stop() began: no second stop, no start
+        self._closing = False  # stop()'s drain is over: no new calls (NB-1)
         self._pid: int | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._inherited = False
@@ -285,12 +286,12 @@ class LLMQueue:
         """Refuse a call from a forked child or (async calls) from another event loop.
 
         `work` marks a method that starts new work (a call, a stream, a job): it is refused
-        once `stop()` has begun, instead of failing later on a closed pool (CO-6, CO-13).
+        once `stop()` has drained, instead of failing later on a closed pool (CO-6, CO-13).
+        During the drain it is still served: a running job's next call and an app's follow-up
+        call were refused there, which broke the graceful shutdown (NB-1).
         """
-        if work and self._stopped:
-            raise LLMQueueError(
-                "this LLMQueue is stopping or stopped; build and start a new one to make calls"
-            )
+        if work and self._closing:
+            raise LLMQueueError("this LLMQueue is stopped; build and start a new one to make calls")
         if self._inherited or (self._pid is not None and self._pid != os.getpid()):
             raise LLMQueueError(
                 f"this LLMQueue was started in process {self._pid} and this process is a fork "
@@ -371,7 +372,8 @@ class LLMQueue:
         """Shut down in order (plan §3.18) and close every client; a second call does nothing.
 
         `drain_secs` (default `LLMQ_DRAIN_SECS`) bounds the whole wait: jobs first (they make
-        calls), then running calls get what is left of it. Every step runs even when an earlier
+        calls), then running calls get what is left of it. Calls made during the drain are
+        served; new calls are refused once it is over. Every step runs even when an earlier
         one fails (each failure is logged) and the first failure is raised at the end; if the
         stop is cancelled, the steps left still close their clients, without draining.
         """
@@ -405,6 +407,8 @@ class LLMQueue:
         ]
         failures: list[Exception] = []
         for name, step in steps:
+            if name == "sync":  # the drain is over: refuse new calls from here (NB-1)
+                self._closing = True
             try:
                 await step()
             except asyncio.CancelledError:
@@ -509,10 +513,10 @@ class LLMQueue:
             if self._builder is None:
                 raise LLMQueueError("sync calls need LLMQueue.from_env (a second, private engine)")
             with self._sync_lock:  # threads making their first sync call together build one
-                if self._stopped:  # stop() closed the runner; a new one would leak (CO-6)
-                    raise LLMQueueError(
-                        "this LLMQueue is stopping or stopped; build a new one to make calls"
-                    )
+                # stop() closes the runner after setting `_closing`; one built later would leak
+                # (CO-6). One built during the drain is closed by stop()'s sync step.
+                if self._closing:
+                    raise LLMQueueError("this LLMQueue is stopped; build a new one to make calls")
                 if self._sync is None:
                     self._sync = _SyncRunner(self._builder, self._offload)
                 runner = self._sync
