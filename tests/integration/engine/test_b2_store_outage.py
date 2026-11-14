@@ -19,7 +19,7 @@ from redis.exceptions import ConnectionError as StoreConnectionError
 from redis.exceptions import ResponseError
 
 from llm_queue.engine.errors import CallFailed
-from llm_queue.engine.runtime import Engine
+from llm_queue.engine.runtime import Engine, _QueueDown
 from llm_queue.engine.streaming import ChunkWriter
 
 pytestmark = pytest.mark.integration
@@ -121,7 +121,62 @@ async def test_cancel_cleanup_never_runs_past_the_deadline(
         if engine._running:
             await asyncio.sleep(0.1)
     rids = [k async for k in engine.state.scan_iter(match=engine.keys.request("*", "cancel"))]
-    assert len(rids) == 2  # the call and its retry on the store_down path
+    assert len(rids) == 1  # the call: its retry on the store_down path keeps its id (S11)
+
+
+async def test_send_whose_reply_was_lost_runs_once(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Restart drill S11: a node restart cut the reply of a send that had reached the store.
+
+    The caller saw a store error, paused, and retried under a new request id: the first send
+    ran too, and the provider got the call twice. The retry keeps the call's id (and options)
+    and attaches to the first send.
+    """
+    engine, fake = await make({"small": {"store_down": "pause"}})
+    real = engine.requests.register_send
+    lost: list[str] = []
+
+    async def reply_lost(rid: str, **kwargs: Any) -> Any:
+        found = await real(rid, **kwargs)  # it ran on the store ...
+        if not lost:
+            lost.append(rid)
+            raise StoreConnectionError("Connection closed by server.")  # ... its reply did not
+        return found
+
+    monkeypatch.setattr(engine.requests, "register_send", reply_lost)
+    reply = await engine.call("small", CHAT, allowed_regions=["r1"])
+    assert lost
+    assert reply.ok
+    await asyncio.sleep(0.5)  # a second run, if any, would have reached the provider by now
+    counts = stats(fake, f"{SMALL}@r1")
+    assert counts["calls"] == 1
+    assert counts.get("duplicates", 0) == 0
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [StoreConnectionError("Connection closed by server."), ResponseError("OOM command")],
+)
+async def test_direct_run_after_queue_down_keeps_the_error_family(
+    make: Make, monkeypatch: pytest.MonkeyPatch, refusal: Exception
+) -> None:
+    """Audit RT-2: the direct run after the queue store refused ran inside an `except` handler.
+
+    A state store error there reached the app as a raw redis-py error and skipped the model's
+    `store_down` rule.
+    """
+    engine, _ = await make({"small": {"store_down": "fail_fast"}})
+
+    async def call_once(*args: Any) -> Any:
+        if not args[-1]:  # not direct: the separate queue store refused the send
+            raise _QueueDown
+        raise refusal
+
+    monkeypatch.setattr(engine, "_call_once", call_once)
+    with pytest.raises(CallFailed) as info:
+        await engine.call("small", CHAT)
+    assert info.value.kind == "queue_unavailable"
 
 
 async def test_store_lost_mid_stream_is_queue_unavailable(

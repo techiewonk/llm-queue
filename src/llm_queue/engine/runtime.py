@@ -542,18 +542,16 @@ class Engine:
         try:
             async with asyncio.timeout_at(deadline):
                 try:
-                    return await self._call_once(
+                    return await self._call_routed(
                         view, alias, envelope, params, priority, timeout, request_id, direct
-                    )
-                except _QueueDown:
-                    return await self._call_once(
-                        view, alias, envelope, params, priority, timeout, request_id, True
                     )
                 except STORE_ERRORS as exc:
                     if stream:  # chunks travel through the state store
                         message = "the state store is unreachable"
                         raise CallFailed("queue_unavailable", message) from exc
-                    return await self._store_down(view, alias, envelope, exc, deadline)
+                    return await self._store_down(
+                        view, alias, envelope, exc, deadline, direct=direct
+                    )
                 except ResponseError as exc:
                     # The store answered but refused (out of memory, a script error): still one
                     # error family for callers. A refused registration raised redis-py's
@@ -742,6 +740,32 @@ class Engine:
             return True
         pct = int(view.value(alias, "queue_pct"))
         return pct < 100 and int(hashlib.sha256(rid.encode()).hexdigest()[:8], 16) % 100 >= pct
+
+    async def _call_routed(
+        self,
+        view: ResolvedRegistry,
+        alias: str,
+        envelope: Envelope,
+        params: Mapping[str, Any],
+        priority: bool,
+        call_secs: float,
+        request_id: str | None,
+        direct: bool,
+    ) -> Reply:
+        """`_call_once`, run direct when the separate queue store refuses the send.
+
+        Its own `try`, so the callers' store handlers also see the direct run's errors: run
+        inside an `except _QueueDown` handler, a store error there reached the app as a raw
+        redis-py error and skipped the model's `store_down` rule (audit RT-2).
+        """
+        try:
+            return await self._call_once(
+                view, alias, envelope, params, priority, call_secs, request_id, direct
+            )
+        except _QueueDown:
+            return await self._call_once(
+                view, alias, envelope, params, priority, call_secs, request_id, True
+            )
 
     async def _call_once(
         self,
@@ -985,11 +1009,14 @@ class Engine:
         envelope: Envelope,
         exc: BaseException,
         deadline: float,
+        *,
+        direct: bool = False,
     ) -> Reply:
         """The state store is unreachable: the model's `store_down` rule (plan §3.11).
 
         `deadline` is the call's own (loop time, margin included): `pause` waits only until
-        then, never a fresh timeout from the moment the store failed.
+        then, never a fresh timeout from the moment the store failed. `direct` is the call's
+        own route, kept for the retry.
         """
         mode = view.value(alias, "store_down")
         logger.warning("store_down", model=alias, mode=mode, error=str(exc))
@@ -998,6 +1025,7 @@ class Engine:
         if mode == "pause":
             loop = asyncio.get_running_loop()
             until = deadline - self.settings.caller_margin_secs
+            app_id = envelope.request_id if envelope.app_request_id else None
             while loop.time() < until:
                 await asyncio.sleep(1.0)
                 try:
@@ -1007,17 +1035,23 @@ class Engine:
                 left = until - loop.time()
                 if left <= 0:
                     break
-                # Only the time left: at least 1 s (as before) ran the retry past the deadline.
-                return await self.call(
-                    alias,
-                    envelope.params or {},
-                    priority=envelope.priority,
-                    timeout_secs=left,
-                    request_id=envelope.request_id if envelope.app_request_id else None,
-                    session_id=envelope.session_id,
-                    user_id=envelope.user_id,
-                    tenant_id=envelope.tenant_id,
-                )
+                # The same request id and every option of the call, with only the time left (at
+                # least 1 s, as before, ran the retry past the deadline). A new id ran the call
+                # twice when the failed send had reached the store and only its reply was cut
+                # (restart drill S11); with the same id the retry attaches to that send. A
+                # fresh `call()` also dropped allowed_regions / accounts, fallback and direct.
+                retry = envelope.model_copy(update={"timeout_secs": left})
+                try:
+                    return await self._call_routed(
+                        view, alias, retry, retry.params, retry.priority, left, app_id, direct
+                    )
+                except STORE_ERRORS as again:  # out of reach again: pause again
+                    exc = again
+                    logger.warning("store_down", model=alias, mode=mode, error=str(exc))
+                except ResponseError as refused:  # as `call()`: one error family (S9)
+                    raise CallFailed(
+                        "queue_unavailable", _refusal(refused), request_id=retry.request_id
+                    ) from refused
         raise CallFailed("queue_unavailable", "the state store is unreachable") from exc
 
     async def _static_cap(self, view: ResolvedRegistry, alias: str, envelope: Envelope) -> Reply:
