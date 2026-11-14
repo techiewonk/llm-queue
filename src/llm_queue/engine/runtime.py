@@ -83,6 +83,9 @@ logger = get_logger(__name__)
 OPS = {("bedrock", "chat"): "converse", ("bedrock", "embedding"): "invoke_model"}
 HEALTH_PROBE_EVERY_SECS = 5.0  # the background store probe behind readiness (RESCAN O1)
 NEWER_MESSAGE_DELAY_SECS = 15.0  # a message from a newer library waits this long for a newer pod
+# Store retries (send, result read, settling writes): full jitter from 0.1 s doubling to 1 s.
+STORE_RETRY_BASE_SECS = 0.1
+STORE_RETRY_CAP_SECS = 1.0
 # Request fields a fallback model may not understand (another family's knobs): dropped from the
 # caller's params when the call is served by another model (RESCAN P6). The target's own
 # `inference` defaults are applied after, so its own extra fields still go in.
@@ -160,6 +163,12 @@ def _text(value: Any) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
+def _seen(task: asyncio.Future[Any]) -> None:
+    """Mark a finished task's exception as read (no "exception was never retrieved")."""
+    if not task.cancelled():
+        task.exception()
+
+
 def _refusal(exc: BaseException) -> str:
     """A caller-facing message for a store that answered with a refusal."""
     if isinstance(exc, OutOfMemoryError) or "OOM" in str(exc):
@@ -196,6 +205,7 @@ class _Held:
     cancelled: bool = False
     target_failed: list[tuple[str, str]] = field(default_factory=list)
     run: asyncio.Task[None] | None = None
+    hold: asyncio.Task[None] | None = None  # its `_hold` task while it waits for budget
     # Model-level request and estimate, built once per registry view (a deep copy of the
     # prompt each time: ~0.7 ms for 200 KB, and it was rebuilt in _ask, _decide and _attempt).
     charged: tuple[Any, str, tokens.Estimate] | None = None
@@ -303,6 +313,12 @@ class Engine:
         self._store_trouble_at = -1e9  # monotonic time this process last saw the store fail
         self._store_ping: asyncio.Task[bool] | None = None  # pings for paused calls
         self._store_waiting = 0  # calls paused on the store_down path, waiting on the probe
+        # Calls whose awaiting task was cancelled, for the one canceller (`_cancel_later`).
+        self._cancel_queue: list[tuple[str, asyncio.Future[None]]] = []
+        self._canceller: asyncio.Task[None] | None = None
+        self._settling: set[asyncio.Task[None]] = set()  # shutdown give-backs (`_run`)
+        # Per model: the claim (key, nonce) of a receive whose reply was lost (S11).
+        self._unclaimed: dict[str, tuple[str, str]] = {}
         self._results_exist = state.register_script(_RESULTS_EXIST)
         self.ready = False
         self._direct_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -409,11 +425,7 @@ class Engine:
         until = loop.time() + drain
         self.ready = False
         self._stopping = True
-        for held in list(self._held.values()):
-            if not held.grants and held.run is None and held.message is not None:
-                with contextlib.suppress(*STORE_ERRORS):
-                    await self.queues.return_(held.message)
-                self._drop(held)  # else the heartbeat hides it again for the whole drain
+        await self._hand_back_held(until)
         if self._running:
             await asyncio.wait(set(self._running), timeout=max(0.0, until - loop.time()))
         # The drain ran out (plan C3): calls still running are given back, not failed: grants
@@ -426,6 +438,8 @@ class Engine:
                 held.run.cancel()
         if late:
             await asyncio.wait(set(late), timeout=5.0)
+        if self._settling:  # the give-backs of those runs, before the clients close (RT-6)
+            await asyncio.wait(set(self._settling), timeout=5.0)
         if self._tails:  # streams already delivered: their call tasks read the result
             await asyncio.wait(set(self._tails), timeout=max(0.0, until - loop.time()))
         if self._waiters:
@@ -437,19 +451,63 @@ class Engine:
             *self._model_tasks.values(),
             *self._running,
             *self._tails,
+            *self._settling,
         ]
-        if self._store_ping is not None:
-            tasks.append(self._store_ping)
+        for extra in (self._store_ping, self._reload):
+            if extra is not None:
+                tasks.append(extra)
         for task in tasks:
             task.cancel()
-        for task in tasks:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+        # `gather` lets a cancel of `stop()` itself through (a k8s hook timing out) and keeps
+        # each result: a loop that died with an error is logged, not swallowed (audit RT-7).
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for task, result in zip(tasks, results, strict=True):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "stop_task_failed",
+                    task=task.get_name(),
+                    error=str(result),
+                    error_type=type(result).__name__,
+                )
         await self.chunks.aclose()
         for pubsub in (self._pubsub, self._cancels):
             if pubsub is not None:
-                with contextlib.suppress(Exception):
+                try:
                     await pubsub.aclose()
+                except Exception as exc:  # closing anyway: the clients go next
+                    logger.debug("pubsub_close_failed", error=str(exc))
+
+    async def _hand_back_held(self, until: float) -> None:
+        """Return every call held while waiting for budget, at once and by the drain's end.
+
+        Its hold task is stopped first: it ran one more round, re-admitted the returned call
+        and ran it at the provider while the message was already back (audit RT-5). The returns
+        run together under the drain's deadline: one at a time, a down store held `stop()` for
+        connect timeouts and retries per message, far past `drain_secs` (audit RT-7).
+        """
+        handed = [
+            h
+            for h in list(self._held.values())
+            if not h.grants and h.run is None and h.message is not None
+        ]
+        for held in handed:
+            self._drop(held)  # else the heartbeat hides it again for the whole drain
+            if held.hold is not None:
+                held.hold.cancel()
+        messages = [h.message for h in handed if h.message is not None]
+        if not messages:
+            return
+        try:
+            async with asyncio.timeout_at(until):
+                results = await asyncio.gather(
+                    *(self.queues.return_(m) for m in messages), return_exceptions=True
+                )
+        except TimeoutError:
+            logger.warning("stop_return_timeout", calls=len(messages))
+            return
+        failed = [r for r in results if isinstance(r, BaseException)]
+        if failed:  # their visibility timeout brings them back
+            logger.warning("stop_return_failed", calls=len(failed), error=str(failed[0]))
 
     async def aclose(self) -> None:
         """Close the provider clients and both store clients (after `stop()`)."""
@@ -582,23 +640,14 @@ class Engine:
         except asyncio.CancelledError:
             # The awaiting task was cancelled: cancel the call unless others wait on its id,
             # in other processes or in this one (they share this process's caller entry).
-            alone_here = self._local_callers.get(rid, 0) <= 1
-
-            async def cancel_unless_shared() -> None:
-                with contextlib.suppress(Exception):
-                    callers = await self.requests.callers(rid)
-                    if alone_here and set(callers) <= {self.worker_id}:
-                        await self.cancel(rid)
-
-            # Waited for until the deadline at most, then it goes on behind: a slow store (its
-            # client's retries) held the cancellation up to 1.9 s past the deadline (scenario
-            # L4: a deadline cancelling the call retried on the store_down path).
-            cleanup = asyncio.create_task(cancel_unless_shared())
-            self._running.add(cleanup)
-            cleanup.add_done_callback(self._running.discard)
-            remaining = deadline - asyncio.get_running_loop().time()
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.wait({cleanup}, timeout=max(0.0, remaining))
+            if self._local_callers.get(rid, 0) <= 1:  # shared here: the others still wait
+                # Waited for until the deadline at most, then it goes on behind: a slow store
+                # (its client's retries) held the cancellation up to 1.9 s past the deadline
+                # (scenario L4: a deadline cancelling the call retried on the store_down path).
+                cleanup = self._cancel_later(rid)
+                remaining = deadline - asyncio.get_running_loop().time()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.wait({cleanup}, timeout=max(0.0, remaining))
             raise
         finally:
             left = self._local_callers.get(rid, 1) - 1
@@ -647,13 +696,18 @@ class Engine:
                         raise CallFailed("deadline_exceeded", "no reply in time", request_id=rid)
                     getter = asyncio.ensure_future(queue.get())
                     finished = task.done()
-                    done, _ = await asyncio.wait(
-                        {getter} if finished else {getter, task},
-                        timeout=min(idle, left) if started or finished else left,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
+                    try:
+                        done, _ = await asyncio.wait(
+                            {getter} if finished else {getter, task},
+                            timeout=min(idle, left) if started or finished else left,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        # Also when the consumer is cancelled mid-wait: the getter stayed
+                        # pending on the chunk queue, one leaked task per stream (audit RT-25).
+                        if not getter.done():
+                            getter.cancel()
                     if getter not in done:
-                        getter.cancel()
                         if not done and deadline - loop.time() <= 0:  # the deadline, not idleness
                             raise CallFailed(
                                 "deadline_exceeded", "no reply in time", request_id=rid
@@ -722,8 +776,12 @@ class Engine:
             else:
                 if not task.done():
                     task.cancel()  # the call's own handler cancels the request
-                with contextlib.suppress(BaseException):
-                    await task
+                # The call's failure is this stream's to see, never raised here; `asyncio.wait`
+                # lets the consumer's own cancel through. `suppress(BaseException)` swallowed
+                # it, and the wait (the call's cancel cleanup, up to the deadline) could not be
+                # cut short (audit RT-4).
+                task.add_done_callback(_seen)
+                await asyncio.wait({task})
 
     def _tail_done(self, task: asyncio.Task[Reply]) -> None:
         """A stream's call task ended after its `end` was read: log a failure, never raise it."""
@@ -846,22 +904,19 @@ class Engine:
         until = loop.time() + call_secs + self.settings.caller_margin_secs
         try:
             while True:
+                run: asyncio.Task[None] | None = None  # the direct run, watched while waiting
                 if outcome in ("new", "takeover") and not sent:
                     if direct:
                         await self.requests.confirm(rid, keep_secs=call_secs)
-                        task = asyncio.create_task(self._direct(envelope))
-                        self._running.add(task)
-                        task.add_done_callback(self._running.discard)
+                        run = self._start_direct(envelope)
                     else:
                         try:
                             await self._send(rid, envelope, view, alias, priority, call_secs)
                         except _SendNotReplicated:
                             await self.requests.confirm(rid, keep_secs=call_secs)
-                            task = asyncio.create_task(self._direct(envelope))
-                            self._running.add(task)
-                            task.add_done_callback(self._running.discard)
+                            run = self._start_direct(envelope)
                 reply = await self._wait_result(
-                    rid, waiter, until - loop.time(), recheck=outcome == "attached"
+                    rid, waiter, until - loop.time(), recheck=outcome == "attached", watch=run
                 )
                 if reply is not None:
                     return reply
@@ -920,6 +975,7 @@ class Engine:
         loop = asyncio.get_running_loop()
         give_up = loop.time() + self.settings.queue_failover_secs
         body = envelope.dumps()
+        tries = 0
         while True:
             try:
                 await self.queues.send(
@@ -946,7 +1002,8 @@ class Engine:
                 raise
             except STORE_ERRORS as exc:
                 if not self.queues_shared and loop.time() < give_up:
-                    await asyncio.sleep(0.25)
+                    tries += 1
+                    await asyncio.sleep(self._store_retry_secs(tries))
                     continue
                 await self.requests.abandon(rid, caller=self.worker_id)
                 if self.queues_shared:
@@ -971,6 +1028,70 @@ class Engine:
             self.keys.request(request_id, "cancel"), "1", ex=self.settings.status_ttl_secs
         )
         await self.state.publish(self.keys.cancel_channel, request_id)
+
+    def _cancel_later(self, rid: str) -> asyncio.Future[None]:
+        """Queue the cancel of a call its awaiting task gave up on; resolved once tried.
+
+        One canceller per process serves every such call, in batches: each cancelled caller
+        started its own cleanup task (up to three store calls, no timeout, failures hidden), so
+        apps cancelling many calls during a store outage made one connection storm per call
+        (audit RT-3).
+        """
+        done = asyncio.get_running_loop().create_future()
+        self._cancel_queue.append((rid, done))
+        task = self._canceller
+        if task is None or task.done():
+            task = self._canceller = asyncio.create_task(self._cancel_worker())
+            self._running.add(task)
+            task.add_done_callback(self._running.discard)
+        return done
+
+    async def _cancel_worker(self) -> None:
+        """Cancel the queued calls, a batch at a time, each batch bounded by the probe timer.
+
+        A batch that fails or runs out of time is logged and dropped: the worker settles each
+        of its calls by the call's deadline anyway.
+        """
+        while self._cancel_queue:
+            batch, self._cancel_queue = self._cancel_queue, []
+            try:
+                async with asyncio.timeout(self.settings.timings.health_probe_secs):
+                    await self._cancel_batch([rid for rid, _ in batch])
+            except Exception as exc:
+                logger.warning(
+                    "cancel_cleanup_failed",
+                    calls=len(batch),
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+            finally:
+                for _, done in batch:
+                    if not done.done():
+                        done.set_result(None)
+
+    async def _cancel_batch(self, rids: Sequence[str]) -> None:
+        """Cancel each call no other process waits on: two pipelined round trips per 500."""
+        for start in range(0, len(rids), 500):
+            part = rids[start : start + 500]
+            async with self.state.pipeline(transaction=False) as pipe:
+                for rid in part:
+                    pipe.smembers(self.keys.request(rid, "callers"))
+                found = await pipe.execute()
+            mine = {self.worker_id}
+            alone = [
+                rid
+                for rid, callers in zip(part, found, strict=True)
+                if {_text(c) for c in callers or ()} <= mine
+            ]
+            if not alone:
+                continue
+            async with self.state.pipeline(transaction=False) as pipe:
+                for rid in alone:
+                    pipe.set(
+                        self.keys.request(rid, "cancel"), "1", ex=self.settings.status_ttl_secs
+                    )
+                    pipe.publish(self.keys.cancel_channel, rid)
+                await pipe.execute()
 
     async def _cancel_reader(self) -> None:
         """Stop running attempts whose call was cancelled (by any process)."""
@@ -1139,6 +1260,44 @@ class Engine:
                 )
         raise CallFailed("provider_error", str(error or "no usable deployment"))
 
+    def _start_direct(self, env: Envelope) -> asyncio.Task[None]:
+        """Start a direct run; its caller watches the task (`_wait_result`, `watch`)."""
+        task = asyncio.create_task(self._direct(env))
+        self._running.add(task)
+        task.add_done_callback(self._direct_done)
+        return task
+
+    def _direct_done(self, task: asyncio.Task[None]) -> None:
+        """A direct run ended: log a failure (its caller raises it; read here, never lost)."""
+        self._running.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning("direct_run_failed", error=str(exc), error_type=type(exc).__name__)
+
+    @staticmethod
+    def _direct_failure(task: asyncio.Task[None], rid: str) -> CallFailed | None:
+        """The failure a finished direct run leaves its caller, as one `CallFailed`; None if none.
+
+        A direct run that raised wrote no reply: its caller waited to its deadline and got
+        `deadline_exceeded`, never the real error (audit RT-1).
+        """
+        if not task.done() or task.cancelled() or (exc := task.exception()) is None:
+            return None
+        if isinstance(exc, CallFailed):
+            exc.request_id = exc.request_id or rid
+            return exc
+        if isinstance(exc, ResponseError):
+            message = _refusal(exc)
+        elif isinstance(exc, (*STORE_ERRORS, RedisError)):
+            message = "the state store is unreachable"
+        else:
+            message = f"the direct run failed ({type(exc).__name__})"
+        failure = CallFailed("queue_unavailable", message, request_id=rid)
+        failure.__cause__ = exc
+        return failure
+
     async def _direct(self, env: Envelope) -> None:
         """Run a call in this process (no queue), with the same admission and waiter order.
 
@@ -1203,19 +1362,50 @@ class Engine:
             self._waiters[rid] = current
         return current
 
+    async def _wake_or_fail(
+        self,
+        rid: str,
+        waiter: asyncio.Future[None],
+        secs: float,
+        watch: asyncio.Task[None] | None,
+    ) -> asyncio.Task[None] | None:
+        """Wait up to `secs` for the wake-up or the end of the watched direct run.
+
+        Raises the direct run's failure (audit RT-1); returns the run still to watch (None once
+        it ended well: its reply is in the store). `asyncio.wait` never cancels the shared
+        waiter, as `wait_for(shield(...))` did not.
+        """
+        pending = {waiter} if watch is None else {waiter, watch}
+        await asyncio.wait(pending, timeout=max(0.0, secs), return_when=asyncio.FIRST_COMPLETED)
+        if watch is None or not watch.done():
+            return watch
+        failure = self._direct_failure(watch, rid)
+        if failure is not None:
+            raise failure
+        return None
+
     async def _wait_result(
-        self, rid: str, waiter: asyncio.Future[None], secs: float, *, recheck: bool = False
+        self,
+        rid: str,
+        waiter: asyncio.Future[None],
+        secs: float,
+        *,
+        recheck: bool = False,
+        watch: asyncio.Task[None] | None = None,
     ) -> Reply | None:
-        """The reply; None (only with `recheck`) when the call's record disappeared."""
+        """The reply; None (only with `recheck`) when the call's record disappeared.
+
+        `watch`: this call's direct run; its failure is raised at once (it writes no reply).
+        """
         loop = asyncio.get_running_loop()
         until = loop.time() + secs
         if not recheck:
             # Just sent: the reply cannot be there yet. Wait for the wake-up (or one poll)
             # before the first read; reading at once cost a round trip on every call.
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(asyncio.shield(waiter), min(secs, self.settings.poll_secs))
+            watch = await self._wake_or_fail(rid, waiter, min(secs, self.settings.poll_secs), watch)
             if waiter.done():
                 waiter = self._rearm(rid, waiter)
+        tries = 0
         while True:
             try:
                 reply = await self.requests.take_result(rid)
@@ -1227,7 +1417,11 @@ class Engine:
                     raise CallFailed(
                         "deadline_exceeded", "the store did not answer in time", request_id=rid
                     ) from exc
-                await asyncio.sleep(min(0.5, max(0.0, until - loop.time())))
+                tries += 1
+                pause = min(self._store_retry_secs(tries), max(0.0, until - loop.time()))
+                watch = await self._wake_or_fail(rid, waiter, pause, watch)
+                if waiter.done():
+                    waiter = self._rearm(rid, waiter)
                 continue
             if gone:
                 return None
@@ -1247,10 +1441,10 @@ class Engine:
             # The wake-up comes by pub/sub (published with the result), or from this process's
             # one result sweep (`_result_sweep`); a read per waiting caller made store load
             # grow with the backlog (B56). The timeout is only a last-resort recheck.
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(
-                    asyncio.shield(waiter), min(left, self.settings.timings.result_recheck_secs)
-                )
+            tries = 0
+            watch = await self._wake_or_fail(
+                rid, waiter, min(left, self.settings.timings.result_recheck_secs), watch
+            )
             if waiter.done():
                 waiter = self._rearm(rid, waiter)
 
@@ -1416,24 +1610,55 @@ class Engine:
             for priority in (True, False)
             if (alias, "p" if priority else "n") not in self._held_class
         ]
-        messages, dead = await self.queues.receive_first(
-            names, min(free, self.settings.receive_batch), settings
-        )
-        for letter in dead:
-            await self._dead_lettered(letter.body)
-        for index, message in enumerate(messages):
+        key = self.queues.claim_key(f"{self.worker_id}:{alias}")
+        lost = self._unclaimed.pop(alias, None)
+        if lost is not None:
+            # The last receive's reply was lost (scenario S11): what it took is ours and hidden
+            # for the visibility timeout (60 s). It goes back to the queue now, receipt-checked.
             try:
-                held = await self._admit_new(alias, message)
-            except Exception:
-                for rest in messages[index + 1 :]:  # not seen: back to the queue now
-                    with contextlib.suppress(Exception):
-                        await self.queues.return_(rest)
+                back = await self.queues.reclaim(*lost)
+            except BaseException:
+                self._unclaimed[alias] = lost
                 raise
-            if held:
-                for rest in messages[index + 1 :]:
-                    await self.queues.return_(rest)
-                break
+            if back:
+                logger.warning("receive_reclaimed", model=alias, count=back)
+        claim = (key, new_id())
+        try:
+            messages, dead = await self.queues.receive_first(
+                names, min(free, self.settings.receive_batch), settings, claim=claim
+            )
+        except (*STORE_ERRORS, RedisError):
+            self._unclaimed[alias] = claim  # it may have run: reclaim it on the next round
+            raise
+        rest = list(messages)  # not admitted yet: back to the queue whatever happens
+        try:
+            for letter in dead:
+                # One failed reply skips only itself: it skipped every received message,
+                # neither admitted nor returned (hidden 60 s) (audit RT-8).
+                try:
+                    await self._dead_lettered(alias, letter.body)
+                except Exception as exc:
+                    logger.warning("dead_letter_reply_failed", model=alias, error=str(exc))
+            while rest:
+                if await self._admit_new(alias, rest.pop(0)):
+                    break
+        finally:
+            if rest:
+                await self._return_all(rest)
         return bool(messages)
+
+    async def _return_all(self, messages: Sequence[Message]) -> None:
+        """Return messages to their queue together; a failure is logged and skips only itself.
+
+        One at a time, the first failed return stranded the rest (audit RT-8); their
+        visibility timeout brings back the ones that failed.
+        """
+        results = await asyncio.gather(
+            *(self.queues.return_(m) for m in messages), return_exceptions=True
+        )
+        failed = [r for r in results if isinstance(r, BaseException)]
+        if failed:
+            logger.warning("return_failed", count=len(failed), error=str(failed[0]))
 
     def _queue_settings(self, view: ResolvedRegistry, alias: str) -> QueueSettings:
         queue = view.value(alias, "queue")
@@ -1445,10 +1670,13 @@ class Engine:
             max_waiting=int(view.value(alias, "max_waiting")),
         )
 
-    async def _dead_lettered(self, body: bytes) -> None:
+    async def _dead_lettered(self, alias: str, body: bytes) -> None:
+        """Tell a dead letter's caller (`dead_lettered`); an unreadable one is counted, dropped."""
         try:
             env = parse(body)
-        except Exception:
+        except Exception as exc:  # nobody to tell: counted, it was dropped silently (RT-24)
+            logger.warning("bad_dead_letter", model=alias, error_type=type(exc).__name__)
+            self.metrics.count("llmq_bad_messages_total", model=alias)
             return
         await self._reply(env, "dead_lettered", "the call failed too many times", final="failed")
 
@@ -1789,7 +2017,7 @@ class Engine:
             if attempt == 1:
                 cls = "p" if env.priority else "n"
                 self._held_class.add((alias, cls))
-                task = asyncio.create_task(self._hold(held, decision.wait_secs))
+                task = held.hold = asyncio.create_task(self._hold(held, decision.wait_secs))
                 self._running.add(task)
                 task.add_done_callback(self._running.discard)
                 return True
@@ -1909,11 +2137,22 @@ class Engine:
         try:
             while not self._stopping:
                 await asyncio.sleep(min(max(wait, 0.01), 1.0))
+                # Handed back by `stop()` or let go by `_free_stuck` meanwhile: one more round
+                # re-admitted a call whose message was already back (audit RT-5).
+                if not self._owns(held):  # `stop()` drops what it hands back
+                    return
                 view = self.registry.current
-                if held.message is not None:
-                    await self.queues.extend(
-                        held.message, float(view.value(alias, "queue")["visibility_secs"])
+                message = held.message
+                if message is not None:
+                    kept = await self.queues.extend(
+                        message, float(view.value(alias, "queue")["visibility_secs"])
                     )
+                    if not kept and held.message is message:
+                        # A stale receipt: the message is another worker's now (its hold
+                        # lapsed) or back on the queue. Admitting it here ran it twice.
+                        logger.warning("hold_lost", request_id=held.envelope.request_id)
+                        self._drop(held)
+                        return
                 now = self.clock.now()
                 if now >= self._deadline(held):
                     await self._finish_call(
@@ -1987,12 +2226,37 @@ class Engine:
 
     # ================================================================ worker: running
 
+    def _owns(self, held: _Held) -> bool:
+        """True while this process still holds the call (not dropped, handed back or freed)."""
+        return self._held.get(held.envelope.request_id) is held
+
     def _start_run(
         self, held: _Held, decision: Decision, attempt: int, served: str | None = None
     ) -> None:
         alias = served or held.envelope.model
-        held.grants.add((alias, self._owner(held, attempt)))
+        owner = self._owner(held, attempt)
+        if not self._owns(held):
+            # Let go while its admission was in flight (`_free_stuck`, `stop`, a lost hold):
+            # a run would hold a grant the heartbeat never renews, swept only after its lease
+            # (scenario L4 left leases behind). The grant goes straight back.
+            logger.warning("grant_for_released_call", request_id=held.envelope.request_id)
+            self._spawn(self.admission.undo(alias, owner, held.envelope.request_id))
+            return
+        held.grants.add((alias, owner))
         task = asyncio.create_task(self._run(held, decision, attempt, alias))
+        self._running.add(task)
+        task.add_done_callback(self._running.discard)
+
+    def _spawn(self, work: Awaitable[Any]) -> None:
+        """Run a best-effort store write behind, tracked (stopped by `stop`), errors logged."""
+
+        async def run() -> None:
+            try:
+                await work
+            except Exception as exc:
+                logger.warning("background_write_failed", error=str(exc))
+
+        task = asyncio.create_task(run())
         self._running.add(task)
         task.add_done_callback(self._running.discard)
 
@@ -2009,7 +2273,12 @@ class Engine:
                     await self._attempts(held, decision, attempt, alias)
         except asyncio.CancelledError:
             if held.shutdown:  # the drain ran out (`stop`): give it back, never fail it
-                await asyncio.shield(self._shutdown_call(held))
+                # A kept task: `stop()` waits for it before the clients close. Shielded as a
+                # bare coroutine, it was an orphan still writing to closing clients (RT-6).
+                settle = asyncio.create_task(self._shutdown_call(held))
+                self._settling.add(settle)
+                settle.add_done_callback(self._settling.discard)
+                await asyncio.shield(settle)
                 return
             if not held.cancelled:
                 raise
@@ -2823,6 +3092,7 @@ class Engine:
         Only for writes that are safe to run twice (each checks its own receipt or key).
         """
         give_up = time.monotonic() + self.settings.lease_secs
+        tries = 0
         while True:
             try:
                 await write()
@@ -2831,7 +3101,19 @@ class Engine:
                 self._store_trouble("settle")
                 if time.monotonic() >= give_up:
                     raise
-                await asyncio.sleep(0.5)
+                tries += 1
+                await asyncio.sleep(self._store_retry_secs(tries))
+
+    def _store_retry_secs(self, tries: int) -> float:
+        """The pause before store retry `tries` (from 1): exponential with full jitter, capped.
+
+        The fixed 0.25 s (`_send`) and 0.5 s (`_wait_result`, `_through_outage`) pauses had
+        every call that failed in one outage retry in lockstep against the recovering store
+        (audit RT-15); the X1 and S11 drills show recoveries are where the storms happen. The
+        effect on the gates' connects per second is unverified (not measured yet).
+        """
+        ceiling = min(STORE_RETRY_CAP_SECS, STORE_RETRY_BASE_SECS * 2 ** max(0, tries - 1))
+        return max(0.01, self._rng.uniform(0.0, ceiling))
 
     # ================================================================ background
 
@@ -2860,6 +3142,8 @@ class Engine:
             if running:
                 assert held.run is not None
                 held.run.cancel()
+            if held.hold is not None and not held.hold.done():
+                held.hold.cancel()  # its next round must not grant and run a freed call
             task = asyncio.create_task(self._release(held))
             self._running.add(task)
             task.add_done_callback(self._running.discard)
@@ -2879,6 +3163,7 @@ class Engine:
                 self._sync_model_loops()
             except Exception as exc:
                 logger.warning("heartbeat_failed", step="loops", error=str(exc))
+            renewed = False
             try:
                 await self.state.set(
                     self.keys.caller(self.worker_id), "1", ex=self.settings.caller_ttl_secs
@@ -2897,20 +3182,31 @@ class Engine:
                     if not held.grants
                 ]
                 _, lost = await self.admission.renew_all(items, jobs)
-                if lost:  # swept, or lost with the store: still running here (A2, A6)
-                    await self._reregister(set(lost))
                 now = time.monotonic()
                 if now - self._beat_ok_at > 2 * beat + 1:  # a gap: the store was out of reach
                     self._store_trouble_at = now
                 self._beat_ok_at = now
                 self._beat_ran_at = now
-                await self._check_cancels()
+                renewed = True
             except Exception as exc:  # the heartbeat must survive store hiccups
                 logger.warning("heartbeat_failed", step="renew", error=str(exc))
                 self._store_trouble("heartbeat")
                 beat = 1.0  # renew the caller key as soon as the store is back
+            if renewed:
+                # Each step on its own: a failure here was logged as `renew`, counted as store
+                # trouble and sped the beat up although the renew had worked (audit RT-33).
+                if lost:  # swept, or lost with the store: still running here (A2, A6)
+                    try:
+                        await self._reregister(set(lost))
+                    except Exception as exc:
+                        logger.warning("heartbeat_failed", step="reregister", error=str(exc))
+                try:
+                    await self._check_cancels()
+                except Exception as exc:
+                    logger.warning("heartbeat_failed", step="cancels", error=str(exc))
             view = self.registry.current
             holds: list[tuple[Message, float]] = []
+            holders: list[_Held] = []
             for held in list(self._held.values()):
                 if held.message is None:
                     continue
@@ -2926,17 +3222,40 @@ class Engine:
                     continue
                 beat = min(beat, visibility / 3)
                 holds.append((held.message, visibility))
+                holders.append(held)
             self._beat_ran_at = time.monotonic()  # progress, even on a slow store (O2)
             try:
-                await self.queues.extend_many(holds)  # every hold in one call
+                kept = await self.queues.extend_many(holds)  # every hold in one call
             except Exception as exc:
                 logger.warning("heartbeat_failed", step="extend", error=str(exc))
+            else:
+                self._holds_lost(holds, holders, kept)
             try:
                 await self.clock.sync(self.state)
                 await self._check_epoch()
             except Exception as exc:
                 logger.warning("heartbeat_failed", step="clock", error=str(exc))
             await asyncio.sleep(max(0.2, beat))
+
+    def _holds_lost(
+        self, holds: Sequence[tuple[Message, float]], holders: Sequence[_Held], kept: Sequence[bool]
+    ) -> None:
+        """Let go of waiting calls whose receipt went stale (their flags were ignored, RT-5).
+
+        A stale receipt means the message is another worker's now (its hold lapsed in a store
+        outage) or back on the queue. A waiting call (no run, no grant) is dropped and its hold
+        stopped, so it is never admitted here as well; a running call goes on (its ack reports
+        the stale receipt). A message replaced meanwhile (redelivered here) is not judged.
+        """
+        for (message, _), held, ok in zip(holds, holders, kept, strict=True):
+            if ok or held.message is not message or held.run is not None or held.grants:
+                continue
+            if not self._owns(held):
+                continue
+            logger.warning("hold_lost", request_id=held.envelope.request_id)
+            self._drop(held)
+            if held.hold is not None and not held.hold.done():
+                held.hold.cancel()
 
     async def _check_epoch(self) -> None:
         """The store lost its data (restart, failover): re-register running calls (T10).
@@ -3001,7 +3320,7 @@ class Engine:
                 if lock:
                     view = self.registry.current
                     for alias in view.registry.models:
-                        await self.admission.sweep(alias)
+                        await self.admission.sweep(alias, [d.key for d in view.deployments(alias)])
                         # Dead letters age out on a timer too: only the next dead letter trimmed
                         # them, so a quiet queue kept its prompts for good (RESCAN X10).
                         keep = int(view.value(alias, "queue")["dlq_retention_secs"])
