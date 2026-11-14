@@ -711,14 +711,15 @@ async def b33() -> bool:
     Here 3K / min and one version.
 
     Pass: 0 lost, 0 failed priority calls; with a live edit at each restart, the
-    registry version each caller sees never goes back and ends at the last edit.
+    registry change counter each caller sees never goes back and ends at the last edit
+    (a live edit keeps `version` and bumps the counter).
     """
     doc = registry({"chat": {"rpm": 1_000_000}}, accounts=1, regions=1)
     async with Gate(doc) as gate:
         await gate.workers(4)
         queues = await gate.callers(2)
         run = Run()
-        seen: list[list[int]] = [[], []]  # versions each caller saw, sampled
+        seen: list[list[int]] = [[], []]  # change counters each caller saw, sampled
         done = asyncio.Event()
         edits = 0
 
@@ -739,25 +740,25 @@ async def b33() -> bool:
         async def sample() -> None:
             while not done.is_set():
                 for k, queue in enumerate(queues):
-                    seen[k].append(int(queue.registry.current.registry.version))
+                    seen[k].append(queue.registry.changes)
                 await asyncio.sleep(0.2)
 
         load = paced(50, 40, lambda i: run.call(queues[i % 2], "chat", chat(), priority=i % 4 == 0))
         await asyncio.gather(load, restarts(), sample())
         await asyncio.sleep(2)  # LLMQ_CFG_RELOAD_SECS default: every caller has the last edit
-        final = [int(q.registry.current.registry.version) for q in queues]
+        final = [q.registry.changes for q in queues]
     start = seen[0][0] if seen[0] else 0
     return verdict(
         "B33",
         {
             "0 lost": all(r.ok for r in run.results),
             "0 failed priority calls": all(r.ok for r in run.results if r.priority),
-            "registry version never goes back": all(v == sorted(v) for v in seen),
+            "registry changes never go back": all(v == sorted(v) for v in seen),
             "every caller ends on the last edit": final == [start + edits] * 2,
         },
         [
             f"{len(run.results)} calls during 4 restarts and {edits} live edits; "
-            f"failures {run.kinds() or 0}; versions seen {[sorted(set(v)) for v in seen]}"
+            f"failures {run.kinds() or 0}; changes seen {[sorted(set(v)) for v in seen]}"
         ],
     )
 

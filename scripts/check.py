@@ -64,7 +64,7 @@ STEPS: dict[str, Step] = {
     ),
     "tools": Step(
         "Test tooling: provider error table, budget properties, 200-way contention",
-        sources=("tests/unit/providers", "tests/unit/engine", "scripts"),
+        sources=("tests/unit/providers", "scripts"),
         tests=(
             "tests/unit/providers",
             "tests/unit/engine/test_budget_properties.py",
