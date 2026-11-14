@@ -191,6 +191,41 @@ def test_en28_tokens_does_not_import_the_provider_stack() -> None:
     assert out == "False"
 
 
+class FakeEmbedEngine:
+    """Just enough of `Engine` for `embed_partial`: OpenAI model, batch size 1."""
+
+    def __init__(self, bad: set[str]) -> None:
+        from types import SimpleNamespace
+
+        entry = SimpleNamespace(provider="openai", model_id="text-embedding")
+        registry = SimpleNamespace(alias_of=lambda m: m, models={"e": entry})
+        view = SimpleNamespace(registry=registry, value=lambda _a, _n: 1)
+        self.registry = SimpleNamespace(current=view)
+        self.bad = bad
+
+    async def call(self, _alias: str, request: dict[str, Any], **_: Any) -> Any:
+        from llm_queue.engine.envelope import Reply
+
+        text = request["input"][0]
+        item: dict[str, Any] = (
+            {"index": 0} if text in self.bad else {"index": 0, "embedding": [1.0]}
+        )
+        return Reply(request_id=text, ok=True, response={"data": [item]})
+
+
+async def test_en6_unreadable_embedding_body_is_a_call_failure() -> None:
+    """EN-6: a body without vectors raised a raw KeyError and aborted every other batch."""
+    from llm_queue.engine import embed
+    from llm_queue.engine.errors import CallFailed
+
+    engine: Any = FakeEmbedEngine({"b"})
+    vectors, errors = await embed.embed_partial(engine, "e", ["a", "b", "c"])
+    assert vectors == [[1.0], [], [1.0]]
+    assert errors[1].kind == "provider_error"
+    with pytest.raises(CallFailed):
+        await embed.embed(engine, "e", ["a", "b"])
+
+
 class CountingOffload:
     """An offload that counts writes; `fail_put` makes every write raise."""
 

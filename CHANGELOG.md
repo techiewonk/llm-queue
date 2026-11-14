@@ -186,6 +186,9 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   get `result_expired` (EN-4).
 - `S3Offload.get` reads a result as gone only on S3's `NoSuchKey` / `404` error code; any error
   whose text held "404" (a request id, a host) was reported as `result_expired` (EN-11).
+- An embedding reply the parser cannot read is a `CallFailed("provider_error")`; a raw
+  `KeyError` / `ValueError` aborted every batch of `embed_partial` and reached the app outside
+  `LLMQueueError` (EN-6).
 
 ### Security
 
