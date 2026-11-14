@@ -19,6 +19,7 @@ from redis.exceptions import ResponseError
 from llm_queue.engine import runtime
 from llm_queue.engine.envelope import Envelope
 from llm_queue.engine.errors import CallFailed
+from llm_queue.engine.queue import QueueSettings
 from llm_queue.engine.runtime import Engine, EngineSettings
 
 pytestmark = pytest.mark.integration
@@ -242,19 +243,28 @@ async def test_retry_keys_expire_under_the_served_model(
 
 
 async def test_bad_message_uses_the_models_queue_settings(
-    make: Make, store: redis.asyncio.Redis
+    make: Make, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A12: a bad message was failed with default queue settings (10 receives, not the model's)."""
-    engine, _ = await make({"small": {"queue": {"max_receives": 1}}})
+    engine, _ = await make({"small": {"queue": {"max_receives": 2}}})
+    seen: list[QueueSettings] = []
+    real = engine.queues.fail
+
+    async def fail(message: Any, settings: QueueSettings, delay_secs: float = 0.0) -> str:
+        seen.append(settings)
+        return str(await real(message, settings, delay_secs))
+
+    monkeypatch.setattr(engine.queues, "fail", fail)
     name = engine._queue_name(engine.registry.current, "small", False)
     await engine.queues.send(
         name, b"not json", engine._queue_settings(engine.registry.current, "small")
     )
 
-    async def dead() -> bool:
-        return bool((await engine.queues.depth(name))[2] == 1)
+    async def failed() -> bool:
+        return bool(seen)
 
-    await _until(dead, 4)
+    await _until(failed, 4)
+    assert seen[0].max_receives == 2
 
 
 async def test_sweeper_runs_below_one_second(make: Make, monkeypatch: pytest.MonkeyPatch) -> None:
