@@ -111,9 +111,9 @@ class Proxy(FaultProxy):  # type: ignore[misc]  # gates_fleet is a script module
         """The node new connections go to (`a` or `b`)."""
         return self._target
 
-    @target.setter
-    def target(self, node: str) -> None:
-        self.upstream = NODES[node][1]
+    async def move_to(self, node: str) -> None:
+        """Point new connections at `node` (async: the proxy's answer is read in a thread)."""
+        await self.set(upstream=NODES[node][1])
         self._target = node
 
 
@@ -151,7 +151,7 @@ async def _drill(scenario: str, stack: contextlib.AsyncExitStack) -> bool:
     stack.push_async_callback(asyncio.to_thread, proxy.stop)
     await asyncio.to_thread(proxy.start)
     fake = FakeLLM({"defaults": {"latency_ms": {"p50": 150, "p95": 250}}})
-    stack.callback(fake.stop)
+    stack.push_async_callback(asyncio.to_thread, fake.stop)  # its wait off the loop (N7)
     await asyncio.to_thread(fake.start)
     llmq = LLMQueue.from_env(environment(f"llmqfo:{uuid7().hex[-6:]}", fake.url))
     stack.push_async_callback(llmq.stop, drain_secs=1)
@@ -188,13 +188,13 @@ async def _drill(scenario: str, stack: contextlib.AsyncExitStack) -> bool:
         await asyncio.sleep(EVENT_AT_SECS)
         at = f"[{time.monotonic() - started:.1f}s]"
         if scenario == "restart":
-            proxy.refuse = True
+            await proxy.set(refuse=True)
             try:
-                proxy.drop_all()
+                await proxy.drop_all()
                 print(f"  {at} node down: every connection dropped")
                 await asyncio.sleep(OUTAGE_SECS)
             finally:
-                proxy.refuse = False
+                await proxy.set(refuse=False)
             print(f"  [{time.monotonic() - started:.1f}s] node back")
             return
         # In a thread: a blocking call here stalled the drill's own callers mid-traffic.
@@ -202,7 +202,7 @@ async def _drill(scenario: str, stack: contextlib.AsyncExitStack) -> bool:
         print(f"  {at} FAILOVER: a is now a replica")
         if scenario == "slowdns":
             await asyncio.sleep(OUTAGE_SECS)
-        proxy.target = "b"
+        await proxy.move_to("b")
         print(f"  [{time.monotonic() - started:.1f}s] the name now points at b")
 
     await asyncio.gather(traffic(), event())

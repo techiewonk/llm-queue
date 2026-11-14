@@ -93,10 +93,24 @@ async def test_gate_teardown_runs_every_step_when_one_raises() -> None:
     assert done == ["fake", "cleanup", "close"]
 
 
+class FakeProxy:
+    """A `FaultProxy` stand-in: `set(refuse=...)` and `drop_all()` only record."""
+
+    def __init__(self) -> None:
+        """Not refusing."""
+        self.refuse = False
+
+    async def set(self, *, refuse: bool) -> None:
+        self.refuse = refuse
+
+    async def drop_all(self) -> None:
+        return None
+
+
 async def test_pair_turns_the_store_block_off_when_the_other_fault_raises() -> None:
     """The bug: `gather` left store_block running, the proxy refusing during teardown."""
     scenarios: Any = importlib.import_module("scenarios")
-    proxy = types.SimpleNamespace(refuse=False, drop_all=lambda: None)
+    proxy = FakeProxy()
     ctx = types.SimpleNamespace(proxy=proxy, profile=types.SimpleNamespace(fault_secs=30))
 
     async def boom(ctx: Any) -> None:
@@ -128,14 +142,14 @@ async def test_proxy_holds_frozen_bytes_and_switches_faults(
         reader, writer = await asyncio.open_connection("127.0.0.1", proxy.port)
         writer.write(b"a")
         assert await asyncio.wait_for(reader.read(10), 5) == b"a"
-        proxy.freeze = True
+        await proxy.set(freeze=True)
         writer.write(b"b")
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(reader.read(10), 0.3)
-        proxy.freeze = False
+        await proxy.set(freeze=False)
         assert await asyncio.wait_for(reader.read(10), 5) == b"b"
-        proxy.refuse = True
-        proxy.drop_all()
+        await proxy.set(refuse=True)
+        await proxy.drop_all()
         assert await asyncio.wait_for(reader.read(10), 5) == b""
         writer.close()
         refused_r, refused_w = await asyncio.open_connection("127.0.0.1", proxy.port)

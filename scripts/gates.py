@@ -218,7 +218,7 @@ class Gate:
                 await stop_all(self.fleet)
             finally:
                 try:
-                    self.fake.stop()
+                    await asyncio.to_thread(self.fake.stop)  # its wait off the loop (N7)
                 finally:
                     try:
                         self.store.cleanup(self.prefix)
@@ -504,7 +504,7 @@ async def b94() -> bool:
             ]
             await asyncio.sleep(8)
             killed_at = time.monotonic() - run.t0
-            fleet[0].kill()
+            await fleet[0].kill()
             await asyncio.gather(*tasks)
         grants = sorted(r.started for r in run.results if r.ok and r.started > killed_at)
         interval = 60 / rpm if window == "smooth" else 0.5
@@ -546,12 +546,12 @@ async def b95() -> bool:
                 for i in range(500)
             ]
             await asyncio.sleep(5)
-            proxy.refuse = True
-            proxy.drop_all()
+            await proxy.set(refuse=True)
+            await proxy.drop_all()
             try:
                 await asyncio.sleep(45)
             finally:
-                proxy.refuse = False
+                await proxy.set(refuse=False)
             await asyncio.gather(*tasks)
     finally:
         await asyncio.to_thread(proxy.stop)
@@ -871,7 +871,7 @@ async def b23() -> bool:
                         "NO",
                         "ONE",
                     )
-                    proxy.target = "b"  # noqa: B023  # awaited within this iteration
+                    await proxy.move_to("b")  # noqa: B023  # awaited within this iteration
 
                 load = paced(
                     100,
