@@ -189,7 +189,7 @@ async def test_a_cut_stream_fails_the_same_after_the_same_text(both: Any, cut_wi
         for e in seen["aiohttp"]
         if "contentBlockDelta" in e
     )
-    # An abrupt close can lose the buffered chunks (then the reset gets its one quick retry).
+    # An abrupt close can lose the buffered chunks; a body cut gets no quick retry (CL-9).
     assert len(text) == (0 if cut_with == "close" else 64)  # the partial text the caller gets
     assert decisions["aiohttp"][:3] == decisions["botocore"][:3]
 
@@ -329,8 +329,8 @@ async def test_public_endpoints_tls_and_refusals() -> None:
     client = await BedrockHTTP.open(
         region="us-east-1",
         credentials=None,
-        read_timeout=5,
-        connect_timeout=5,
+        read_timeout_secs=5,
+        connect_timeout_secs=5,
         pool_size=10,
         keepalive_secs=15,
     )

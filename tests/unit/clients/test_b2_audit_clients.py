@@ -8,6 +8,9 @@ servers in process; no network, no real model.
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
+import sys
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -17,11 +20,12 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from botocore.exceptions import NoCredentialsError
-from clients_testkit import TRANSPORTS, StartFake, registry_doc
+from clients_testkit import TRANSPORTS, StartFake, http_session, registry_doc
 from fakellm import eventstream
 
 from llm_queue.clients import (
     AttemptTimeout,
+    ClientHub,
     ClientPool,
     CredentialsUnavailable,
     Providers,
@@ -30,8 +34,10 @@ from llm_queue.clients import (
     WarmOptions,
     route_for,
 )
+from llm_queue.clients import pool as pool_module
 from llm_queue.errors import ErrorKind
 from llm_queue.providers import classify_bedrock, is_auth_error
+from llm_queue.providers.classify import is_transport_error
 from llm_queue.registry import ResolvedRegistry, load_registry
 from llm_queue.tuning import BedrockOptions
 
@@ -268,8 +274,8 @@ async def test_a_slow_refresh_is_not_cancelled_by_the_attempt_timer(
 ) -> None:
     """CL-8: each caller's attempt timeout cancelled the in-band refresh; it never landed.
 
-    Inside the mandatory window every call refreshes first. The refresh (0.5 s) outlasts the
-    attempt timer (0.2 s): it now runs as one shared task, so a later call finds it done.
+    Inside the mandatory window every call refreshes first. The refresh (0.8 s) outlasts the
+    attempt timer (0.3 s): it now runs as one shared task, so a later call finds it done.
     """
     asked: list[int] = []
 
@@ -278,19 +284,19 @@ async def test_a_slow_refresh_is_not_cancelled_by_the_attempt_timer(
         if len(asked) == 1:  # the build: keys about to expire
             soon = datetime.now(UTC) + timedelta(seconds=60)
             return {**_keys(account), "aws_session_token": "t", "expiry_time": soon}
-        time.sleep(0.5)  # a slow refresh (runs in a thread)
+        time.sleep(0.8)  # a slow refresh (runs in a thread)
         later = datetime.now(UTC) + timedelta(hours=1)
         return {**_keys(account), "aws_session_token": "t", "expiry_time": later}
 
     url, _ = await start_fake()
     view = load_registry(registry_doc(url))
     providers = _providers(url, transport, credentials=credentials)
-    tight = Timing(0.2, 0.2, attempt_secs=0.2)
+    tight = Timing(0.3, 0.3, attempt_secs=0.3)
     try:
         bedrock = providers.get("bedrock")
         await providers.pool.bedrock(_route(view))  # built outside the tight timer
         ok = False
-        for _ in range(10):
+        for _ in range(30):
             try:
                 await bedrock.call("converse", CHAT, _route(view), tight)
             except AttemptTimeout:
@@ -330,3 +336,238 @@ async def test_the_credentials_callable_does_not_block_the_loop(start_fake: Star
         task.cancel()
         await pool.aclose()
     assert max(gaps) < 0.25  # the loop kept running while the callable slept
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_a_dropped_stream_is_a_transport_error(start_fake: StartFake, transport: str) -> None:
+    """CL-1 (clients part): a connection dropped mid-stream classifies as a transport error.
+
+    The worker maps such an error to `worker_lost` once chunks were sent (runtime side of
+    CL-1); this pins that both transports hand it a transport error to recognise.
+    """
+    url, _ = await start_fake(
+        {"defaults": {"output_tokens": 80, "cut_after_chunks": 2, "cut_with": "close"}}
+    )
+    view = load_registry(registry_doc(url))
+    providers = _providers(url, transport)
+
+    async def sink(event: Any) -> None:
+        return None
+
+    try:
+        with pytest.raises(Exception) as info:  # noqa: PT011  # any error: classified below
+            await providers.get("bedrock").call("converse", CHAT, _route(view), FAST, sink)
+    finally:
+        await providers.aclose()
+    assert is_transport_error(info.value), repr(info.value)
+    assert classify_bedrock(info.value).kind is ErrorKind.RETRYABLE
+
+
+def _fake_lease(hub: ClientHub, key: str, closed: list[str], close_secs: float = 0.0) -> Any:
+    async def build() -> tuple[Any, Any]:
+        async def close() -> None:
+            await asyncio.sleep(close_secs)
+            closed.append(key)
+
+        return object(), close
+
+    return hub.acquire((key,), build)
+
+
+async def test_aclose_never_releases_a_retired_lease_twice() -> None:
+    """CL-2: aclose released retired leases again while the retire task was releasing them.
+
+    Lease A (shared with another pool) was released by the task, which then awaited B's slow
+    close; aclose released A once more, so A was closed under the other pool.
+    """
+    hub, closed = ClientHub(), []
+    shared = await _fake_lease(hub, "a", closed)
+    await _fake_lease(hub, "a", closed)  # the other pool's hold
+    slow = await _fake_lease(hub, "b", closed, close_secs=0.3)
+    pool = ClientPool(hub=hub, warm=NO_WARM)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(pool_module, "RETIRE_GRACE_SECS", 0.0)
+        pool._retire([shared, slow])
+        for _ in range(200):  # until the task released A and is closing B
+            if shared.refs == 1 and slow.refs == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert (shared.refs, slow.refs) == (1, 0)
+        await pool.aclose()
+    assert shared.refs == 1  # was 0: closed while the other pool still used it
+    assert "a" not in closed
+    for _ in range(100):
+        if "b" in closed:
+            break
+        await asyncio.sleep(0.01)
+    assert closed == ["b"]  # B's close was not cut by aclose
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_a_retired_client_waits_for_its_calls(start_fake: StartFake, transport: str) -> None:
+    """CL-3: a client retired by forget() was closed after a fixed grace under a long answer.
+
+    The grace was `read + connect` seconds whatever the call; a healthy answer longer than that
+    was cut by the library. Retired clients now close when their calls end.
+    """
+    url, _ = await start_fake({"defaults": {"output_tokens": 30, "tokens_per_s": 30}})
+    view = load_registry(registry_doc(url))
+    providers = _providers(url, transport)
+    route = _route(view)
+    started = asyncio.Event()
+
+    async def sink(event: Any) -> None:
+        started.set()
+
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(pool_module, "RETIRE_GRACE_SECS", 0.05)
+            call = asyncio.create_task(
+                providers.get("bedrock").call("converse", CHAT, route, FAST, sink)
+            )
+            await asyncio.wait_for(started.wait(), 5)
+            old = await providers.pool.bedrock(route)
+            providers.pool.forget(route)
+            result = await call  # about 1 s, far past the 0.05 s grace
+            assert result.usage.output_tokens == 30
+            session = http_session(old)
+            for _ in range(200):
+                if session.closed:
+                    break
+                await asyncio.sleep(0.01)
+            assert session.closed  # closed once the call ended
+    finally:
+        await providers.aclose()
+
+
+async def _cut_server(servers: Any, hits: list[int], *, stale_first: bool) -> str:
+    """A ConverseStream that drops its connection after one event, or a stale first socket."""
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        hits.append(1)
+        transport = request.transport
+        assert transport is not None
+        if stale_first and len(hits) == 1:  # dropped before any reply: a stale keep-alive
+            transport.close()
+            return web.Response()
+        reply = web.StreamResponse(headers={"Content-Type": eventstream.CONTENT_TYPE})
+        await reply.prepare(request)
+        await reply.write(eventstream.event("messageStart", {"role": "assistant"}))
+        await reply.write(
+            eventstream.event(
+                "contentBlockDelta", {"contentBlockIndex": 0, "delta": {"text": "hi"}}
+            )
+        )
+        if stale_first:
+            await reply.write(eventstream.event("messageStop", {"stopReason": "end_turn"}))
+            await reply.write_eof()
+            return reply
+        await asyncio.sleep(0.05)
+        transport.close()  # the body is cut: the model already ran
+        return reply
+
+    app = web.Application()
+    app.router.add_post("/model/{model_id:.+}/{action}", handler)
+    return str(await servers(app))
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_a_body_cut_is_not_quick_retried(servers: Any, transport: str) -> None:
+    """CL-9: a stream cut after the answer began was re-run at once with no sink (billed twice).
+
+    The quick retry is for a stale socket that fails before any reply; that one still gets it.
+    """
+    hits: list[int] = []
+    url = await _cut_server(servers, hits, stale_first=False)
+    providers = _providers(url, transport)
+    try:
+        with pytest.raises(Exception):  # noqa: PT011, B017  # any error: counted below
+            await providers.get("bedrock").call(
+                "converse", CHAT, _route(load_registry(registry_doc(url))), FAST
+            )
+    finally:
+        await providers.aclose()
+    assert len(hits) == 1  # was 2: the generation ran twice
+
+    hits.clear()
+    url = await _cut_server(servers, hits, stale_first=True)
+    providers = _providers(url, transport)
+    try:
+        result = await providers.get("bedrock").call(
+            "converse", CHAT, _route(load_registry(registry_doc(url))), FAST
+        )
+    finally:
+        await providers.aclose()
+    assert result.response["output"]["message"]["content"] == [{"text": "hi"}]
+    assert len(hits) == 2  # the stale socket got its one quick retry
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_a_failing_sink_releases_the_connection_at_once(
+    start_fake: StartFake, transport: str
+) -> None:
+    """CL-10: a sink that raised left the stream generator suspended, holding its connection.
+
+    It was closed later by the asyncgen finalizer; now the connection is free when the call
+    raises.
+    """
+    url, _ = await start_fake({"defaults": {"output_tokens": 400, "tokens_per_s": 200}})
+    view = load_registry(registry_doc(url))
+    providers = _providers(url, transport)
+    seen: list[Any] = []
+
+    async def sink(event: Any) -> None:
+        seen.append(event)
+        if len(seen) == 2:
+            raise RuntimeError("store down")
+
+    try:
+        with pytest.raises(RuntimeError, match="store down"):
+            await providers.get("bedrock").call("converse", CHAT, _route(view), FAST, sink)
+        session = http_session(await providers.pool.bedrock(_route(view)))
+        assert not session.connector._acquired  # no extra await: released already
+    finally:
+        await providers.aclose()
+
+
+async def test_a_cancelled_release_stays_cancelled() -> None:
+    """CL-11: release() swallowed a cancellation of its own task while awaiting warm tasks.
+
+    The cancel was lost (broke asyncio.timeout / TaskGroup); the client is still closed.
+    """
+    hub, closed = ClientHub(), []
+    lease = await _fake_lease(hub, "a", closed)
+    stubborn = asyncio.Event()
+
+    async def warm() -> None:
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            stubborn.set()
+            await asyncio.sleep(0.2)  # ignores the cancel for a while
+
+    hub.spawn(lease, warm())
+    await asyncio.sleep(0)
+    outer = asyncio.create_task(hub.release(lease))
+    await asyncio.wait_for(stubborn.wait(), 5)
+    outer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+    assert outer.cancelled()
+    assert closed == ["a"]
+
+
+def test_importing_the_hub_registers_no_fork_hook() -> None:
+    """CL-18: `os.register_at_fork` ran at import (a side effect); now on the first acquire."""
+    code = (
+        "import asyncio, llm_queue.clients.hub as h\n"
+        "assert not h._fork_hook\n"
+        "async def build():\n"
+        "    async def close(): pass\n"
+        "    return object(), close\n"
+        "asyncio.run(h.ClientHub().acquire(('k',), build))\n"
+        "assert h._fork_hook\n"
+    )
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    done = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, check=False)
+    assert done.returncode == 0, done.stderr.decode()

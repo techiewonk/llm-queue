@@ -7,6 +7,10 @@ botocore's `SigV4Auth`, POSTed on the client's own aiohttp session and parsed wi
 stream frames go through botocore's `EventStreamBuffer` (CRC-checked). Errors are botocore
 `ClientError` / `EventStreamError` with the response dict botocore builds, so
 `classify_bedrock` reads both transports the same way.
+
+Why it is the default (measured on fakellm, 0.1.0b2, three runs of 3-4 alternating rounds):
+Converse at 20 / 200 concurrent calls +78-104 % calls/s, client CPU per call -55-61 %, p99
+-27-44 %; stream first event -18-23 %; memory per client 669 -> 87 KiB (CHANGELOG.md).
 """
 
 from __future__ import annotations
@@ -127,7 +131,11 @@ def _text_blobs(request: Mapping[str, Any]) -> bool:
 
 
 def _with_text_blobs_encoded(request: dict[str, Any]) -> dict[str, Any]:
-    """A copy of `request` whose text blob members are bytes (sent base64-encoded)."""
+    """A copy of `request` whose text blob members are bytes (sent base64-encoded).
+
+    Rare (only a text `bytes` member): the deep copy is not measured (unverified cost); it keeps
+    the caller's request unchanged.
+    """
     copy = deepcopy(request)
     for message in copy.get("messages") or ():
         content = message.get("content") if isinstance(message, dict) else None
@@ -299,8 +307,8 @@ class BedrockHTTP:
         region: str,
         credentials: Any,
         endpoint_url: str | None = None,
-        read_timeout: float,
-        connect_timeout: float,
+        read_timeout_secs: float,
+        connect_timeout_secs: float,
         pool_size: int,
         keepalive_secs: float,
     ) -> BedrockHTTP:
@@ -313,7 +321,9 @@ class BedrockHTTP:
         connector = aiohttp.TCPConnector(limit=pool_size, keepalive_timeout=keepalive_secs, ssl=tls)
         session = aiohttp.ClientSession(
             connector=connector,
-            timeout=aiohttp.ClientTimeout(sock_connect=connect_timeout, sock_read=read_timeout),
+            timeout=aiohttp.ClientTimeout(
+                sock_connect=connect_timeout_secs, sock_read=read_timeout_secs
+            ),
             auto_decompress=False,
             headers={"User-Agent": _USER_AGENT, "Accept-Encoding": "identity"},
         )

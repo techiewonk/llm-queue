@@ -279,6 +279,23 @@ def is_connection_reset(exc: BaseException) -> bool:
     return False
 
 
+# A body cut while it was being read: the request reached the model (CL-9). aiobotocore wraps
+# the aiohttp error in `ConnectionClosedError` / `ResponseStreamingError`; the chain keeps it.
+_BODY_CUT: dict[str, tuple[str, ...]] = {
+    "aiohttp": ("ClientPayloadError",),
+    "botocore.exceptions": ("ResponseStreamingError",),
+}
+
+
+def is_body_cut(exc: BaseException) -> bool:
+    """True when the connection dropped while the reply body was read (the model already ran).
+
+    Such a failure is still a reset for classification, but no quick retry: the generation
+    ran and was billed, so running it again at once doubled it (CL-9).
+    """
+    return any(_is_any(err, _BODY_CUT) for err in _chain(exc))
+
+
 def _chain(exc: BaseException) -> list[BaseException]:
     """The error and its causes (`__cause__`, else `__context__`), at most 8 deep."""
     out: list[BaseException] = []

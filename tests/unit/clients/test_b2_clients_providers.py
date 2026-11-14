@@ -7,6 +7,7 @@ choices / reasoning / logprobs were dropped, cached tokens were counted twice.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
@@ -129,6 +130,10 @@ class _OnePool:
 
     async def bedrock(self, route: Any) -> Any:
         return self.client
+
+    @contextlib.asynccontextmanager
+    async def borrow_bedrock(self, route: Any) -> AsyncIterator[Any]:
+        yield self.client
 
 
 @pytest.mark.parametrize(("failures", "ok"), [(1, True), (2, False)])
