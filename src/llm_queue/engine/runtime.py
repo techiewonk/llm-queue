@@ -1211,10 +1211,13 @@ class Engine:
 
         Idle, it blocks on its queues' doorbell (a send wakes one worker at once) for 50 ms at a
         time, then 1 s after a second with nothing: polling idle loops made ~96 receive
-        scripts/s per pod with 4 models (measured); a busy loop never waits.
+        scripts/s per pod with 4 models (measured); a busy loop never waits. With no free worker
+        slot it waits for one (`_run` wakes it), not on the doorbell; a token it took but cannot
+        serve (no slot, or that class held) goes back, so another pod's worker wakes for it.
         """
         empty = 0
         wake = self._wake.setdefault(alias, asyncio.Event())
+        rung: str | None = None  # the queue whose doorbell token this loop took last
         while not self._stopping:
             if alias not in self.registry.current.registry.models:
                 return  # removed by a reload; `_sync_model_loops` starts it again if it returns
@@ -1231,6 +1234,16 @@ class Engine:
                     self._store_trouble("receive")
                 await asyncio.sleep(1)
                 continue
+            view = self.registry.current
+            names = {self._queue_name(view, alias, p): "p" if p else "n" for p in (True, False)}
+            if (
+                rung is not None
+                and not got
+                and (got is None or (alias, names.get(rung)) in self._held_class)
+            ):
+                with contextlib.suppress(*STORE_ERRORS):
+                    await self.queues.ring_again(rung)
+            rung = None
             held = (alias, "p") in self._held_class or (alias, "n") in self._held_class
             # Idle only when the queues were empty, not when a class waits on its held call.
             empty = 0 if got or held else empty + 1
@@ -1239,19 +1252,22 @@ class Engine:
                 pause = (
                     pace.idle_poll_secs if empty < pace.idle_after_empty else pace.idle_slow_secs
                 )
-                if held:  # a held call ending (granted or settled) wakes it at once
+                if held or got is None:  # a held call ending, or a slot freed, wakes it at once
                     with contextlib.suppress(TimeoutError):
                         await asyncio.wait_for(wake.wait(), pause)
                 else:  # a send rings the doorbell: one idle worker wakes per call
-                    view = self.registry.current
-                    names = [self._queue_name(view, alias, p) for p in (True, False)]
                     try:
-                        await self.queues.wait_bell(names, pause)
+                        rung = await self.queues.wait_bell(list(names), pause)
                     except STORE_ERRORS:
                         self._store_trouble("bell")  # (was swallowed unseen)
                 wake.clear()
 
-    async def _receive_once(self, alias: str) -> bool:
+    async def _receive_once(self, alias: str) -> bool | None:
+        """Receive and admit this model's next calls: True if any came, None with no free slot.
+
+        One script reads the priority queue, then the normal one (classes waiting on a held
+        call are skipped): two round trips per poll before.
+        """
         view = self.registry.current
         if alias not in view.registry.models:
             await asyncio.sleep(1)
@@ -1259,38 +1275,31 @@ class Engine:
         slots = self._slots[alias]
         free = slots._value  # free worker slots of this model, read only
         if free <= 0:
-            await asyncio.sleep(0.02)
-            return False
+            return None
         settings = self._queue_settings(view, alias)
-        got_any = False
-        for priority in (True, False):
-            cls = "p" if priority else "n"
-            if (alias, cls) in self._held_class:
-                continue
-            name = self._queue_name(view, alias, priority)
-            messages, dead = await self.queues.receive(
-                name, min(free, self.settings.receive_batch), settings
-            )
-            for letter in dead:
-                await self._dead_lettered(letter.body)
-            if not messages:
-                continue
-            got_any = True
-            for index, message in enumerate(messages):
-                try:
-                    held = await self._admit_new(alias, message)
-                except Exception:
-                    for rest in messages[index + 1 :]:  # not seen: back to the queue now
-                        with contextlib.suppress(Exception):
-                            await self.queues.return_(rest)
-                    raise
-                if held:
-                    for rest in messages[index + 1 :]:
+        names = [
+            self._queue_name(view, alias, priority)
+            for priority in (True, False)
+            if (alias, "p" if priority else "n") not in self._held_class
+        ]
+        messages, dead = await self.queues.receive_first(
+            names, min(free, self.settings.receive_batch), settings
+        )
+        for letter in dead:
+            await self._dead_lettered(letter.body)
+        for index, message in enumerate(messages):
+            try:
+                held = await self._admit_new(alias, message)
+            except Exception:
+                for rest in messages[index + 1 :]:  # not seen: back to the queue now
+                    with contextlib.suppress(Exception):
                         await self.queues.return_(rest)
-                    break
-            if got_any:
+                raise
+            if held:
+                for rest in messages[index + 1 :]:
+                    await self.queues.return_(rest)
                 break
-        return got_any
+        return bool(messages)
 
     def _queue_settings(self, view: ResolvedRegistry, alias: str) -> QueueSettings:
         queue = view.value(alias, "queue")
@@ -1891,6 +1900,9 @@ class Engine:
             await self._release(held)
             if held.message is None:
                 raise
+        finally:
+            if slots is not None and (event := self._wake.get(held.envelope.model)) is not None:
+                event.set()  # a worker slot is free: the model's loop receives at once
 
     async def _attempts(self, held: _Held, decision: Decision, attempt: int, alias: str) -> None:
         throttles = 0
@@ -2322,15 +2334,20 @@ class Engine:
         while True:
             await asyncio.sleep(5)
             try:
-                view = self.registry.current
-                for alias in view.registry.models:
-                    lock = await self.state.set(
-                        f"{self.keys.prefix}:lock:probe:{alias}", self.worker_id, nx=True, ex=5
-                    )
-                    if lock:
-                        await self.probe_due(alias)
+                # One lock for every model (one SET per model per 5 s from every pod before).
+                lock = await self.state.set(
+                    f"{self.keys.prefix}:lock:probe", self.worker_id, nx=True, ex=5
+                )
             except Exception as exc:
                 logger.warning("prober_failed", error=str(exc))
+                continue
+            if not lock:
+                continue
+            for alias in self.registry.current.registry.models:
+                try:
+                    await self.probe_due(alias)
+                except Exception as exc:  # one model's failure does not skip the others
+                    logger.warning("prober_failed", model=alias, error=str(exc))
 
     async def probe_due(self, alias: str) -> dict[str, str]:
         """Probe every disabled deployment of a model that is due; their outcomes."""
@@ -2723,21 +2740,27 @@ class Engine:
                 self._store_trouble("heartbeat")
                 beat = 1.0  # renew the caller key as soon as the store is back
             view = self.registry.current
+            holds: list[tuple[Message, float]] = []
             for held in list(self._held.values()):
                 if held.message is None:
                     continue
-                self._beat_ran_at = time.monotonic()  # progress, even on a slow store (O2)
                 try:
                     visibility = float(view.value(held.envelope.model, "queue")["visibility_secs"])
-                    beat = min(beat, visibility / 3)
-                    await self.queues.extend(held.message, visibility)
-                except Exception as exc:
+                except Exception as exc:  # e.g. a model removed by a reload: skip only this one
                     logger.warning(
                         "heartbeat_failed",
                         step="extend",
                         request_id=held.envelope.request_id,
                         error=str(exc),
                     )
+                    continue
+                beat = min(beat, visibility / 3)
+                holds.append((held.message, visibility))
+            self._beat_ran_at = time.monotonic()  # progress, even on a slow store (O2)
+            try:
+                await self.queues.extend_many(holds)  # every hold in one call
+            except Exception as exc:
+                logger.warning("heartbeat_failed", step="extend", error=str(exc))
             try:
                 await self.clock.sync(self.state)
                 await self._check_epoch()
