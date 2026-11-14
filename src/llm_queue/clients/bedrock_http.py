@@ -37,6 +37,7 @@ from botocore.httpsession import ProxyConfiguration, create_urllib3_context, get
 from yarl import URL
 
 from llm_queue._version import __version__
+from llm_queue.providers.classify import StreamTruncated
 
 SIGNING_NAME = "bedrock"  # bedrock-runtime signs as "bedrock"
 _USER_AGENT = f"llm-queue/{__version__} aiohttp/{aiohttp.__version__}"
@@ -183,6 +184,18 @@ def client_error(status: int, headers: dict[str, str], body: bytes, operation: s
     return ClientError(response, operation)
 
 
+def _loads(data: bytes, what: str) -> Any:
+    """Parse JSON from the wire; garbage (a gateway's HTML page, a cut frame) is retryable.
+
+    `StreamTruncated` instead of `orjson.JSONDecodeError`, which classified FATAL and was never
+    retried (CL-13); the cause keeps the parser's detail.
+    """
+    try:
+        return orjson.loads(data) if data else {}
+    except orjson.JSONDecodeError as exc:
+        raise StreamTruncated(f"the Bedrock {what} is not JSON") from exc
+
+
 def _event(message: EventStreamMessage) -> dict[str, Any] | None:
     """One ConverseStream frame as botocore yields it: `{event_type: payload}`.
 
@@ -195,12 +208,12 @@ def _event(message: EventStreamMessage) -> dict[str, Any] | None:
         event_type = headers.get(":event-type")
         if event_type not in _EVENTS:
             return None
-        payload = orjson.loads(message.payload) if message.payload else {}
+        payload = _loads(message.payload, "stream event")
         if event_type == "contentBlockDelta":
             _decode_blobs((payload.get("delta"),))
         return {event_type: payload}
     if kind == "exception":
-        body = orjson.loads(message.payload) if message.payload else {}
+        body = _loads(message.payload, "stream exception")
         error = {
             "Code": headers.get(":exception-type", ""),
             "Message": body.get("Message", body.get("message", "")),
@@ -371,7 +384,7 @@ class BedrockHTTP:
         except BaseException:
             response.close()
             raise
-        reply: dict[str, Any] = orjson.loads(data) if data else {}
+        reply: dict[str, Any] = _loads(data, "Converse reply")
         _decode_blobs(((reply.get("output") or {}).get("message") or {}).get("content"))
         reply["ResponseMetadata"] = _metadata(response.status, _headers(response))
         return reply

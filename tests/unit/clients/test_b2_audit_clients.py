@@ -13,7 +13,8 @@ from typing import Any
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
-from clients_testkit import registry_doc
+from clients_testkit import TRANSPORTS, registry_doc
+from fakellm import eventstream
 
 from llm_queue.clients import ClientPool, Providers, Route, Timing, WarmOptions, route_for
 from llm_queue.errors import ErrorKind
@@ -107,3 +108,58 @@ async def test_a_redirect_is_never_followed(servers: Any, status: int, transport
         await providers.aclose()
     assert not seen  # the other host never got the signed request
     assert (found.kind, found.code) == (ErrorKind.FATAL, str(status))
+
+
+def _broken_frame() -> bytes:
+    """A ConverseStream event whose message CRC is wrong (corrupted on the wire)."""
+    frame = bytearray(eventstream.event("messageStart", {"role": "assistant"}))
+    frame[-1] ^= 0xFF
+    return bytes(frame)
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_a_corrupt_stream_frame_is_retryable(servers: Any, transport: str) -> None:
+    """CL-13: a frame failing its CRC check classified FATAL on both transports (no retry)."""
+
+    async def corrupt(request: web.Request) -> web.StreamResponse:
+        reply = web.StreamResponse(headers={"Content-Type": eventstream.CONTENT_TYPE})
+        await reply.prepare(request)
+        await reply.write(_broken_frame())
+        await reply.write_eof()
+        return reply
+
+    app = web.Application()
+    app.router.add_post("/model/{model_id:.+}/{action}", corrupt)
+    url = await servers(app)
+    providers = _providers(url, transport)
+    try:
+        bedrock = providers.get("bedrock")
+        route = _route(load_registry(registry_doc(url)))
+        with pytest.raises(Exception) as info:  # noqa: PT011  # any error: classified below
+            await bedrock.call("converse", CHAT, route, FAST)
+        assert bedrock.classify(info.value).kind is ErrorKind.RETRYABLE
+    finally:
+        await providers.aclose()
+
+
+async def test_a_reply_that_is_not_json_is_retryable(servers: Any) -> None:
+    """CL-13: a 200 with a gateway's HTML page raised `orjson.JSONDecodeError`: FATAL, no retry.
+
+    aiohttp transport only: botocore's parser turns a non-JSON 200 into `{"message": ...}`.
+    """
+
+    async def html(request: web.Request) -> web.Response:
+        return web.Response(text="<html>gateway</html>", content_type="application/json")
+
+    app = web.Application()
+    app.router.add_post("/model/{model_id:.+}/{action}", html)
+    url = await servers(app)
+    providers = _providers(url, "aiohttp")
+    try:
+        bedrock = providers.get("bedrock")
+        route = _route(load_registry(registry_doc(url)))
+        with pytest.raises(Exception) as info:  # noqa: PT011  # any error: classified below
+            await bedrock.call("converse", CHAT, route, PLAIN)
+        assert bedrock.classify(info.value).kind is ErrorKind.RETRYABLE
+    finally:
+        await providers.aclose()
