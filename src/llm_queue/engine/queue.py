@@ -155,29 +155,94 @@ return {taken, gone, now}
 """
 )
 
-# KEYS: the keys of several queues (7 each), in order of preference. ARGV as RECEIVE. Receives
-# from the first queue that has messages (a model's priority queue, then its normal one: one
-# round trip, not two). Reply: {queue index from 1 (0: none), taken, dead {index, id, body,
-# ...} of every queue read, the store's time in ms}.
+# KEYS: the keys of several queues (7 each), in order of preference. ARGV as RECEIVE, then the
+# claim key ('' for none) and this receive's nonce. Receives from the first queue that has
+# messages (a model's priority queue, then its normal one: one round trip, not two). Reply:
+# {queue index from 1 (0: none), taken, dead {index, id, body, ...} of every queue read, the
+# store's time in ms}.
+#
+# The claim (a list: nonce, the queue's key base, id, generation, ...; it lives one visibility
+# time) records what this receive took for its receiver. A receive whose reply was lost (a cut
+# connection) left its messages hidden for the whole visibility timeout: run again with the
+# same nonce (redis-py's retry) it hands back the same messages, and `RECLAIM` returns them to
+# the queue at once (scenario S11). Key names come from data here, as in the admission scripts
+# (the single-primary store the library supports).
 RECEIVE_FIRST = (
     _NOW
     + _DLQ
     + _RECEIVE_FN
     + """
+local claim, nonce, vis_ms = ARGV[5] or '', ARGV[6] or '', tonumber(ARGV[2])
+if claim ~= '' then
+  local prior = redis.call('LRANGE', claim, 0, -1)
+  if prior[1] == nonce then
+    for q = 1, #KEYS / 7 do
+      local K = {}
+      for i = 1, 7 do K[i] = KEYS[(q - 1) * 7 + i] end
+      if K[1] == prior[2] .. 's' then
+        local taken = {}
+        for i = 3, #prior, 2 do
+          local id, gen = prior[i], prior[i + 1]
+          if redis.call('HGET', K[3], id) == gen and redis.call('HGET', K[5], id) == 'h' then
+            local entry = redis.call('XRANGE', K[1], id, id)
+            if #entry > 0 then
+              redis.call('ZADD', K[2], now + vis_ms, id)
+              table.insert(taken, id)
+              table.insert(taken, gen)
+              table.insert(taken, entry[1][2][2])
+            end
+          end
+        end
+        if #taken > 0 then return {q, taken, {}, now} end
+        return {0, {}, {}, now}
+      end
+    end
+  end
+end
 local dead = {}
 for q = 1, #KEYS / 7 do
   local K = {}
   for i = 1, 7 do K[i] = KEYS[(q - 1) * 7 + i] end
-  local taken, gone = receive(K, tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]),
+  local taken, gone = receive(K, tonumber(ARGV[1]), vis_ms, tonumber(ARGV[3]),
     tonumber(ARGV[4]))
   for i = 1, #gone, 2 do
     table.insert(dead, q)
     table.insert(dead, gone[i])
     table.insert(dead, gone[i + 1])
   end
-  if #taken > 0 then return {q, taken, dead, now} end
+  if #taken > 0 then
+    if claim ~= '' then
+      redis.call('DEL', claim)
+      redis.call('RPUSH', claim, nonce, string.sub(K[1], 1, -2))
+      for i = 1, #taken, 3 do redis.call('RPUSH', claim, taken[i], taken[i + 1]) end
+      redis.call('PEXPIRE', claim, vis_ms)
+    end
+    return {q, taken, dead, now}
+  end
 end
 return {0, {}, dead, now}
+"""
+)
+
+# ARGV: claim key, nonce. The receive with this nonce lost its reply: each message it took that
+# is still under that receipt is visible again now, with no failure (as RETURN). Reply: how many.
+RECLAIM = (
+    _NOW
+    + """
+local prior = redis.call('LRANGE', ARGV[1], 0, -1)
+if prior[1] ~= ARGV[2] then return 0 end
+local base, n = prior[2], 0
+for i = 3, #prior, 2 do
+  local id, gen = prior[i], prior[i + 1]
+  if redis.call('HGET', base .. 'gen', id) == gen then
+    redis.call('HINCRBY', base .. 'gen', id, 1)
+    redis.call('HSET', base .. 'st', id, 'r')
+    redis.call('ZADD', base .. 'vis', now, id)
+    n = n + 1
+  end
+end
+redis.call('DEL', ARGV[1])
+return n
 """
 )
 
@@ -388,6 +453,7 @@ class StreamQueues:
         self._redrive = client.register_script(REDRIVE)
         self._trim_dead = client.register_script(TRIM_DEAD)
         self._ring = client.register_script(RING)
+        self._reclaim = client.register_script(RECLAIM)
 
     async def _send_and_wait(
         self, queue: str, args: list[bytes | int | str], replicas: int, wait_ms: int
@@ -475,17 +541,25 @@ class StreamQueues:
         return _messages(queue, taken, int(now)), letters
 
     async def receive_first(
-        self, queues: Sequence[str], count: int, settings: QueueSettings
+        self,
+        queues: Sequence[str],
+        count: int,
+        settings: QueueSettings,
+        *,
+        claim: tuple[str, str] | None = None,
     ) -> tuple[list[Message], list[DeadLetter]]:
         """`receive` from the first of `queues` that has messages, in one round trip.
 
         A model's worker reads its priority queue, then its normal one: two scripts per poll
-        before. Dead letters of every queue read come back too.
+        before. Dead letters of every queue read come back too. `claim` (key, nonce): record
+        what was taken there, so a receive whose reply is lost can be `reclaim`ed (see
+        RECEIVE_FIRST); one key per receiving loop, each receive with a new nonce.
         """
         if not queues:
             return [], []
         keys = [key for queue in queues for key in self.queue_keys(queue)]
-        index, taken, dead, now = await self._receive_first(keys, _receive_args(count, settings))
+        args: list[int | str] = [*_receive_args(count, settings), *(claim or ("", ""))]
+        index, taken, dead, now = await self._receive_first(keys, args)
         letters = [
             DeadLetter(queues[int(dead[i]) - 1], _text(dead[i + 1]), _bytes(dead[i + 2]))
             for i in range(0, len(dead), 3)
@@ -493,6 +567,18 @@ class StreamQueues:
         if not int(index):
             return [], letters
         return _messages(queues[int(index) - 1], taken, int(now)), letters
+
+    def claim_key(self, receiver: str) -> str:
+        """The claim of one receiving loop (`receive_first`'s `claim`), e.g. worker and model."""
+        return f"{self.keys.prefix}:rcv:{receiver}"
+
+    async def reclaim(self, key: str, nonce: str) -> int:
+        """Return to the queue, now, what the receive `nonce` took (its reply was lost).
+
+        Safe with receipts: only a message still under the receipt that receive gave is
+        returned (generation + 1, as RETURN); one received again since is left alone.
+        """
+        return int(await self._reclaim([], [key, nonce]))
 
     async def receive_wait(
         self, queue: str, count: int, settings: QueueSettings, wait_secs: float
@@ -614,7 +700,7 @@ class StreamQueues:
         await self._client.delete(*[k for name in names for k in self.queue_keys(name)])
 
 
-def _receive_args(count: int, settings: QueueSettings) -> list[int]:
+def _receive_args(count: int, settings: QueueSettings) -> list[int | str]:
     return [
         count,
         int(settings.visibility_secs * 1000),

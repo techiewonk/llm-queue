@@ -70,6 +70,8 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   to it); it said only "was stopped; build a new one". The queue cannot be started again: build
   a new one. A `start()` from a second event loop while one runs is an `LLMQueueError`, not
   asyncio's `RuntimeError`.
+- `stream()` on a model that is not a chat model raises `CallFailed("invalid_request")`, not
+  `ConfigError` (that is for start-up and refused registry edits) (RT-28).
 - Performance: <!-- filled at release -->
 
 ### Added
@@ -191,8 +193,7 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 - A message from a newer library was taken again every 5 s with a log line each time; it now
   goes back for 15 s with no failure counted, a metric and one warning a minute.
 - The message size cap is checked in the engine, so sync calls, streams, embeddings, jobs and
-  the LangChain adapters all meet it; `converse_stream` on an embedding model raises
-  `ConfigError`.
+  the LangChain adapters all meet it; `converse_stream` on an embedding model is refused.
 - A stream's open and its first event share one first-response budget (a slow open gave the
   first event a whole budget again); a Bedrock stream cut mid-body (`ClientPayloadError`)
   counts as a connection reset.
@@ -290,7 +291,50 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   ran it. FAIL now ends its receipt (generation + 1, like RETURN), so a replay is `stale` and
   one failure is counted, not two. A replayed RECEIVE still takes a second batch (the first is
   hidden for the visibility time and charged one failure) and a replayed plain SEND appends
-  twice; both are rare and bounded, and are documented in `store_client.py` (EN-5).
+  twice; both are rare and bounded, and are documented in `store_client.py` (EN-5). The worker's
+  receive is now safe: see S11 below.
+- A receive whose reply was lost (a connection cut after the store ran it) hid its messages
+  for the whole visibility timeout (60 s), and a replayed one took a second batch. The worker's
+  receive records its batch under a nonce: a replay hands back the same messages, and the next
+  round returns a lost batch to the queue at once, receipt-checked (S11, EN-5).
+- A direct call (kill switch, `queue_pct`, `force_direct`, queue-store failover) whose run
+  failed (a store refusal, missing admission numbers) waited until its deadline and got
+  `deadline_exceeded`; the caller now gets the real error at once (RT-1).
+- Calls cancelled by the app each started a cleanup task with three store calls and no
+  timeout: many cancels during a store outage made a connection storm. One canceller per
+  process now cancels them in pipelined batches, bounded by the probe timer and logged (RT-3).
+- Closing a stream swallowed the consumer's own cancel, and a cancelled stream left a pending
+  chunk getter (RT-4, RT-25).
+- `stop()` returns held calls together under the drain deadline and stops their hold tasks
+  (one more round could run a call already handed back), waits for the drain's give-backs
+  before the clients close, cancels the registry reload, can itself be cancelled, logs a loop
+  that died, and closes each part even when one fails. `aclose()` closes every client and
+  raises the first failure (RT-5, RT-6, RT-7, CO-1).
+- A call let go while its admission was in flight (`held_call_stuck`) could still start a run
+  whose grant nobody renewed; the grant now goes straight back. SWEEP also removes leases past
+  their end whose in-progress entry already expired: they stayed for good on a deployment no
+  call picked again (scenario L4).
+- One failed dead-letter reply skipped the whole received batch, and one failed return
+  stranded the rest (RT-8). A failed abandon after a failed send replaced the send's error (a
+  cancel became a store error) (RT-9). A failed status write after a model-fallback grant left
+  the grant unrun (RT-10). A refused FINISH, or a failed debug-capture write, after a success
+  ran the call again (RT-11, RT-12).
+- `start()` is bounded on a dead store (it waited connect timeouts times retries) and never
+  raises a raw store refusal (RT-13). Calls paused on `store_down` resume spread over half a
+  second, not in one tick (RT-14). Store retries use full jitter (0.1 s doubling to 1 s; the
+  effect on reconnect storms is unverified) instead of fixed 0.25 / 0.5 s pauses (RT-15).
+- A reload removing a granted deployment raised `StopIteration` mid-call (RT-16); an
+  `expired` id found on re-registration waited out its deadline (RT-17); caller errors carry
+  the request id (RT-18); `store_down: static_cap` classifies provider errors and stops on a
+  request error with its own kind (RT-19); any error building a call's admission request fails
+  it as `invalid_request` instead of re-running it (EN-2); a corrupt registry counter during a
+  call's reload is logged, never raised into the call (CO-9).
+- A live `worker_slots` edit is warned about once (it needs a restart) (RT-23); the probe lock
+  is held for each probe's budget, so two pods no longer probe one deployment at once (RT-27);
+  heartbeat steps fail on their own (RT-33); silent `suppress(Exception)` blocks now log
+  (RT-24); the `model_unavailable` diagnosis reads every breaker in one round trip (RT-31);
+  registry reload failures are counted (`llmq_registry_reload_errors_total`, CO-4); OpenAI
+  routes are checked for missing secrets at start (CL-6).
 
 ### Performance
 

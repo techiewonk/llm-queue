@@ -36,6 +36,7 @@ from llm_queue.registry.validate import RegistryError, check
 if TYPE_CHECKING:
     import redis.asyncio
 
+    from llm_queue.engine.metrics import Metrics
     from llm_queue.registry.schema import Registry
 
 logger = get_logger(__name__)
@@ -401,6 +402,8 @@ class RegistryStore:
         self._edit = client.register_script(_lua.EDIT)
         self._current: ResolvedRegistry | None = None
         self._changes = -1
+        # The engine's metrics sink (set by `Engine`): reload failures are counted (CO-4).
+        self.metrics: Metrics | None = None
         self._version = 0
         self.invalid_count = 0
         self.stored_refused = False
@@ -612,8 +615,11 @@ class RegistryStore:
             f"the registry kept changing during a publish ({tries} tries); try again"
         )
 
-    def _run_on_config(self) -> ResolvedRegistry:
-        """Run on this process's own document (the stored one is unreachable or refused)."""
+    def run_on_config(self) -> ResolvedRegistry:
+        """Run on this process's own document (the stored one is unreachable or refused).
+
+        Also the engine's fallback when `boot` runs out of time at start (a blackholed store).
+        """
         assert self.config is not None
         registry, errors, warnings = check(self.config, allowed_hosts=self._hosts)
         if registry is None:
@@ -636,10 +642,10 @@ class RegistryStore:
             await self.publish(self.config, actor=actor or process_actor("boot"))
         except (RedisError, OSError) as exc:
             logger.warning("registry_store_unreachable_at_boot", error=str(exc))
-            return self._run_on_config()
+            return self.run_on_config()
         if self._current is None:
             logger.error("registry_stored_refused_running_on_config", lib_too_old=self.lib_too_old)
-            return self._run_on_config()
+            return self.run_on_config()
         return self.current
 
     # ---------------------------------------------------------------- live edits
@@ -909,6 +915,7 @@ class RegistryStore:
             except (RedisError, OSError, ConfigError) as exc:
                 failures += 1
                 logger.warning("registry_reload_failed", error=repr(exc), failures=failures)
+                self._count_reload_error(exc)
             except Exception as exc:
                 # Anything else (a corrupt meta counter, a bug in a check) ended the task for
                 # good, silently: the pod never saw a live edit or kill switch again (CO-4).
@@ -916,7 +923,17 @@ class RegistryStore:
                 logger.error(
                     "registry_reload_failed", error=repr(exc), failures=failures, exc_info=True
                 )
+                self._count_reload_error(exc)
             await self._sleep(_reload_wait(interval_secs, failures))
+
+    def _count_reload_error(self, exc: BaseException) -> None:
+        """Count a failed reload by error type; a failing sink never stops the loop."""
+        if self.metrics is None:
+            return
+        try:
+            self.metrics.count("llmq_registry_reload_errors_total", error=type(exc).__name__)
+        except Exception as sink_exc:
+            logger.debug("registry_metric_failed", error=str(sink_exc))
 
 
 def _removed_models(stored: Mapping[str, Any] | None, registry: Registry) -> list[str]:

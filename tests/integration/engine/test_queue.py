@@ -152,3 +152,43 @@ async def test_receive_wait_returns_when_a_message_arrives(
     assert [m.body for m in messages] == [b"x"]
     empty, _ = await queues.receive_wait("q", 1, FAST, wait_secs=0.1)
     assert empty == []
+
+
+SLOW_VIS = QueueSettings(visibility_secs=60, max_receives=3, max_waiting=0)
+
+
+async def test_s11_a_lost_receive_is_reclaimed(store: redis.asyncio.Redis, prefix: str) -> None:
+    """Scenario S11: a receive whose reply was lost left its messages hidden for 60 s.
+
+    Its receiver now returns them to the queue at once (receipt-checked), and a message taken
+    by another receive since is left alone.
+    """
+    queues = await _filled(store, prefix, 3)
+    key = queues.claim_key("w1:model")
+    lost, _ = await queues.receive_first(["q"], 2, SLOW_VIS, claim=(key, "n1"))  # reply "lost"
+    assert [m.body for m in lost] == [b"m0", b"m1"]
+    assert await queues.reclaim(key, "other") == 0  # another receive's nonce: nothing
+    assert await queues.reclaim(key, "n1") == 2
+    again, _ = await queues.receive_first(["q"], 3, SLOW_VIS)
+    assert [m.body for m in again] == [b"m0", b"m1", b"m2"]  # visible now, in place
+    for message in lost:
+        assert not await queues.ack(message)  # the lost receipts are stale
+    assert await queues.reclaim(key, "n1") == 0  # once
+
+
+async def test_s11_a_retried_receive_hands_back_the_same_messages(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """Scenario S11: redis-py re-ran a receive whose reply was cut; the first batch was lost.
+
+    Run again with the same nonce, the receive returns what it took, and takes nothing new.
+    """
+    queues = await _filled(store, prefix, 4)
+    key = queues.claim_key("w1:model")
+    first, _ = await queues.receive_first(["q"], 2, SLOW_VIS, claim=(key, "n1"))
+    retry, _ = await queues.receive_first(["q"], 2, SLOW_VIS, claim=(key, "n1"))
+    assert [(m.id, m.generation) for m in retry] == [(m.id, m.generation) for m in first]
+    fresh, _ = await queues.receive_first(["q"], 5, SLOW_VIS, claim=(key, "n2"))
+    assert [m.body for m in fresh] == [b"m2", b"m3"]
+    for message in retry + fresh:
+        assert await queues.ack(message)

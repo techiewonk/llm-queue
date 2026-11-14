@@ -773,8 +773,9 @@ return done
 """
 )
 
-# req: {alias}. Remove in-progress entries whose owner stopped renewing (the dead worker's
-# estimate stays charged for that minute; plan §3.18). Reply: how many were removed.
+# req: {alias, deps}. Remove in-progress entries whose owner stopped renewing (the dead worker's
+# estimate stays charged for that minute; plan §3.18), and lapsed leases of the deployments
+# `deps`. Reply: how many were removed.
 SWEEP = (
     _COMMON
     + r"""
@@ -798,6 +799,15 @@ for _, owner in ipairs(redis.call('ZRANGEBYSCORE', inprog, '-inf', now, 'LIMIT',
     end
   end
   removed = removed + 1
+end
+-- Leases past their end whose entry was gone (it expires after two leases: a store block or a
+-- sweep gap that long) were never removed above, and stayed for good on a deployment no call
+-- picked again (scenario L4 left leases). A lease's score is its end: past it, nobody holds it.
+for _, dep in ipairs(req.deps or {}) do
+  for _, c in ipairs({'p', 'n'}) do
+    removed = removed + redis.call('ZREMRANGEBYSCORE', mk(req.alias, 'lease:' .. dep .. ':' .. c),
+      '-inf', now)
+  end
 end
 -- Waiters that expired with no `waitexp` member (written by an older library): a batch per
 -- sweep, so the waiter sets never keep them for good.

@@ -462,7 +462,8 @@ async def test_probe_recovers_or_backs_off(make: Make) -> None:
     await engine.health.disable("big", "aws-a/r2", probe_after_secs=0)
     assert await engine.probe_due("big") == {"aws-a/r2": "waiting"}
     health = await engine.health.snapshot("big")
-    assert int(health["aws-a/r2|wait"]) == 60000  # doubles, never below 60 s
+    # Doubles, never below the model's `probe_after_secs` (900 s by default; EN-23).
+    assert int(health["aws-a/r2|wait"]) == 900_000
 
 
 async def test_credential_failure_is_per_process(make: Make) -> None:
