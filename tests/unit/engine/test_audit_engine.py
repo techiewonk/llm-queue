@@ -136,3 +136,56 @@ def test_en17_resettled_owner_does_not_block_pruning(monkeypatch: pytest.MonkeyP
     now[0] += 1.0
     admission._settle("C")
     assert list(admission._settled) == ["A", "C"]
+
+
+def test_en2_raising_estimator_falls_back_to_chars(caplog: pytest.LogCaptureFixture) -> None:
+    """EN-2: a custom estimator that raised escaped into the call loop (hot requeue)."""
+    from llm_queue.engine import tokens
+
+    tokens.register_token_estimator("en2_broken", lambda *_: 1 // 0)
+    params = {"messages": [{"role": "user", "content": [{"text": "x" * 400}]}]}
+    with caplog.at_level(logging.WARNING):
+        first = tokens.input_tokens("converse", params, "en2_broken")
+        second = tokens.input_tokens("converse", params, "en2_broken")
+    assert first == second == tokens.input_tokens("converse", params)
+    assert len(events(caplog, "hook_failed")) == 1
+
+
+def test_en2_inference_config_none_is_filled() -> None:
+    """EN-2: `"inferenceConfig": None` raised `TypeError` ('NoneType' item assignment)."""
+    from llm_queue.engine import inference, tokens
+
+    params: dict[str, Any] = {"inferenceConfig": None, "additionalModelRequestFields": None}
+    out = inference.apply(
+        "bedrock", "converse", params, {"max_tokens": 1, "extra": {"k": 1}, "top_k": 5}, {}
+    )
+    assert out["inferenceConfig"] == {"maxTokens": 1}
+    assert out["additionalModelRequestFields"] == {"top_k": 5, "k": 1}
+    assert params["inferenceConfig"] is None  # the caller's request is not changed
+    assert tokens.max_tokens_of("converse", {"inferenceConfig": None}) is None
+
+
+def test_en15_unknown_estimator_warns_once(caplog: pytest.LogCaptureFixture) -> None:
+    """EN-15: an estimator name nobody registered fell back to characters / 4 with no log."""
+    from llm_queue.engine import tokens
+
+    with caplog.at_level(logging.WARNING):
+        tokens.input_tokens("converse", {"x": "abcd"}, "en15_nope")
+        tokens.input_tokens("converse", {"x": "abcd"}, "en15_nope")
+    found = events(caplog, "hook_not_registered")
+    assert len(found) == 1
+    assert found[0].llmq["kind"] == "token_estimator"  # type: ignore[attr-defined]  # extra
+
+
+def test_en28_tokens_does_not_import_the_provider_stack() -> None:
+    """EN-28: `engine.tokens` imported `clients.providers` for one annotation (~60 ms)."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys, llm_queue.engine.tokens\nprint('llm_queue.clients.providers' in sys.modules)"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert out == "False"

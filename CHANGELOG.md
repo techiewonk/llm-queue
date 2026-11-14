@@ -172,6 +172,11 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 - `Admission.undo` skips (returns False, logs `undo_skipped`) when the store is unreachable,
   like `finish`, instead of raising (EN-16). A re-settled owner no longer stops the pruning of
   the settled-owner memory (EN-17).
+- A custom `token_estimator` that raises falls back to characters / 4 with one `hook_failed`
+  warning, and a request with `"inferenceConfig": None` (or `additionalModelRequestFields:
+  None`) gets the defaults filled in. Both used to raise into the worker loop, which returned the
+  message at once with no failure counted, so it spun until its deadline (EN-2). A
+  `token_estimator` name that is not registered now warns once (EN-15).
 
 ### Security
 

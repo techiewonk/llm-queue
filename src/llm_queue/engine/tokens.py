@@ -1,26 +1,27 @@
 """Token accounting (plan §3.7a): the estimate before a call and what goes back after it.
 
-The estimate is characters / 4 of every text in the request (tool definitions included) plus
-the output reservation (`max_tokens`, as Bedrock reserves it). After the call the budget is
-corrected to the real usage; a throttled attempt gives everything back; a failed one keeps its
-input. Binary blocks (images, documents, video, audio) are not read as text: each costs a fixed
-`BINARY_BLOCK_TOKENS`, and the real usage corrects it after the call.
-
-Characters / 4 fits English; Indic and CJK scripts take more tokens per character, so a model
-serving them is better estimated by its own tokenizer: `register_token_estimator("name", fn)`
-once at import, then set the model's `token_estimator` setting to "name" (per model, or per
-deployment). The default is unchanged (plan C8).
+The estimate is characters / 4 of every text (tool definitions included) plus the output
+reservation; after the call the budget is corrected to the real usage. Used by admission.
 """
+
+# Binary blocks (images, documents, video, audio) are not read as text: each costs a fixed
+# `BINARY_BLOCK_TOKENS`, and the real usage corrects it after the call. Characters / 4 fits
+# English; Indic and CJK scripts take more tokens per character, so a model serving them is
+# better estimated by its own tokenizer: `register_token_estimator("name", fn)` once at import,
+# then the model's `token_estimator` setting "name" (per model or deployment; plan C8).
 
 from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from llm_queue.clients.providers import Usage
+from llm_queue.engine import hooks
 from llm_queue.errors import ConfigError
+
+if TYPE_CHECKING:  # an annotation only: importing it pulled the provider stack in (EN-28)
+    from llm_queue.clients.providers import Usage
 
 Estimator = Callable[[str, Mapping[str, Any]], int]
 _ESTIMATORS: dict[str, Estimator] = {}
@@ -63,8 +64,20 @@ def input_tokens(op: str, params: Mapping[str, Any], estimator: str | None = Non
 
     Binary blocks count `BINARY_BLOCK_TOKENS` each instead of their encoded size.
     """
-    if estimator and estimator in _ESTIMATORS:
-        return max(1, int(_ESTIMATORS[estimator](op, params)))
+    if estimator:
+        fn = _ESTIMATORS.get(estimator)
+        if fn is None:
+            # Registry validation checks only the name's form: say once that it is unknown
+            # (it fell back to characters / 4 silently, EN-15).
+            hooks.warn_missing("token_estimator", estimator)
+        else:
+            # A custom estimator that raises falls back to characters / 4: it escaped into the
+            # call loop, which returned the message at once with no failure counted (EN-2).
+            value = hooks.call_safely(
+                "token_estimator", estimator, lambda: int(fn(op, params)), default=None
+            )
+            if isinstance(value, int):
+                return max(1, value)
     totals = [0, 0]
     _count(params, totals)
     return max(1, math.ceil(totals[0] / 4) + totals[1] * BINARY_BLOCK_TOKENS)
@@ -73,7 +86,8 @@ def input_tokens(op: str, params: Mapping[str, Any], estimator: str | None = Non
 def max_tokens_of(op: str, params: Mapping[str, Any]) -> int | None:
     """The `max_tokens` a request carries, if any (Converse or OpenAI shape)."""
     if op == "converse":
-        value = (params.get("inferenceConfig") or {}).get("maxTokens")
+        config = params.get("inferenceConfig")
+        value = config.get("maxTokens") if isinstance(config, Mapping) else None
     else:
         value = params.get("max_tokens") or params.get("max_completion_tokens")
     return int(value) if isinstance(value, int) else None
