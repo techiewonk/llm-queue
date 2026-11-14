@@ -8,10 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from typing import Any
 
 import pytest
 import redis.asyncio
-from test_admission import CONFIRMED, Candidate, rig
+from test_admission import (  # type: ignore[import-not-found]  # sibling test module
+    CONFIRMED,
+    Candidate,
+    rig,
+)
 
 from llm_queue.engine.admission import owner_token
 
@@ -22,6 +27,10 @@ R1 = [Candidate("aws-a/r1")]
 async def _now_ms(store: redis.asyncio.Redis) -> int:
     secs, micros = await store.time()
     return int(secs * 1000 + micros // 1000)
+
+
+def _n(value: Any) -> int:
+    return int(value or 0)
 
 
 def _m(prefix: str, name: str) -> str:
@@ -36,8 +45,8 @@ async def test_refund_is_capped_at_the_charge(store: redis.asyncio.Redis, prefix
     assert await r.admission.finish("m", owner, "a", refund_r=5, refund_t=500, outcome="ok")
     seen = await store.hget(_m(prefix, "rate:aws-a/r1"), "seen_tokens")
     calls = await store.hget(_m(prefix, "rate:aws-a/r1"), "seen_calls")
-    assert int(seen) == 0
-    assert int(calls) == 0
+    assert _n(seen) == 0
+    assert _n(calls) == 0
 
 
 async def test_settle_gives_back_to_the_grants_budgets(
@@ -52,7 +61,7 @@ async def test_settle_gives_back_to_the_grants_budgets(
     await r.store.publish(doc, actor="test")
     owner = owner_token("a", "w1", 1)
     assert await r.admission.finish("m", owner, "a", refund_r=0, refund_t=100, outcome="ok")
-    assert int(await store.hget(_m(prefix, "rate:aws-a/r1"), "tpm_n")) == 0
+    assert _n(await store.hget(_m(prefix, "rate:aws-a/r1"), "tpm_n")) == 0
 
 
 async def test_stale_latency_no_longer_marks_slow(store: redis.asyncio.Redis, prefix: str) -> None:
@@ -143,9 +152,9 @@ async def test_throttle_keeps_a_deployment_out_for_every_pod(
     cb = _m(prefix, "cb:aws-a/r2")
     owner = owner_token("c", "w3", 1)
     await r.admission.finish("m", owner, "c", refund_r=1, refund_t=0, outcome="throttle")
-    first = int(await store.hget(cb, "thr_until")) - await _now_ms(store)
+    first = _n(await store.hget(cb, "thr_until")) - await _now_ms(store)
     assert 900 <= first <= 2100  # no Retry-After: a jittered 1-2 s backoff
-    assert int(await store.hget(cb, "thr_n")) == 1
+    assert _n(await store.hget(cb, "thr_n")) == 1
 
 
 async def test_success_ends_the_throttle_streak(store: redis.asyncio.Redis, prefix: str) -> None:
@@ -157,7 +166,7 @@ async def test_success_ends_the_throttle_streak(store: redis.asyncio.Redis, pref
     await r.admission.finish(
         "m", owner_token("a", "w1", 1), "a", refund_r=0, refund_t=0, outcome="ok"
     )
-    assert int(await store.hget(cb, "thr_n")) == 0
+    assert _n(await store.hget(cb, "thr_n")) == 0
 
 
 async def test_renew_reports_lost_grants_and_refreshes_claims(
@@ -173,7 +182,7 @@ async def test_renew_reports_lost_grants_and_refreshes_claims(
     renewed, lost = await r.admission.renew_all([kept, gone], jobs=[("c", "w1@t")])
     assert renewed == 1
     assert lost == [gone[1]]
-    assert int(await store.hget(job, "hb")) > 0
+    assert _n(await store.hget(job, "hb")) > 0
 
 
 async def test_claim_owner_is_the_delivery(store: redis.asyncio.Redis, prefix: str) -> None:

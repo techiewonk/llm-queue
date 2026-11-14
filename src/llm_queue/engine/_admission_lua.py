@@ -715,8 +715,11 @@ REREGISTER = (
     + r"""
 local done = 0
 for _, item in ipairs(req.items) do
-  -- A call whose result is stored has finished: never bring its slot back.
-  if redis.call('EXISTS', P .. ':{r:' .. item.request_id .. '}:res') == 0 then
+  -- A call whose result is stored has finished: never bring its slot back. An entry another
+  -- owner holds now (it took over a lost grant) is left alone.
+  local current = redis.call('HGET', mk(item.alias, 'inprog:' .. item.request_id), 'owner')
+  if redis.call('EXISTS', P .. ':{r:' .. item.request_id .. '}:res') == 0
+    and (not current or current == item.owner) then
     local until_ = now + num(req.lease_ms, 60000)
     redis.call('ZADD', mk(item.alias, 'lease:' .. item.dep .. ':' .. item.cls), until_, item.owner)
     redis.call('ZADD', mk(item.alias, 'inprog'), until_, item.owner)

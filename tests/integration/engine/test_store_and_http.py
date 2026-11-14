@@ -73,7 +73,7 @@ async def test_readiness_reports_a_read_only_store(
         raise ReadOnlyError("You can't write against a read only replica.")
 
     monkeypatch.setattr(engine.state, "set", refuse)
-    health = await engine.health_check()
+    health = await engine.health_check(fresh=True)
     assert health["stores"] == {"state": "read_only", "queue": "read_only"}
     assert health["ready"] is True  # the stores never make the process unready
 
