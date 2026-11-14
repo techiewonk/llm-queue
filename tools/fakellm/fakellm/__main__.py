@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import sys
 
 from fakellm.app import create_app
 from fakellm.behaviour import Engine
@@ -27,6 +28,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--scenario", default=env.get("FAKELLM_SCENARIO") or None)
     seed_env = env.get("FAKELLM_SEED")
     parser.add_argument("--seed", type=int, default=int(seed_env) if seed_env else None)
+    parser.add_argument(
+        "--exit-on-stdin-eof",
+        action="store_true",
+        help="stop when stdin closes: a drill passes a pipe, so a parent killed hard (no "
+        "cleanup) does not leave fakellm holding its port (CO-15)",
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     scenario = load_scenario(args.scenario) if args.scenario else Scenario()
@@ -36,7 +43,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     # Not web.run_app: it never re-opens a listening socket asyncio closed (see serve.py).
     with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(serve(create_app(engine=engine), args.host, args.port))
+        parent = sys.stdin.buffer if args.exit_on_stdin_eof else None
+        asyncio.run(serve(create_app(engine=engine), args.host, args.port, parent=parent))
 
 
 if __name__ == "__main__":
