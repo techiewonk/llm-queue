@@ -68,7 +68,9 @@ class ResolvedRegistry:
         self.registry = registry
         # Effective settings already resolved, by (model, name, deployment): the hot path asks
         # the same ones for every call (~40 per call, each walking the levels). A reload builds
-        # a new view, so nothing here goes stale. Values are shared: never mutate one.
+        # a new view, so nothing here goes stale. Values are shared: never mutate one. They are
+        # not frozen: they go into provider request bodies, which refuse a MappingProxyType
+        # (CO-25, measured in the CHANGELOG).
         self._memo: dict[tuple[str, str, str | None], Effective] = {}
         self._deployments: dict[str, tuple[Deployment, ...]] = {}
         self._entries: dict[tuple[str, str], Mapping[str, Any]] = {}

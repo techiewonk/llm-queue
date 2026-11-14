@@ -59,6 +59,17 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 - CLI: `dlq purge`, `dlq redrive`, `drain` and `registry gc` need `--yes` (or `--dry-run`);
   `registry gc` also removes the queues of removed models.
 - Safe live-edit mode also protects `model_fallback` and `inference.extra`.
+- `Tuning`, `StoreOptions`, `BedrockOptions`, `OpenAIOptions`, `WarmOptions`, `EngineTimings`
+  and `RegistryOptions` are `slots=True` dataclasses: `vars()` / `__dict__` and setting an
+  attribute they do not declare now fail (use `dataclasses.asdict` / `replace`).
+- `RegistryStore.rollback` can raise `RegistryConflict`: it retries when a deploy publishes in
+  between, `Tuning.registry.edit_retries` times, then gives up.
+- `Tuning.registry.edit_retries` is at most 10 (`ConfigError` above), and each conflict backoff
+  wait is capped at 2 s: with `edit_retries=20` the last publish wait could reach about 11.6 h.
+- A `start()` retried after a failed one raises `LLMQueueError` naming the first error (chained
+  to it); it said only "was stopped; build a new one". The queue cannot be started again: build
+  a new one. A `start()` from a second event loop while one runs is an `LLMQueueError`, not
+  asyncio's `RuntimeError`.
 - Performance: <!-- filled at release -->
 
 ### Added
@@ -145,7 +156,9 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 - Bedrock pool size is the slots routed to the client (at least 10) without the 200 cap, under
   which callers queued for a socket inside the first-response timer and charged the breaker.
 - `BedrockHTTP.open` takes `read_timeout_secs` / `connect_timeout_secs`; `ClientPool.bedrock()`
-  returns a `BedrockClient` protocol; the at-fork hook is registered on first use, not at import.
+  returns a `BedrockClient` protocol; the client hub's at-fork hook is registered on first use,
+  not at import (the fork guard in `core.py` is still registered at import, the one exception
+  CONTRIBUTING names).
 - A redelivery to the pod already running a call started a second run and leaked its slot.
 - After a store reset only the first pod re-registered its calls; `RENEW` losses went unnoticed.
 - The per-minute retries key had no TTL on a minute without a retry.
@@ -192,11 +205,14 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   nothing, so store pools, provider sessions and the S3 client leaked; every step now runs and
   the first failure is raised at the end. `start()` is serialised (two concurrent starts doubled
   every background task) and a start that fails part-way stops what it started.
-- Calls, streams, jobs and sync calls after `stop()` raise a clear `LLMQueueError` (they failed
-  on a closed pool, and a sync call built a new private engine that nothing closed). A sync
-  call cancelled by `close_sync()` raises `CallFailed("cancelled")`, not
-  `concurrent.futures.CancelledError`; a sync call to a loop that was stopped but not closed
-  fails with `CallFailed("worker_shutdown")` instead of blocking forever. Offload and sync-engine
+- Calls, streams, jobs and sync calls made once `stop()` has drained its jobs and running calls
+  raise a clear `LLMQueueError` (they failed on a closed pool, and a sync call built a new
+  private engine that nothing closed). Calls made during the drain are still served: a running
+  job's next call and an app's follow-up call in a graceful shutdown. A sync call cancelled by
+  `close_sync()` raises `CallFailed("cancelled")`, not `concurrent.futures.CancelledError`; a
+  sync call to a loop that was stopped but not closed fails with `CallFailed("worker_shutdown")`
+  instead of blocking forever, and one whose call raised a `TimeoutError` (such as
+  `AttemptTimeout`) gets that error instead of waiting forever. Offload and sync-engine
   close failures are logged instead of swallowed.
 - The registry reload loop ended for good, silently, on any error other than a store or config
   error (a corrupt change counter); it now logs it and backs off, up to 30 s.
@@ -286,6 +302,13 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   call 9.2 -> 5.3 us (Python 3.12.13, Windows, 2026-11-15).
 - `alias_of(model_id)` is one dict lookup instead of a scan of every model: 2674 -> 241 ns with
   55 models (Python 3.12.13, 2026-11-15).
+- Setting values (`inference`, `params`, `tags` ...) are shared by every call and not
+  deep-frozen; nothing may change one. Freezing them is left out: they go into provider request
+  bodies, and botocore's parameter check and the OpenAI SDK's JSON encoder refuse
+  `MappingProxyType`, so each call would have to copy them back to plain dicts. Measured on one
+  Converse request (inference with `stop` and `extra`, a guardrail in `params`): a memoised
+  settings read stays 232 ns (freezing happens once per view), but the request build goes
+  13.6 -> 21.1 us (+55 %) with the copy (Python 3.12.13, Windows, 2026-11-15).
 
 ### Security
 
