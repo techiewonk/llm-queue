@@ -242,7 +242,11 @@ async def drill(scenario: str) -> bool:
 
 def main() -> int:
     """Run the chosen scenarios on fresh containers; exit 1 if any fails."""
-    chosen = sys.argv[1:] or ["failover", "slowdns", "restart"]
+    known = ["failover", "slowdns", "restart"]
+    chosen = sys.argv[1:] or known
+    if set(chosen) - set(known):  # `--help` once started the Docker nodes and a drill
+        print(__doc__)
+        return 2
     os.environ.update({"AWS_ACCESS_KEY_ID": "aws-main", "AWS_SECRET_ACCESS_KEY": "fake"})
     os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
     nodes_up()
