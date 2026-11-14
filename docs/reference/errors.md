@@ -54,7 +54,7 @@ class CallFailed(LLMQueueError):
 | `cancelled` | The call was cancelled (`cancel()`, or its caller process was gone) | Nothing, unless you did not cancel it |
 | `rejected` | The app's `admission` hook rejected the call before it was sent | Handle as your hook intends |
 
-<!-- verify after merge: `invalid_request`, `context_length_exceeded` and `worker_shutdown` are raised by the 0.1.0b2 branches but were not in `llm_queue.KINDS` (engine/errors.py) when this was written, and `worker_shutdown` had no HTTP status in http_transport._STATUS. -->
+<!-- verify after merge: `invalid_request`, `context_length_exceeded` and `worker_shutdown` are raised in dev/0.1.0b2 (84c979d) but are missing from `llm_queue.KINDS` (engine/errors.py); `worker_shutdown` has no entry in http_transport._STATUS (falls to 500). -->
 
 The set of kinds is `llm_queue.KINDS`. Over the OpenAI-compatible HTTP transport the LangChain
 OpenAI adapters use, kinds map to status codes. Only the request's own faults are 4xx; failures
@@ -69,6 +69,7 @@ them as server-side, not as a bad request:
 | 502 | `provider_error`, `worker_lost`, `dead_lettered` |
 | 503 | `retry_budget_exhausted`, `no_deployment`, `queue_unavailable`, `model_unavailable`, `credentials_unavailable` |
 | 504 | `deadline_exceeded` |
+| 500 | any other kind |
 
 ## StoreUnavailable
 

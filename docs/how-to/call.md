@@ -1,7 +1,8 @@
 # Make calls
 
-Every call goes through one `LLMQueue`, built once per process and started in the app's startup
-hook:
+Every call goes through one `LLMQueue`, built once per process (after any fork) and started in
+the app's startup hook on the event loop that makes the calls (see
+[Clients and connections](../explanation/clients.md)):
 
 ```python
 from llm_queue import LLMQueue
@@ -36,6 +37,36 @@ runs any operation of a model. Each takes these keyword arguments:
 | `allow_fallback` | `"all"` (default) lets a disabled model fall back to its `model_fallback` model |
 | `allowed_regions`, `allowed_accounts` | Limit the deployments this call may use |
 
+### Images and documents
+
+Converse content blocks with bytes (images, documents) are sent inline, as you would call
+Bedrock directly:
+
+```python
+with open("chart.png", "rb") as f:
+    image = f.read()
+
+request = {"messages": [{"role": "user", "content": [
+    {"text": "What does this chart show?"},
+    {"image": {"format": "png", "source": {"bytes": image}}},
+]}]}
+reply = await llmq.converse("claude-sonnet", request)
+```
+
+- Bytes travel through the queue encoded (`{"__b64__": ...}`) and reach the provider as bytes.
+- The whole message, bytes included, may be at most the model's `max_message_bytes` (default
+  4 MB). A larger one fails `CallFailed("invalid_request")` at once, before it is queued. For
+  larger files, use a smaller image or an S3 location the model can read.
+- The token estimate does not read the bytes: each binary block costs a fixed 1,000 tokens until
+  the real usage corrects the budget after the call (see
+  [Token estimates](../explanation/attempts.md#token-estimates)).
+
+### Token estimates for other scripts
+
+The TPM estimate is characters / 4, which is low for Hindi, other Indic scripts and CJK text. For
+a model that serves them, register a tokenizer-based estimator and name it in the model's
+`token_estimator` setting; see [Token estimates](../explanation/attempts.md#token-estimates).
+
 ## Streaming: `converse_stream`
 
 ```python
@@ -57,7 +88,20 @@ result = await llmq.embed("embed-cohere", texts, input_type="search_document")
 result.vectors          # one vector per text, in order
 ```
 
-Texts are batched by the model's `embed_batch_size`.
+Texts are batched by the model's `embed_batch_size` (capped by what the provider accepts: Titan
+1, Cohere 96, OpenAI 2048), at most 16 batches in flight at a time.
+
+- **Empty texts** (or only whitespace) are refused at once with `CallFailed("invalid_request")`.
+- **`request_id=X`** names batch *n* `X:n`, so each batch is its own call and a repeat of the
+  same `embed` returns the same vectors.
+- **Partial results:** by default one failed batch fails the call. With `partial=True` the call
+  returns what succeeded; a text whose batch failed has the vector `[]` and its error in
+  `result.errors` (by text index):
+
+```python
+result = await llmq.embed("embed-cohere", texts, partial=True)
+retry = [texts[i] for i in result.errors]      # texts to send again
+```
 
 ## Sync code: `converse_sync`, `embed_sync`
 
@@ -69,9 +113,13 @@ vectors = llmq.embed_sync("embed-cohere", texts).vectors
 llmq.close_sync()       # in sync-only processes; stop() does it too
 ```
 
-Sync calls run on the direct path, on a private event loop with its own caller-only engine:
-same budgets and order, no queue. Async code should use `converse` / `embed`; calling a sync
-method from a running event loop blocks it and logs `sync_call_on_event_loop` once.
+Sync calls run on the direct path: same budgets and order, no queue. When the queue is started,
+they run on its event loop (from your thread), with its clients and connections. Otherwise they
+run on one private event loop per process, with a caller-only engine and a small store pool.
+Async code should use `converse` / `embed`: a sync call on the queue's own loop thread is refused
+(it would deadlock), and one from any other running loop blocks it and logs
+`sync_call_on_event_loop` once. Celery: see
+[Clients and connections](../explanation/clients.md#celery).
 
 ## Jobs: `register_job`, `send_job`
 
@@ -82,13 +130,25 @@ async def index_documents(payload: dict) -> None:
     result = await llmq.embed("cohere", payload["texts"], input_type="search_document")
     ...
 
-llmq.register_job("index_documents", index_documents)   # before start()
+llmq.register_job("index_documents", index_documents, timeout_secs=600)   # before start()
 await llmq.start()
 job_id = await llmq.send_job("index_documents", {"ids": ids, "texts": texts})
 ```
 
 Jobs run at least once, on processes in `both` or `worker` mode. They have no LLM budget of
 their own; the LLM calls inside them do.
+
+- **`timeout_secs`**: a run longer than this is cancelled and counts as a failure (retried, then
+  dead-lettered after 5 failures). Without it a hung job holds a worker slot for good.
+- **Queue limit**: a jobs queue holds at most 10,000 waiting jobs; `send_job` beyond that fails
+  instead of filling the store.
+- **No consumer**: `send_job` to a name no running process has registered still queues the job,
+  but logs `job_no_consumer` (once a minute per name) and counts `llmq_jobs_no_consumer_total`,
+  so a typo or a missing worker deployment shows up at once.
+- **Shutdown**: a job still running when the drain ends is returned to the queue, not failed.
+  A job whose acknowledgement failed after it finished is logged as a duplicate run.
+
+<!-- verify after merge: LLMQueue.register_job (core.py) forwards timeout_secs to JobRunner.register; at 84c979d it took only (name, fn). Also the exception send_job raises at the 10,000 limit. -->
 
 ## Request context
 
