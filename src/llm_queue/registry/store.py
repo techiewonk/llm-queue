@@ -612,8 +612,11 @@ class RegistryStore:
             f"the registry kept changing during a publish ({tries} tries); try again"
         )
 
-    def _run_on_config(self) -> ResolvedRegistry:
-        """Run on this process's own document (the stored one is unreachable or refused)."""
+    def run_on_config(self) -> ResolvedRegistry:
+        """Run on this process's own document (the stored one is unreachable or refused).
+
+        Also the engine's fallback when `boot` runs out of time at start (a blackholed store).
+        """
         assert self.config is not None
         registry, errors, warnings = check(self.config, allowed_hosts=self._hosts)
         if registry is None:
@@ -636,10 +639,10 @@ class RegistryStore:
             await self.publish(self.config, actor=actor or process_actor("boot"))
         except (RedisError, OSError) as exc:
             logger.warning("registry_store_unreachable_at_boot", error=str(exc))
-            return self._run_on_config()
+            return self.run_on_config()
         if self._current is None:
             logger.error("registry_stored_refused_running_on_config", lib_too_old=self.lib_too_old)
-            return self._run_on_config()
+            return self.run_on_config()
         return self.current
 
     # ---------------------------------------------------------------- live edits

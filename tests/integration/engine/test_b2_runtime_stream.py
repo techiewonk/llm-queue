@@ -16,7 +16,6 @@ from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import QueueSettings, StreamQueues
 from llm_queue.engine.requests import RequestStore
 from llm_queue.engine.streaming import ChunkReader
-from llm_queue.errors import ConfigError
 
 pytestmark = pytest.mark.integration
 
@@ -65,9 +64,10 @@ async def test_stream_keeps_the_app_id_and_refuses_embeddings(make: Make) -> Non
     async for _ in engine.stream("small", CHAT, request_id="app-1"):
         pass
     assert (await engine.requests.job("app-1")).get("app") == "1"
-    with pytest.raises(ConfigError):
+    with pytest.raises(CallFailed) as info:  # a failed call, not bad config (audit RT-28)
         async for _ in engine.stream("titan", {"inputText": "x"}):
             pass
+    assert info.value.kind == "invalid_request"
 
 
 async def test_chunk_reader_skips_a_bad_entry(store: redis.asyncio.Redis, prefix: str) -> None:

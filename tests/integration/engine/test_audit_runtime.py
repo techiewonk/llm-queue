@@ -13,10 +13,11 @@ import time
 from typing import Any
 
 import pytest
-from engine_testkit import CHAT, SMALL, Make, away_from_minute_end, stats
+from engine_testkit import CHAT, GPT, SMALL, Make, away_from_minute_end, stats
 from redis.exceptions import ConnectionError as StoreConnectionError
 from redis.exceptions import ResponseError
 
+from llm_queue.engine import runtime
 from llm_queue.engine.admission import Decision
 from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.runtime import Engine
@@ -561,3 +562,196 @@ async def test_rt12_debug_capture_failure_never_reruns_the_call(
     await asyncio.sleep(0.5)
     assert stats(fake, f"{SMALL}@r1").get("duplicates", 0) == 0
     assert stats(fake, f"{SMALL}@r1")["calls"] == 1
+
+
+# ---------------------------------------------------------------- RT-13 to RT-19, EN-2, CO-9
+
+
+async def _hang(*args: Any, **kwargs: Any) -> Any:
+    await asyncio.sleep(30)
+
+
+@pytest.mark.parametrize("fault", ["hang", "refused"])
+async def test_rt13_start_is_bounded_on_a_dead_store(
+    make: Make, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    """Audit RT-13: `start()` had no timeout and let a store refusal out raw.
+
+    A blackholed store held start for connect timeouts times retries (41 s per command); an
+    out-of-memory refusal raised redis-py's own error. Start now goes on, bounded.
+    """
+    engine, _ = await make()
+    fresh = Engine(engine.state, engine.registry, engine.providers, settings=engine.settings)
+    monkeypatch.setattr(runtime, "START_PROBE_SECS", 0.3)
+
+    async def refused(*args: Any, **kwargs: Any) -> Any:
+        raise ResponseError("OOM command not allowed when used memory > 'maxmemory'")
+
+    if fault == "hang":
+        monkeypatch.setattr(fresh.registry, "boot", _hang)
+    monkeypatch.setattr(fresh.clock, "sync", _hang if fault == "hang" else refused)
+    started = time.monotonic()
+    await fresh.start()
+    try:
+        assert time.monotonic() - started < 1.5
+        assert fresh.ready
+    finally:
+        await fresh.stop(drain_secs=0)
+
+
+async def test_rt14_a_store_answering_with_errors_fails_paused_calls_cleanly(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit RT-14: a probe `ping` refused (MISCONF, NOAUTH) raised raw out of `_store_back`."""
+    engine, _ = await make({"small": {"store_down": "pause"}})
+    engine.settings = dataclasses.replace(engine.settings, caller_margin_secs=0.5)
+
+    async def cut(*args: Any, **kwargs: Any) -> Any:
+        raise StoreConnectionError("Connection closed by server.")
+
+    async def misconf(**kwargs: Any) -> Any:
+        raise ResponseError("MISCONF Redis is configured to save RDB snapshots")
+
+    monkeypatch.setattr(engine.requests, "register_send", cut)
+    monkeypatch.setattr(engine.state, "ping", misconf)
+    with pytest.raises(CallFailed) as info:
+        await engine.call("small", CHAT, timeout_secs=2)
+    assert info.value.kind in ("queue_unavailable", "deadline_exceeded")
+    assert info.value.request_id
+
+
+async def test_rt16_a_deployment_removed_since_the_grant_is_retried(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit RT-16: a reload removing the granted deployment raised StopIteration in `_attempt`.
+
+    It surfaced as a bare `run_failed` and the call ran again. The grant now goes back in full
+    and the attempt asks for another deployment.
+    """
+    engine, _ = await make()
+    finished: list[dict[str, Any]] = []
+
+    async def finish(*args: Any, **kwargs: Any) -> bool:
+        finished.append(kwargs)
+        return True
+
+    monkeypatch.setattr(engine.admission, "finish", finish)
+    held = _a_held(engine, "r-removed")
+    result = await engine._attempt(
+        engine.registry.current, "small", held, "aws-a/r9", "owner|w@t|1", 1
+    )
+    assert (result.outcome, result.kind) == ("retry", "target")
+    assert finished
+    assert finished[0]["outcome"] == "none"
+    assert finished[0]["refund_r"] == 1
+
+
+async def test_rt17_an_expired_id_found_on_re_registration_fails_at_once(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit RT-17: after a re-registration only `conflict` was checked.
+
+    An `expired` outcome went back to waiting for a result that was gone, until the deadline.
+    """
+    from llm_queue.engine.requests import Registration
+
+    engine, _ = await make()
+    outcomes = iter(["attached", "expired"])
+
+    async def register_send(*args: Any, **kwargs: Any) -> Registration:
+        return Registration(next(outcomes))
+
+    async def nothing(*args: Any, **kwargs: Any) -> Any:
+        return None
+
+    async def no_job(*args: Any, **kwargs: Any) -> dict[str, str]:
+        return {}
+
+    monkeypatch.setattr(engine.requests, "register_send", register_send)
+    monkeypatch.setattr(engine.requests, "take_result", nothing)
+    monkeypatch.setattr(engine.requests, "job", no_job)
+    started = time.monotonic()
+    with pytest.raises(CallFailed) as info:
+        await engine.call("small", CHAT, request_id="r-expired", timeout_secs=8)
+    assert info.value.kind == "result_expired"
+    assert info.value.request_id == "r-expired"  # RT-18: the id is on every caller's error
+    assert time.monotonic() - started < 2
+
+
+async def test_rt19_static_cap_stops_on_a_request_error(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit RT-19: `static_cap` retried every error on each deployment, unlogged.
+
+    A validation error went to every deployment and came back as `provider_error`.
+    """
+    engine, fake = await make(
+        {
+            "big": {
+                "store_down": "static_cap",
+                "deployments": {"aws-a": {"confirmed": ["r1", "r2"]}},
+            }
+        },
+        {
+            "models": {
+                f"{GPT}@r1": {"force_error": "ValidationException"},
+                f"{GPT}@r2": {"force_error": "ValidationException"},
+            }
+        },
+    )
+
+    async def cut(*args: Any, **kwargs: Any) -> Any:
+        raise StoreConnectionError("Connection closed by server.")
+
+    monkeypatch.setattr(engine.requests, "register_send", cut)
+    with pytest.raises(CallFailed) as info:
+        await engine.call("big", CHAT)
+    assert info.value.kind == "invalid_request"
+    calls = stats(fake, f"{GPT}@r1").get("calls", 0) + stats(fake, f"{GPT}@r2").get("calls", 0)
+    assert calls == 1
+
+
+async def test_en2_an_unusable_request_fails_once(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EN-2: any error building the admission ask put the call straight back (`_release`).
+
+    It ran again and again until dead-lettered. It now fails at once with `invalid_request`.
+    """
+    engine, _ = await make()
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise TypeError("an estimator that cannot read this request")
+
+    monkeypatch.setattr(engine, "_ask", broken)
+    with pytest.raises(CallFailed) as info:
+        await engine.call("small", CHAT, timeout_secs=8)
+    assert info.value.kind == "invalid_request"
+    await _until(lambda: not engine._held, what="nothing held")
+
+
+async def test_co9_a_corrupt_registry_counter_never_fails_a_call(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CO-9: a corrupt stored change counter (ValueError) raised out of a registry refresh.
+
+    It reached the live call that met `no_config`. It is now logged and the call goes on.
+    """
+    engine, _ = await make()
+    real = engine.admission.pick_take
+    first = {"done": False}
+
+    async def pick_take(*args: Any, **kwargs: Any) -> Decision:
+        if not first["done"]:
+            first["done"] = True
+            return Decision("no_config")
+        got: Decision = await real(*args, **kwargs)
+        return got
+
+    async def corrupt() -> None:
+        raise ValueError("invalid literal for int() with base 10: b'x'")
+
+    monkeypatch.setattr(engine.admission, "pick_take", pick_take)
+    monkeypatch.setattr(engine.registry, "refresh", corrupt)
+    reply = await engine.call("small", CHAT, timeout_secs=8)
+    assert reply.ok
