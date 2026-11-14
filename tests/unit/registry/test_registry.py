@@ -470,3 +470,18 @@ def test_accounts_cannot_point_at_metadata_or_process_secrets(small: dict[str, A
         base_url="https://llm.example.com/v1", api_key_ref="AWS_SECRET_ACCESS_KEY"
     )
     assert _has(_errors(doc), "process secret")
+
+
+def test_alias_of_uses_an_index_with_the_first_model_winning(full: dict[str, Any]) -> None:
+    """CO-25: `alias_of(model_id)` scanned every model on each call; now one dict lookup.
+
+    The first model listed with an id still wins, as the scan did, and an unknown name is
+    still `UnknownModel`.
+    """
+    registry = load_registry(full).registry
+    model_id = full["models"]["gpt20b"]["model_id"]
+    first = next(a for a, m in full["models"].items() if m["model_id"] == model_id)
+    assert registry.alias_of(model_id) == first
+    assert registry.alias_of("gpt20b") == "gpt20b"
+    with pytest.raises(KeyError, match="nope"):
+        registry.alias_of("nope")
