@@ -213,3 +213,36 @@ async def test_reregister_skips_finished_calls(store: redis.asyncio.Redis, prefi
     }
     assert await r.admission.reregister([item]) == 0
     assert not await store.exists(_m(prefix, "inprog:done"))
+
+
+async def test_reregister_skips_grants_this_process_settled(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """A heartbeat that found a just-settled grant lost put its slot back until the lease ended.
+
+    FINISH (or UNDO) ran between the heartbeat's snapshot of held grants and its RENEW, so the
+    RENEW reported the owner lost and REREGISTER brought back a lease nobody would free (a
+    `grants_reregistered` in the logs; scenarios R4, P1 ... ended with one lease left).
+    """
+    r = await rig(store, prefix)
+    lease = _m(prefix, "lease:aws-a/r1:n")
+    for rid, settle in (("f", "finish"), ("u", "undo")):
+        assert (await r.ask(rid, candidates=R1)).kind == "granted"
+        owner = owner_token(rid, "w1", 1)
+        if settle == "finish":
+            await r.admission.finish("m", owner, rid, refund_r=0, refund_t=0, outcome="fail")
+        else:
+            await r.admission.undo("m", owner, rid)
+        assert await r.admission.renew_all([("m", owner, rid)]) == (0, [])  # settled, not lost
+        item = {
+            "alias": "m",
+            "owner": owner,
+            "request_id": rid,
+            "dep": "aws-a/r1",
+            "cls": "n",
+            "cost_r": 1,
+            "cost_t": 0,
+        }
+        assert await r.admission.reregister([item]) == 0
+        assert await store.zcard(lease) == 0
+        assert not await store.exists(_m(prefix, f"inprog:{rid}"))
