@@ -14,15 +14,6 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 
 ### Changed (behaviour)
 
-- **Bedrock calls go over aiohttp by default** (`Tuning(bedrock=BedrockOptions(transport=...))`,
-  `"aiohttp"` or `"botocore"`). The body is built and the reply parsed with orjson and sent on
-  one aiohttp session per client; botocore still resolves and refreshes credentials, signs
-  (SigV4) and decodes stream frames. Measured on fakellm (3 alternating rounds): Converse at
-  20 concurrent calls 434 -> 808 calls/s, client CPU per call -60 %, p50 -41 %; ConverseStream
-  first event -23 %; memory per client 669 -> 87 KiB. All nine samples pass on real Bedrock.
-  Differences: Converse fields botocore does not know are sent (Bedrock refuses them) instead
-  of dropped; FIPS endpoints and `AWS_ENDPOINT_URL_*` are not read (`AWS_CA_BUNDLE` and proxy
-  variables are). `transport="botocore"` keeps the old client.
 - **`LLMQ_ENVIRONMENT` unset is strict.** Only `dev`, `local`, `test` and `ci` relax the checks;
   unset (reported as `unset`) or any other name requires TLS stores, `LLMQ_ID_HASH_SALT`,
   `LLMQ_BASE_URL_ALLOWED_HOSTS` when the registry has an `openai` account, and refuses debug
@@ -63,6 +54,13 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 
 ### Added
 
+- **`BedrockOptions(transport="aiohttp")`, opt-in** (default `"botocore"`: aiobotocore). The
+  body is built and the reply parsed with orjson and sent on one aiohttp session per client;
+  botocore still resolves and refreshes credentials, signs (SigV4) and decodes stream frames.
+  Measured on fakellm (3 alternating rounds): Converse at 20 concurrent calls 434 -> 808
+  calls/s, client CPU per call -60 %; memory per client 669 -> 87 KiB. All nine samples pass on
+  real Bedrock with it. Differences: Converse fields botocore does not know are sent (Bedrock
+  refuses them) instead of dropped; FIPS endpoints and `AWS_ENDPOINT_URL_*` are not read.
 - **Client hub:** one SDK client per (event loop, credential identity, region, options) per
   process, shared by every queue and the sync path, reference-counted; clients for every
   deployment built concurrently at start; warm connections (unsigned `HEAD` requests, refreshed
