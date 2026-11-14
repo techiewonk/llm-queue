@@ -213,6 +213,7 @@ class Scenario:
     settle_secs: float = 0.0  # after the fault, before `after` starts
     extra: Callable[[Ctx], Awaitable[None]] | None = None  # scenario checks, after `after`
     env: dict[str, str] = dataclasses.field(default_factory=dict)  # more process settings
+    fast_env: dict[str, str] = dataclasses.field(default_factory=dict)  # fast profile only
     models: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)  # registry
     fake: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)  # by model id
     share: float = 1.0  # of the load sent by `during` here (client processes send the rest)
@@ -257,7 +258,7 @@ async def run_one(scenario: Scenario, load: str, profile_name: str) -> bool:
     limit = profile.deadline_secs + CALLER_MARGIN_SECS + 1
     started = time.monotonic()
     phases: dict[str, list[Result]] = {}
-    env = {**profile.env, **scenario.env}
+    env = {**profile.env, **scenario.env, **(scenario.fast_env if profile_name == "fast" else {})}
     queue_proxy = None
     try:
         if scenario.queue_proxy:
@@ -467,24 +468,36 @@ async def workers_all_down(ctx: Ctx) -> None:
 
 async def store_block(ctx: Ctx) -> None:
     """Every store connection dropped, new ones refused."""
+    # Each fault is turned off in a finally: a fault that raised (or a cancelled pair) used to
+    # leave the proxy refusing while the gate drained through it (CO-16).
     ctx.proxy.refuse = True
-    ctx.proxy.drop_all()
-    await _hold(ctx)
-    ctx.proxy.refuse = False
+    try:
+        ctx.proxy.drop_all()
+        await _hold(ctx)
+    finally:
+        ctx.proxy.refuse = False
 
 
 async def store_half_open(ctx: Ctx) -> None:
-    """Connections stay open but nothing comes back (a blackholed node)."""
+    """Connections stay open but nothing comes back (a blackholed node).
+
+    The hold outlasts the store read timeout (`Scenario.fast_env` lowers it in the fast
+    profile), so the read-timeout path S5 is named for is reached (CO-14).
+    """
     ctx.proxy.freeze = True
-    await _hold(ctx)
-    ctx.proxy.freeze = False
+    try:
+        await _hold(ctx)
+    finally:
+        ctx.proxy.freeze = False
 
 
 async def store_slow(ctx: Ctx) -> None:
     """Every store packet 50 ms late."""
     ctx.proxy.delay_secs = 0.05
-    await _hold(ctx)
-    ctx.proxy.delay_secs = 0.0
+    try:
+        await _hold(ctx)
+    finally:
+        ctx.proxy.delay_secs = 0.0
 
 
 async def store_reset(ctx: Ctx) -> None:
@@ -496,48 +509,58 @@ async def store_reset(ctx: Ctx) -> None:
 
 async def store_oom(ctx: Ctx) -> None:
     """The store refuses writes (maxmemory reached, noeviction)."""
+    # Blocking redis calls in a thread: they stalled the loop the in-process callers run on.
+    # Both settings are read before, and put back in the finally even if setting one failed
+    # (CO-17).
     client = ctx.gate.store.client
-    before = client.config_get("maxmemory")["maxmemory"]
-    policy = client.config_get("maxmemory-policy")["maxmemory-policy"]
-    used = int(client.info("memory")["used_memory"])
-    client.config_set("maxmemory-policy", "noeviction")
-    client.config_set("maxmemory", str(max(1, used - 1_000_000)))
+    before = (await asyncio.to_thread(client.config_get, "maxmemory"))["maxmemory"]
+    got = await asyncio.to_thread(client.config_get, "maxmemory-policy")
+    policy = got["maxmemory-policy"]
+    used = int((await asyncio.to_thread(client.info, "memory"))["used_memory"])
     try:
+        await asyncio.to_thread(client.config_set, "maxmemory-policy", "noeviction")
+        await asyncio.to_thread(client.config_set, "maxmemory", str(max(1, used - 1_000_000)))
         await _hold(ctx)
     finally:
-        client.config_set("maxmemory", before)
-        client.config_set("maxmemory-policy", policy)
+        await asyncio.to_thread(client.config_set, "maxmemory", before)
+        await asyncio.to_thread(client.config_set, "maxmemory-policy", policy)
 
 
 def _provider_fault(**behaviour: Any) -> Callable[[Ctx], Awaitable[None]]:
     async def fault(ctx: Ctx) -> None:
-        await ctx.provider(REGIONS[0], **behaviour)
-        await _hold(ctx)
-        reset = dict.fromkeys(behaviour)
-        await ctx.provider(REGIONS[0], **reset)
+        try:
+            await ctx.provider(REGIONS[0], **behaviour)
+            await _hold(ctx)
+        finally:
+            await ctx.provider(REGIONS[0], **dict.fromkeys(behaviour))
 
     return fault
 
 
 async def provider_both_down(ctx: Ctx) -> None:
     """Every region of the model failing (5xx)."""
-    for region in REGIONS:
-        await ctx.provider(region, force_error="InternalServerException")
-    await _hold(ctx)
-    for region in REGIONS:
-        await ctx.provider(region, force_error=None)
+    try:
+        for region in REGIONS:
+            await ctx.provider(region, force_error="InternalServerException")
+        await _hold(ctx)
+    finally:
+        for region in REGIONS:
+            await ctx.provider(region, force_error=None)
 
 
 async def rpm_cut(ctx: Ctx) -> None:
     """The budget cut to a quarter, live, then put back."""
-    await ctx.edit({"rpm": RPM // 4})
-    await asyncio.sleep(1.5)  # LLMQ_CFG_RELOAD_SECS 1: every process has the new budget
     stop = asyncio.Event()
-    sampler = asyncio.create_task(_budget_samples(ctx, stop))
-    await _hold(ctx)
-    stop.set()
-    samples = await sampler
-    await ctx.edit({"rpm": RPM})
+    sampler: asyncio.Task[list[tuple[float, list[int]]]] | None = None
+    try:
+        await ctx.edit({"rpm": RPM // 4})
+        await asyncio.sleep(1.5)  # LLMQ_CFG_RELOAD_SECS 1: every process has the new budget
+        sampler = asyncio.create_task(_budget_samples(ctx, stop))
+        await _hold(ctx)
+    finally:
+        stop.set()
+        samples = await sampler if sampler is not None else []
+        await ctx.edit({"rpm": RPM})
     # The bucket may still hold the old burst; after that, the quarter rate.
     excess = _over_budget(samples, RPM // 4, burst=BURST)
     ctx.checks["provider calls within the cut budget"] = excess <= 0
@@ -547,19 +570,23 @@ async def rpm_cut(ctx: Ctx) -> None:
 async def deployment_off(ctx: Ctx) -> None:
     """One region disabled live, then enabled."""
     path = f"deployments.aws-0.overrides.{REGIONS[0]}.enabled"
-    await ctx.edit({path: False})
-    await _hold(ctx)
-    await ctx.edit({path: True})
+    try:
+        await ctx.edit({path: False})
+        await _hold(ctx)
+    finally:
+        await ctx.edit({path: True})
 
 
 async def kill_switch(ctx: Ctx) -> None:
     """The kill switch: every call runs direct (no queue), same budgets."""
-    await ctx.edit({"routing.kill_switch": True}, model=None)
-    await asyncio.sleep(1.5)  # LLMQ_CFG_RELOAD_SECS 1: both callers see the switch
-    on = ctx.now()
-    await _hold(ctx)
-    off = ctx.now()
-    await ctx.edit({"routing.kill_switch": False}, model=None)
+    try:
+        await ctx.edit({"routing.kill_switch": True}, model=None)
+        await asyncio.sleep(1.5)  # LLMQ_CFG_RELOAD_SECS 1: both callers see the switch
+        on = ctx.now()
+        await _hold(ctx)
+        off = ctx.now()
+    finally:
+        await ctx.edit({"routing.kill_switch": False}, model=None)
     callers = {q.engine.worker_id for q in ctx.queues}
     switched = [r for r in ctx.run.results if on <= r.sent <= off and r.ok]
     queued = [r for r in switched if r.worker not in callers]
@@ -617,13 +644,18 @@ async def caller_dies(ctx: Ctx) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
-    assert proc.stdin is not None
-    assert proc.stdout is not None
-    await asyncio.to_thread(proc.stdout.readline)
-    proc.stdin.write(b"go\n")
-    proc.stdin.flush()
-    await asyncio.sleep(1)
-    proc.kill()
+    # Killed and reaped whatever happens: it used to be left running if the ready line never
+    # came (a readline with no timeout), and never waited for (a zombie on POSIX) (CO-17).
+    try:
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+        await asyncio.wait_for(asyncio.to_thread(proc.stdout.readline), 30)
+        proc.stdin.write(b"go\n")
+        proc.stdin.flush()
+        await asyncio.sleep(1)
+    finally:
+        proc.kill()
+        await asyncio.to_thread(proc.wait, 10)
     await _hold(ctx)
     # Its waiting calls must never reach the provider: once its liveness key has expired
     # (caller TTL) and running attempts ended, the provider count stops growing.
@@ -666,10 +698,21 @@ async def duplicate_id(ctx: Ctx) -> None:
 def pair(
     first: Callable[[Ctx], Awaitable[None]], second: Callable[[Ctx], Awaitable[None]]
 ) -> Callable[[Ctx], Awaitable[None]]:
-    """Two faults at once."""
+    """Two faults at once; if one raises, the other is cancelled and its finally turns it off.
+
+    `gather` left the sibling running in the background while the gate drained (CO-16).
+    """
+
+    async def run(fault: Callable[[Ctx], Awaitable[None]], ctx: Ctx) -> None:
+        await fault(ctx)
 
     async def both(ctx: Ctx) -> None:
-        await asyncio.gather(first(ctx), second(ctx))
+        try:
+            async with asyncio.TaskGroup() as group:
+                group.create_task(run(first, ctx))
+                group.create_task(run(second, ctx))
+        except BaseExceptionGroup as errors:  # the first one, as a plain exception
+            raise errors.exceptions[0] from errors
 
     return both
 
@@ -698,7 +741,9 @@ class Client:
     async def _line(self) -> dict[str, Any]:
         assert self.proc.stdout is not None
         while True:
-            line = await asyncio.to_thread(self.proc.stdout.readline)
+            # A pod that hangs without a line would hold the run for ever: 5 minutes is far
+            # above any client spec here (CO-17).
+            line = await asyncio.wait_for(asyncio.to_thread(self.proc.stdout.readline), 300)
             if not line:
                 raise RuntimeError(f"client {self.spec['tag']} ended (exit {self.proc.poll()})")
             if line.startswith(b"{"):
@@ -721,10 +766,10 @@ class Client:
         return self.report
 
     def kill(self) -> None:
-        """Gone at once (cleanup)."""
+        """Gone at once (cleanup), and reaped."""
         if self.proc.poll() is None:
             self.proc.kill()
-            self.proc.wait(10)
+        self.proc.wait(10)
 
 
 async def clients(ctx: Ctx, pods: list[Client], *, during: Awaitable[None] | None = None) -> None:
@@ -922,9 +967,11 @@ async def queue_store_block(ctx: Ctx) -> None:
     assert ctx.queue_proxy is not None
     sent = len(ctx.run.results)
     ctx.queue_proxy.refuse = True
-    ctx.queue_proxy.drop_all()
-    await _hold(ctx)
-    ctx.queue_proxy.refuse = False
+    try:
+        ctx.queue_proxy.drop_all()
+        await _hold(ctx)
+    finally:
+        ctx.queue_proxy.refuse = False
     await asyncio.sleep(2)  # the calls sent while blocked come back
     caller_ids = {q.engine.worker_id for q in ctx.queues}
     direct = [r for r in ctx.run.results[sent:] if r.ok and r.worker in caller_ids]
@@ -1014,6 +1061,10 @@ def _s(
 
 
 ON_TIME = ("deadline_exceeded", "queue_unavailable", "rate_limited")
+# Half-open in the fast profile: the store read timeout (15 s by default) was above the 5 s
+# fault, so the read-timeout path S5 is named for was never reached (CO-14). 3 s stays above
+# every blocking command (idle BLPOP 1 s + 1, see Tuning.problems) and below the fault.
+HALF_OPEN_FAST = {"LLMQ_DRILL_STORE_READ_TIMEOUT_SECS": "3"}
 SCENARIOS = [
     _s(
         "S1",
@@ -1049,6 +1100,7 @@ SCENARIOS = [
         store_half_open,
         *ON_TIME,
         settle=17,
+        fast_env=HALF_OPEN_FAST,
     ),
     _s(
         "S8",
@@ -1208,6 +1260,7 @@ SCENARIOS = [
         pair(store_half_open, worker_kill),
         *ON_TIME,
         settle=17,
+        fast_env=HALF_OPEN_FAST,
     ),
     _s(
         "X6",
@@ -1339,7 +1392,19 @@ async def parallel(
         try:
             with (folder / f"{name}.log").open("w", encoding="utf-8") as log:
                 proc = await asyncio.create_subprocess_exec(*cmd, env=env, stdout=log, stderr=log)
-                await proc.wait()
+                try:
+                    await proc.wait()
+                except BaseException:  # Ctrl-C or a failing sibling: no orphan runs (CO-15)
+                    # A Ctrl-C reached the child too (same console / process group): give its
+                    # teardown time to stop its workers and fakellm, then kill it. Its workers
+                    # and store proxy also end on their stdin closing.
+                    if proc.returncode is None:
+                        try:
+                            await asyncio.wait_for(proc.wait(), 30)
+                        except TimeoutError:
+                            proc.kill()
+                            await proc.wait()
+                    raise
             results[f"{sid} {load}"] = proc.returncode == 0
             text = (folder / f"{name}.log").read_text(encoding="utf-8", errors="replace")
             lines = [
@@ -1406,8 +1471,8 @@ def main() -> int:
         async def drill(name: str = FAILOVER[sid]) -> bool:
             return bool(await failover.drill(name))
 
-        failover.nodes_up()
-        try:
+        try:  # a failed nodes_up still removes what it started (CO-17)
+            failover.nodes_up()
             results[sid] = asyncio.run(drill())
         finally:
             failover.nodes_down()

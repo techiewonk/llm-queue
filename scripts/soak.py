@@ -220,14 +220,19 @@ async def soak(profile: Profile, live: Path | None = None) -> bool:
                         victim.kill()
                         await gate.workers(1)
                     elif event == "block":
-                        proxy.refuse = True
-                        proxy.drop_all()
-                        await asyncio.sleep(profile.block_secs)
-                        proxy.refuse = False
+                        proxy.refuse = True  # off again whatever happens (CO-16)
+                        try:
+                            proxy.drop_all()
+                            await asyncio.sleep(profile.block_secs)
+                        finally:
+                            proxy.refuse = False
                     elif event == "edit":
-                        await queues[0].registry.set({"rpm": rpm // 2}, model="chat", actor="soak")
-                        await asyncio.sleep(profile.edit_secs)
-                        await queues[0].registry.set({"rpm": rpm}, model="chat", actor="soak")
+                        registry = queues[0].registry
+                        try:
+                            await registry.set({"rpm": rpm // 2}, model="chat", actor="soak")
+                            await asyncio.sleep(profile.edit_secs)
+                        finally:
+                            await registry.set({"rpm": rpm}, model="chat", actor="soak")
                     else:
                         victim = random.choice([w for w in gate.fleet if w.proc.poll() is None])
                         await gate.workers(1)

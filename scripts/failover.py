@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import json
 import os
 import subprocess
@@ -138,11 +139,22 @@ async def drill(scenario: str) -> bool:
         docker("exec", NODES["b"][0], "valkey-cli", "FAILOVER")
         await asyncio.sleep(2)
     await asyncio.to_thread(wait_link)
+    # Each resource is undone on its own, in reverse, even if a later start or an earlier
+    # undo fails: the proxy and fakellm leaked when llmq.start() raised (CO-17).
+    async with contextlib.AsyncExitStack() as stack:
+        return await _drill(scenario, stack)
+    raise AssertionError("unreachable: the exit stack swallows no exception")
+
+
+async def _drill(scenario: str, stack: contextlib.AsyncExitStack) -> bool:
     proxy = Proxy()
+    stack.push_async_callback(asyncio.to_thread, proxy.stop)
     await asyncio.to_thread(proxy.start)
     fake = FakeLLM({"defaults": {"latency_ms": {"p50": 150, "p95": 250}}})
+    stack.callback(fake.stop)
     await asyncio.to_thread(fake.start)
     llmq = LLMQueue.from_env(environment(f"llmqfo:{uuid7().hex[-6:]}", fake.url))
+    stack.push_async_callback(llmq.stop, drain_secs=1)
     await llmq.start()
     started = time.monotonic()
     ok: collections.Counter[int] = collections.Counter()
@@ -177,10 +189,12 @@ async def drill(scenario: str) -> bool:
         at = f"[{time.monotonic() - started:.1f}s]"
         if scenario == "restart":
             proxy.refuse = True
-            proxy.drop_all()
-            print(f"  {at} node down: every connection dropped")
-            await asyncio.sleep(OUTAGE_SECS)
-            proxy.refuse = False
+            try:
+                proxy.drop_all()
+                print(f"  {at} node down: every connection dropped")
+                await asyncio.sleep(OUTAGE_SECS)
+            finally:
+                proxy.refuse = False
             print(f"  [{time.monotonic() - started:.1f}s] node back")
             return
         # In a thread: a blocking call here stalled the drill's own callers mid-traffic.
@@ -191,15 +205,11 @@ async def drill(scenario: str) -> bool:
         proxy.target = "b"
         print(f"  [{time.monotonic() - started:.1f}s] the name now points at b")
 
-    try:
-        await asyncio.gather(traffic(), event())
-        health = await llmq.health()
-        await asyncio.sleep(1)  # the last attempts have ended
-        provider = await asyncio.to_thread(fake.stats)
-    finally:
-        await llmq.stop(drain_secs=1)
-        await asyncio.to_thread(proxy.stop)
-        fake.stop()
+    await asyncio.gather(traffic(), event())
+    health = await llmq.health()
+    await asyncio.sleep(1)  # the last attempts have ended
+    provider = await asyncio.to_thread(fake.stats)
+    await stack.aclose()  # stopped before the report, as before
     twice = sum(int(m.get("duplicates", 0)) for m in provider.values())
     provider_calls = sum(int(m.get("calls", 0)) for m in provider.values())
     total_ok, total_failed = sum(ok.values()), sum(failed.values())
@@ -234,8 +244,8 @@ def main() -> int:
         return 2
     os.environ.update({"AWS_ACCESS_KEY_ID": "aws-main", "AWS_SECRET_ACCESS_KEY": "fake"})
     os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
-    nodes_up()
-    try:
+    try:  # a failed nodes_up still removes what it started (CO-17)
+        nodes_up()
         results = []
         for scenario in chosen:
             print(f"[{scenario}]")
