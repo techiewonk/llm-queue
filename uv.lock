@@ -1971,6 +1971,7 @@ dev = [
     { name = "pytest-timeout" },
     { name = "ruff" },
     { name = "types-aiobotocore", extra = ["bedrock-runtime", "s3", "sts"] },
+    { name = "types-psutil" },
 ]
 
 [package.metadata]
@@ -2012,6 +2013,7 @@ dev = [
     { name = "pytest-timeout", specifier = ">=2.3" },
     { name = "ruff", specifier = ">=0.6" },
     { name = "types-aiobotocore", extras = ["s3", "bedrock-runtime", "sts"] },
+    { name = "types-psutil" },
 ]
 
 [[package]]
@@ -3841,6 +3843,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/06/f5/e45a5bf3c1dc16c952518f245604b177d14dc674a37659a084165f063911/types_aiobotocore_sts-3.10.0.tar.gz", hash = "sha256:609d7dd646559c78f6548f4cc40ae822efe0378d40b207c70985c5bf230092ae", size = 17119, upload-time = "2026-10-24T03:52:54.844Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/43/30/127f2a593361b5d95d9db667b1cd43f551d4391e2a136011a7f70299ac8e/types_aiobotocore_sts-3.10.0-py3-none-any.whl", hash = "sha256:e7cf7662eca8e729d58c646d8c6904342cc08184d21b43472853d7098d7bec69", size = 21537, upload-time = "2026-10-24T03:52:52.732Z" },
+]
+
+[[package]]
+name = "types-psutil"
+version = "7.2.2.20261111"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9c/30/9eb9f10b074aa0cb3456ad3469716169d0af6de58096719f31cb065aac68/types_psutil-7.2.2.20261111.tar.gz", hash = "sha256:d677119c44fb80cc9be41d8ac731f08bf89974bb1daa49b6688665a9d7224f42", size = 27439, upload-time = "2026-11-11T08:32:33.155Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c1/c2/6a9d0b3e4f55ad008891dda1f9316b077f28c22274c58869f8047f7d6b74/types_psutil-7.2.2.20261111-py3-none-any.whl", hash = "sha256:054f7b635fc908d3d27e49e8d274fbfed115a1a859f2edeae17519c0238286a1", size = 33394, upload-time = "2026-11-11T08:32:32.097Z" },
 ]
 
 [[package]]

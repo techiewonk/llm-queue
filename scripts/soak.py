@@ -18,14 +18,18 @@ Time is what finds slow leaks and drift (more calls, more growth above the noise
 runs the 20-minute soak; the 3-minute one is a smoke test only.
 
 Pass: every call answered by its deadline (ok, or `rate_limited` / `deadline_exceeded` /
-`queue_unavailable` while a chaos event is on); nothing left in progress once the calls drain;
-store memory and key count flat (the last sixth of the run within 25 % of the second sixth,
-after the ramp-up); store calls per second flat.
+`queue_unavailable` while a chaos event is on, which ends `SETTLE_SECS` after the event);
+outside chaos at least 0.9 x the offered calls served; nothing left in progress for any model
+once the calls drain; flat (the last sixth of the run within 10 % of the second sixth, after the
+ramp-up, plus a small absolute slack): store memory, keys, calls per second and connections
+(CLIENT LIST, by the run's client name), and per process (each worker that lived through both
+sixths, and the driver) RSS and asyncio task count.
 
     python scripts/soak.py                 # 10 minutes
     python scripts/soak.py --minutes 3
     python scripts/soak.py --minutes 20
     python scripts/soak.py --minutes 3 --live   # real Bedrock at a small budget
+    python scripts/soak.py --seed 7             # replay the random choices (printed at start)
 
 `--live` calls real Bedrock (keys and `AWS_MODEL_REGION` from `--env-file`, never printed) at a
 budget a test can afford: chat (gpt-oss-20b) 10 RPM / 5,000 TPM, titan 10 RPM, offered at about
@@ -45,6 +49,7 @@ import random
 import statistics
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -52,9 +57,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import failover  # needs the sys.path entry
 from gates import Gate, Run, chat, registry
-from gates_fleet import TITAN_ID, log_dir, setup_logging
+from gates_fleet import TITAN_ID, free_port, log_dir, process_stats, setup_logging
 
-PROXY_PORT = 6387
+PROXY_PORT = free_port()
+# After a chaos event ends: reconnect backoff, a registry reload, a breaker cooldown (15 s).
+SETTLE_SECS = 20.0
+DRIFT = 0.10  # the last sixth may be this much above the second sixth
+SLACK = {  # plus this much, for small absolute numbers
+    "memory_mb": 2.0,
+    "keys": 50,
+    "scripts_per_s": 10,
+    "connections": 4,
+    "rss_mb": 8.0,
+    "tasks": 5,
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -154,11 +170,13 @@ async def soak(profile: Profile, live: Path | None = None) -> bool:
     server = await asyncio.start_server(proxy.handle, "127.0.0.1", PROXY_PORT)
     chaos_windows: list[tuple[float, float]] = []
     samples: list[dict[str, float]] = []
+    processes: list[dict[str, float]] = []  # per-process samples (pid 0: this driver)
     late: list[Any] = []
     try:
         # Status records expire within the run (default 30 min), so the key count levels off
         # and growth after that is a leak, not retention.
-        store = f"redis://:localdev@127.0.0.1:{PROXY_PORT}/0"
+        name = f"llmqsoak-{uuid.uuid4().hex[:8]}"  # CLIENT LIST counts this run's connections
+        store = f"redis://:localdev@127.0.0.1:{PROXY_PORT}/0?client_name={name}"
         ttl = str(profile.status_ttl_secs)
         async with Gate(doc, LLMQ_STORE_URL=store, LLMQ_STATUS_TTL_SECS=ttl) as gate:
             if live is not None:  # real Bedrock: no fakellm endpoint, the env file's keys
@@ -216,7 +234,7 @@ async def soak(profile: Profile, live: Path | None = None) -> bool:
                         victim = random.choice([w for w in gate.fleet if w.proc.poll() is None])
                         await gate.workers(1)
                         await victim.stop()
-                    chaos_windows.append((start - 1, time.monotonic() - run.t0 + 45))
+                    chaos_windows.append((start - 1, time.monotonic() - run.t0 + SETTLE_SECS))
                     print(f"  [{start / 60:5.1f} min] chaos: {event}", flush=True)
 
             async def sampler() -> None:
@@ -233,32 +251,39 @@ async def soak(profile: Profile, live: Path | None = None) -> bool:
                     ok = sum(r.ok for r in recent)
                     sample = {
                         "minute": (time.monotonic() - run.t0) / 60,
+                        "since": since,
                         "memory_mb": int(info["used_memory"]) / 1e6,
                         "keys": keys,
                         "scripts_per_s": rate,
+                        "connections": gate.store.connections(name),
                         "ok": ok,
                         "failed": len(recent) - ok,
                     }
                     samples.append(sample)
+                    for worker in [*gate.fleet]:  # a worker's own numbers, by pid
+                        stats = await worker.stats()
+                        if stats is not None:
+                            processes.append({"minute": sample["minute"], **stats})
+                    processes.append({"minute": sample["minute"], **process_stats(), "pid": 0})
                     print(
                         f"  [{sample['minute']:5.1f} min] ok {ok}, failed {len(recent) - ok}, "
                         f"memory {sample['memory_mb']:.0f} MB, keys {keys}, "
-                        f"store scripts/s {rate:.0f}",
+                        f"store scripts/s {rate:.0f}, connections {sample['connections']}",
                         flush=True,
                     )
 
             await asyncio.gather(traffic(), chaos(), sampler())
             # Every caller has its answer; a worker may still be finishing an attempt, and a
             # killed worker's entry goes when its lease does (60 s) and the sweep runs.
-            inprog_key = f"{gate.prefix}:{{m:chat}}:inprog"
+            inprog_keys = [f"{gate.prefix}:{{m:{alias}}}:inprog" for alias in doc["models"]]
             drain_by = time.monotonic() + 90
             for _ in range(90):  # polls the store: no event to wait on
-                inprog = gate.store.client.zcard(inprog_key)
+                inprog = sum(gate.store.client.zcard(key) for key in inprog_keys)
                 if not inprog or time.monotonic() > drain_by:
                     break
                 await asyncio.sleep(1)
-            if inprog:
-                print(f"  still in progress: {gate.store.client.zrange(inprog_key, 0, -1)}")
+            for key in inprog_keys if inprog else []:
+                print(f"  still in progress ({key}): {gate.store.client.zrange(key, 0, -1)}")
             held = sum(1 for w in gate.fleet if w.proc.poll() is None)  # live workers
     finally:
         server.close()
@@ -277,12 +302,38 @@ async def soak(profile: Profile, live: Path | None = None) -> bool:
     tail = max(2 * step, sixth)
     last = [s for s in samples if s["minute"] >= samples[-1]["minute"] - tail] or samples[-3:]
 
-    def flat(field: str) -> bool:
+    def grew(field: str, before: list[dict[str, float]], after: list[dict[str, float]]) -> bool:
         # Medians: in the short soaks every window holds a chaos event, and one store-block dip
         # (a third of the rate) pulled a mean baseline down until a normal end read as drift.
-        a = statistics.median(s[field] for s in warm)
-        b = statistics.median(s[field] for s in last)
-        return b <= a * 1.25 + 5
+        a = statistics.median(s[field] for s in before)
+        b = statistics.median(s[field] for s in after)
+        return b > a * (1 + DRIFT) + SLACK[field]
+
+    def flat(field: str) -> bool:
+        return not grew(field, warm, last)
+
+    # Per process: only processes sampled in both windows (killed workers are replaced).
+    warm_min, last_min = min(s["minute"] for s in warm), min(s["minute"] for s in last)
+    warm_end = max(s["minute"] for s in warm)
+    leaks: list[str] = []
+    for pid in sorted({int(p["pid"]) for p in processes}):
+        mine = [p for p in processes if int(p["pid"]) == pid]
+        before = [p for p in mine if warm_min <= p["minute"] <= warm_end]
+        after = [p for p in mine if p["minute"] >= last_min]
+        if before and after:
+            leaks += [
+                f"{pid or 'driver'} {f}" for f in ("rss_mb", "tasks") if grew(f, before, after)
+            ]
+
+    # Throughput outside chaos: a sample whose stretch touches no chaos window.
+    offered = rate * profile.sample_secs
+    calm = [
+        s
+        for s in samples
+        if s["minute"] > 2 * step  # after the ramp-up
+        and not any(a <= s["minute"] * 60 and s["since"] <= b for a, b in chaos_windows)
+    ]
+    slow = [round(s["minute"], 1) for s in calm if s["ok"] < 0.9 * offered]
 
     print(
         f"  {len(run.results)} calls over {minutes:.0f} min; failed outside chaos: "
@@ -300,6 +351,12 @@ async def soak(profile: Profile, live: Path | None = None) -> bool:
         "store memory flat": flat("memory_mb"),
         "store keys flat": flat("keys"),
         "store calls per second flat": flat("scripts_per_s"),
+        "store connections flat": flat("connections"),
+        f"per process RSS and tasks flat {leaks or ''}".rstrip(): not leaks,
+        f"outside chaos >= 0.9 x offered served ({len(calm)} samples) {slow or ''}".rstrip(): bool(
+            calm
+        )
+        and not slow,
     }
     for name, ok in checks.items():
         print(f"  {'ok  ' if ok else 'FAIL'} {name}")
@@ -318,7 +375,11 @@ def main() -> int:
     )
     parser.add_argument("--live", action="store_true", help="real Bedrock, small budget")
     parser.add_argument("--env-file", type=Path, default=Path(__file__).parents[3] / ".env")
+    parser.add_argument("--seed", type=int, help="seed of every random choice (default: new)")
     args = parser.parse_args()
+    seed = args.seed if args.seed is not None else random.randrange(2**31)
+    random.seed(seed)
+    print(f"  seed {seed} (replay with --seed {seed})", flush=True)
     live = args.env_file if args.live else None
     return 0 if asyncio.run(soak(PROFILES[args.minutes], live)) else 1
 
