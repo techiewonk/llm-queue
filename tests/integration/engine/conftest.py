@@ -18,6 +18,7 @@ from engine_testkit import FakeEngine, Make, Scenario, create_app, registry
 
 from llm_queue.clients import ClientPool, Providers
 from llm_queue.engine.runtime import Engine, EngineSettings
+from llm_queue.engine.store_client import store_client
 from llm_queue.registry.store import RegistryStore
 
 PASSWORD = os.environ.get("LLMQ_TEST_REDIS_PASSWORD", "localdev")
@@ -26,8 +27,11 @@ ENGINES = {"valkey": 6379, "redis": 6380}
 
 @pytest.fixture(params=sorted(ENGINES))
 async def store(request: pytest.FixtureRequest) -> AsyncIterator[redis.asyncio.Redis]:
-    """An async client (no decode_responses, as in the library) on one engine."""
-    client = redis.asyncio.Redis(host="127.0.0.1", port=ENGINES[request.param], password=PASSWORD)
+    """The library's own client (blocking pool, bytes replies) on one engine.
+
+    redis-py's default pool raises at 100 connections; apps get `store_client`, so tests do too.
+    """
+    client = store_client(f"redis://:{PASSWORD}@127.0.0.1:{ENGINES[request.param]}/0")
     await client.ping()
     yield client
     await client.aclose()
