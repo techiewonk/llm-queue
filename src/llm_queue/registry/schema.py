@@ -10,13 +10,15 @@ from __future__ import annotations
 
 import difflib
 import ipaddress
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
+from llm_queue._version import __version__
 from llm_queue.errors import ConfigError, UnknownModel
 from llm_queue.registry.settings import SETTINGS, A, D, M, R, settings_at
 
@@ -26,9 +28,22 @@ QUEUE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,71}$")  # leaves room for "-priori
 # Account kind -> the provider it serves. `register_account_kind` adds more.
 ACCOUNT_KINDS: dict[str, str] = {"aws": "bedrock", "openai": "openai"}
 MODEL_TYPES = ("chat", "embedding")
-_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "host.docker.internal"})
+LIVE_EDIT_MODES = ("safe", "all", "off")
+# The only hosts a plain-http `base_url` may name (no single-label or `.localhost` names).
+LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "host.docker.internal"})
+# An account's secrets are environment variables (or secrets) under this prefix only, so a
+# registry edit can never name the store password or the pod's own AWS keys.
+SECRET_REF_PREFIX = "LLMQ_ACCOUNT_"
+_SECRET_REF_RE = re.compile(rf"^{SECRET_REF_PREFIX}[A-Z0-9_]+$")
+# Query names that carry a credential: a key in a URL ends up in logs and proxies.
+_URL_SECRET_PARAMS = frozenset(
+    {"api_key", "apikey", "key", "token", "access_token", "password", "secret", "sig", "signature"}
+)
+# AWS instance metadata, DNS and time over IPv6 (fd00:ec2::/32) and link-local everywhere.
+_METADATA_NET = ipaddress.ip_network("fd00:ec2::/32")
+_VERSION_RE = re.compile(r"^(\d+(?:\.\d+)*)(?:(a|b|rc)(\d+))?(?:\.post(\d+))?(?:\.dev(\d+))?$")
 
-_TOP = ("registry_version", "min_lib_version", "defaults", "routing", "residency")
+_TOP = ("registry_version", "min_lib_version", "live_edit", "defaults", "routing", "residency")
 _TOP_KEYS = frozenset((*_TOP, "accounts", "models"))
 _ACCOUNT_FIELDS = frozenset(
     {"kind", "enabled", "role_arn", "external_id_ref", "base_url", "api_key_ref", "settings"}
@@ -44,6 +59,78 @@ def register_account_kind(kind: str, provider: str) -> None:
     if not NAME_RE.match(kind) or not NAME_RE.match(provider):
         raise ConfigError("kind and provider must be lowercase names")
     ACCOUNT_KINDS[kind] = provider
+
+
+def version_key(text: str) -> tuple[Any, ...] | None:
+    """A sortable key of a PEP 440 version (`0.1.0b2`, `1.2.dev3`); None when it is not one."""
+    found = _VERSION_RE.match(text.strip().lower().removeprefix("v"))
+    if not found:
+        return None
+    release, pre, pre_n, post, dev = found.groups()
+    parts = [int(p) for p in release.split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    if pre:
+        stage = ({"a": 0, "b": 1, "rc": 2}[pre], int(pre_n))
+    elif dev is not None and post is None:
+        stage = (-1, 0)  # 1.0.dev1 comes before 1.0a1
+    else:
+        stage = (3, 0)
+    post_n = -1 if post is None else int(post)
+    return (tuple(parts), stage, post_n, math.inf if dev is None else int(dev))
+
+
+def needs_newer_lib(min_version: str | None) -> bool:
+    """True when a registry's `min_lib_version` is above this library's version.
+
+    An unreadable version counts as newer: it can only come from a library this one predates.
+    """
+    if not min_version:
+        return False
+    wanted, own = version_key(min_version), version_key(__version__)
+    return wanted is None or own is None or wanted > own
+
+
+Address = ipaddress.IPv4Address | ipaddress.IPv6Address
+_INET_PART_RE = re.compile(r"^(0x[0-9a-f]+|[0-9]+)$")
+
+
+def host_address(host: str) -> Address | None:
+    """The IP address a host names, in every form a resolver accepts, else None.
+
+    `0x7f.1`, `2130706433` and `0177.0.0.1` are 127.0.0.1 to `inet_aton`, and `::ffff:a.b.c.d`
+    is the IPv4 address it maps: each is read as that address.
+    """
+    text = host.strip("[]").lower().split("%", 1)[0]
+    try:
+        address: Address = ipaddress.ip_address(text)
+    except ValueError:
+        parts = text.split(".")
+        if not 1 <= len(parts) <= 4 or not all(_INET_PART_RE.match(p) for p in parts):
+            return None
+        try:
+            numbers = [
+                int(p, 16)
+                if p.startswith("0x")
+                else int(p, 8 if len(p) > 1 and p[0] == "0" else 10)
+                for p in parts
+            ]
+        except ValueError:  # 8 or 9 in an octal part
+            return None
+        *head, last = numbers
+        if any(n > 255 for n in head) or last >= 256 ** (4 - len(head)):
+            return None
+        value = sum(n << (8 * (3 - i)) for i, n in enumerate(head)) + last
+        address = ipaddress.IPv4Address(value)
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    return address
+
+
+def normal_host(host: str) -> str:
+    """A host as compared with the local and allowed lists: the address, or the lowercase name."""
+    address = host_address(host)
+    return str(address) if address is not None else host.lower().rstrip(".")
 
 
 def _frozen(value: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -123,6 +210,7 @@ class Registry:
     models: Mapping[str, ModelEntry]
     residency: tuple[str, ...] | None = None
     min_lib_version: str | None = None
+    live_edit: str | None = None  # None: the process's `LLMQ_REGISTRY_LIVE_EDIT` applies
     warnings: tuple[str, ...] = ()
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
@@ -205,31 +293,35 @@ def _settings(
     return kept
 
 
-# Secrets of the process itself: never an account's key (a registry edit must not exfiltrate).
-_PROCESS_SECRETS = frozenset(
-    {
-        "LLMQ_STORE_PASSWORD",
-        "LLMQ_QUEUE_STORE_PASSWORD",
-        "LLMQ_ID_HASH_SALT",
-        "LLMQ_STORE_URL",
-        "LLMQ_QUEUE_STORE_URL",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-    }
-)
-
-
-def _is_link_local(host: str) -> bool:
-    """169.254.0.0/16 or fe80::/10: instance metadata endpoints live there."""
+def _base_url_problem(url: str, allowed_hosts: tuple[str, ...]) -> str | None:
+    """What is wrong with an `openai` account's `base_url`, or None."""
+    parsed = urlparse(url)
     try:
-        return ipaddress.ip_address(host.strip("[]")).is_link_local
+        host = parsed.hostname or ""
     except ValueError:
-        return False
-
-
-def _is_local(host: str) -> bool:
-    return host in _LOCAL_HOSTS or host.endswith(".localhost") or "." not in host
+        return "must be an http(s) URL"
+    if parsed.scheme not in ("https", "http") or not host:
+        return "must be an http(s) URL"
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        return "must not carry a user or password (use `api_key_ref`)"
+    if any(name.lower() in _URL_SECRET_PARAMS for name, _ in parse_qsl(parsed.query, True)):
+        return "must not carry a key in its query (use `api_key_ref`)"
+    address = host_address(host)
+    # Instance metadata lives on link-local addresses (169.254.169.254, fe80::) and, on AWS
+    # over IPv6, in fd00:ec2::/32; `0.0.0.0` and multicast are never an endpoint.
+    if address is not None and (
+        address.is_link_local
+        or address.is_unspecified
+        or address.is_multicast
+        or (isinstance(address, ipaddress.IPv6Address) and address in _METADATA_NET)
+    ):
+        return "a link-local, metadata or unspecified address is refused"
+    name = normal_host(host)
+    if parsed.scheme == "http" and name not in LOCAL_HOSTS:
+        return f"must use https unless the host is local ({', '.join(sorted(LOCAL_HOSTS))})"
+    if allowed_hosts and name not in {normal_host(h) for h in allowed_hosts}:
+        return f"host `{host}` is not in the allowed hosts"
+    return None
 
 
 def _account(
@@ -263,10 +355,14 @@ def _account(
         out.error(f"{path}.external_id_ref", "needs `role_arn`")
     for key in ("external_id_ref", "api_key_ref"):
         ref = texts[key]
-        if ref and ref in _PROCESS_SECRETS:
-            # A registry author could otherwise send the store password or the pod's AWS
-            # keys as a Bearer token to a base_url they choose.
-            out.error(f"{path}.{key}", f"`{ref}` is a process secret, not an account's")
+        if ref and not _SECRET_REF_RE.match(ref):
+            # Any other name could be the store password or the pod's own AWS keys, sent as a
+            # Bearer token to a base_url the registry author chose.
+            out.error(
+                f"{path}.{key}",
+                f"`{ref}` is not an account secret: an upper-case name starting with "
+                f"`{SECRET_REF_PREFIX}` (never a process secret)",
+            )
     if kind == "aws":
         for key in ("base_url", "api_key_ref"):
             if texts[key]:
@@ -275,17 +371,8 @@ def _account(
         url = texts["base_url"]
         if not url:
             out.error(f"{path}.base_url", "an `openai` account needs `base_url`")
-        else:
-            parsed = urlparse(url)
-            host = parsed.hostname or ""
-            if parsed.scheme not in ("https", "http") or not host:
-                out.error(f"{path}.base_url", "must be an http(s) URL")
-            elif _is_link_local(host):
-                out.error(f"{path}.base_url", "a link-local host (instance metadata) is refused")
-            elif parsed.scheme == "http" and not _is_local(host):
-                out.error(f"{path}.base_url", "must use https unless the host is local")
-            elif allowed_hosts and host not in allowed_hosts:
-                out.error(f"{path}.base_url", f"host `{host}` is not in the allowed hosts")
+        elif problem := _base_url_problem(url, allowed_hosts):
+            out.error(f"{path}.base_url", problem)
     enabled = body.get("enabled", True)
     if not isinstance(enabled, bool):
         out.error(f"{path}.enabled", "must be true or false")
@@ -485,9 +572,17 @@ def build(
         out.error("registry_version", "is required: an integer of at least 1")
         version = 0
     min_lib = raw.get("min_lib_version")
-    if min_lib is not None and not (isinstance(min_lib, str) and min_lib):
-        out.error("min_lib_version", "must be a version string")
+    if min_lib is not None and not (isinstance(min_lib, str) and version_key(min_lib)):
+        out.error("min_lib_version", "must be a version such as 0.1.0b2")
         min_lib = None
+    elif strict and needs_newer_lib(min_lib):
+        # The process's own config: this library cannot honour it. A stored one is read and
+        # the store keeps the pod on its own config instead (RegistryStore.lib_too_old).
+        out.error("min_lib_version", f"needs llm-queue {min_lib} or later (this is {__version__})")
+    live_edit = raw.get("live_edit")
+    if live_edit is not None and live_edit not in LIVE_EDIT_MODES:
+        out.error("live_edit", f"must be one of {', '.join(LIVE_EDIT_MODES)}")
+        live_edit = None
     defaults_raw = out.mapping("defaults", raw.get("defaults", {})) or {}
     defaults = _settings(out, "defaults", defaults_raw, D)
     accounts_raw = out.mapping("accounts", raw.get("accounts")) or {}
@@ -514,6 +609,7 @@ def build(
         models=MappingProxyType(models),
         residency=_residency(out, "residency", raw.get("residency")),
         min_lib_version=min_lib,
+        live_edit=live_edit,
         raw=_frozen(raw),
     )
     if out.errors:

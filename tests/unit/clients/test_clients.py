@@ -44,7 +44,7 @@ async def setup(start_fake: StartFake) -> AsyncIterator[Any]:
                 "aws_access_key_id": account.name,
                 "aws_secret_access_key": "x",
             },
-            secrets={"VLLM_KEY": "key-v"}.get,
+            secrets={"LLMQ_ACCOUNT_VLLM_KEY": "key-v"}.get,
         )
         built = Providers(pool)
         providers.append(built)
