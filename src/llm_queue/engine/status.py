@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from llm_queue._logging import get_logger
+from llm_queue.engine._codec import text as _text
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import StreamQueues
 
@@ -48,10 +49,6 @@ for i = 2, #ARGV do
 end
 return out
 """
-
-
-def _text(value: Any) -> str:
-    return value.decode() if isinstance(value, bytes) else str(value)
 
 
 def _num(value: Any, default: float = 0.0) -> float:

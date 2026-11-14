@@ -8,11 +8,12 @@ scripts fail on their first call. `check_store` warns on the first and refuses t
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from redis.exceptions import RedisError
 
 from llm_queue._logging import get_logger
+from llm_queue.engine._codec import text as _text
 from llm_queue.errors import ConfigError
 
 if TYPE_CHECKING:
@@ -21,10 +22,6 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 UNKNOWN = "unknown"
-
-
-def _text(value: Any) -> str:
-    return value.decode() if isinstance(value, bytes) else str(value)
 
 
 async def eviction_policy(client: redis.asyncio.Redis) -> str:

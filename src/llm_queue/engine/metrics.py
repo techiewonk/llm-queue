@@ -59,7 +59,11 @@ class EmfSink:
         namespace: str = NAMESPACE,
         static: Mapping[str, str] | None = None,
     ) -> None:
-        """`write` receives each line (default: stdout); `static` labels go on every point."""
+        """`write` receives each line (default: stdout); `static` labels go on every point.
+
+        `write` runs on the event loop for every point: pass one that never blocks (a queue
+        handler, a buffered stream) if stdout can back up (EN-20, unmeasured).
+        """
         self._write = write or (lambda line: sys.stdout.write(line + "\n"))
         self.namespace = namespace
         self.static = dict(static or {})

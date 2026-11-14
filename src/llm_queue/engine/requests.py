@@ -1,11 +1,12 @@
 """Per-request records: the duplicate-id claim, the result and the request status.
 
-A call's record is written only if absent when it is sent and confirmed only after the send
-succeeded, so a failed send never leaves a phantom (plan §3.18 R23). Results are written once
-(and announced to the caller in the same script); a library id's result is deleted on its
-first read, an app id's kept `result_ttl_secs`. A final status is never replaced. Scripts use
-the store's clock.
+Results are written once and announced to the caller in the same script; a final status is
+never replaced. Used by the runtime on both the caller and the worker side.
 """
+
+# A call's record is written only if absent when it is sent and confirmed only after the send
+# succeeded, so a failed send never leaves a phantom (plan §3.18 R23). A library id's result is
+# deleted on its first read, an app id's kept `result_ttl_secs`. Scripts use the store's clock.
 
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ from redis.exceptions import ReadOnlyError
 from redis.exceptions import TimeoutError as StoreTimeoutError
 
 from llm_queue._logging import get_logger
+from llm_queue.engine._codec import text as _text
 from llm_queue.engine.envelope import Reply
 from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.keys import Keys
@@ -501,7 +503,3 @@ def _pairs(fields: Mapping[str, Any]) -> list[str]:
     return [
         part for name, value in fields.items() if value is not None for part in (name, str(value))
     ]
-
-
-def _text(value: Any) -> str:
-    return value.decode() if isinstance(value, bytes) else str(value)

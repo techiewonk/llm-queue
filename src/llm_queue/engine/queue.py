@@ -1,11 +1,13 @@
 """A queue on any Redis-protocol store: a stream plus visibility, generation and failure records.
 
-Order is the stream id (the store's clock at send). A received message is held (invisible) for
-the visibility time; `return_` makes it visible again in its place without a failure;
-a lapsed hold (the worker died) counts one failure, and `max_receives` failures move it to the
-dead-letter stream, reported to the receiver so the caller can be told (plan §3.18). Every
-operation is one Lua call. A model has two queues: `<name>` and `<name>-priority` (E92).
+Every operation is one Lua call. Used by the runtime (a model's `<name>` and `<name>-priority`
+queues, E92), the job runner and the CLI.
 """
+
+# Order is the stream id (the store's clock at send). A received message is held (invisible)
+# for the visibility time; `return_` makes it visible again in its place without a failure; a
+# lapsed hold (the worker died) counts one failure, and `max_receives` failures move it to the
+# dead-letter stream, reported to the receiver so the caller can be told (plan §3.18).
 
 from __future__ import annotations
 
@@ -17,6 +19,8 @@ from typing import TYPE_CHECKING, Any
 from redis.exceptions import NoScriptError
 
 from llm_queue._logging import get_logger
+from llm_queue.engine._codec import as_bytes as _bytes
+from llm_queue.engine._codec import text as _text
 from llm_queue.engine.keys import Keys
 
 if TYPE_CHECKING:
@@ -624,11 +628,3 @@ def _messages(queue: str, taken: Sequence[Any], now_ms: int) -> list[Message]:
         Message(queue, _text(taken[i]), int(taken[i + 1]), _bytes(taken[i + 2]), now_ms)
         for i in range(0, len(taken), 3)
     ]
-
-
-def _text(value: Any) -> str:
-    return value.decode() if isinstance(value, bytes) else str(value)
-
-
-def _bytes(value: Any) -> bytes:
-    return value if isinstance(value, bytes) else str(value).encode()

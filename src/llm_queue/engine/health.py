@@ -1,12 +1,13 @@
 """Deployment health (plan §3.5, §3.18): auto-disable with safeguards, probes, recovery.
 
-Target errors (model not in region, access denied) are counted per deployment and request in a
-window; at `disable_errors` the deployment is disabled, unless it is the model's last usable one
-(then only an alert). Errors are counted once the call's outcome is known: a request that hits
-target errors on two deployments is the cause and is never counted. A disabled deployment stays
-out until a probe succeeds; probes start after `probe_after_secs` and back off up to
-`probe_max_secs`. Health lives apart from the registry, so a publish never re-enables one.
+Target errors (model not in region, access denied) disable a deployment at `disable_errors`
+in a window; probes bring it back. Used by the runtime's call and probe loops.
 """
+
+# A model's last usable deployment is never disabled (only an alert). Errors are counted once
+# the call's outcome is known: a request that hits target errors on two deployments is the
+# cause and is never counted. Probes start after `probe_after_secs` and back off up to
+# `probe_max_secs`. Health lives apart from the registry, so a publish never re-enables one.
 
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import orjson
 
+from llm_queue.engine._codec import text as _text
 from llm_queue.engine.keys import Keys
 
 if TYPE_CHECKING:
@@ -106,7 +108,7 @@ class Health:
         reply = await self._record(
             [self.keys.model(alias, "health"), self._terr(alias, dep)], [orjson.dumps(body)]
         )
-        return reply.decode() if isinstance(reply, bytes) else str(reply)
+        return _text(reply)
 
     async def probed(
         self,
@@ -125,14 +127,14 @@ class Health:
         if probe_after_secs is not None:
             body["probe_min_ms"] = int(probe_after_secs * 1000)
         reply = await self._probed([self.keys.model(alias, "health")], [orjson.dumps(body)])
-        return reply.decode() if isinstance(reply, bytes) else str(reply)
+        return _text(reply)
 
     async def disabled(self, alias: str) -> dict[str, float]:
         """Disabled deployments of a model and when each is next probed (store time, secs)."""
         raw = await self._client.hgetall(self.keys.model(alias, "health"))
         out: dict[str, float] = {}
         for field, value in (raw or {}).items():
-            name = field.decode() if isinstance(field, bytes) else str(field)
+            name = _text(field)
             if name.endswith("|until"):
                 out[name[: -len("|until")]] = float(value) / 1000.0
         return out
@@ -150,9 +152,4 @@ class Health:
     async def snapshot(self, alias: str) -> dict[str, Any]:
         """The raw health hash of a model (status view)."""
         raw = await self._client.hgetall(self.keys.model(alias, "health"))
-        return {
-            (k.decode() if isinstance(k, bytes) else str(k)): (
-                v.decode() if isinstance(v, bytes) else str(v)
-            )
-            for k, v in (raw or {}).items()
-        }
+        return {_text(k): (_text(v)) for k, v in (raw or {}).items()}

@@ -1,10 +1,11 @@
 """Streaming to the caller (plan §3.13, F6, R19): chunk streams in the state store.
 
-The worker serving a streaming call appends the provider's events to the request's chunk
-stream (`P:{r:ID}:chunks`) through a `ChunkWriter`: the first event at once, later ones batched
-by `stream_flush_ms`, then one `end` or `error` entry. Each caller process runs one
+A worker writes a call's events with a `ChunkWriter`; each caller process runs one
 `ChunkReader` that reads all its open chunk streams with one blocking read.
 """
+
+# The stream is `P:{r:ID}:chunks`: the first event at once, later ones batched by
+# `stream_flush_ms`, then one `end` or `error` entry.
 
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 import orjson
 
 from llm_queue._logging import get_logger
+from llm_queue.engine._codec import text as _text
 from llm_queue.engine.envelope import decode_bytes, json_default
 
 if TYPE_CHECKING:
@@ -253,12 +255,12 @@ class ChunkReader:
                 logger.info("chunk_reader_recovered", failures=failures)
                 failures = 0
             for raw_key, entries in found or []:
-                key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
+                key = _text(raw_key)
                 if key not in self._open:
                     continue
                 queue, last = self._open[key]
                 for entry_id, fields in entries:
-                    last[0] = entry_id.decode() if isinstance(entry_id, bytes) else str(entry_id)
+                    last[0] = _text(entry_id)
                     # One bad entry is skipped: it ended the reader shared by every stream of
                     # this process (RESCAN S11); the stream's caller then sees a gap.
                     try:
@@ -297,7 +299,3 @@ def _chunk_default(value: Any) -> Any:
     if isinstance(value, bytes | bytearray | memoryview):
         return json_default(value)
     return str(value)
-
-
-def _text(value: Any) -> str:
-    return value.decode() if isinstance(value, bytes) else str(value)

@@ -23,6 +23,7 @@ import orjson
 import redis.asyncio
 from redis.exceptions import RedisError
 
+from llm_queue.engine._codec import text as _text
 from llm_queue.engine.http import redacted
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import StreamQueues
@@ -32,11 +33,6 @@ from llm_queue.engine.store_client import secret_store_client
 from llm_queue.errors import ConfigError, LLMQueueError
 from llm_queue.registry.store import RegistryStore
 from llm_queue.tuning import Tuning
-
-
-def _text(value: Any) -> str:
-    return value.decode() if isinstance(value, bytes) else str(value)
-
 
 _GC_BATCH = 500  # keys per UNLINK pipeline in `registry gc`
 

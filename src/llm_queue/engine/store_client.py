@@ -1,12 +1,14 @@
 """The store client (Valkey / Redis) every process builds: one place for its failover options.
 
-A managed store (ElastiCache) fails over by promoting the replica and moving the endpoint's DNS
-name. Pooled connections still reach the old primary, now a replica, and every write gets
-`READONLY`; redis-py keeps such a connection, so without these options the queue stayed down
-after a failover until the process restarted (measured, CHANGELOG 0.3.0). Here `READONLY`, like
-a dropped connection, closes the connection and retries on a new one, which resolves the name
-again. Used by `LLMQueue.from_env` and the `llm-queue` CLI.
+`READONLY`, like a dropped connection, closes the connection and retries on a new one.
+Used by `LLMQueue.from_env` and the `llm-queue` CLI.
 """
+
+# A managed store (ElastiCache) fails over by promoting the replica and moving the endpoint's
+# DNS name. Pooled connections still reach the old primary, now a replica, and every write gets
+# `READONLY`; redis-py keeps such a connection, so without these options the queue stayed down
+# after a failover until the process restarted (measured, CHANGELOG 0.3.0). A new connection
+# resolves the name again.
 
 from __future__ import annotations
 
