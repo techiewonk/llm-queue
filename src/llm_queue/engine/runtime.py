@@ -206,6 +206,7 @@ class _Held:
     shutdown: bool = False  # the drain ran out: give it back, do not fail it (plan C3)
     refused: bool = False  # an admission refusal was counted for this call (RESCAN O4)
     model_retried: bool = False  # its one free retry after a model error was used (P9)
+    check_callers: bool = False  # its first admission also checks its callers are alive
 
     @property
     def position(self) -> float:
@@ -741,29 +742,53 @@ class Engine:
     ) -> Reply:
         rid = envelope.request_id
         user_id, session_id = envelope.user_id, envelope.session_id
-        user_hash = self.hash_id(user_id or session_id or "")
-        found = await self.requests.register(
-            rid,
-            caller=self.worker_id,
-            user_hash=user_hash,
-            params_hash=params_hash({"m": alias, "p": params}),
-            model=alias,
-            priority=priority,
-            app_id=request_id is not None,
-        )
-        if found.outcome == "conflict":
+        record: dict[str, Any] = {
+            "caller": self.worker_id,
+            "user_hash": self.hash_id(user_id or session_id or ""),
+            "params_hash": params_hash({"m": alias, "p": params}),
+            "model": alias,
+            "priority": priority,
+            "app_id": request_id is not None,
+        }
+        # Queues in the state store: register, send and confirm are one script (3 round trips
+        # before). Not with `queue_wait_replicas`: that send needs its own WAIT.
+        combined = not direct and self.queues_shared and not self.settings.queue_wait_replicas
+
+        async def register() -> tuple[str, bool]:
+            """The registration's outcome, and whether the call was sent with it."""
+            if not combined:
+                return (await self.requests.register(rid, **record)).outcome, False
+            name = self._queue_name(view, alias, priority)
+            settings = QueueSettings(max_waiting=int(view.value(alias, "max_waiting")))
+            try:
+                found = await self.requests.register_send(
+                    rid,
+                    **record,
+                    queue=name,
+                    queue_keys=self.queues.queue_keys(name),
+                    bell=self.queues.bell(name),
+                    body=envelope.dumps(),
+                    max_waiting=settings.max_waiting,
+                    retention_secs=settings.retention_secs,
+                    keep_secs=call_secs,
+                )
+            except QueueFull as exc:
+                raise CallFailed("queue_full", str(exc), retry_after_secs=5) from exc
+            return found.outcome, found.outcome in ("new", "takeover")
+
+        outcome, sent = await register()
+        if outcome == "conflict":
             raise CallFailed(
                 "request_id_conflict", "the id was used with other params", request_id=rid
             )
-        if found.outcome == "expired":
+        if outcome == "expired":
             raise CallFailed("result_expired", "the id finished earlier", request_id=rid)
         waiter = self._waiters.setdefault(rid, asyncio.get_running_loop().create_future())
         loop = asyncio.get_running_loop()
         until = loop.time() + call_secs + self.settings.caller_margin_secs
-        outcome = found.outcome
         try:
             while True:
-                if outcome in ("new", "takeover"):
+                if outcome in ("new", "takeover") and not sent:
                     if direct:
                         await self.requests.confirm(rid, keep_secs=call_secs)
                         task = asyncio.create_task(self._direct(envelope))
@@ -783,16 +808,7 @@ class Engine:
                 if reply is not None:
                     return reply
                 # The send this caller attached to never happened: register again.
-                again = await self.requests.register(
-                    rid,
-                    caller=self.worker_id,
-                    user_hash=user_hash,
-                    params_hash=params_hash({"m": alias, "p": params}),
-                    model=alias,
-                    priority=priority,
-                    app_id=request_id is not None,
-                )
-                outcome = again.outcome
+                outcome, sent = await register()
                 if outcome == "conflict":
                     raise CallFailed("request_id_conflict", "the id was used with other params")
         finally:
@@ -1354,25 +1370,24 @@ class Engine:
         held = _Held(
             message,
             env,
-            first_seen=self.clock.now(),
+            # The store's time at receive: the wait is measured on one clock (the local view
+            # of the store clock drifted between syncs).
+            first_seen=message.received_ms / 1000 if message.received_ms else self.clock.now(),
             position_ms=message.position_ms,
             tag=message.id,
         )
         self._held[env.request_id] = held
+        # Its first admission checks that a caller still waits (plan §3.18 R24), in the same
+        # script: dropped as `caller_gone` when none does.
+        held.check_callers = self._callers_judgeable()
         try:
-            if not await self._caller_alive(env):
-                # A warning: a dropped call is worth seeing (the soak and scenario S5 found
-                # calls dropped wrongly, and INFO logs alone did not show it).
-                logger.warning("caller_gone", request_id=env.request_id, model=env.model)
-                await self._finish_call(held, "cancelled", "caller_gone", final="cancelled")
-                return False
             return await self._try(held, attempt=1)
         except Exception:
             await self._release(held)
             raise
 
-    async def _caller_alive(self, env: Envelope) -> bool:
-        """False when every caller of this call is gone (plan §3.18 R24).
+    def _callers_judgeable(self) -> bool:
+        """False while lapsed caller keys prove nothing: the store was out of reach lately.
 
         After a store outage the callers' liveness keys may have expired only because nobody
         could renew them: for a caller TTL and a heartbeat after this process last saw the
@@ -1381,21 +1396,12 @@ class Engine:
         Judged from this process's own heartbeat too: a half-open store hung every command for
         the read timeout, the doorbell wait swallowed its error, and calls were dropped the
         moment the store came back (scenario S5). A heartbeat that is late or just recovered
-        from a gap means the store was out of reach here as well, so a lapsed key proves
-        nothing.
+        from a gap means the store was out of reach here as well.
         """
         beat = self.settings.lease_secs / 3
         grace = self.settings.caller_ttl_secs + beat + 5
         now = time.monotonic()
-        if now - self._store_trouble_at < grace or now - self._beat_ok_at > 2 * beat + 1:
-            return True
-        try:
-            return await self.requests.callers_alive(
-                env.request_id, prefix=self.keys.prefix, caller_ttl=self.settings.caller_ttl_secs
-            )
-        except STORE_ERRORS:
-            self._store_trouble("callers")
-            return True
+        return not (now - self._store_trouble_at < grace or now - self._beat_ok_at > 2 * beat + 1)
 
     def _store_trouble(self, where: str) -> None:
         """Note a store failure seen here: callers count as alive for a while; metric."""
@@ -1522,6 +1528,9 @@ class Engine:
             foreign_from=foreign_from,
             require_pct=require_pct,
             tag=held.tag,
+            callers_ttl=self.settings.caller_ttl_secs if held.check_callers else None,
+            count_first=int(self.clock.now() // 60) if attempt == 1 else None,
+            chunks=env.stream and env.op in ("converse", "chat"),
         )
         held.estimates[(alias, ask.owner)] = estimate
         return ask
@@ -1717,6 +1726,13 @@ class Engine:
         if decision.kind == "no_config":  # the store lost the numbers: restore, then once more
             await self.registry.refresh()
             decision = await self.admission.pick_take(ask, self.registry.changes)
+        held.check_callers = False  # checked once, on its first admission
+        if decision.kind == "gone":
+            # A warning: a dropped call is worth seeing (the soak and scenario S5 found calls
+            # dropped wrongly, and INFO logs alone did not show it).
+            logger.warning("caller_gone", request_id=held.envelope.request_id, model=alias)
+            await self._finish_call(held, "cancelled", "caller_gone", final="cancelled")
+            return None
         if decision.kind in ("no_config", "stale_config"):
             # Still no usable numbers. Before, the call stayed held and hidden for good.
             logger.error("admission_config_missing", model=alias, kind=decision.kind)
@@ -1915,7 +1931,7 @@ class Engine:
             owner = self._owner(held, attempt)
             held.grants.add((alias, owner))
             outcome, reply_or_error = await self._attempt(
-                view, alias, held, dep_key, owner, attempt
+                view, alias, held, dep_key, owner, attempt, decision.extra.get("streamed")
             )
             held.grants.discard((alias, owner))
             if outcome == "ok":
@@ -2020,18 +2036,6 @@ class Engine:
         )
         return used <= allowed
 
-    async def _count_first(self, alias: str) -> None:
-        """Count a first attempt for the retry budget, under the model that serves it.
-
-        The key lives 3 minutes (the sliding window reads the previous one); it got no TTL in
-        a minute without a retry and stayed for good (RESCAN A3).
-        """
-        key = self.keys.model(alias, f"retries:{int(self.clock.now() // 60)}")
-        async with self.state.pipeline(transaction=False) as pipe:
-            pipe.hincrby(key, "first", 1)
-            pipe.expire(key, 180)
-            await pipe.execute()
-
     async def _attempt(
         self,
         view: ResolvedRegistry,
@@ -2040,8 +2044,13 @@ class Engine:
         dep_key: str,
         owner: str,
         attempt: int,
+        streamed: int | None = None,
     ) -> tuple[str, Any]:
-        """One provider attempt and its settlement: ('ok', None) or (outcome, (kind, info, exc))."""
+        """One provider attempt and its settlement: ('ok', None) or (outcome, (kind, info, exc)).
+
+        `streamed`: the chunk stream's length its grant reported (read here when None). A first
+        attempt was counted for the retry budget by its grant (PICK_TAKE, `count_first`).
+        """
         env = held.envelope
         entry = view.registry.models[alias]
         deployment = next(d for d in view.deployments(alias) if d.key == dep_key)
@@ -2080,8 +2089,6 @@ class Engine:
             "cost_r": 1,
             "cost_t": estimate.total,
         }
-        if attempt == 1:
-            await self._count_first(alias)
         writer = held.writer = None
         if env.stream and env.op in ("converse", "chat"):
             writer = held.writer = ChunkWriter(
@@ -2092,7 +2099,9 @@ class Engine:
                 max_bytes=int(view.value(alias, "stream_max_bytes")),
                 ttl_secs=self.settings.result_ttl_secs + int(env.timeout_secs),
             )
-            if await self.state.xlen(writer.key):
+            if streamed is None:
+                streamed = await self.state.xlen(writer.key)
+            if streamed:
                 # Another worker already streamed part of this answer (plan R19).
                 await self.admission.finish(
                     alias,
@@ -2250,17 +2259,6 @@ class Engine:
             count_cached=bool(view.value(alias, "tpm_count_cached", dep_key)),
         )
         refund = tokens.refund(estimate, "ok", used)
-        await self.admission.finish(
-            alias,
-            owner,
-            env.request_id,
-            refund_r=refund.requests,
-            refund_t=refund.tokens,
-            outcome="ok",
-            latency_ms=latency,
-        )
-        held.grants.discard((alias, owner))  # settled: a failure below must not renew it
-        self._bad_accounts.pop((deployment.account, deployment.region), None)  # (plan A4)
         meta = Meta(
             served_model=alias,
             deployment=dep_key,
@@ -2275,21 +2273,38 @@ class Engine:
             worker=self.worker_id,
         )
         reply = Reply(request_id=env.request_id, ok=True, response=result.response, meta=meta)
-        await self.requests.put_result(reply, final_state="done")
-        await self._count_target_errors(held, succeeded=True)
+        self._bad_accounts.pop((deployment.account, deployment.region), None)  # (plan A4)
         self._record(held, alias, deployment.account, deployment.region, "ok", meta)
+        # The caller first: its result, with the final status in the same script. Then the
+        # grant and the message are settled together (four round trips one after another
+        # before the caller was woken, before).
+        await self.requests.put_result(
+            reply,
+            final_state="done",
+            status={
+                "deployment": dep_key,
+                "served_model": alias,
+                "attempts": attempt,
+                "tokens_in": result.usage.input_tokens,
+                "tokens_out": result.usage.output_tokens,
+            },
+        )
+        await asyncio.gather(
+            self.admission.finish(
+                alias,
+                owner,
+                env.request_id,
+                refund_r=refund.requests,
+                refund_t=refund.tokens,
+                outcome="ok",
+                latency_ms=latency,
+            ),
+            self._ack(held),
+        )
+        held.grants.discard((alias, owner))  # settled: a failure below must not renew it
+        await self._count_target_errors(held, succeeded=True)
         if self.settings.debug_capture_allowed and view.value(alias, "debug_capture"):
             await self._debug(env.request_id, params, result.response)
-        await self.requests.set_status(
-            env.request_id,
-            "done",
-            deployment=dep_key,
-            served_model=alias,
-            attempts=attempt,
-            tokens_in=result.usage.input_tokens,
-            tokens_out=result.usage.output_tokens,
-        )
-        await self._ack(held)
         return "ok", None
 
     async def _target_error(
@@ -2412,8 +2427,7 @@ class Engine:
             partial_text=partial or None,
             meta=Meta(served_model=env.model, worker=self.worker_id),
         )
-        await self.requests.put_result(reply, final_state=final)
-        await self.requests.set_status(env.request_id, final, error=kind)
+        await self.requests.put_result(reply, final_state=final, status={"error": kind})
 
     async def _finish_call(
         self,

@@ -19,6 +19,7 @@ from llm_queue.engine.envelope import Reply
 from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.offload import MARKER, ResultOffload
+from llm_queue.engine.queue import SEND_FN, QueueFull
 from llm_queue.errors import ConfigError
 
 if TYPE_CHECKING:
@@ -26,25 +27,16 @@ if TYPE_CHECKING:
 
 FINAL_STATES = ("done", "failed", "expired", "cancelled")
 
-# KEYS: callers, epoch. ARGV: caller key prefix, caller ttl secs. Reply: 1 when any caller of
-# the call is alive, or the store came back less than a TTL ago (keys not renewed yet).
-CALLERS_ALIVE = """
+_NOW_MS = """
 local t = redis.call('TIME')
-local now = tonumber(t[1])
-local epoch = tonumber(redis.call('GET', KEYS[2]) or '')
-if not epoch or now - epoch < tonumber(ARGV[2]) then return 1 end
-local callers = redis.call('SMEMBERS', KEYS[1])
-if #callers == 0 then return 1 end
-for _, caller in ipairs(callers) do
-  if redis.call('EXISTS', ARGV[1] .. caller) == 1 then return 1 end
-end
-return 0
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 """
 
 # KEYS: job, callers, status, result. ARGV: user hash, params hash, caller, unconfirmed ttl,
-# status ttl, model, priority, takeover grace secs.
-# Reply: new | attached | takeover | done | expired | conflict.
-REGISTER = """
+# status ttl, model, priority, takeover grace secs, app id ('1': kept after its first read).
+# Returns new | attached | takeover | done | expired | conflict.
+_REGISTER_FN = """
+local function register()
 local job = redis.call('HGETALL', KEYS[1])
 local clock = redis.call('TIME')
 local now = tonumber(clock[1])
@@ -56,6 +48,7 @@ end
 if #job == 0 then
   redis.call('HSET', KEYS[1], 'state', 'queued', 'user', ARGV[1], 'params', ARGV[2],
     'caller', ARGV[3], 'confirmed', '0', 'created', now)
+  if ARGV[9] == '1' then redis.call('HSET', KEYS[1], 'app', '1') end
   redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
   redis.call('SADD', KEYS[2], ARGV[3])
   redis.call('EXPIRE', KEYS[2], tonumber(ARGV[4]))
@@ -94,7 +87,36 @@ end
 redis.call('SADD', KEYS[2], ARGV[3])
 keep_callers()
 return 'attached'
+end
 """
+
+REGISTER = _REGISTER_FN + "return register()\n"
+
+# KEYS: REGISTER's, then the queue's keys (stream first, `_PARTS` order). ARGV: REGISTER's, then
+# body, max waiting, retention ms, doorbell key, keep secs. Register, send a new call and
+# confirm it in one round trip when the queues share the state store (three before). A full
+# queue drops the record it just made. Reply: {outcome}, {outcome, message id} or {'full', depth}.
+REGISTER_SEND = (
+    _NOW_MS
+    + SEND_FN
+    + _REGISTER_FN
+    + """
+local outcome = register()
+if outcome ~= 'new' and outcome ~= 'takeover' then return {outcome} end
+local sent = send(KEYS[5], ARGV[10], tonumber(ARGV[11]), tonumber(ARGV[12]), ARGV[13])
+if sent[1] == 'full' then
+  if redis.call('HGET', KEYS[1], 'confirmed') == '0'
+    and redis.call('HGET', KEYS[1], 'caller') == ARGV[3] then
+    redis.call('DEL', KEYS[1], KEYS[2], KEYS[3])
+  end
+  return sent
+end
+redis.call('HSET', KEYS[1], 'confirmed', '1')
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[14]))
+redis.call('EXPIRE', KEYS[2], tonumber(ARGV[14]))
+return {outcome, sent[2]}
+"""
+)
 
 # KEYS: job, callers. ARGV: keep secs. The send succeeded: the record lives until the deadline
 # plus the status TTL.
@@ -115,10 +137,36 @@ end
 return 0
 """
 
-# KEYS: result, job, callers. ARGV: reply JSON, result ttl, final state, keep secs, channel
-# prefix (`<prefix>:done:`), request id. Writes the result only if none exists, marks the claim
-# final and wakes every caller waiting on this id. Reply: 1 written, 0 a result already existed.
-RESULT_PUT = """
+# A status write: state, ttl, field / value pairs from ARGV[from]. A final state is never
+# replaced; the TTL only grows; every write stamps the store's time as `<state>_at`.
+_STATUS_FN = """
+local function set_status(key, state, ttl, from)
+  local current = redis.call('HGET', key, 'state')
+  if current == 'done' or current == 'failed' or current == 'expired'
+    or current == 'cancelled' then
+    return 0
+  end
+  local t = redis.call('TIME')
+  local stamp = t[1] .. '.' .. string.format('%06d', tonumber(t[2]))
+  local args = {'HSET', key, 'state', state, state .. '_at', stamp}
+  for i = from, #ARGV, 2 do
+    table.insert(args, ARGV[i])
+    table.insert(args, ARGV[i + 1])
+  end
+  redis.call(unpack(args))
+  if redis.call('TTL', key) < ttl then redis.call('EXPIRE', key, ttl) end
+  return 1
+end
+"""
+
+# KEYS: result, job, callers, status. ARGV: reply JSON, result ttl, final state, keep secs,
+# channel prefix (`<prefix>:done:`), request id, then '1' to write the status too (its TTL and
+# field / value pairs follow). Writes the result only if none exists, marks the claim final,
+# writes the final status and wakes every caller waiting on this id (one round trip; the
+# status was a second). Reply: 1 written, 0 a result already existed.
+RESULT_PUT = (
+    _STATUS_FN
+    + """
 local written = redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', tonumber(ARGV[2]))
 if redis.call('EXISTS', KEYS[2]) == 1 then
   redis.call('HSET', KEYS[2], 'state', ARGV[3])
@@ -128,9 +176,11 @@ for _, caller in ipairs(redis.call('SMEMBERS', KEYS[3])) do
   redis.call('PUBLISH', ARGV[5] .. caller, ARGV[6])
 end
 redis.call('EXPIRE', KEYS[3], tonumber(ARGV[4]))  -- (S9) no-op when the set is gone
+if ARGV[7] == '1' then set_status(KEYS[4], ARGV[3], tonumber(ARGV[8]), 9) end
 if written then return 1 end
 return 0
 """
+)
 
 # KEYS: result, job. ARGV: dedupe secs. After its first read a result of a library-made id lives
 # only `dedupe secs` more (an app-supplied id keeps its TTL).
@@ -160,25 +210,8 @@ if ARGV[2] ~= '' and string.sub(value, 1, #ARGV[2]) == ARGV[2] then return value
 )
 RESULT_DROP = _DROP_READ + "return 1\n"
 
-# KEYS: status. ARGV: state, ttl, then field / value pairs. A final state is never replaced; the
-# TTL only grows; every write stamps the store's time as `<state>_at`.
-STATUS_SET = """
-local current = redis.call('HGET', KEYS[1], 'state')
-if current == 'done' or current == 'failed' or current == 'expired' or current == 'cancelled' then
-  return 0
-end
-local t = redis.call('TIME')
-local now = t[1] .. '.' .. string.format('%06d', tonumber(t[2]))
-local args = {'HSET', KEYS[1], 'state', ARGV[1], ARGV[1] .. '_at', now}
-for i = 3, #ARGV, 2 do
-  table.insert(args, ARGV[i])
-  table.insert(args, ARGV[i + 1])
-end
-redis.call(unpack(args))
-local ttl = redis.call('TTL', KEYS[1])
-if ttl < tonumber(ARGV[2]) then redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2])) end
-return 1
-"""
+# KEYS: status. ARGV: state, ttl, then field / value pairs (see `_STATUS_FN`).
+STATUS_SET = _STATUS_FN + "return set_status(KEYS[1], ARGV[1], tonumber(ARGV[2]), 3)\n"
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,13 +257,13 @@ class RequestStore:
         self.offload = offload
         self.offload_bytes = offload_bytes
         self._register = client.register_script(REGISTER)
+        self._register_send = client.register_script(REGISTER_SEND)
         self._confirm = client.register_script(CONFIRM)
         self._abandon = client.register_script(ABANDON)
         self._put = client.register_script(RESULT_PUT)
         self._take = client.register_script(RESULT_TAKE)
         self._drop_read = client.register_script(RESULT_DROP)
         self._status = client.register_script(STATUS_SET)
-        self._alive = client.register_script(CALLERS_ALIVE)
 
     def _req(self, request_id: str) -> tuple[str, str, str, str]:
         k = self.keys
@@ -253,9 +286,8 @@ class RequestStore:
         app_id: bool,
     ) -> Registration:
         """Register a call before it is sent (duplicate ids attach to the first run)."""
-        job, callers, status, result = self._req(request_id)
         outcome = await self._register(
-            [job, callers, status, result],
+            list(self._req(request_id)),
             [
                 user_hash,
                 params_hash,
@@ -265,12 +297,57 @@ class RequestStore:
                 model,
                 "1" if priority else "0",
                 self.takeover_grace,
+                "1" if app_id else "0",
             ],
         )
-        text = _text(outcome)
-        if text == "new" and app_id:
-            await self._client.hset(job, "app", "1")
-        return Registration(text)
+        return Registration(_text(outcome))
+
+    async def register_send(
+        self,
+        request_id: str,
+        *,
+        caller: str,
+        user_hash: str,
+        params_hash: str,
+        model: str,
+        priority: bool,
+        app_id: bool,
+        queue: str,
+        queue_keys: Sequence[str],
+        bell: str,
+        body: bytes,
+        max_waiting: int,
+        retention_secs: int,
+        keep_secs: float,
+    ) -> Registration:
+        """`register`, and for a new (or taken over) call its send and `confirm`, in one call.
+
+        Only when the queue lives in this store. `QueueFull` above `max_waiting` (the record
+        just made is dropped, as `abandon` did).
+        """
+        reply = await self._register_send(
+            [*self._req(request_id), *queue_keys],
+            [
+                user_hash,
+                params_hash,
+                caller,
+                self.unconfirmed,
+                self.status_ttl,
+                model,
+                "1" if priority else "0",
+                self.takeover_grace,
+                "1" if app_id else "0",
+                body,
+                max_waiting,
+                retention_secs * 1000,
+                bell,
+                int(keep_secs) + self.status_ttl,
+            ],
+        )
+        outcome = _text(reply[0])
+        if outcome == "full":
+            raise QueueFull(queue, int(reply[1]))
+        return Registration(outcome)
 
     async def confirm(self, request_id: str, *, keep_secs: float) -> None:
         """The send succeeded: keep the record until the deadline plus the status TTL."""
@@ -282,23 +359,29 @@ class RequestStore:
         job, callers, status, _ = self._req(request_id)
         await self._abandon([job, callers, status], [caller])
 
-    async def put_result(self, reply: Reply, *, final_state: str) -> bool:
-        """Store a result once and wake its callers; False when one was already stored."""
-        job, callers, _, result = self._req(reply.request_id)
+    async def put_result(
+        self, reply: Reply, *, final_state: str, status: Mapping[str, Any] | None = None
+    ) -> bool:
+        """Store a result once and wake its callers; False when one was already stored.
+
+        With `status`, the request status is set to `final_state` with these fields in the
+        same script (as `set_status` would; None values are left out).
+        """
+        job, callers, status_key, result = self._req(reply.request_id)
         data = reply.dumps()
         if self.offload is not None and self.offload_bytes and len(data) > self.offload_bytes:
             data = MARKER + (await self.offload.put(reply.request_id, data)).encode()
-        written = await self._put(
-            [result, job, callers],
-            [
-                data,
-                self.result_ttl,
-                final_state,
-                self.status_ttl,
-                f"{self.keys.prefix}:done:",
-                reply.request_id,
-            ],
-        )
+        args: list[Any] = [
+            data,
+            self.result_ttl,
+            final_state,
+            self.status_ttl,
+            f"{self.keys.prefix}:done:",
+            reply.request_id,
+        ]
+        if status is not None:
+            args += ["1", self.status_ttl, *_pairs(status)]
+        written = await self._put([result, job, callers, status_key], args)
         return bool(written)
 
     async def take_result(self, request_id: str) -> Reply | None:
@@ -332,24 +415,15 @@ class RequestStore:
 
     async def set_status(self, request_id: str, state: str, **fields: Any) -> bool:
         """Write a status (False when a final state was already there)."""
-        pairs: list[str] = []
-        for name, value in fields.items():
-            if value is not None:
-                pairs += [name, str(value)]
-        done = await self._status([self.keys.status(request_id)], [state, self.status_ttl, *pairs])
+        done = await self._status(
+            [self.keys.status(request_id)], [state, self.status_ttl, *_pairs(fields)]
+        )
         return bool(done)
 
     async def status(self, request_id: str) -> dict[str, str]:
         """The status hash of a request (empty when unknown or expired)."""
         raw = await self._client.hgetall(self.keys.status(request_id))
         return {_text(k): _text(v) for k, v in (raw or {}).items()}
-
-    async def callers_alive(self, request_id: str, *, prefix: str, caller_ttl: int) -> bool:
-        """False only when every caller of the call is gone (and the store is not new)."""
-        reply = await self._alive(
-            [self._req(request_id)[1], f"{prefix}:epoch"], [f"{prefix}:caller:", caller_ttl]
-        )
-        return bool(reply)
 
     async def callers(self, request_id: str) -> Sequence[str]:
         """Callers waiting on a request id."""
@@ -359,6 +433,13 @@ class RequestStore:
         """The claim record (for tests and status views)."""
         raw = await self._client.hgetall(self._req(request_id)[0])
         return {_text(k): _text(v) for k, v in (raw or {}).items()}
+
+
+def _pairs(fields: Mapping[str, Any]) -> list[str]:
+    """Field / value pairs of a status write, None values left out."""
+    return [
+        part for name, value in fields.items() if value is not None for part in (name, str(value))
+    ]
 
 
 def _text(value: Any) -> str:
