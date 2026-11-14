@@ -64,10 +64,16 @@ async def paced(stream: AsyncIterator[_T], timing: Timing, *, started: bool) -> 
     iterator = stream.__aiter__()
     limit = timing.idle_secs if started else timing.first_response_secs
     what = "chunk" if started else "first response"
-    while True:
-        try:
-            item = await first(iterator.__anext__(), limit, what)
-        except StopAsyncIteration:
-            return
-        yield item
-        limit, what = timing.idle_secs, "chunk"
+    try:
+        while True:
+            try:
+                item = await first(iterator.__anext__(), limit, what)
+            except StopAsyncIteration:
+                return
+            yield item
+            limit, what = timing.idle_secs, "chunk"
+    finally:
+        # Close the inner iterator now, not when the finalizer gets to it (CL-10).
+        aclose = getattr(iterator, "aclose", None)
+        if aclose is not None:
+            await aclose()

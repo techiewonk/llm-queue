@@ -13,7 +13,7 @@ import base64
 import contextlib
 import inspect
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -26,6 +26,7 @@ from llm_queue.providers.classify import (
     StreamTruncated,
     classify_bedrock,
     classify_openai,
+    is_body_cut,
     is_connection_reset,
 )
 
@@ -87,25 +88,27 @@ class Provider(Protocol):
 async def _reset_retry(
     attempt: Callable[[Sink | None], Awaitable[Result]], sink: Sink | None
 ) -> Result:
-    """Run `attempt`; on a dropped connection with nothing sent to `sink`, run it once more.
+    """Run `attempt`; on a connection dropped before any answer arrived, run it once more.
 
     The first failure never reaches the worker, so it charges no breaker and no retry budget;
-    the second one is classified as usual.
+    the second one is classified as usual. Only a stale socket that failed before the reply
+    qualifies: once a stream event arrived (sent to `sink` or not) or the body was being read,
+    the model already ran, and running it again billed the generation twice (CL-9).
     """
-    sent = False
+    received = False
 
     async def forward(event: Any) -> None:
-        nonlocal sent
-        sent = True
-        assert sink is not None
-        await sink(event)
+        nonlocal received
+        received = True
+        if sink is not None:
+            await sink(event)
 
     try:
-        return await attempt(forward if sink is not None else None)
+        return await attempt(forward)
     except Exception as exc:
-        if sent or not is_connection_reset(exc):
+        if received or is_body_cut(exc) or not is_connection_reset(exc):
             raise
-    return await attempt(forward if sink is not None else None)
+    return await attempt(forward)
 
 
 # ------------------------------------------------------------------------------- Bedrock
@@ -199,23 +202,23 @@ class BedrockProvider:
 
     async def stream(
         self, params: Mapping[str, Any], route: Route, timing: Timing
-    ) -> AsyncIterator[Mapping[str, Any]]:
+    ) -> AsyncGenerator[Mapping[str, Any], None]:
         """ConverseStream events of one attempt, each within the attempt timers."""
-        client = await self._pool.bedrock(route)
-        request = {**params, "modelId": route.model_id}
-        started = time.monotonic()
-        reply = await first(
-            client.converse_stream(**request), timing.first_response_secs, "first response"
-        )
-        stream = reply["stream"]
-        try:
-            async for event in paced(stream, opened(timing, started), started=False):
-                yield event
-        finally:
-            # Always release the HTTP connection: a stream given up on an idle timeout (or a
-            # cancelled call) left it to garbage collection (aiohttp warned from __del__).
-            with contextlib.suppress(Exception):
-                stream.close()
+        async with self._pool.borrow_bedrock(route) as client:
+            request = {**params, "modelId": route.model_id}
+            started = time.monotonic()
+            reply = await first(
+                client.converse_stream(**request), timing.first_response_secs, "first response"
+            )
+            stream = reply["stream"]
+            try:
+                async for event in paced(stream, opened(timing, started), started=False):
+                    yield event
+            finally:
+                # Always release the HTTP connection: a stream given up on an idle timeout (or
+                # a cancelled call) left it to garbage collection (aiohttp warned from __del__).
+                with contextlib.suppress(Exception):
+                    stream.close()
 
     async def call(
         self,
@@ -238,6 +241,7 @@ class BedrockProvider:
             plain = converse_api != "stream" and timing.attempt_secs is not None
             if sink is None and plain:
                 return await _reset_retry(lambda _: self._converse(params, route, timing), None)
+            # A sink is always passed: it marks that the stream answered (no quick retry then).
             return await _reset_retry(
                 lambda s: self._converse_stream(params, route, timing, s), sink
             )
@@ -246,9 +250,10 @@ class BedrockProvider:
         raise ValueError(f"Bedrock does not support op {op!r}")
 
     async def _converse(self, params: Mapping[str, Any], route: Route, timing: Timing) -> Result:
-        client = await self._pool.bedrock(route)
-        pending = client.converse(**{**params, "modelId": route.model_id})
-        reply = await first(pending, timing.attempt_secs or timing.first_response_secs, "response")
+        async with self._pool.borrow_bedrock(route) as client:
+            pending = client.converse(**{**params, "modelId": route.model_id})
+            limit = timing.attempt_secs or timing.first_response_secs
+            reply = await first(pending, limit, "response")
         body: dict[str, Any] = {k: v for k, v in reply.items() if k != "ResponseMetadata"}
         return Result(body, _bedrock_usage(body.get("usage")))
 
@@ -256,25 +261,28 @@ class BedrockProvider:
         self, params: Mapping[str, Any], route: Route, timing: Timing, sink: Sink | None
     ) -> Result:
         events = []
-        async for event in self.stream(params, route, timing):
-            events.append(event)
-            if sink is not None:
-                await sink(event)
+        # aclosing: a sink that raised (or a cancel during it) left the generator suspended and
+        # its connection held until the asyncgen finalizer ran (CL-10).
+        async with contextlib.aclosing(self.stream(params, route, timing)) as stream:
+            async for event in stream:
+                events.append(event)
+                if sink is not None:
+                    await sink(event)
         body = _converse_body(events)
         return Result(body, _bedrock_usage(body.get("usage")))
 
     async def _invoke(self, params: Mapping[str, Any], route: Route, timing: Timing) -> Result:
-        client = await self._pool.bedrock(route)
         request = {**params, "modelId": route.model_id}
         if isinstance(request.get("body"), Mapping | list):
             request["body"] = orjson.dumps(request["body"])
         request.setdefault("contentType", "application/json")
         request.setdefault("accept", "application/json")
-        raw = await first(
-            client.invoke_model(**request), timing.first_response_secs, "first response"
-        )
-        async with raw["body"] as stream:
-            data = await first(stream.read(), timing.idle_secs, "body")
+        async with self._pool.borrow_bedrock(route) as client:
+            raw = await first(
+                client.invoke_model(**request), timing.first_response_secs, "first response"
+            )
+            async with raw["body"] as stream:
+                data = await first(stream.read(), timing.idle_secs, "body")
         headers = raw.get("ResponseMetadata", {}).get("HTTPHeaders", {})
         counted = headers.get(_TOKEN_HEADER)
         response = {
@@ -426,27 +434,27 @@ class OpenAIProvider:
 
     async def stream(
         self, params: Mapping[str, Any], route: Route, timing: Timing
-    ) -> AsyncIterator[Any]:
+    ) -> AsyncGenerator[Any, None]:
         """Chat completion chunks of one attempt, each within the attempt timers."""
-        client = self._pool.openai(route)
-        create = client.chat.completions.create
-        request = split_params(
-            create,
-            {
-                **params,
-                "model": route.model_id,
-                "stream": True,
-                "stream_options": {"include_usage": True},
-            },
-        )
-        started = time.monotonic()
-        reply = await first(create(**request), timing.first_response_secs, "first response")
-        try:
-            async for chunk in paced(reply, opened(timing, started), started=False):
-                yield chunk
-        finally:  # release the connection on a timeout or cancel too (as for Bedrock)
-            with contextlib.suppress(Exception):
-                await reply.close()
+        with self._pool.borrow_openai(route) as client:
+            create = client.chat.completions.create
+            request = split_params(
+                create,
+                {
+                    **params,
+                    "model": route.model_id,
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                },
+            )
+            started = time.monotonic()
+            reply = await first(create(**request), timing.first_response_secs, "first response")
+            try:
+                async for chunk in paced(reply, opened(timing, started), started=False):
+                    yield chunk
+            finally:  # release the connection on a timeout or cancel too (as for Bedrock)
+                with contextlib.suppress(Exception):
+                    await reply.close()
 
     async def call(
         self,
@@ -469,20 +477,22 @@ class OpenAIProvider:
         self, params: Mapping[str, Any], route: Route, timing: Timing, sink: Sink | None
     ) -> Result:
         chunks = []
-        async for chunk in self.stream(params, route, timing):
-            chunks.append(chunk)
-            if sink is not None:
-                await sink(chunk)
+        async with contextlib.aclosing(self.stream(params, route, timing)) as stream:  # CL-10
+            async for chunk in stream:
+                chunks.append(chunk)
+                if sink is not None:
+                    await sink(chunk)
         body = _chat_body(chunks)
         return Result(body, _openai_usage(body.get("usage")))
 
     async def _embeddings(self, params: Mapping[str, Any], route: Route, timing: Timing) -> Result:
-        create = self._pool.openai(route).embeddings.create
-        reply = await first(
-            create(**split_params(create, {**params, "model": route.model_id})),
-            timing.first_response_secs,
-            "response",
-        )
+        with self._pool.borrow_openai(route) as client:
+            create = client.embeddings.create
+            reply = await first(
+                create(**split_params(create, {**params, "model": route.model_id})),
+                timing.first_response_secs,
+                "response",
+            )
         body = reply.model_dump(mode="json", exclude_unset=True)
         return Result(body, _openai_usage(body.get("usage")))
 

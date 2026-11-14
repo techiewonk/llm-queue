@@ -12,10 +12,10 @@ import asyncio
 import contextlib
 import os
 import re
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping
 from dataclasses import astuple, dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from llm_queue._logging import get_logger
 from llm_queue.clients.hub import (
@@ -25,26 +25,57 @@ from llm_queue.clients.hub import (
     identity_hash,
     pool_size_for,
 )
-from llm_queue.errors import ConfigError, LLMQueueError, MissingExtra
+from llm_queue.errors import LLMQueueError, MissingExtra
 from llm_queue.tuning import BedrockOptions, OpenAIOptions, WarmOptions
 
 if TYPE_CHECKING:
     from aiobotocore.session import AioSession
     from openai import AsyncOpenAI
-    from types_aiobotocore_bedrock_runtime import BedrockRuntimeClient
 
+    from llm_queue.clients.bedrock_http import BedrockHTTP
     from llm_queue.registry import Account, Deployment, ResolvedRegistry
 
 logger = get_logger(__name__)
 
-# Unverified starting values. The SDK read timeout only guards a dead socket: the library's own
-# first-response and idle timers decide when an attempt is given up.
+
+class BedrockClient(Protocol):
+    """The Bedrock calls `BedrockProvider` makes, on either transport (`BedrockOptions`).
+
+    `BedrockHTTP` (aiohttp) and the aiobotocore client both fit: an adapter per transport
+    behind one interface, so strict mypy checks the provider against what actually runs.
+    """
+
+    async def converse(self, **request: Any) -> dict[str, Any]:
+        """Bedrock Converse: the parsed reply with `ResponseMetadata`."""
+        ...
+
+    async def converse_stream(self, **request: Any) -> dict[str, Any]:
+        """Bedrock ConverseStream: `{"stream": ..., "ResponseMetadata": ...}`."""
+        ...
+
+    async def invoke_model(self, **request: Any) -> dict[str, Any]:
+        """Bedrock InvokeModel: `{"body": ..., "contentType": ..., "ResponseMetadata": ...}`."""
+        ...
+
+
+if TYPE_CHECKING:
+
+    def _fits(client: BedrockHTTP) -> BedrockClient:
+        """Type check only: a signature drift in `BedrockHTTP` fails mypy here (CL-12)."""
+        return client
+
+
+# A retired client (forget, account edit) is given back once no call uses it; the grace lets
+# a call that just looked it up start borrowing it, the cap bounds a call stuck forever.
+RETIRE_GRACE_SECS = 1.0
+RETIRE_MAX_SECS = 3600.0
 
 # Extra `create_client` arguments for an AWS account (None = the pod's own credential chain).
 # A mapping with `expiry_time` (datetime or ISO 8601) is refreshed: the callable is asked again
-# ~5 minutes before that time (`REFRESH_BEFORE_SECS`), in a thread.
+# ~5 minutes before that time (`REFRESH_BEFORE_SECS`). Called in a thread (CL-8).
 CredentialSource = Callable[["Account"], Mapping[str, Any] | None]
 # The value of a secret by name (`api_key_ref`, `external_id_ref`); default: the environment.
+# Called in a thread on the async paths (a Secrets Manager lookup must not block the loop).
 SecretSource = Callable[[str], str | None]
 
 # Refreshable credentials (assumed roles, `credentials=` with an expiry) are renewed from this
@@ -52,6 +83,13 @@ SecretSource = Callable[[str], str | None]
 # call); inside the last 2 minutes every caller waits for the renewal.
 REFRESH_BEFORE_SECS = 300
 REFRESH_MANDATORY_SECS = 120
+# STS answers in well under a second; botocore's defaults (60 s connect and read, legacy
+# retries) let one slow AssumeRole eat a caller's whole attempt (CL-8). Unverified values.
+STS_READ_TIMEOUT_SECS = 10.0
+STS_MAX_ATTEMPTS = 2
+# `credentials=` keys the aiohttp transport understands; any other key (verify, use_ssl,
+# api_version ...) is a `create_client` argument, so that account uses the botocore transport.
+_AWS_KEYS = frozenset({"aws_access_key_id", "aws_secret_access_key", "aws_session_token"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,13 +148,35 @@ def _metadata(extra: Mapping[str, Any], expiry: Any) -> dict[str, Any]:
     }
 
 
+def _single_flight(
+    fetch: Callable[[], Awaitable[dict[str, Any]]],
+) -> Callable[[], Awaitable[dict[str, Any]]]:
+    """`fetch` run as one shared task: a caller cancelled while waiting does not abort it.
+
+    aiobotocore refreshes inside the caller's attempt timer; when the timer fired it cancelled
+    the refresh, so inside the mandatory window a slow STS was never waited out and every call
+    failed (CL-8). The next caller now awaits the same task.
+    """
+    running: asyncio.Task[dict[str, Any]] | None = None
+
+    async def refresh() -> dict[str, Any]:
+        nonlocal running
+        if running is None or running.done():
+            running = asyncio.ensure_future(fetch())
+            # Read the outcome even when every waiter was cancelled (no "never retrieved").
+            running.add_done_callback(lambda t: t.cancelled() or t.exception())
+        return await asyncio.shield(running)
+
+    return refresh
+
+
 def _refreshing(metadata: dict[str, Any], refresh: Any, method: str) -> AioSession:
     """A session whose credentials renew themselves `REFRESH_BEFORE_SECS` before expiry."""
     from aiobotocore.credentials import AioRefreshableCredentials
     from aiobotocore.session import AioSession
 
     credentials = AioRefreshableCredentials.create_from_metadata(
-        metadata=metadata, refresh_using=refresh, method=method
+        metadata=metadata, refresh_using=_single_flight(refresh), method=method
     )
     # Set after creation: older botocore has no advisory/mandatory arguments here.
     credentials._advisory_refresh_timeout = REFRESH_BEFORE_SECS  # type: ignore[attr-defined]  # botocore class attribute, not in the stubs
@@ -201,8 +261,8 @@ class ClientPool:
         self._options = options or BedrockOptions()  # timeouts, pool size: `Tuning.bedrock`
         self._openai_options = openai_options or OpenAIOptions()
         self._warm = warm or WarmOptions()
-        self._read = self._options.read_timeout_secs
-        self._connect = self._options.connect_timeout_secs
+        self._read_secs = self._options.read_timeout_secs
+        self._connect_secs = self._options.connect_timeout_secs
         self._sts_endpoint = sts_endpoint_url
         self._session_name = session_name
         self._hub = hub if hub is not None else client_hub()  # an empty hub is falsy
@@ -212,32 +272,58 @@ class ClientPool:
         self._locks: dict[tuple[Any, ...], asyncio.Lock] = {}
         self._sizes: dict[tuple[str, str], int] = {}
         self._retiring: dict[asyncio.Task[None], list[Lease]] = {}
+        self._warned: set[tuple[str, str]] = set()
 
-    def _lock(self, key: tuple[Any, ...]) -> asyncio.Lock:
-        lock = self._locks.get(key)
-        if lock is None:
-            lock = self._locks[key] = asyncio.Lock()
-        return lock
+    def _warn_once(self, event: str, account: str, **fields: Any) -> None:
+        """Log a config problem once per (event, account): it would repeat on every build."""
+        if (event, account) not in self._warned:
+            self._warned.add((event, account))
+            logger.warning(event, account=account, **fields)
 
-    async def bedrock(self, route: Route) -> BedrockRuntimeClient:
+    async def bedrock(self, route: Route) -> BedrockClient:
         """The Bedrock runtime client of the route's account and region."""
+        return cast("BedrockClient", (await self._bedrock_lease(route)).client)
+
+    @contextlib.asynccontextmanager
+    async def borrow_bedrock(self, route: Route) -> AsyncIterator[BedrockClient]:
+        """The route's Bedrock client, counted as in use until the block ends (CL-3)."""
+        lease = await self._bedrock_lease(route)
+        lease.enter()
+        try:
+            yield cast("BedrockClient", lease.client)
+        finally:
+            lease.leave()
+
+    @contextlib.contextmanager
+    def borrow_openai(self, route: Route) -> Iterator[AsyncOpenAI]:
+        """The route's OpenAI-compatible client, counted as in use until the block ends."""
+        self.openai(route)
+        lease = self._openai[_identity(route.account)]
+        lease.enter()
+        try:
+            yield cast("AsyncOpenAI", lease.client)
+        finally:
+            lease.leave()
+
+    async def _bedrock_lease(self, route: Route) -> Lease:
         key = (_identity(route.account), route.region)
         if (lease := self._bedrock.get(key)) is not None:
-            return lease.client  # type: ignore[no-any-return]
-        async with self._lock(("bedrock", *key)):  # per key: other accounts build meanwhile
+            return lease
+        # Per key: other accounts build meanwhile.
+        async with self._locks.setdefault(("bedrock", *key), asyncio.Lock()):
             if (lease := self._bedrock.get(key)) is not None:
-                return lease.client  # type: ignore[no-any-return]
+                return lease
             lease = await self._acquire_bedrock(route)
             stale = [
                 k for k in self._bedrock if k[1] == route.region and k[0][0] == route.account.name
             ]
             self._bedrock[key] = lease
-            # The registry changed this account's fields: the old client goes after a grace.
+            # The registry changed this account's fields: the old client goes when idle.
             old = [self._bedrock.pop(k) for k in stale]
             for lease_ in old:
                 self._hub.evict(lease_)
             self._retire(old)
-            return lease.client  # type: ignore[no-any-return]
+            return lease
 
     async def _acquire_bedrock(self, route: Route) -> Lease:
         from aiobotocore.config import AioConfig
@@ -246,7 +332,8 @@ class ClientPool:
         account = route.account
         if self._session is None:
             self._session = get_session()
-        extra = dict(self._credentials(account) or {})
+        given: Mapping[str, Any] | None = await asyncio.to_thread(self._credentials, account)
+        extra = dict(given or {})
         expiry = extra.pop("expiry_time", None)
         who: tuple[Any, ...] = (
             _identity(account),
@@ -258,10 +345,17 @@ class ClientPool:
             who = (*who, "role", role)
         size = self._sizes.get((account.name, route.region), self._options.max_pool_connections)
         transport = self._options.transport
+        unknown = sorted(set(extra) - _AWS_KEYS)
+        if transport == "aiohttp" and unknown and not account.role_arn and expiry is None:
+            # Never raise into a call for this (CL-6): botocore takes these keys.
+            self._warn_once(
+                "bedrock_transport_fallback", account.name, keys=unknown, transport="botocore"
+            )
+            transport = "botocore"
         options = (
             self._endpoint,
-            self._read,
-            self._connect,
+            self._read_secs,
+            self._connect_secs,
             size,
             self._warm.keepalive_secs,
             transport,
@@ -272,8 +366,8 @@ class ClientPool:
             if transport == "aiohttp":
                 return await self._build_http(route, extra, expiry, size)
             config = AioConfig(
-                read_timeout=self._read,
-                connect_timeout=self._connect,
+                read_timeout=self._read_secs,
+                connect_timeout=self._connect_secs,
                 max_pool_connections=size,
                 # One attempt per call: throttles reach the library, not botocore's retries.
                 retries={"total_max_attempts": 1, "mode": "standard"},
@@ -290,6 +384,8 @@ class ClientPool:
             elif expiry is not None:
                 session, kwargs = self._refreshing_session(account, extra, expiry), {}
             assert session is not None
+            if not kwargs and session is self._session:
+                await self._chain_credentials(account, session)
             context = session.create_client(
                 "bedrock-runtime",
                 region_name=route.region,
@@ -324,16 +420,6 @@ class ClientPool:
         elif expiry is not None:
             credentials = await self._refreshing_session(account, extra, expiry).get_credentials()
         elif extra:
-            unknown = set(extra) - {
-                "aws_access_key_id",
-                "aws_secret_access_key",
-                "aws_session_token",
-            }
-            if unknown:
-                raise ConfigError(
-                    f"account {account.name}: the aiohttp Bedrock transport takes only AWS keys "
-                    f"from credentials=, not {', '.join(sorted(unknown))}"
-                )
             credentials = Credentials(
                 str(extra.get("aws_access_key_id") or ""),
                 str(extra.get("aws_secret_access_key") or ""),
@@ -341,17 +427,29 @@ class ClientPool:
             )
         else:
             assert self._session is not None
-            credentials = await self._session.get_credentials()
+            credentials = await self._chain_credentials(account, self._session)
         client = await BedrockHTTP.open(
             region=route.region,
             credentials=credentials,
             endpoint_url=self._endpoint,
-            read_timeout=self._read,
-            connect_timeout=self._connect,
+            read_timeout_secs=self._read_secs,
+            connect_timeout_secs=self._connect_secs,
             pool_size=size,
             keepalive_secs=self._warm.keepalive_secs,
         )
         return client, client.close
+
+    @staticmethod
+    async def _chain_credentials(account: Account, session: AioSession) -> Any:
+        """The pod chain's credentials; `CredentialsUnavailable` when it resolves none (CL-7).
+
+        Raised before a client exists, so no client holding `None` is cached: the worker
+        backs off and the next build reads the chain again (IRSA / IMDS keys that appear later).
+        """
+        credentials = await session.get_credentials()
+        if credentials is None:
+            raise CredentialsUnavailable(f"account {account.name}: no AWS credentials found")
+        return credentials
 
     def _refreshing_session(self, account: Account, extra: dict[str, Any], expiry: Any) -> Any:
         """A session for `credentials=` values with an expiry: asked again before it passes."""
@@ -375,13 +473,24 @@ class ClientPool:
         from aiobotocore.session import get_session
 
         base = self._session or get_session()
-        base_kwargs = dict(self._credentials(account) or {})
+        given: Mapping[str, Any] | None = await asyncio.to_thread(self._credentials, account)
+        base_kwargs = dict(given or {})
         base_kwargs.pop("expiry_time", None)
-        external_id = self._secrets(account.external_id_ref) if account.external_id_ref else None
+        external_id = None
+        if account.external_id_ref:
+            external_id = await asyncio.to_thread(self._secrets, account.external_id_ref)
         if account.external_id_ref and not external_id:
             raise CredentialsUnavailable(
                 f"account {account.name}: secret {account.external_id_ref} is not set"
             )
+
+        from aiobotocore.config import AioConfig
+
+        sts_config = AioConfig(
+            connect_timeout=self._connect_secs,
+            read_timeout=STS_READ_TIMEOUT_SECS,
+            retries={"total_max_attempts": STS_MAX_ATTEMPTS, "mode": "standard"},
+        )
 
         async def assume() -> dict[str, Any]:
             request: dict[str, Any] = {
@@ -393,7 +502,11 @@ class ClientPool:
                 request["ExternalId"] = external_id
             try:
                 async with base.create_client(
-                    "sts", region_name=route.region, endpoint_url=self._sts_endpoint, **base_kwargs
+                    "sts",
+                    region_name=route.region,
+                    endpoint_url=self._sts_endpoint,
+                    config=sts_config,
+                    **base_kwargs,
                 ) as sts:
                     reply = await sts.assume_role(**request)
             except Exception as exc:
@@ -429,9 +542,15 @@ class ClientPool:
             from openai._constants import DEFAULT_CONNECTION_LIMITS
         except ImportError as exc:
             raise MissingExtra("an openai account", "openai") from exc
+        # Sync (the provider builds the client in line): the lookup runs once per account.
         key = self._secrets(account.api_key_ref) if account.api_key_ref else None
         if account.api_key_ref and not key:
-            raise ConfigError(f"account {account.name}: secret {account.api_key_ref} is not set")
+            # Not ConfigError (FATAL, `provider_error`): the worker forgets the route, backs off
+            # and tries the next deployment, as for the Bedrock twin (CL-6).
+            self._warn_once("account_secret_missing", account.name, secret=account.api_key_ref)
+            raise CredentialsUnavailable(
+                f"account {account.name}: secret {account.api_key_ref} is not set"
+            )
         opts = self._openai_options
 
         def build() -> tuple[Any, Callable[[], Awaitable[Any]]]:
@@ -470,7 +589,7 @@ class ClientPool:
     def plan(self, slots: Mapping[tuple[str, str], int]) -> None:
         """Size future Bedrock clients: concurrency slots per (account name, region) (E5).
 
-        Each client gets `pool_size_for(slots)` connections (at least 10, at most 200); a
+        Each client gets `pool_size_for(slots)` connections (at least 10); a
         client already built keeps its size until it is built again.
         """
         self._sizes = {key: pool_size_for(n) for key, n in slots.items()}
@@ -485,6 +604,9 @@ class ClientPool:
         """
         if slots is not None:
             self.plan(slots)
+        routes = list(routes)
+        for problem in await asyncio.to_thread(self.problems, routes):
+            logger.warning("client_config_problem", problem=problem)
         unique = {(_identity(r.account), r.region): r for r in routes if r.account.kind == "aws"}
         results = await asyncio.gather(
             *(self.bedrock(r) for r in unique.values()), return_exceptions=True
@@ -497,6 +619,23 @@ class ClientPool:
                     region=route.region,
                     error=type(result).__name__,
                 )
+
+    def problems(self, routes: Iterable[Route]) -> list[str]:
+        """Every secret the routes' accounts name but `secrets` does not have, listed at once.
+
+        `warm` logs them at start, so a missing key shows before the first call; a call on such
+        an account fails over with `CredentialsUnavailable` instead of raising config errors.
+        """
+        out: list[str] = []
+        seen: set[str] = set()
+        for route in routes:
+            account = route.account
+            for ref in (account.api_key_ref, account.external_id_ref):
+                if ref and (account.name, ref) not in self._warned and ref not in seen:
+                    seen.add(ref)
+                    if not self._secrets(ref):
+                        out.append(f"account {account.name}: secret {ref} is not set")
+        return out
 
     def forget(self, route: Route) -> None:
         """Drop the route's account clients in its region so the next call reads credentials again.
@@ -524,16 +663,28 @@ class ClientPool:
         task.add_done_callback(lambda done: self._retiring.pop(done, None))
 
     async def _release_later(self, leases: list[Lease]) -> None:
-        await asyncio.sleep(self._read + self._connect)  # the longest a running call can need
-        for lease in leases:
-            await self._hub.release(lease)
+        """Give retired leases back once no call uses them (at most `RETIRE_MAX_SECS`).
+
+        A fixed `read + connect` grace closed the client under a healthy answer longer than
+        that (the stream timer is idle-based), which read as a provider fault (CL-3). Each
+        lease leaves `leases` as it is released, so `aclose` never releases one twice (CL-2).
+        """
+        await asyncio.sleep(RETIRE_GRACE_SECS)  # a call that just got the client borrows it
+        await asyncio.gather(*(lease.wait_idle(RETIRE_MAX_SECS) for lease in leases))
+        while leases:
+            lease = leases.pop(0)
+            # Shielded: `aclose` cancelling this task must not cut a close half way.
+            await asyncio.shield(self._hub.release(lease))
 
     async def aclose(self) -> None:
         """Give every client back to the hub (the last holder closes it); safe to repeat."""
-        retired = [lease for leases in self._retiring.values() for lease in leases]
-        for task in list(self._retiring):  # give retired clients back now, not after the grace
+        tasks, lists = list(self._retiring), list(self._retiring.values())
+        for task in tasks:  # give retired clients back now, not after the calls on them end
             task.cancel()
+        # Wait for the tasks first: one may be releasing a lease right now (CL-2).
+        await asyncio.gather(*tasks, return_exceptions=True)
         self._retiring.clear()
+        retired = [lease for leases in lists for lease in leases]  # those not released yet
         leases = [*self._bedrock.values(), *self._openai.values(), *retired]
         self._bedrock.clear()
         self._openai.clear()

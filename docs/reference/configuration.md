@@ -25,7 +25,7 @@ Passed as `LLMQueue.from_env(tuning=Tuning(...))`. Defaults:
 What each field does and the start-up checks are in [Tune](../how-to/tune.md).
 
 Bedrock connection pools are sized from the registry: each (account, region) client gets the sum
-of the concurrency slots routed to it, at least 10 and at most 200 connections. `WarmOptions`
+of the concurrency slots routed to it, at least 10 connections (no upper cap). `WarmOptions`
 (2 warm connections per client, refreshed every 10 s, kept idle 15 s) controls the warm
 connections; see [Clients and connections](../explanation/clients.md). Both are importable
 from `llm_queue` and passed like the other parts:

@@ -25,15 +25,16 @@ logger = get_logger(__name__)
 _T = TypeVar("_T")
 
 # Pool size per client from the concurrency slots routed to its account and region (E5): a
-# floor so a small model still has spare connections, a cap so one client cannot hold sockets
-# for a whole fleet (aiohttp's limit is per client).
+# floor so a small model still has spare connections. No cap: the slots already bound this
+# process's calls on the client, and a cap below them (200) made callers queue for a socket
+# inside the first-response timer, so a local wait charged the breaker as a provider timeout
+# (CL-14).
 POOL_FLOOR = 10
-POOL_CAP = 200
 
 
 def pool_size_for(slots: int) -> int:
-    """Connections for one client: the slots routed to it, at least 10 and at most 200."""
-    return max(POOL_FLOOR, min(POOL_CAP, int(slots)))
+    """Connections for one client: the slots routed to it, at least 10."""
+    return max(POOL_FLOOR, int(slots))
 
 
 def identity_hash(*parts: Any) -> str:
@@ -43,7 +44,11 @@ def identity_hash(*parts: Any) -> str:
 
 @dataclass(eq=False)
 class Lease:
-    """One hub entry: the client, how to close it, and how many pools hold it."""
+    """One hub entry: the client, how to close it, how many pools hold it, calls using it.
+
+    `inflight` counts calls running on the client (`ClientPool.borrow`), so a retired client
+    is closed when its calls end, not after a fixed grace that cut long answers (CL-3).
+    """
 
     key: tuple[Any, ...]
     client: Any
@@ -51,6 +56,33 @@ class Lease:
     close: Callable[[], Awaitable[Any]]
     refs: int = 0
     tasks: list[asyncio.Task[Any]] = field(default_factory=list)
+    inflight: int = 0
+    _idle: asyncio.Event | None = None
+
+    def enter(self) -> None:
+        """One more call on the client."""
+        self.inflight += 1
+        if self._idle is not None:
+            self._idle.clear()
+
+    def leave(self) -> None:
+        """One call fewer; wakes `wait_idle` at zero."""
+        self.inflight -= 1
+        if self.inflight <= 0 and self._idle is not None:
+            self._idle.set()
+
+    async def wait_idle(self, limit_secs: float) -> bool:
+        """Wait until no call uses the client, at most `limit_secs`; True when idle."""
+        if self.inflight <= 0:
+            return True
+        if self._idle is None:
+            self._idle = asyncio.Event()
+        try:
+            async with asyncio.timeout(limit_secs):
+                await self._idle.wait()
+        except TimeoutError:
+            return False
+        return True
 
 
 class ClientHub:
@@ -85,6 +117,7 @@ class ClientHub:
         build: Callable[[], Awaitable[tuple[Any, Callable[[], Awaitable[Any]]]]],
     ) -> Lease:
         """The entry of `key` with one more holder; `build()` -> (client, close) when missing."""
+        _register_fork_hook()
         loop = asyncio.get_running_loop()
         full = (id(loop), *key)
         if (lease := self._live(full)) is None:
@@ -104,6 +137,7 @@ class ClientHub:
         self, key: tuple[Any, ...], build: Callable[[], tuple[Any, Callable[[], Awaitable[Any]]]]
     ) -> Lease:
         """`acquire` for clients built without awaiting (OpenAI); must run on an event loop."""
+        _register_fork_hook()
         loop = asyncio.get_running_loop()
         full = (id(loop), *key)
         with self._guard:
@@ -137,13 +171,16 @@ class ClientHub:
                 self._locks.pop(lease.key, None)
         if not last:
             return
-        for task in list(lease.tasks):
+        tasks = list(lease.tasks)
+        for task in tasks:
             task.cancel()
-        for task in list(lease.tasks):
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
-        with contextlib.suppress(Exception):
-            await lease.close()
+        try:
+            # gather hands back the tasks' own CancelledError as values but re-raises a
+            # cancellation of this task: suppressing it lost the caller's cancel (CL-11).
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            with contextlib.suppress(Exception):
+                await lease.close()
 
     def reset_after_fork(self) -> None:
         """Forget every entry in a forked child: they belong to the parent's loops and sockets."""
@@ -158,15 +195,21 @@ def _forget_task(lease: Lease, task: asyncio.Task[Any]) -> None:
 
 
 _HUB = ClientHub()
+_fork_hook = False  # registered on the first acquire, not at import (CL-18)
+
+
+def _register_fork_hook() -> None:
+    """Reset the process hub in a forked child; registered once, when a client is first made."""
+    global _fork_hook
+    if not _fork_hook:
+        _fork_hook = True
+        if hasattr(os, "register_at_fork"):  # not on Windows
+            os.register_at_fork(after_in_child=_HUB.reset_after_fork)
 
 
 def client_hub() -> ClientHub:
     """The process's hub (a fresh, empty one in a forked child)."""
     return _HUB
-
-
-if hasattr(os, "register_at_fork"):  # not on Windows
-    os.register_at_fork(after_in_child=_HUB.reset_after_fork)
 
 
 def run(main: Coroutine[Any, Any, _T], *, use_uvloop: bool | None = None) -> _T:

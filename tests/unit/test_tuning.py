@@ -114,7 +114,7 @@ def test_values_reach_their_clients() -> None:
     assert pool.timeout == 3
     assert engine.settings.timings.result_recheck_secs == 30
     assert engine.chunks._block_ms == 50
-    assert engine.providers.pool._read == 120
+    assert engine.providers.pool._read_secs == 120
     assert engine.providers.pool._options.role_session_secs == 1800
     assert engine.registry._history_size == 5
     assert engine.registry._edit_retries == 7

@@ -17,6 +17,7 @@ from clients_testkit import StartFake, registry_doc
 from llm_queue.clients import (
     AttemptTimeout,
     ClientPool,
+    CredentialsUnavailable,
     OpenAIOptions,
     Providers,
     Route,
@@ -140,6 +141,9 @@ async def test_hung_region_gives_up_at_first_response(setup: Any) -> None:
 async def test_long_healthy_answer_is_not_cut(setup: Any) -> None:
     view, providers = await setup({"defaults": {"output_tokens": 200, "tokens_per_s": 400}})
     route = _route(view, "gpt120b", "aws-a/ap-south-1")
+    # CL-19: warm first, so the 0.3 s first-response budget never covers the cold connect
+    # and TLS setup (it failed under a full parallel-load run and passed alone).
+    await providers.get("bedrock").call("converse", CHAT, route, FAST)
     started = time.monotonic()
     result = await providers.get("bedrock").call("converse", CHAT, route, Timing(0.3, 0.3))
     assert time.monotonic() - started > 0.4  # longer than the first-response limit
@@ -210,7 +214,7 @@ async def test_openai_key_and_errors(setup: Any) -> None:
         "m",
         "x/dc1",
     )
-    with pytest.raises(ConfigError, match="NOPE is not set"):
+    with pytest.raises(CredentialsUnavailable, match="NOPE is not set"):  # CL-6: fails over
         providers.pool.openai(missing)
 
 

@@ -93,6 +93,10 @@ _AUTH_FAMILIES = (
     "authentication",
     "invalidapikey",
     "requestexpired",
+    # botocore found no (or half of the) credentials: the client is rebuilt so keys that
+    # appear later (IRSA, IMDS, a rotated secret) are read; before, it kept failing (CL-7).
+    "nocredentials",
+    "partialcredentials",
 )
 _AUTH_MESSAGE = re.compile(
     r"signature expired|security token included in the request is (?:invalid|expired)"
@@ -116,6 +120,9 @@ _RESET_TYPES: dict[str, tuple[str, ...]] = {
         "ClientPayloadError",
     ),
     "botocore.exceptions": ("ConnectionClosedError",),
+    # A garbled status line: aiobotocore maps it to ConnectionClosedError, while the aiohttp
+    # transport raises `ClientResponseError` from it, so look for the cause (CL-5).
+    "aiohttp.http_exceptions": ("BadStatusLine",),
     "httpx": ("RemoteProtocolError", "ReadError"),
     "httpx2": ("RemoteProtocolError", "ReadError"),
 }
@@ -137,6 +144,9 @@ _TRANSPORT_TYPES: dict[str, tuple[str, ...]] = {
         "ConnectionClosedError",
         "HTTPClientError",
     ),
+    # A stream frame that fails its CRC or length checks: corrupt on the wire, so another
+    # attempt can succeed (was FATAL on both transports, CL-13).
+    "botocore.eventstream": ("ParserError",),
     "aiohttp": ("ClientError",),
     "httpx": ("TransportError",),
     "httpx2": ("TransportError",),
@@ -216,8 +226,28 @@ def parse_retry_after(
     return max(when.timestamp() - current, 0.0)
 
 
+# Transport failures no retry fixes: bad TLS (CA bundle, certificate), a refused proxy, a bad
+# URL. aiobotocore maps the first two to botocore `SSLError` / `ProxyConnectionError`, which are
+# not transport errors (FATAL); the aiohttp transport raises the aiohttp types, which were
+# RETRYABLE and charged breakers on every attempt (CL-5). Checked before `_TRANSPORT_TYPES`.
+_FATAL_TRANSPORT: dict[str, tuple[str, ...]] = {
+    "aiohttp": (
+        "ClientSSLError",
+        "ClientProxyConnectionError",
+        "ClientHttpProxyError",
+        "InvalidURL",
+        "TooManyRedirects",
+    ),
+}
+
+
 def is_transport_error(exc: BaseException) -> bool:
-    """True for timeouts and connection failures from asyncio, botocore, aiohttp, httpx, openai."""
+    """True for timeouts and connection failures from asyncio, botocore, aiohttp, httpx, openai.
+
+    False for TLS, proxy and URL failures (`_FATAL_TRANSPORT`): the same on every attempt.
+    """
+    if _is_any(exc, _FATAL_TRANSPORT):
+        return False
     if isinstance(exc, TimeoutError | ConnectionError | StreamTruncated):
         return True
     return _is_any(exc, _TRANSPORT_TYPES)
@@ -247,6 +277,23 @@ def is_connection_reset(exc: BaseException) -> bool:
         if isinstance(err, ConnectionResetError | BrokenPipeError) or _is_any(err, _RESET_TYPES):
             return True
     return False
+
+
+# A body cut while it was being read: the request reached the model (CL-9). aiobotocore wraps
+# the aiohttp error in `ConnectionClosedError` / `ResponseStreamingError`; the chain keeps it.
+_BODY_CUT: dict[str, tuple[str, ...]] = {
+    "aiohttp": ("ClientPayloadError",),
+    "botocore.exceptions": ("ResponseStreamingError",),
+}
+
+
+def is_body_cut(exc: BaseException) -> bool:
+    """True when the connection dropped while the reply body was read (the model already ran).
+
+    Such a failure is still a reset for classification, but no quick retry: the generation
+    ran and was billed, so running it again at once doubled it (CL-9).
+    """
+    return any(_is_any(err, _BODY_CUT) for err in _chain(exc))
 
 
 def _chain(exc: BaseException) -> list[BaseException]:

@@ -7,6 +7,10 @@ botocore's `SigV4Auth`, POSTed on the client's own aiohttp session and parsed wi
 stream frames go through botocore's `EventStreamBuffer` (CRC-checked). Errors are botocore
 `ClientError` / `EventStreamError` with the response dict botocore builds, so
 `classify_bedrock` reads both transports the same way.
+
+Why it is the default (measured on fakellm, 0.1.0b2, three runs of 3-4 alternating rounds):
+Converse at 20 / 200 concurrent calls +78-104 % calls/s, client CPU per call -55-61 %, p99
+-27-44 %; stream first event -18-23 %; memory per client 669 -> 87 KiB (CHANGELOG.md).
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ from botocore.httpsession import ProxyConfiguration, create_urllib3_context, get
 from yarl import URL
 
 from llm_queue._version import __version__
+from llm_queue.providers.classify import StreamTruncated
 
 SIGNING_NAME = "bedrock"  # bedrock-runtime signs as "bedrock"
 _USER_AGENT = f"llm-queue/{__version__} aiohttp/{aiohttp.__version__}"
@@ -126,7 +131,11 @@ def _text_blobs(request: Mapping[str, Any]) -> bool:
 
 
 def _with_text_blobs_encoded(request: dict[str, Any]) -> dict[str, Any]:
-    """A copy of `request` whose text blob members are bytes (sent base64-encoded)."""
+    """A copy of `request` whose text blob members are bytes (sent base64-encoded).
+
+    Rare (only a text `bytes` member): the deep copy is not measured (unverified cost); it keeps
+    the caller's request unchanged.
+    """
     copy = deepcopy(request)
     for message in copy.get("messages") or ():
         content = message.get("content") if isinstance(message, dict) else None
@@ -183,6 +192,18 @@ def client_error(status: int, headers: dict[str, str], body: bytes, operation: s
     return ClientError(response, operation)
 
 
+def _loads(data: bytes, what: str) -> Any:
+    """Parse JSON from the wire; garbage (a gateway's HTML page, a cut frame) is retryable.
+
+    `StreamTruncated` instead of `orjson.JSONDecodeError`, which classified FATAL and was never
+    retried (CL-13); the cause keeps the parser's detail.
+    """
+    try:
+        return orjson.loads(data) if data else {}
+    except orjson.JSONDecodeError as exc:
+        raise StreamTruncated(f"the Bedrock {what} is not JSON") from exc
+
+
 def _event(message: EventStreamMessage) -> dict[str, Any] | None:
     """One ConverseStream frame as botocore yields it: `{event_type: payload}`.
 
@@ -195,12 +216,12 @@ def _event(message: EventStreamMessage) -> dict[str, Any] | None:
         event_type = headers.get(":event-type")
         if event_type not in _EVENTS:
             return None
-        payload = orjson.loads(message.payload) if message.payload else {}
+        payload = _loads(message.payload, "stream event")
         if event_type == "contentBlockDelta":
             _decode_blobs((payload.get("delta"),))
         return {event_type: payload}
     if kind == "exception":
-        body = orjson.loads(message.payload) if message.payload else {}
+        body = _loads(message.payload, "stream exception")
         error = {
             "Code": headers.get(":exception-type", ""),
             "Message": body.get("Message", body.get("message", "")),
@@ -286,8 +307,8 @@ class BedrockHTTP:
         region: str,
         credentials: Any,
         endpoint_url: str | None = None,
-        read_timeout: float,
-        connect_timeout: float,
+        read_timeout_secs: float,
+        connect_timeout_secs: float,
         pool_size: int,
         keepalive_secs: float,
     ) -> BedrockHTTP:
@@ -300,7 +321,9 @@ class BedrockHTTP:
         connector = aiohttp.TCPConnector(limit=pool_size, keepalive_timeout=keepalive_secs, ssl=tls)
         session = aiohttp.ClientSession(
             connector=connector,
-            timeout=aiohttp.ClientTimeout(sock_connect=connect_timeout, sock_read=read_timeout),
+            timeout=aiohttp.ClientTimeout(
+                sock_connect=connect_timeout_secs, sock_read=read_timeout_secs
+            ),
             auto_decompress=False,
             headers={"User-Agent": _USER_AGENT, "Accept-Encoding": "identity"},
         )
@@ -333,8 +356,14 @@ class BedrockHTTP:
         raw, url = self._url(model_id, action)
         request = AWSRequest(method="POST", url=raw, data=body, headers=headers)
         SigV4Auth(frozen, SIGNING_NAME, self.region).add_auth(request)
+        # Never follow a redirect (botocore does not): aiohttp would re-send the signed body,
+        # `X-Amz-Date` and `X-Amz-Security-Token` to the new host (CL-4). A 3xx is an error.
         return await self.session.post(
-            url, data=body, headers=dict(request.headers.items()), proxy=self.proxy
+            url,
+            data=body,
+            headers=dict(request.headers.items()),
+            proxy=self.proxy,
+            allow_redirects=False,
         )
 
     async def _fail(self, response: aiohttp.ClientResponse, operation: str) -> ClientError:
@@ -365,7 +394,7 @@ class BedrockHTTP:
         except BaseException:
             response.close()
             raise
-        reply: dict[str, Any] = orjson.loads(data) if data else {}
+        reply: dict[str, Any] = _loads(data, "Converse reply")
         _decode_blobs(((reply.get("output") or {}).get("message") or {}).get("content"))
         reply["ResponseMetadata"] = _metadata(response.status, _headers(response))
         return reply

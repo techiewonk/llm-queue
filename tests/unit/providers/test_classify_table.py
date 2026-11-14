@@ -8,18 +8,25 @@ and the request-error kind. The C7 and P5 rows failed before their fixes (strict
 
 from __future__ import annotations
 
+import ssl
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import aiohttp
 import httpx
 import openai
 import pytest
+from aiohttp.http_exceptions import BadStatusLine
+from botocore.eventstream import ChecksumMismatch
 from botocore.exceptions import (
     ClientError,
     ConnectionClosedError,
     EndpointConnectionError,
     EventStreamError,
+    ProxyConnectionError,
     ReadTimeoutError,
+    SSLError,
 )
 
 from llm_queue.errors import ErrorInfo, ErrorKind
@@ -478,3 +485,73 @@ def test_openai_errors(
     assert is_target_error(exc, info) is target
     assert info.retry_after_secs == retry_after
     _refinements(request.node.callspec.id, exc, info)
+
+
+def _conn_key() -> Any:
+    """The connection key aiohttp's connector errors read their host, port and ssl from."""
+    return SimpleNamespace(host="bedrock-runtime.ap-south-1.amazonaws.com", port=443, ssl=True)
+
+
+def _caused(error: BaseException, cause: BaseException) -> BaseException:
+    error.__cause__ = cause
+    return error
+
+
+# (aiohttp transport error, the botocore error aiobotocore raises for the same failure, kind,
+# connection reset). The aiohttp transport raises `ClientResponseError` from a garbled status
+# line; aiobotocore raises `ConnectionClosedError` from it.
+TRANSPORT_PAIRS: list[Any] = [
+    pytest.param(
+        aiohttp.ClientSSLError(_conn_key(), ssl.SSLError(1, "CERTIFICATE_VERIFY_FAILED")),
+        SSLError(endpoint_url=URL, error=ssl.SSLError(1, "CERTIFICATE_VERIFY_FAILED")),
+        F,
+        False,
+        id="tls",
+    ),
+    pytest.param(
+        aiohttp.ClientProxyConnectionError(_conn_key(), OSError(111, "refused")),
+        ProxyConnectionError(proxy_url="http://proxy:3128", error=OSError(111, "refused")),
+        F,
+        False,
+        id="proxy",
+    ),
+    pytest.param(
+        aiohttp.InvalidURL("https://bedrock-runtime..amazonaws.com"),
+        ValueError("Invalid endpoint"),  # botocore refuses a bad URL before sending
+        F,
+        False,
+        id="bad-url",
+    ),
+    pytest.param(
+        _caused(
+            aiohttp.ClientResponseError(Mock(), (), status=400, message="bad status line"),
+            BadStatusLine("HTTP/1.1 OOPS"),
+        ),
+        _caused(ConnectionClosedError(endpoint_url=URL), BadStatusLine("HTTP/1.1 OOPS")),
+        R,
+        True,
+        id="bad-status-line",
+    ),
+    pytest.param(
+        ChecksumMismatch(1, 2),
+        ChecksumMismatch(1, 2),  # both transports decode frames with botocore
+        R,
+        False,
+        id="frame-crc",
+    ),
+]
+
+
+@pytest.mark.parametrize(("aio", "boto", "kind", "reset"), TRANSPORT_PAIRS)
+def test_transport_errors_classify_alike_on_both_bedrock_transports(
+    aio: BaseException, boto: BaseException, kind: ErrorKind, reset: bool
+) -> None:
+    """CL-5 / CL-13: TLS, proxy and URL failures retried on aiohttp only; a corrupt frame never.
+
+    aiobotocore turns aiohttp's TLS / proxy errors into botocore types that classify FATAL, but
+    the aiohttp transport's own types were RETRYABLE (every attempt failed the same way and
+    charged a breaker); a garbled status line got no quick retry there; a CRC error was FATAL.
+    """
+    for exc in (aio, boto):
+        assert classify_bedrock(exc).kind is kind, exc
+        assert is_connection_reset(exc) is reset, exc
