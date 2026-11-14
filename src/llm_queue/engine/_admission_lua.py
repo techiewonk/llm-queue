@@ -12,6 +12,8 @@ from __future__ import annotations
 _COMMON = r"""
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+-- ARGV[3], tests only: an injected clock (ms) instead of the store's (production never sends it).
+if ARGV[3] then now = tonumber(ARGV[3]) end
 local minute = math.floor(now / 60000)
 local P = ARGV[1]
 local req = cjson.decode(ARGV[2])

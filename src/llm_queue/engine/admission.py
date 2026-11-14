@@ -9,7 +9,7 @@ tokens and learns; `undo` gives a grant back; `renew` is the heartbeat; `sweep` 
 from __future__ import annotations
 
 import random
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -31,15 +31,6 @@ Class = Literal["p", "n"]
 Outcome = Literal["ok", "throttle", "fail", "none"]
 
 logger = get_logger(__name__)
-
-# Script pacing not (yet) in `EngineTimings`: a throttled deployment is skipped for a jittered
-# backoff from 1-2 s doubling to 30 s per throttle in a row (or Retry-After when longer); a
-# latency average not updated for 5 minutes no longer marks a deployment slow; a claim record
-# made by a worker lives an hour.
-THROTTLE_BASE_MS = 1000
-THROTTLE_MAX_MS = 30_000
-SLOW_STALE_MS = 300_000
-JOB_TTL_MS = 3_600_000
 
 
 def owner_token(request_id: str, worker: str, attempt: int) -> str:
@@ -127,12 +118,14 @@ class Admission:
         rng: random.Random | None = None,
         timings: EngineTimings | None = None,
         metrics: Metrics | None = None,
+        clock_ms: Callable[[], int] | None = None,
     ) -> None:
         """Register the scripts; no I/O until the first call.
 
         `timings` (`Tuning.engine`) carries the scripts' pacing: probe and slot waits, the
         limiter's cut, budget key lifetime; each script falls back to the same defaults.
-        `metrics` counts grants found lost when settled or renewed.
+        `metrics` counts grants found lost when settled or renewed. `clock_ms` (tests only)
+        replaces the store's clock in the scripts, so budgets can be checked at chosen times.
         """
         self._client = client
         self.keys = keys
@@ -140,6 +133,7 @@ class Admission:
         self.waiter_ms = int(waiter_secs * 1000)
         self._rng = rng or random.Random()
         self.metrics: Metrics = metrics or NullSink()
+        self._clock_ms = clock_ms
         pace = timings or EngineTimings()
         self._t = {
             "probe_wait_ms": pace.admission_probe_wait_ms,
@@ -149,10 +143,10 @@ class Admission:
             "limiter_cut_ms": pace.limiter_cut_ms,
             "limiter_cut_factor": pace.limiter_cut_factor,
             "budget_key_ms": pace.budget_key_ms,
-            "throttle_base_ms": THROTTLE_BASE_MS,
-            "throttle_max_ms": THROTTLE_MAX_MS,
-            "slow_stale_ms": SLOW_STALE_MS,
-            "job_ttl_ms": JOB_TTL_MS,
+            "throttle_base_ms": pace.throttle_base_ms,
+            "throttle_max_ms": pace.throttle_max_ms,
+            "slow_stale_ms": pace.slow_stale_ms,
+            "job_ttl_ms": pace.job_ttl_ms,
         }
         self._pick = client.register_script(lua.PICK_TAKE)
         self._finish = client.register_script(lua.FINISH)
@@ -162,7 +156,10 @@ class Admission:
         self._reregister = client.register_script(lua.REREGISTER)
 
     async def _call(self, script: Any, body: dict[str, Any]) -> Any:
-        return await script([], [self.keys.prefix, orjson.dumps({**body, "t": self._t})])
+        args: list[Any] = [self.keys.prefix, orjson.dumps({**body, "t": self._t})]
+        if self._clock_ms is not None:
+            args.append(int(self._clock_ms()))
+        return await script([], args)
 
     async def pick_take(self, ask: Ask, changes: int) -> Decision:
         """Choose and take, or say how long to wait and why."""
