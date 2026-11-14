@@ -674,6 +674,10 @@ def _wait_on_loop(future: Future[_T], loop: asyncio.AbstractEventLoop) -> _T:
         try:
             return future.result(timeout=_LOOP_CHECK_SECS)
         except TimeoutError:
+            if future.done():
+                # The call itself raised a TimeoutError (or a subclass such as AttemptTimeout):
+                # taken for a poll timeout, it was re-raised on every poll forever (NB-2).
+                return future.result()
             if loop.is_running():
                 continue
             future.cancel()

@@ -301,3 +301,41 @@ def test_wait_on_loop_returns_the_result() -> None:
 def test_concurrent_cancelled_error_is_not_an_llmqueue_error() -> None:
     """Why CO-7 maps it: `concurrent.futures.CancelledError` is outside the error family."""
     assert not issubclass(concurrent.futures.CancelledError, LLMQueueError)
+
+
+def test_wait_on_loop_reraises_a_timeout_raised_by_the_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NB-2: a call that itself raised a TimeoutError (or AttemptTimeout) spun the caller forever.
+
+    `_wait_on_loop` took the call's TimeoutError for its own poll timeout and polled again.
+    """
+    monkeypatch.setattr("llm_queue.core._LOOP_CHECK_SECS", 0.05)
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+
+        async def boom() -> None:
+            raise TimeoutError("the call's own timeout")
+
+        future = asyncio.run_coroutine_threadsafe(boom(), loop)
+        outcome: list[BaseException] = []
+
+        def wait() -> None:
+            try:
+                _wait_on_loop(future, loop)
+            except BaseException as exc:
+                outcome.append(exc)
+
+        waiter = threading.Thread(target=wait, daemon=True)
+        waiter.start()
+        waiter.join(5)
+        assert not waiter.is_alive(), "the sync caller never returned"
+        assert len(outcome) == 1
+        assert isinstance(outcome[0], TimeoutError)
+        assert "the call's own timeout" in str(outcome[0])
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(5)
+        loop.close()
