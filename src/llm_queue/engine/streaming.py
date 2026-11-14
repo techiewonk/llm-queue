@@ -61,7 +61,7 @@ class ChunkWriter:
         self.attempt_id = attempt_id
         self._flush_secs = flush_ms / 1000
         self._max_bytes = max_bytes
-        self._ttl = ttl_secs
+        self._ttl_secs = ttl_secs
         self._buffer: list[Any] = []
         self._seq = 0
         self._bytes = 0
@@ -104,6 +104,9 @@ class ChunkWriter:
             await self._flush()
         except Exception as exc:  # StreamTooLarge or a store error: raised by the next add()/end()
             self._failed = exc
+            # Logged here too: a call that ends through error() or shutdown never re-raised it,
+            # so the failure went unseen (EN-19).
+            logger.warning("chunk_flush_failed", key=self.key, error_type=type(exc).__name__)
 
     async def _write(self, kind: str, data: Any, *, ttl_secs: int | None = None) -> None:
         payload = orjson.dumps(data, default=_chunk_default)
@@ -113,7 +116,9 @@ class ChunkWriter:
         seq = self._seq + 1  # counted only once written: a failed write leaves no gap
         async with self._client.pipeline(transaction=False) as pipe:
             pipe.xadd(self.key, {"seq": seq, "att": self.attempt_id, "t": kind, "d": payload})
-            pipe.expire(self.key, ttl_secs or self._ttl)  # every write: the first may have failed
+            pipe.expire(
+                self.key, ttl_secs or self._ttl_secs
+            )  # every write: the first may have failed
             await pipe.execute()
         self._seq = seq
         self._bytes = size
@@ -157,9 +162,7 @@ class ChunkWriter:
 
     async def _stop_timer(self) -> None:
         if self._timer is not None and not self._timer.done():
-            self._timer.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._timer
+            await _cancel_and_wait([self._timer])
 
 
 class ChunkReader:
@@ -218,14 +221,15 @@ class ChunkReader:
         self._open.pop(key, None)
 
     async def aclose(self) -> None:
-        """Stop the read task."""
+        """Stop the read task and any wake-up still being sent."""
         self._open.clear()
-        if self._task is not None:
-            self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
+        # The wake-up tasks were left pending at loop close ("Task was destroyed") (EN-18).
+        tasks = [*self._rings, *([self._task] if self._task is not None else [])]
+        await _cancel_and_wait(tasks)
+        self._rings.clear()
 
     async def _read(self) -> None:
+        failures = 0
         while self._open:
             streams: dict[Any, Any] = {key: last[0] for key, (_, last) in self._open.items()}
             if self._wake_key is not None:
@@ -236,11 +240,18 @@ class ChunkReader:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("chunk_reader_error", error=str(exc))
-                await asyncio.sleep(0.5)
+                # A store outage logged a warning every 0.5 s per process: log the first
+                # failure and the recovery, and back off to 5 s between reads (EN-18).
+                if failures == 0:
+                    logger.warning("chunk_reader_error", error=str(exc))
+                failures += 1
+                await asyncio.sleep(min(5.0, 0.5 * 2 ** min(failures - 1, 4)))
                 continue
             finally:
                 self._reading = None
+            if failures:
+                logger.info("chunk_reader_recovered", failures=failures)
+                failures = 0
             for raw_key, entries in found or []:
                 key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
                 if key not in self._open:
@@ -262,6 +273,19 @@ class ChunkReader:
                         logger.warning("chunk_entry_bad", error_type=type(exc).__name__)
                         continue
                     queue.put_nowait(item)
+
+
+async def _cancel_and_wait(tasks: list[asyncio.Task[None]]) -> None:
+    """Cancel tasks and wait for them; a cancel of the caller itself still propagates.
+
+    `suppress(CancelledError)` around the await also ate the caller's own cancellation (a
+    shutdown timeout), and the caller kept running (EN-7). Other errors are logged.
+    """
+    for task in tasks:
+        task.cancel()
+    for result in await asyncio.gather(*tasks, return_exceptions=True):
+        if isinstance(result, Exception):
+            logger.warning("stream_task_failed", error_type=type(result).__name__)
 
 
 def _chunk_default(value: Any) -> Any:

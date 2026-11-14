@@ -195,6 +195,10 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   task errors are logged (EN-7); an idle loop sleeps on the jobs queue's doorbell instead of
   polling RECEIVE about 7 times a second (EN-29); a job whose ack failed every try logs
   `job_ack_gave_up` and counts `llmq_job_ack_failed_total` (EN-32).
+- Chunk streams: stopping a writer's flush timer or closing a reader no longer swallows the
+  caller's own cancellation (EN-7); a failed background flush is logged when it happens
+  (EN-19); during a store outage the reader logs the first failure and the recovery and backs
+  off to 5 s (it warned every 0.5 s), and `aclose` also cancels pending wake-ups (EN-18).
 
 ### Security
 
