@@ -41,7 +41,9 @@ class BedrockOptions:
     role_session_secs: int = 3600  # assumed-role session; 3600 is the role-chaining maximum
     # How Bedrock calls are sent: "botocore" (aiobotocore clients) or "aiohttp" (orjson body,
     # botocore only for credentials, SigV4 and stream frames: `clients/bedrock_http.py`).
-    transport: str = "aiohttp"
+    # aiohttp is the default: measured vs botocore, converse +78-104 % calls/s, client CPU per
+    # call -55-61 %, memory per client 669 -> 87 KiB (2026-11-14, sequential ABAB rounds).
+    transport: Literal["aiohttp", "botocore"] = "aiohttp"
 
 
 @dataclass(frozen=True, slots=True)
