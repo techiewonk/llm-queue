@@ -22,29 +22,25 @@ from dataclasses import dataclass, field
 from typing import Any, NotRequired, TypedDict, TypeVar, cast, overload
 
 import orjson
-import redis.asyncio
-from redis.credentials import CredentialProvider
 
 from llm_queue._logging import get_logger
 from llm_queue.clients import ClientPool, Providers
 from llm_queue.context import current_context
-from llm_queue.engine.envelope import MAX_MESSAGE_BYTES, Meta, Reply, message_size_bytes
+from llm_queue.engine.envelope import Meta, Reply
 from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.jobs import JobFn, JobRunner
 from llm_queue.engine.metrics import Metrics, sink_for
 from llm_queue.engine.offload import ResultOffload
 from llm_queue.engine.runtime import Engine, EngineSettings
 from llm_queue.engine.settings import InfraSettings
-from llm_queue.engine.store_client import store_client
+from llm_queue.engine.store_client import Secrets, secret_store_client
 from llm_queue.engine.store_guard import store_op
 from llm_queue.errors import ConfigError, LLMQueueError
-from llm_queue.registry import SETTINGS
 from llm_queue.registry.store import RegistryStore
-from llm_queue.tuning import StoreOptions, Tuning
+from llm_queue.tuning import Tuning
 
 logger = get_logger(__name__)
 _T = TypeVar("_T")
-Secrets = Callable[[str], "str | None"]
 # Store connections of the private engine that serves sync calls when no queue is started
 # (Celery workers, scripts): a caller-only engine needs few (D1).
 SYNC_STORE_CONNECTIONS = 20
@@ -120,12 +116,17 @@ class RequestStatus(TypedDict, total=False):
 
 
 class Health(TypedDict):
-    """Liveness, readiness and each store's state (`ok`, `read_only`, `down`)."""
+    """Liveness, readiness, each store's state (`ok`, `read_only`, `down`) and eviction policy.
+
+    `eviction_policy` is the state store's `maxmemory-policy` read at start (`unknown` when
+    unreadable); `queue_eviction_policy` is the queue store's, when it is a separate store.
+    """
 
     live: bool
     ready: bool
     stores: dict[str, str | None]
-    eviction_policy: NotRequired[str]
+    eviction_policy: str
+    queue_eviction_policy: NotRequired[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,27 +140,6 @@ class EmbedResult:
     vectors: list[list[float]]
     meta: Meta
     errors: dict[int, CallFailed] = field(default_factory=dict)
-
-
-class _FreshPassword(CredentialProvider):
-    """Reads the store password from the secret on every new connection (rotation, R42)."""
-
-    def __init__(self, secrets: Secrets, name: str, username: str | None = None) -> None:
-        self._secrets = secrets
-        self._name = name
-        self._username = username
-
-    def get_credentials(self) -> tuple[str] | tuple[str, str]:
-        password = self._secrets(self._name) or ""
-        return (self._username, password) if self._username else (password,)
-
-
-def _client(
-    url: str, secrets: Secrets | None, name: str, max_connections: int, options: StoreOptions
-) -> redis.asyncio.Redis:
-    """An async client (bytes replies) for a store URL; a password secret wins when present."""
-    provider = _FreshPassword(secrets, name) if secrets is not None and secrets(name) else None
-    return store_client(url, provider, max_connections=max_connections, options=options)
 
 
 # Every queue of the process, so a fork can mark them (weak: a dropped queue is not kept).
@@ -183,7 +163,9 @@ class LLMQueue:
         """
         self.engine = engine
         self.settings = settings
-        self.jobs = JobRunner(engine.queues, queue_prefix=engine.settings.queue_prefix)
+        self.jobs = JobRunner(
+            engine.queues, queue_prefix=engine.settings.queue_prefix, metrics=engine.metrics
+        )
         self._builder = builder
         self._offload = offload
         self._sync: _SyncRunner | None = None
@@ -222,9 +204,11 @@ class LLMQueue:
         sink = metrics or sink_for(settings.metrics_sink)  # one sink for both engines (O5)
 
         def build(cap: int = settings.store_max_connections) -> Engine:
-            state = _client(settings.store_url, secrets, "LLMQ_STORE_PASSWORD", cap, tuning.store)
+            state = secret_store_client(
+                settings.store_url, secrets, "LLMQ_STORE_PASSWORD", cap, tuning.store
+            )
             queue_store = (
-                _client(
+                secret_store_client(
                     settings.queue_store_url,
                     secrets,
                     "LLMQ_QUEUE_STORE_PASSWORD",
@@ -249,6 +233,8 @@ class LLMQueue:
                 "sts_endpoint_url": settings.sts_endpoint_url,
                 "session_name": f"llmq-{settings.environment}-{worker_id or socket.gethostname()}",
                 "options": tuning.bedrock,
+                "openai_options": tuning.openai,
+                "warm": tuning.warm,
             }
             if credentials is not None:
                 pool_kwargs["credentials"] = credentials
@@ -306,21 +292,6 @@ class LLMQueue:
                         "its connections. Use the *_sync methods from other threads, or build "
                         "one queue per loop"
                     )
-
-    def _check_size(self, model: str, params: Mapping[str, Any]) -> None:
-        """`CallFailed("invalid_request")` for a message above `max_message_bytes` (C1).
-
-        One orjson pass over the params: 0.22 ms at 240 KB (measured 2026-11-14, Python 3.12).
-        """
-        limit = MAX_MESSAGE_BYTES
-        if "max_message_bytes" in SETTINGS:
-            view = self.engine.registry.current
-            limit = int(view.value(view.registry.alias_of(model), "max_message_bytes"))
-        size = message_size_bytes(params)
-        if size > limit:
-            raise CallFailed(
-                "invalid_request", f"the message is {size} bytes, above max_message_bytes {limit}"
-            )
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -404,7 +375,6 @@ class LLMQueue:
     ) -> Reply:
         """Any operation of a model (`converse`, `chat`, `invoke_model`, `embeddings`)."""
         self._check()
-        self._check_size(model, params)
         return await self.engine.call(model, params, **self._call_kwargs(priority, **kw))
 
     async def converse(
@@ -428,7 +398,6 @@ class LLMQueue:
         chunks. A failure after events were yielded raises `CallFailed` with `partial_text`.
         """
         self._check()
-        self._check_size(model, request)
         kwargs = self._call_kwargs(priority, **kw)
         async for event in self.engine.stream(model, request, **kwargs):
             yield event
@@ -492,7 +461,6 @@ class LLMQueue:
         kwargs = self._call_kwargs(priority, **kw)
 
         async def run(engine: Engine) -> Reply:
-            self._check_size(model, request)
             return await engine.call(model, request, force_direct=True, **kwargs)
 
         return self._run_sync(run)
@@ -526,9 +494,13 @@ class LLMQueue:
 
     # ---------------------------------------------------------------- jobs and admin
 
-    def register_job(self, name: str, fn: JobFn) -> None:
-        """Allow this process to run job `name` (call before `start`)."""
-        self.jobs.register(name, fn)
+    def register_job(self, name: str, fn: JobFn, *, timeout_secs: float | None = None) -> None:
+        """Allow this process to run job `name` (call before `start`).
+
+        A run longer than `timeout_secs` is cancelled and counts as a failure (retried, then
+        dead-lettered); None (the default) lets it run as long as it takes.
+        """
+        self.jobs.register(name, fn, timeout_secs=timeout_secs)
 
     @store_op
     async def send_job(

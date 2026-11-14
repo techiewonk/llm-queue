@@ -37,7 +37,14 @@ from llm_queue.engine.admission import (
     owner_token,
     position_of,
 )
-from llm_queue.engine.envelope import Envelope, Meta, Reply, params_hash, parse
+from llm_queue.engine.envelope import (
+    Envelope,
+    Meta,
+    Reply,
+    message_size_bytes,
+    params_hash,
+    parse,
+)
 from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.health import Health
 from llm_queue.engine.keys import Keys
@@ -52,10 +59,18 @@ from llm_queue.engine.queue import (
 )
 from llm_queue.engine.requests import RequestStore
 from llm_queue.engine.status import AlertEvaluator, StatusReader
+from llm_queue.engine.store_checks import UNKNOWN as UNKNOWN_POLICY
+from llm_queue.engine.store_checks import check_store
 from llm_queue.engine.streaming import ChunkReader, ChunkWriter, StreamTooLarge
 from llm_queue.errors import ConfigError, ErrorKind, UnsupportedEnvelopeError
 from llm_queue.ids import new_id
-from llm_queue.providers.classify import error_family, is_target_error
+from llm_queue.providers.classify import (
+    error_family,
+    is_auth_error,
+    is_target_error,
+    request_error_kind,
+)
+from llm_queue.registry.validate import tpm_refuses
 from llm_queue.tuning import EngineTimings
 
 if TYPE_CHECKING:
@@ -67,6 +82,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 OPS = {("bedrock", "chat"): "converse", ("bedrock", "embedding"): "invoke_model"}
 HEALTH_PROBE_EVERY_SECS = 5.0  # the background store probe behind readiness (RESCAN O1)
+NEWER_MESSAGE_DELAY_SECS = 15.0  # a message from a newer library waits this long for a newer pod
 # Request fields a fallback model may not understand (another family's knobs): dropped from the
 # caller's params when the call is served by another model (RESCAN P6). The target's own
 # `inference` defaults are applied after, so its own extra fields still go in.
@@ -90,12 +106,14 @@ def _probe_params(provider: str, kind: str, model_id: str) -> dict[str, Any]:
     }
 
 
-def _auth_error(code: str) -> bool:
-    """Credential errors: drop the cached client so the secret is read again."""
-    lowered = code.lower()
+def _takes_calls(view: ResolvedRegistry, alias: str) -> bool:
+    """True when a model is enabled with at least one enabled deployment on an enabled account."""
+    if not view.value(alias, "enabled"):
+        return False
+    accounts = view.registry.accounts
     return any(
-        part in lowered
-        for part in ("unrecognizedclient", "expiredtoken", "authentication", "invalid_api_key")
+        view.value(alias, "enabled", d.key) and accounts[d.account].enabled
+        for d in view.deployments(alias)
     )
 
 
@@ -116,7 +134,8 @@ class EngineSettings:
     caller_margin_secs: float = 5.0
     local_limit_cap: int = 10
     drain_secs: float = 25.0  # k8s grace 30 s: calls still running then are given back (C3)
-    id_hash_salt: str = ""  # LLMQ_ID_HASH_SALT: the key of every user / session id hash
+    # LLMQ_ID_HASH_SALT: the key of every user / session id hash; never in repr() (X10).
+    id_hash_salt: str = field(default="", repr=False)
     cfg_reload_secs: float = 30.0  # LLMQ_CFG_RELOAD_SECS: how often the registry is re-read
     queue_failover_secs: float = 5.0  # queue-store errors this long before calls run direct
     queue_wait_replicas: int = 0  # a send waits for this many replicas (0: off)
@@ -302,6 +321,9 @@ class Engine:
         self._reload: asyncio.Task[Any] | None = None  # the one registry reload in flight (R10)
         self._stores: tuple[float, dict[str, str]] | None = None  # cached store probe (O1)
         self._beat_ran_at = time.monotonic()  # the heartbeat loop last made progress (O2)
+        # Each store's `maxmemory-policy`, read at start (plan C4): in `health_check`.
+        self._eviction: dict[str, str] = {}
+        self._newer_warned_at = -1e9  # last warning about a message from a newer library (C5)
 
     # ================================================================ lifecycle
 
@@ -310,6 +332,10 @@ class Engine:
         await self.registry.boot()  # runs on its own config when the store is down
         try:
             await self.clock.sync(self.state)
+            # Cluster mode is refused (`ConfigError`); an evicting store is a warning (C4, A14).
+            self._eviction["state"] = await check_store(self.state, "state")
+            if self._queue_store is not None:
+                self._eviction["queue"] = await check_store(self._queue_store, "queue")
             await self.state.set(self.keys.epoch, str(self.clock.now()), nx=True)
             self._epoch = _text(await self.state.get(self.keys.epoch))
         except STORE_ERRORS as exc:
@@ -445,15 +471,31 @@ class Engine:
         alias = view.registry.alias_of(model)
         if view.effective(alias, "enabled").level == "model" and not view.value(alias, "enabled"):
             rule = view.value(alias, "model_fallback")
-            if rule and allow_fallback == "all" and rule["models"]:
-                alias = rule["models"][0]["model"]
-            else:
+            if not rule or allow_fallback != "all" or not rule["models"]:
                 raise CallFailed("model_disabled", f"{alias} is disabled")
+            # The first target that can take calls: one disabled itself (model, every
+            # deployment or every account) got them all and failed each (RESCAN R8).
+            targets = [item["model"] for item in rule["models"]]
+            usable = [t for t in targets if t in view.registry.models and _takes_calls(view, t)]
+            if not usable:
+                raise CallFailed(
+                    "model_unavailable", f"{alias} is disabled and no fallback model is enabled"
+                )
+            alias = usable[0]
         entry = view.registry.models[alias]
         op = OPS.get((entry.provider, entry.type), "chat" if entry.type == "chat" else "embeddings")
+        rid = request_id or stream_id or new_id()
+        # Here, not in the front door, so every path meets it: async and sync calls, streams,
+        # embeddings, jobs and the LangChain adapters (plan C1). One orjson pass over the params.
+        size, limit = message_size_bytes(params), int(view.value(alias, "max_message_bytes"))
+        if size > limit:
+            raise CallFailed(
+                "invalid_request",
+                f"the message is {size} bytes, above max_message_bytes {limit}",
+                request_id=rid,
+            )
         timeout = float(timeout_secs or view.value(alias, "timeout_secs"))
         timeout = min(timeout, float(view.value(alias, "timeout_max_secs")))
-        rid = request_id or stream_id or new_id()
         envelope = Envelope(
             request_id=rid,
             op=op,
@@ -924,12 +966,16 @@ class Engine:
                     continue
                 route = route_for(view, dep)
                 params = self._params(view, alias, envelope, dep.key)
-                timing = Timing(
-                    float(view.value(alias, "attempt_timeout_secs", dep.key)),
-                    float(view.value(alias, "stream_idle_secs")),
-                )
+                budget = float(view.value(alias, "attempt_timeout_secs", dep.key))
+                timing = Timing(budget, float(view.value(alias, "stream_idle_secs")), budget)
                 try:
-                    result = await provider.call(envelope.op, params, route, timing)
+                    result = await provider.call(
+                        envelope.op,
+                        params,
+                        route,
+                        timing,
+                        converse_api=str(view.value(alias, "converse_api")),
+                    )
                 except Exception as exc:
                     error = exc
                     continue
@@ -1059,15 +1105,23 @@ class Engine:
 
         A client takes about a second to build (measured: the first call of a fresh worker took
         1,032 ms against ~140 ms after; B92 asks for <= 500 ms of first-call overhead).
-        Failures are ignored here: a call meets them again, and handles them.
+        All at once, each pool sized by the worker slots of the models routed to its account
+        and region (E3, E5). Failures are logged by the pool; a call meets them again.
         """
         view = self.registry.current
+        routes = []
+        slots: dict[tuple[str, str], int] = {}
         for alias, entry in view.registry.models.items():
             if entry.provider != "bedrock":
                 continue
+            places = set()
             for deployment in view.deployments(alias):
-                with contextlib.suppress(Exception):
-                    await self.providers.pool.bedrock(route_for(view, deployment))
+                routes.append(route_for(view, deployment))
+                places.add((deployment.account, deployment.region))
+            for place in places:
+                slots[place] = slots.get(place, 0) + int(view.value(alias, "worker_slots"))
+        with contextlib.suppress(Exception):
+            await self.providers.pool.warm(routes, slots=slots)
 
     async def _result_sweep(self) -> None:
         """Every `poll_secs`, one store call finds results of this process's waiting callers.
@@ -1232,8 +1286,16 @@ class Engine:
         """Admit a newly received message; True when it is now held (its class stops)."""
         try:
             env = parse(message.body)
-        except UnsupportedEnvelopeError:
-            await self.queues.return_(message, delay_secs=5)
+        except UnsupportedEnvelopeError as exc:
+            # Sent by a newer library (a rollout in progress, plan C5): passed on in its place
+            # with no failure counted, so a newer pod runs it. Every 5 s this pod took it again
+            # and logged each time; now 15 s, a metric, and one warning a minute.
+            self.metrics.count("llmq_newer_messages_total", model=alias)
+            now = time.monotonic()
+            if now - self._newer_warned_at >= 60:
+                self._newer_warned_at = now
+                logger.warning("message_needs_newer_library", model=alias, error=str(exc))
+            await self.queues.return_(message, delay_secs=NEWER_MESSAGE_DELAY_SECS)
             return False
         except Exception as exc:
             # The type only: the validation text can quote the prompt (RESCAN X10). The model's
@@ -1483,7 +1545,7 @@ class Engine:
         limits = view.value(alias, "inference_limits", dep) or {}
         if alias != env.model:
             dropped: tuple[str, ...] = _MODEL_SPECIFIC
-            if not getattr(entry, "supports_tools", True):
+            if not view.value(alias, "supports_tools"):
                 dropped = (*dropped, *_TOOL_FIELDS)
             params = {k: v for k, v in params.items() if k not in dropped}
             limits = {**limits, "on_exceed": "clamp"}
@@ -1604,9 +1666,10 @@ class Engine:
                 )
             return None
         estimate = self._charged(view, alias, held)
-        tpm = [view.value(alias, "tpm", c.key) for c in ask.candidates]
-        if all(isinstance(v, int) for v in tpm) and tpm and estimate.input > max(tpm):
-            await self._finish_call(held, "request_too_large", "input above the token budget")
+        # The whole reservation (input and output), where TPM is enforced: a call above every
+        # candidate's TPM is never admitted; it waited until its deadline (RESCAN R4).
+        if tpm_refuses(view, alias, (c.key for c in ask.candidates), estimate.total):
+            await self._finish_call(held, "request_too_large", "the call is above the token budget")
             return None
         decision = await self.admission.pick_take(ask, self.registry.changes)
         if decision.kind == "wait" and not held.refused:  # once per call, not per poll (O4)
@@ -1737,7 +1800,7 @@ class Engine:
             return False
         for item in rule["models"]:
             other = item["model"]
-            if other not in view.registry.models:
+            if other not in view.registry.models or not _takes_calls(view, other):
                 continue
             pct = int(view.value(other, "require_headroom_pct")) if item["require_headroom"] else 0
             ask = self._ask(
@@ -1848,7 +1911,8 @@ class Engine:
             else:
                 tries += 1
                 if outcome == "fatal" or tries >= int(view.value(alias, "max_attempts")):
-                    await self._finish_call(held, "provider_error", str(exc))
+                    known = kind in ("invalid_request", "context_length_exceeded")
+                    await self._finish_call(held, kind if known else "provider_error", str(exc))
                     return
                 if kind == "target" and not untried:
                     # The model is missing on the only deployment left: it refuses again however
@@ -1958,10 +2022,14 @@ class Engine:
         attempt_budget = float(view.value(alias, "attempt_timeout_secs", dep_key))
         # One first-response budget, never shortened below `attempt_timeout_secs` but by the
         # deadline itself: a timer halved for the deadline was not the provider's failure, so a
-        # hung region never tripped its breaker (RESCAN P3).
+        # hung region never tripped its breaker (RESCAN P3). `attempt_secs` bounds a plain
+        # Converse answer (the model's `converse_api`, plan P7); a stream to the caller always
+        # uses ConverseStream.
+        budget = min(attempt_budget, remaining)
         timing = Timing(
-            first_response_secs=min(attempt_budget, remaining),
+            first_response_secs=budget,
             idle_secs=float(view.value(alias, "stream_idle_secs")),
+            attempt_secs=budget,
         )
         provider = self.providers.get(entry.provider)
         held.meta[owner] = {
@@ -2004,7 +2072,12 @@ class Engine:
         try:
             async with outer:
                 result = await provider.call(
-                    env.op, params, route, timing, sink=writer.add if writer else None
+                    env.op,
+                    params,
+                    route,
+                    timing,
+                    sink=writer.add if writer else None,
+                    converse_api=str(view.value(alias, "converse_api")),
                 )
             if writer is not None:
                 await writer.end(
@@ -2117,7 +2190,7 @@ class Engine:
             )
             if is_target_error(exc, info):
                 return await self._target_error(view, alias, held, dep_key, exc)
-            if isinstance(exc, CredentialsUnavailable) or _auth_error(info.code):
+            if isinstance(exc, CredentialsUnavailable) or is_auth_error(exc, info):
                 self.providers.pool.forget(route)
                 where = (deployment.account, deployment.region)
                 _, backoff = self._bad_accounts.get(where, (0.0, 2.5))
@@ -2129,7 +2202,8 @@ class Engine:
                     region=deployment.region,
                 )
                 return "retry", ("auth", None, exc)
-            return "fatal", ("fatal", None, exc)
+            # The request itself was refused: its own kind, not `provider_error` (plan P8).
+            return "fatal", (request_error_kind(exc, info) or "fatal", None, exc)
         latency = (time.monotonic() - started) * 1000
         used = tokens.used_tokens(
             result.usage,
@@ -2262,7 +2336,13 @@ class Engine:
         ) or _probe_params(entry.provider, entry.type, entry.model_id)
         provider = self.providers.get(entry.provider)
         try:
-            await provider.call(op, params, route_for(view, deployment), Timing(30, 30))
+            await provider.call(
+                op,
+                params,
+                route_for(view, deployment),
+                Timing(30, 30, 30),
+                converse_api=str(view.value(alias, "converse_api")),  # the calls' own API (IAM)
+            )
         except Exception as exc:
             return provider.classify(exc).kind is ErrorKind.THROTTLE
         return True
@@ -2382,7 +2462,12 @@ class Engine:
         else:
             stores = cached[1]
         loaded = self.registry._current is not None
-        return {"live": self._live(), "ready": bool(self.ready and loaded), "stores": stores}
+        out: dict[str, Any] = {"live": self._live(), "ready": bool(self.ready and loaded)}
+        out["stores"] = stores
+        out["eviction_policy"] = self._eviction.get("state", UNKNOWN_POLICY)
+        if "queue" in self._eviction:
+            out["queue_eviction_policy"] = self._eviction["queue"]
+        return out
 
     async def _probe_stores(self) -> dict[str, str]:
         """Each store's state from a short-lived write (a replica answers PING, refuses writes)."""
@@ -2443,10 +2528,24 @@ class Engine:
                 if dep["latency_ms"] is not None:
                     gauge("llmq_provider_latency_ms", float(dep["latency_ms"]), **labels)
 
+    def _registry_gauges(self) -> None:
+        """This pod's view of the stored registry (R1, C5): every pod, not only the alerter.
+
+        A refused stored document (invalid, or needing a newer library) leaves the pod on its
+        own config; only a log line said so.
+        """
+        store = self.registry
+        gauge = self.metrics.gauge
+        gauge("llmq_registry_invalid_reads", float(store.invalid_count))
+        gauge("llmq_registry_stored_refused", 1.0 if store.stored_refused else 0.0)
+        gauge("llmq_registry_lib_too_old", 1.0 if store.lib_too_old else 0.0)
+        gauge("llmq_registry_on_own_config", 1.0 if store.on_own_config else 0.0)
+
     async def _alert_loop(self) -> None:
         """Every 30 s one process evaluates alerts: gauges every time, a log line per change."""
         while True:
             await asyncio.sleep(30)
+            self._registry_gauges()
             try:
                 lock = await self.state.set(
                     f"{self.keys.prefix}:lock:alerts", self.worker_id, nx=True, ex=25

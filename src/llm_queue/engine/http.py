@@ -41,8 +41,9 @@ class Handlers:
         self.allow_writes = allow_writes
 
     async def live(self) -> Response:
-        """200 while the process runs."""
-        return 200, {"live": True}
+        """200 while the engine's loops run; 503 when one died or the heartbeat stalled (O2)."""
+        live = bool((await self.engine.health_check())["live"])
+        return (200 if live else 503), {"live": live}
 
     async def ready(self) -> Response:
         """200 when the registry is loaded and the process is not draining (stores in the body)."""

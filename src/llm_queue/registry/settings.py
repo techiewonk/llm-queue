@@ -310,6 +310,9 @@ SETTINGS: Mapping[str, Spec] = {
     # Non-stream chat calls: plain Converse (IAM `bedrock:InvokeModel`), or ConverseStream
     # (`bedrock:InvokeModelWithResponseStream`) for its first-response timer.
     "converse_api": _spec("D,M", one_of("converse", "stream"), "converse"),
+    # False for a model without tool use: a call served by it as a fallback model loses the
+    # caller's tool fields (`toolConfig`, `tools`, `tool_choice`) instead of being refused.
+    "supports_tools": _spec("M", boolean, True),
     "max_waiting": _spec("D,M", number(0, integer=True), 50_000),
     "sticky_move_after_secs": _spec("D,M", _POS, 1),
     "require_headroom_pct": _spec("D,M", _PCT, 20),

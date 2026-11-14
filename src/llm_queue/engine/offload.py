@@ -69,7 +69,7 @@ class S3Offload:
         self._owner = (
             {"ExpectedBucketOwner": expected_bucket_owner} if expected_bucket_owner else {}
         )
-        self._delete = delete_after_read
+        self.delete_after_read = delete_after_read
         self._clients: dict[asyncio.AbstractEventLoop, tuple[Any, Any]] = {}
         self._locks: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
         self._guard = threading.Lock()
@@ -116,7 +116,7 @@ class S3Offload:
             raise
         async with reply["Body"] as body:
             data: bytes = await body.read()
-        if self._delete:  # after a successful read only: a failed read can be tried again
+        if self.delete_after_read:  # after a successful read only: a failed read can be tried again
             try:
                 await s3.delete_object(Bucket=self.bucket, Key=ref, **self._owner)
             except Exception as exc:  # the bucket's lifecycle rule removes it later anyway

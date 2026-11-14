@@ -21,12 +21,12 @@ from typing import Any
 import orjson
 import redis.asyncio
 
-from llm_queue.core import _client
 from llm_queue.engine.http import redacted
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import StreamQueues
 from llm_queue.engine.settings import InfraSettings
 from llm_queue.engine.status import StatusReader
+from llm_queue.engine.store_client import secret_store_client
 from llm_queue.errors import ConfigError, LLMQueueError
 from llm_queue.registry.store import RegistryStore
 from llm_queue.tuning import Tuning
@@ -342,9 +342,11 @@ async def amain(argv: Sequence[str], environ: Mapping[str, str] | None = None) -
     # The same clients as the queue's: the password variable wins over one in the URL and is
     # read again on each new connection (rotation); timeouts and retries from `Tuning()`.
     cap, options = settings.store_max_connections, Tuning().store
-    client = _client(settings.store_url, env.get, "LLMQ_STORE_PASSWORD", cap, options)
+    client = secret_store_client(settings.store_url, env.get, "LLMQ_STORE_PASSWORD", cap, options)
     queue_client = (
-        _client(settings.queue_store_url, env.get, "LLMQ_QUEUE_STORE_PASSWORD", cap, options)
+        secret_store_client(
+            settings.queue_store_url, env.get, "LLMQ_QUEUE_STORE_PASSWORD", cap, options
+        )
         if settings.queue_store_url
         else None
     )

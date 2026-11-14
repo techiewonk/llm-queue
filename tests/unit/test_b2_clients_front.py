@@ -12,7 +12,6 @@ import asyncio
 import base64
 import logging
 import os
-import threading
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
@@ -208,7 +207,8 @@ def test_prometheus_sinks_share_collectors() -> None:
 
 
 def test_every_call_failed_kind_has_an_http_status() -> None:
-    assert set(KINDS) | {"invalid_request", "context_length_exceeded"} <= set(_STATUS)
+    assert {"invalid_request", "context_length_exceeded", "worker_shutdown"} <= KINDS
+    assert set(KINDS) <= set(_STATUS)
     request = httpx.Request("POST", "http://llmq.invalid/v1/chat/completions")
     assert _error_response(request, CallFailed("provider_error")).status_code == 502  # was 400
     assert _error_response(request, CallFailed("context_length_exceeded")).status_code == 400
@@ -234,6 +234,7 @@ class _FakeEngine:
         )
         self.registry = SimpleNamespace(current=current)
         self.queues = None
+        self.metrics = None
         self.settings = SimpleNamespace(queue_prefix="", drain_secs=0)
         self.loops: list[asyncio.AbstractEventLoop] = []
 
@@ -306,20 +307,5 @@ async def test_sync_calls_run_on_the_started_queue_loop(no_default: None) -> Non
         assert queue._sync is None  # no private engine was built
         with pytest.raises(LLMQueueError, match="deadlock"):
             queue.converse_sync("m", {"messages": []})  # on the loop's own thread
-    finally:
-        await queue.stop()
-
-
-async def test_a_message_above_the_cap_is_refused(no_default: None) -> None:
-    queue = _queue()
-    await queue.start()
-    try:
-        big = {
-            "messages": [{"content": [{"image": {"source": {"bytes": b"x" * MAX_MESSAGE_BYTES}}}]}]
-        }
-        with pytest.raises(CallFailed) as caught:
-            await queue.converse("m", big)
-        assert caught.value.kind == "invalid_request"
-        assert threading.current_thread() is threading.main_thread()
     finally:
         await queue.stop()

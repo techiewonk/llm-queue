@@ -19,6 +19,7 @@ from llm_queue.engine.envelope import Reply
 from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.offload import MARKER, ResultOffload
+from llm_queue.errors import ConfigError
 
 if TYPE_CHECKING:
     import redis.asyncio
@@ -203,7 +204,16 @@ class RequestStore:
         offload: ResultOffload | None = None,
         offload_bytes: int | None = None,
     ) -> None:
-        """Register the scripts; no I/O until the first call."""
+        """Register the scripts; no I/O until the first call.
+
+        With `result_dedupe_secs`, a result is read again by later callers of the same id, so
+        an offload that deletes its object on the first read is refused (`ConfigError`).
+        """
+        if result_dedupe_secs > 0 and getattr(offload, "delete_after_read", False):
+            raise ConfigError(
+                "result_dedupe_secs > 0 reads a result more than once: build the offload with "
+                "S3Offload(..., delete_after_read=False) (the bucket's expiry rule removes it)"
+            )
         self._client = client
         self.keys = keys
         self.result_ttl = result_ttl_secs

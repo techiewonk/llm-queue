@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 import orjson
 
 from llm_queue._logging import get_logger
+from llm_queue.engine.envelope import decode_bytes, json_default
 
 if TYPE_CHECKING:
     import redis.asyncio
@@ -105,7 +106,7 @@ class ChunkWriter:
             self._failed = exc
 
     async def _write(self, kind: str, data: Any, *, ttl_secs: int | None = None) -> None:
-        payload = orjson.dumps(data, default=str)
+        payload = orjson.dumps(data, default=_chunk_default)
         size = self._bytes + len(payload)  # counted only once written, like the sequence
         if size > self._max_bytes:
             raise StreamTooLarge(f"the stream is above {self._max_bytes} bytes")
@@ -221,12 +222,23 @@ class ChunkReader:
                             "seq": int(entry["seq"]),
                             "att": _text(entry.get("att", b"")),
                             "t": _text(entry["t"]),
-                            "d": orjson.loads(entry["d"]),
+                            "d": decode_bytes(orjson.loads(entry["d"])),
                         }
                     except Exception as exc:
                         logger.warning("chunk_entry_bad", error_type=type(exc).__name__)
                         continue
                     queue.put_nowait(item)
+
+
+def _chunk_default(value: Any) -> Any:
+    """Bytes as the envelope encodes them (Bedrock's redacted reasoning), read back as bytes.
+
+    `default=str` wrote bytes as their repr ("b'...'"): the caller got text, not the bytes.
+    Any other unknown type is still written as its text.
+    """
+    if isinstance(value, bytes | bytearray | memoryview):
+        return json_default(value)
+    return str(value)
 
 
 def _text(value: Any) -> str:
