@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+import contextlib
 import dataclasses
 import json
 import math
@@ -63,6 +64,7 @@ from gates_fleet import (
     ROOT,
     FaultProxy,
     free_port,
+    kill_and_reap,
     lag_note,
     log_dir,
     log_file,
@@ -444,7 +446,7 @@ def _live(ctx: Ctx) -> list[Any]:
 async def worker_kill(ctx: Ctx) -> None:
     """Kill -9 one worker mid-traffic; start a replacement."""
     await asyncio.sleep(1)
-    random.choice(_live(ctx)).kill()
+    await random.choice(_live(ctx)).kill()
     await ctx.gate.workers(1)
     await _hold(ctx)
 
@@ -461,7 +463,7 @@ async def workers_all_down(ctx: Ctx) -> None:
     """Every worker killed; new ones only after the fault time."""
     await asyncio.sleep(1)
     for worker in _live(ctx):
-        worker.kill()
+        await worker.kill()
     await _hold(ctx)
     await ctx.gate.workers(3)
 
@@ -470,12 +472,12 @@ async def store_block(ctx: Ctx) -> None:
     """Every store connection dropped, new ones refused."""
     # Each fault is turned off in a finally: a fault that raised (or a cancelled pair) used to
     # leave the proxy refusing while the gate drained through it (CO-16).
-    ctx.proxy.refuse = True
+    await ctx.proxy.set(refuse=True)
     try:
-        ctx.proxy.drop_all()
+        await ctx.proxy.drop_all()
         await _hold(ctx)
     finally:
-        ctx.proxy.refuse = False
+        await ctx.proxy.set(refuse=False)
 
 
 async def store_half_open(ctx: Ctx) -> None:
@@ -484,20 +486,20 @@ async def store_half_open(ctx: Ctx) -> None:
     The hold outlasts the store read timeout (`Scenario.fast_env` lowers it in the fast
     profile), so the read-timeout path S5 is named for is reached (CO-14).
     """
-    ctx.proxy.freeze = True
+    await ctx.proxy.set(freeze=True)
     try:
         await _hold(ctx)
     finally:
-        ctx.proxy.freeze = False
+        await ctx.proxy.set(freeze=False)
 
 
 async def store_slow(ctx: Ctx) -> None:
     """Every store packet 50 ms late."""
-    ctx.proxy.delay_secs = 0.05
+    await ctx.proxy.set(delay_secs=0.05)
     try:
         await _hold(ctx)
     finally:
-        ctx.proxy.delay_secs = 0.0
+        await ctx.proxy.set(delay_secs=0.0)
 
 
 async def store_reset(ctx: Ctx) -> None:
@@ -544,8 +546,17 @@ async def provider_both_down(ctx: Ctx) -> None:
             await ctx.provider(region, force_error="InternalServerException")
         await _hold(ctx)
     finally:
+        # Every region is reset even if one reset fails; the errors are raised after (CO-16).
+        errors: list[Exception] = []
         for region in REGIONS:
-            await ctx.provider(region, force_error=None)
+            try:
+                await ctx.provider(region, force_error=None)
+            except Exception as exc:  # the next region still gets its reset
+                errors.append(exc)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise ExceptionGroup("provider resets failed", errors)
 
 
 async def rpm_cut(ctx: Ctx) -> None:
@@ -559,8 +570,10 @@ async def rpm_cut(ctx: Ctx) -> None:
         await _hold(ctx)
     finally:
         stop.set()
-        samples = await sampler if sampler is not None else []
-        await ctx.edit({"rpm": RPM})
+        try:
+            samples = await sampler if sampler is not None else []
+        finally:  # restored even if the sampler raised (CO-16)
+            await ctx.edit({"rpm": RPM})
     # The bucket may still hold the old burst; after that, the quarter rate.
     excess = _over_budget(samples, RPM // 4, burst=BURST)
     ctx.checks["provider calls within the cut budget"] = excess <= 0
@@ -649,13 +662,20 @@ async def caller_dies(ctx: Ctx) -> None:
     try:
         assert proc.stdin is not None
         assert proc.stdout is not None
-        await asyncio.wait_for(asyncio.to_thread(proc.stdout.readline), 30)
+        line = await asyncio.wait_for(asyncio.to_thread(proc.stdout.readline), 30)
+        if not line.startswith(b"ready"):  # it died at start: the drill would test nothing
+            raise RuntimeError(f"the dying caller did not start: {line!r}")
         proc.stdin.write(b"go\n")
         proc.stdin.flush()
         await asyncio.sleep(1)
     finally:
-        proc.kill()
-        await asyncio.to_thread(proc.wait, 10)
+        try:
+            await kill_and_reap(proc)
+        finally:
+            for pipe in (proc.stdin, proc.stdout):
+                if pipe is not None:
+                    with contextlib.suppress(OSError):
+                        pipe.close()
     await _hold(ctx)
     # Its waiting calls must never reach the provider: once its liveness key has expired
     # (caller TTL) and running attempts ended, the provider count stops growing.
@@ -765,35 +785,43 @@ class Client:
         await asyncio.to_thread(self.proc.wait, 30)
         return self.report
 
-    def kill(self) -> None:
-        """Gone at once (cleanup), and reaped."""
-        if self.proc.poll() is None:
-            self.proc.kill()
-        self.proc.wait(10)
+    async def kill(self) -> None:
+        """Gone at once (cleanup), and reaped in a thread, off the loop (N7)."""
+        await kill_and_reap(self.proc)
 
 
-async def clients(ctx: Ctx, pods: list[Client], *, during: Awaitable[None] | None = None) -> None:
+async def clients(
+    ctx: Ctx, pods: list[Client], *, during: Callable[[], Awaitable[None]] | None = None
+) -> None:
     """Start the pods one after another, start their calls together, wait for every answer.
 
-    `during` (a fault) runs while the calls go on. The pods are killed if anything fails.
+    `during()` (a fault) runs while the calls go on. If a pod fails, the fault is cancelled
+    (its finally turns it off) before the pods are killed: `gather` left it running in the
+    background through the teardown (CO-16).
     """
+
+    async def run(job: Awaitable[object]) -> None:
+        await job
+
     try:
         for pod in pods:
             if not pod.ready:  # some are started earlier (M2: the newer one first)
                 await pod.start()
         for pod in pods:
             pod.go()
-        waits = [pod.done() for pod in pods]
-        if during is not None:
-            await asyncio.gather(during, *waits)
-        else:
-            await asyncio.gather(*waits)
+        try:
+            async with asyncio.TaskGroup() as group:
+                if during is not None:
+                    group.create_task(run(during()))
+                for pod in pods:
+                    group.create_task(run(pod.done()))
+        except BaseExceptionGroup as errors:  # the first one, as a plain exception
+            raise errors.exceptions[0] from errors
         ctx.extra_sent += sum(
             len(pod.report["results"]) for pod in pods if pod.spec["model"] == "chat"
         )
     finally:
-        for pod in pods:
-            pod.kill()
+        await asyncio.gather(*(pod.kill() for pod in pods), return_exceptions=True)
 
 
 def judge_clients(
@@ -901,7 +929,7 @@ async def registry_versions(ctx: Ctx) -> None:
     try:
         await new_pod.start()  # publishes v2 first
     except BaseException:
-        new_pod.kill()
+        await new_pod.kill()
         raise
     old_pod = Client(ctx, _client_spec(ctx, "old", 0.2))  # the run's v1 document
     await clients(ctx, [new_pod, old_pod])
@@ -957,7 +985,7 @@ async def streams_faulted(ctx: Ctx) -> None:
         await asyncio.sleep(1.5)  # streams under way
         await pair(store_block, worker_kill)(ctx)
 
-    await clients(ctx, pods, during=faults())
+    await clients(ctx, pods, during=faults)
     allowed = {"worker_lost", "deadline_exceeded", "queue_unavailable"}
     judge_clients(ctx, pods, allowed, partial_ok=True)
 
@@ -966,12 +994,12 @@ async def queue_store_block(ctx: Ctx) -> None:
     """Only the separate queue store blocked; the state store keeps working."""
     assert ctx.queue_proxy is not None
     sent = len(ctx.run.results)
-    ctx.queue_proxy.refuse = True
+    await ctx.queue_proxy.set(refuse=True)
     try:
-        ctx.queue_proxy.drop_all()
+        await ctx.queue_proxy.drop_all()
         await _hold(ctx)
     finally:
-        ctx.queue_proxy.refuse = False
+        await ctx.queue_proxy.set(refuse=False)
     await asyncio.sleep(2)  # the calls sent while blocked come back
     caller_ids = {q.engine.worker_id for q in ctx.queues}
     direct = [r for r in ctx.run.results[sent:] if r.ok and r.worker in caller_ids]

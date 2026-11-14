@@ -96,7 +96,7 @@ async def test_aiohttp_client_gets_limits_keepalive_and_timeouts(server: Server)
         read_timeout_secs=42,
         connect_timeout_secs=4,
     )
-    client = pool.openai(route)
+    client = await pool.openai(route)
     http: Any = client._client
     assert isinstance(http, openai.DefaultAioHttpClient)
     assert (http.timeout.read, http.timeout.connect) == (42, 4)
@@ -113,10 +113,10 @@ async def test_aiohttp_is_the_default_and_httpx_the_fallback(
     server: Server, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pool, route = _pool(server.url)
-    assert type(pool.openai(route)._client) is openai.DefaultAioHttpClient
+    assert type((await pool.openai(route))._client) is openai.DefaultAioHttpClient
     await pool.aclose()
     pool, route = _pool(server.url, http="httpx")
-    assert type(pool.openai(route)._client) is openai.DefaultAsyncHttpxClient
+    assert type((await pool.openai(route))._client) is openai.DefaultAsyncHttpxClient
     await pool.aclose()
 
     class Missing:  # what the SDK defines when `httpx-aiohttp` / `aiohttp` is not installed
@@ -125,11 +125,11 @@ async def test_aiohttp_is_the_default_and_httpx_the_fallback(
 
     monkeypatch.setattr(openai, "DefaultAioHttpClient", Missing)
     pool, route = _pool(server.url, http="aiohttp")
-    assert type(pool.openai(route)._client) is openai.DefaultAsyncHttpxClient
+    assert type((await pool.openai(route))._client) is openai.DefaultAsyncHttpxClient
     await pool.aclose()
     monkeypatch.delattr(openai, "DefaultAioHttpClient")  # openai 1.x before the aiohttp client
     pool, route = _pool(server.url, http="aiohttp")
-    assert type(pool.openai(route)._client) is openai.DefaultAsyncHttpxClient
+    assert type((await pool.openai(route))._client) is openai.DefaultAsyncHttpxClient
     await pool.aclose()
 
 
@@ -219,7 +219,7 @@ async def test_errors_classify_the_same_on_both_clients(
     pool, route = _pool(url, http=http, read_timeout_secs=read, connect_timeout_secs=5)
     started = time.monotonic()
     with pytest.raises(openai.APIError) as info:
-        await pool.openai(route).chat.completions.create(model=model, messages=MESSAGES)  # type: ignore[arg-type]
+        await (await pool.openai(route)).chat.completions.create(model=model, messages=MESSAGES)  # type: ignore[arg-type]
     elapsed = time.monotonic() - started
     error = classify_openai(info.value)
     got = (error.kind, error.code, error.retry_after_secs, is_connection_reset(info.value))

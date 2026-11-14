@@ -32,7 +32,14 @@ classifiers = [
 # patch window. Exact versions live only in the consuming app's lockfile.
 dependencies = [
     # Async Bedrock (and S3 offload) client. aiobotocore pins a narrow botocore window.
-    # Upper bound: the pool reads aiobotocore internals (refreshable credentials).
+    # Upper bound: the clients use aiobotocore / botocore internals (CL-20), all checked by
+    # tests/unit/clients (test_keep_warm_reads_internals_that_still_exist and the transports):
+    # - pool._refreshing: AioRefreshableCredentials.create_from_metadata, its
+    #   _advisory_refresh_timeout / _mandatory_refresh_timeout, and AioSession._credentials;
+    # - pool._keep_warm: client._endpoint.http_session (AIOHTTPSession), its _get_session()
+    #   and _proxy_config.proxy_url_for(), and aiohttp's BaseConnector._acquired;
+    # - bedrock_http: awaitable get_frozen_credentials() on refreshable credentials, and
+    #   botocore.httpsession ProxyConfiguration / create_urllib3_context / get_cert_path.
     "aiobotocore>=2.23,<4",
     # Queues, budgets, registry and results on any Redis-protocol store (Valkey, Redis).
     # 6+: TLS connections check the host name by default (off before), and the URL parser

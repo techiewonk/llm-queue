@@ -217,15 +217,15 @@ async def soak(profile: Profile, live: Path | None = None) -> bool:
                     start = time.monotonic() - run.t0
                     if event == "kill":
                         victim = random.choice([w for w in gate.fleet if w.proc.poll() is None])
-                        victim.kill()
+                        await victim.kill()
                         await gate.workers(1)
                     elif event == "block":
-                        proxy.refuse = True  # off again whatever happens (CO-16)
+                        await proxy.set(refuse=True)  # off again whatever happens (CO-16)
                         try:
-                            proxy.drop_all()
+                            await proxy.drop_all()
                             await asyncio.sleep(profile.block_secs)
                         finally:
-                            proxy.refuse = False
+                            await proxy.set(refuse=False)
                     elif event == "edit":
                         registry = queues[0].registry
                         try:

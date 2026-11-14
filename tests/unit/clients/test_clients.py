@@ -215,7 +215,7 @@ async def test_openai_key_and_errors(setup: Any) -> None:
         "x/dc1",
     )
     with pytest.raises(CredentialsUnavailable, match="NOPE is not set"):  # CL-6: fails over
-        providers.pool.openai(missing)
+        await providers.pool.openai(missing)
 
 
 async def test_unknown_provider_is_refused(setup: Any) -> None:

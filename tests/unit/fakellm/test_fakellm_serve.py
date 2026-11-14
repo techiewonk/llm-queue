@@ -7,10 +7,12 @@ request was refused and scenario L4 at 100 % crashed. `keep_listening` opens it 
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 
 import fakellm_testkit  # noqa: F401  # puts tools/fakellm on sys.path
-from fakellm.serve import keep_listening
+from aiohttp import web
+from fakellm.serve import keep_listening, serve
 
 
 def _free_port() -> int:
@@ -63,3 +65,43 @@ async def test_listens_again_after_the_socket_is_closed() -> None:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     assert not servers[-1].is_serving()  # the last one is closed on cancel
+
+
+async def test_serving_ends_when_the_parent_pipe_closes() -> None:
+    """CO-15: fakellm outlived a drill killed hard and kept its port (no parent watch).
+
+    With `parent` (its stdin pipe in a drill), serving ends once the pipe closes, which is
+    what the OS does to a dead parent's end; the port is free again.
+    """
+    port = _free_port()
+    app = web.Application()
+    app.router.add_get("/ping", _pong)
+    read_fd, write_fd = os.pipe()
+    parent = os.fdopen(read_fd, "rb")
+    task = asyncio.create_task(serve(app, "127.0.0.1", port, parent=parent))
+    try:
+        for _ in range(200):  # until it listens
+            if await _accepts(port):
+                break
+            await asyncio.sleep(0.01)
+        assert await _accepts(port)
+        os.close(write_fd)  # the parent is gone
+        await asyncio.wait_for(task, 5)
+        assert not await _accepts(port)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        parent.close()
+
+
+async def _pong(request: web.Request) -> web.Response:
+    return web.Response(text="pong")
+
+
+async def _accepts(port: int) -> bool:
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", port), 2)
+    except OSError:
+        return False
+    writer.close()
+    return True
