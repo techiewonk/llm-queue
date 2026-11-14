@@ -165,6 +165,13 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 - Docs: eight statements that did not match the code (readiness probe, invalid stored registry,
   older services, the `all` live-edit mode, account kinds, `ConfigError` timing, the exception
   tree).
+- `llmq_grants_lost_total` was counted with labels `(model, step)` on finish but `(step)` on
+  the heartbeat; with the Prometheus sink the second form raised, after the provider had
+  answered. Both now use `(model, step)`, and `PrometheusSink` logs and drops a point whose
+  labels do not fit instead of raising into a call (EN-1).
+- `Admission.undo` skips (returns False, logs `undo_skipped`) when the store is unreachable,
+  like `finish`, instead of raising (EN-16). A re-settled owner no longer stops the pruning of
+  the settled-owner memory (EN-17).
 
 ### Security
 

@@ -14,8 +14,10 @@ from typing import Any, Protocol
 
 import orjson
 
+from llm_queue._logging import get_logger
 from llm_queue.errors import MissingExtra
 
+logger = get_logger(__name__)
 NAMESPACE = "llm-queue"
 
 
@@ -107,6 +109,7 @@ class PrometheusSink:
         self._prom = prometheus_client
         self._registry = registry or prometheus_client.REGISTRY
         self._made: dict[str, Any] = {}
+        self._warned: set[str] = set()
 
     def _metric(self, kind: str, name: str, labels: Mapping[str, str]) -> Any:
         if name not in self._made:
@@ -120,6 +123,8 @@ class PrometheusSink:
             except ValueError:
                 # Already registered by another sink in this process (the sync path's engine
                 # made a second one): use that collector instead of failing the call (O5).
+                # `_names_to_collectors` is private: if a release drops it, the lookup finds
+                # nothing and the point is logged and dropped below, never raised (EN-21).
                 found = getattr(self._registry, "_names_to_collectors", {}).get(name)
                 if found is None:
                     raise
@@ -127,17 +132,32 @@ class PrometheusSink:
         metric = self._made[name]
         return metric.labels(**labels) if labels else metric
 
+    def _dropped(self, name: str, exc: Exception) -> None:
+        """Log a point that did not fit its metric, once per name: a metric never fails a call."""
+        if name not in self._warned:
+            self._warned.add(name)
+            logger.warning("metric_dropped", metric=name, error=str(exc))
+
     def count(self, name: str, value: float = 1.0, **labels: str) -> None:
-        """Add to a counter."""
-        self._metric("count", name.removesuffix("_total"), labels).inc(value)
+        """Add to a counter (a point whose labels do not fit is logged and dropped)."""
+        try:
+            self._metric("count", name.removesuffix("_total"), labels).inc(value)
+        except ValueError as exc:  # label names differ from the metric's first use (EN-1)
+            self._dropped(name, exc)
 
     def observe(self, name: str, value: float, **labels: str) -> None:
-        """Observe into a histogram."""
-        self._metric("observe", name, labels).observe(value)
+        """Observe into a histogram (a point whose labels do not fit is logged and dropped)."""
+        try:
+            self._metric("observe", name, labels).observe(value)
+        except ValueError as exc:
+            self._dropped(name, exc)
 
     def gauge(self, name: str, value: float, **labels: str) -> None:
-        """Set a gauge."""
-        self._metric("gauge", name, labels).set(value)
+        """Set a gauge (a point whose labels do not fit is logged and dropped)."""
+        try:
+            self._metric("gauge", name, labels).set(value)
+        except ValueError as exc:
+            self._dropped(name, exc)
 
 
 _SINKS: dict[str, Metrics] = {}
