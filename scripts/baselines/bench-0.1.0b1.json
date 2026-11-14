@@ -1,0 +1,176 @@
+{
+  "meta": {
+    "llm_queue_version": "0.1.0b1",
+    "git": "6491713",
+    "date": "2026-11-14T11:51:35+0530",
+    "python": "3.12.13",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "args": {
+      "reps": 5,
+      "idle": 60.0,
+      "deployments": 6,
+      "latency_ms": 5,
+      "only": [
+        "start",
+        "idle",
+        "steady",
+        "stream",
+        "roundtrips"
+      ],
+      "out": "scripts\\baselines\\bench-0.1.0b1.json",
+      "note": "Indicative: other test processes may have been running on the host (machine load); compare only runs made back to back on the same machine.",
+      "child": null
+    },
+    "fakellm_latency_ms": 5,
+    "duration_s": 202.1,
+    "note": "Indicative: other test processes may have been running on the host (machine load); compare only runs made back to back on the same machine."
+  },
+  "results": {
+    "import": {
+      "n": 5,
+      "p50": 755.6,
+      "p95": 1010.5,
+      "max": 1010.5
+    },
+    "pod_start": {
+      "n": 5,
+      "p50": 145.2,
+      "p95": 336.2,
+      "max": 336.2
+    },
+    "cold_first_call": {
+      "n": 5,
+      "p50": 3010.0,
+      "p95": 3434.6,
+      "max": 3434.6
+    },
+    "first_call_after_idle_60s": {
+      "n": 5,
+      "p50": 360.1,
+      "p95": 640.0,
+      "max": 640.0
+    },
+    "direct_sequential": {
+      "n": 200,
+      "p50": 20.4,
+      "p95": 49.8,
+      "max": 82.8
+    },
+    "direct_concurrent20": {
+      "n": 200,
+      "p50": 93.0,
+      "p95": 266.3,
+      "max": 327.9
+    },
+    "queue_sequential_priority": {
+      "n": 200,
+      "p50": 145.3,
+      "p95": 445.2,
+      "max": 927.3
+    },
+    "queue_concurrent20": {
+      "n": 200,
+      "p50": 866.8,
+      "p95": 1686.2,
+      "max": 2165.5
+    },
+    "overhead_sequential_priority": {
+      "n": 200,
+      "p50": 124.9,
+      "p95": 424.8,
+      "max": 906.9
+    },
+    "overhead_concurrent20": {
+      "n": 200,
+      "p50": 773.8,
+      "p95": 1593.2,
+      "max": 2072.5
+    },
+    "meta_queue_wait_sequential": {
+      "n": 200,
+      "p50": 14.0,
+      "p95": 99.0,
+      "max": 253.0
+    },
+    "meta_queue_wait_concurrent20": {
+      "n": 200,
+      "p50": 689.0,
+      "p95": 1312.0,
+      "max": 1493.0
+    },
+    "stream_direct_first_event": {
+      "n": 50,
+      "p50": 20.3,
+      "p95": 44.3,
+      "max": 54.5
+    },
+    "stream_direct_end": {
+      "n": 50,
+      "p50": 20.6,
+      "p95": 44.7,
+      "max": 58.7
+    },
+    "stream_queue_first_event": {
+      "n": 50,
+      "p50": 143.0,
+      "p95": 386.0,
+      "max": 524.0
+    },
+    "stream_queue_end": {
+      "n": 50,
+      "p50": 226.2,
+      "p95": 469.6,
+      "max": 697.9
+    },
+    "stream_overhead_first_event": {
+      "n": 50,
+      "p50": 122.7,
+      "p95": 365.7,
+      "max": 503.7
+    },
+    "stream_overhead_end": {
+      "n": 50,
+      "p50": 205.6,
+      "p95": 449.0,
+      "max": 677.3
+    },
+    "store_round_trips": {
+      "idle_background_sends_per_s": 8.82,
+      "idle_background_commands_5s": {
+        "EVALSHA": 28,
+        "BLPOP": 14,
+        "SET": 1,
+        "HGETALL": 1
+      },
+      "settle_secs": 0.3,
+      "converse": {
+        "sends_median": 18.6,
+        "sends_min": 13.3,
+        "sends_max": 22.5,
+        "commands_one_run_raw": {
+          "BLPOP": 4,
+          "EVALSHA": 19,
+          "EXISTS": 1,
+          "HGETALL": 1,
+          "HINCRBY": 1,
+          "SET": 2,
+          "TIME": 1
+        }
+      },
+      "converse_stream": {
+        "sends_median": 30.9,
+        "sends_min": 25.1,
+        "sends_max": 71.5,
+        "commands_one_run_raw": {
+          "BLPOP": 4,
+          "EVALSHA": 21,
+          "EXPIRE": 3,
+          "HINCRBY": 1,
+          "XADD": 3,
+          "XLEN": 1,
+          "XREAD": 5
+        }
+      }
+    }
+  }
+}
