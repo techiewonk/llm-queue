@@ -16,10 +16,14 @@ from typing import TYPE_CHECKING, Any
 
 from redis.exceptions import NoScriptError
 
+from llm_queue._logging import get_logger
 from llm_queue.engine.keys import Keys
 
 if TYPE_CHECKING:
     import redis.asyncio
+
+logger = get_logger(__name__)
+RETENTION_SECS = 345_600  # how long a message may wait (4 days), unless the model sets it
 
 _NOW = """
 local t = redis.call('TIME')
@@ -264,18 +268,43 @@ return redis.call('XTRIM', KEYS[6], 'MINID', tostring(now - tonumber(ARGV[1])))
 """
 )
 
-# ARGV: max count. Dead letters back on the queue (new ids: they go to the back).
-REDRIVE = """
-local moved = 0
+# ARGV: max count, retention ms, doorbell key. Dead letters back on the queue (new ids: they go
+# to the back), with SEND's trim and doorbell. An entry without a body is dropped and counted:
+# XADD with a nil body raised part-way, after earlier moves that Lua does not roll back, and
+# the redriven calls rang no doorbell (EN-12). Reply: {moved, dropped}.
+REDRIVE = (
+    _NOW
+    + """
+local moved, dropped = 0, 0
 for _, entry in ipairs(redis.call('XRANGE', KEYS[6], '-', '+', 'COUNT', tonumber(ARGV[1]))) do
   local fields = entry[2]
   local body
   for k = 1, #fields, 2 do if fields[k] == 'body' then body = fields[k + 1] end end
-  redis.call('XADD', KEYS[1], '*', 'body', body)
+  if body then
+    redis.call('XADD', KEYS[1], 'MINID', '~', tostring(now - tonumber(ARGV[2])), '*',
+      'body', body)
+    moved = moved + 1
+  else
+    dropped = dropped + 1
+  end
   redis.call('XDEL', KEYS[6], entry[1])
-  moved = moved + 1
 end
-return moved
+if moved > 0 then
+  redis.call('RPUSH', ARGV[3], '1')
+  redis.call('LTRIM', ARGV[3], -64, -1)
+  redis.call('PEXPIRE', ARGV[3], 60000)
+end
+return {moved, dropped}
+"""
+)
+
+# ARGV: doorbell key. A token back on a doorbell, with SEND's cap and TTL: a bare RPUSH on an
+# expired bell made one with no TTL that outlived a removed model (EN-13).
+RING = """
+redis.call('RPUSH', ARGV[1], '1')
+redis.call('LTRIM', ARGV[1], -64, -1)
+redis.call('PEXPIRE', ARGV[1], 60000)
+return 1
 """
 
 
@@ -314,7 +343,7 @@ class QueueSettings:
 
     visibility_secs: float = 60.0
     max_receives: int = 10
-    retention_secs: int = 345_600
+    retention_secs: int = RETENTION_SECS
     dlq_retention_secs: int = 86_400
     max_waiting: int = 50_000
 
@@ -351,6 +380,7 @@ class StreamQueues:
         self._depth = client.register_script(DEPTH)
         self._redrive = client.register_script(REDRIVE)
         self._trim_dead = client.register_script(TRIM_DEAD)
+        self._ring = client.register_script(RING)
 
     async def _send_and_wait(
         self, queue: str, args: list[bytes | int | str], replicas: int, wait_ms: int
@@ -379,7 +409,7 @@ class StreamQueues:
 
     async def ring_again(self, queue: str) -> None:
         """Put back a doorbell token this worker took but cannot serve: another worker wakes."""
-        await self._client.rpush(self.bell(queue), "1")
+        await self._ring([], [self.bell(queue)])
 
     def queue_keys(self, queue: str) -> list[str]:
         """The keys of one queue, in `_PARTS` order (stream first)."""
@@ -463,13 +493,13 @@ class StreamQueues:
         """`receive`, polling with growing pauses (20 ms to 500 ms) for up to `wait_secs`."""
         loop = asyncio.get_running_loop()
         until = loop.time() + wait_secs
-        pause = 0.02
+        pause_secs = 0.02
         while True:
             messages, dead = await self.receive(queue, count, settings)
             if messages or dead or loop.time() >= until:
                 return messages, dead
-            await asyncio.sleep(min(pause, max(0.0, until - loop.time())))
-            pause = min(pause * 2, 0.5)
+            await asyncio.sleep(min(pause_secs, max(0.0, until - loop.time())))
+            pause_secs = min(pause_secs * 2, 0.5)
 
     async def ack(self, message: Message) -> bool:
         """Delete a handled message; False when the receipt is stale."""
@@ -542,9 +572,19 @@ class StreamQueues:
             )
         return out
 
-    async def redrive(self, queue: str, count: int = 1000) -> int:
-        """Move up to `count` dead letters back to the queue; returns how many."""
-        return int(await self._redrive(self.queue_keys(queue), [count]))
+    async def redrive(
+        self, queue: str, count: int = 1000, retention_secs: int = RETENTION_SECS
+    ) -> int:
+        """Move up to `count` dead letters back to the queue; returns how many.
+
+        A dead letter without a body cannot run again: it is dropped, with a warning.
+        """
+        moved, dropped = await self._redrive(
+            self.queue_keys(queue), [count, retention_secs * 1000, self.bell(queue)]
+        )
+        if int(dropped):
+            logger.warning("redrive_dropped_bodyless", queue=queue, count=int(dropped))
+        return int(moved)
 
     async def trim_dead(self, queue: str, keep_secs: int) -> int:
         """Drop dead letters older than `keep_secs` (on a timer); returns how many went."""

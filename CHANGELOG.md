@@ -199,6 +199,17 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   caller's own cancellation (EN-7); a failed background flush is logged when it happens
   (EN-19); during a store outage the reader logs the first failure and the recovery and backs
   off to 5 s (it warned every 0.5 s), and `aclose` also cancels pending wake-ups (EN-18).
+- `llm-queue redrive` drops (and reports) a dead letter without a body instead of failing
+  part-way with some letters already moved, rings the queue's doorbell so an idle worker takes
+  the redriven calls at once, and trims the stream like a send (EN-12). `ring_again` sets the
+  doorbell's cap and TTL; it could create a bell with no TTL (EN-13).
+- A failed health probe doubles the last wait (starting from the model's `probe_after_secs`)
+  instead of jumping to at least 60 s; `Health.probed(probe_after_secs=)` sets the floor
+  (EN-23).
+- The alert loop writes its change markers with one pipelined `SET ... EX GET` per alert (500
+  per pipeline) instead of `GETSET` then `EXPIRE`: 2 x N serial round trips per sample became
+  N / 500 (about 1,840 alerts at 20 models x 30 deployments; time saved unverified) (EN-9).
+  `Alert` is frozen (EN-25).
 
 ### Security
 

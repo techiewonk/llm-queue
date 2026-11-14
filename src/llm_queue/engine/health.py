@@ -48,7 +48,10 @@ return 'disabled'
 """
 )
 
-# KEYS: health hash. req: dep, ok (bool), probe_max_ms. Reply: recovered | waiting.
+# KEYS: health hash. req: dep, ok (bool), probe_max_ms, probe_min_ms (optional: the model's
+# `probe_after_secs`). Reply: recovered | waiting. The wait doubles from the last one; a fixed
+# 60 s floor turned a 10 s `probe_after` into 60 s after the first failed probe (EN-23). 60 s
+# stays only for a record with no last wait and no floor given.
 PROBED = (
     _NOW
     + """
@@ -57,7 +60,10 @@ if req.ok then
   return 'recovered'
 end
 local last = tonumber(redis.call('HGET', KEYS[1], req.dep .. '|wait') or '0')
-local wait = math.min(math.max(last * 2, 60000), req.probe_max_ms)
+local floor = tonumber(req.probe_min_ms or 0)
+local wait = last * 2
+if wait <= 0 then wait = floor > 0 and floor or 60000 end
+wait = math.min(math.max(wait, floor), req.probe_max_ms)
 redis.call('HSET', KEYS[1], req.dep .. '|until', now + wait, req.dep .. '|wait', wait)
 return 'waiting'
 """
@@ -102,9 +108,22 @@ class Health:
         )
         return reply.decode() if isinstance(reply, bytes) else str(reply)
 
-    async def probed(self, alias: str, dep: str, *, ok: bool, probe_max_secs: float) -> str:
-        """A probe's outcome: `recovered` or `waiting` (the wait doubles up to the maximum)."""
-        body = {"dep": dep, "ok": ok, "probe_max_ms": int(probe_max_secs * 1000)}
+    async def probed(
+        self,
+        alias: str,
+        dep: str,
+        *,
+        ok: bool,
+        probe_max_secs: float,
+        probe_after_secs: float | None = None,
+    ) -> str:
+        """A probe's outcome: `recovered` or `waiting` (the wait doubles up to the maximum).
+
+        `probe_after_secs` (the model's setting) is the shortest wait.
+        """
+        body: dict[str, Any] = {"dep": dep, "ok": ok, "probe_max_ms": int(probe_max_secs * 1000)}
+        if probe_after_secs is not None:
+            body["probe_min_ms"] = int(probe_after_secs * 1000)
         reply = await self._probed([self.keys.model(alias, "health")], [orjson.dumps(body)])
         return reply.decode() if isinstance(reply, bytes) else str(reply)
 

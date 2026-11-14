@@ -188,7 +188,7 @@ class StatusReader:
         return {"request_id": request_id, **status}
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class Alert:
     """One alert state: on or off, with its details."""
 
@@ -196,6 +196,19 @@ class Alert:
     on: bool
     labels: dict[str, str] = field(default_factory=dict)
     detail: str = ""
+
+
+_ALERT_BATCH = 500  # alert markers per pipeline
+
+
+def _marker(keys: Keys, alert: Alert) -> str:
+    """The store key holding an alert's last state."""
+    labels = ",".join(f"{k}={v}" for k, v in sorted(alert.labels.items()))
+    return f"{keys.prefix}:alert:{alert.name}:{labels}"
+
+
+def _state(alert: Alert) -> str:
+    return "1" if alert.on else "0"
 
 
 class AlertEvaluator:
@@ -273,14 +286,18 @@ class AlertEvaluator:
     async def changed(self, alerts: list[Alert]) -> list[Alert]:
         """Alerts whose state flipped since the last evaluation (logged once, by one process)."""
         flipped = []
-        for alert in alerts:
-            marker = f"{self.keys.prefix}:alert:{alert.name}:" + ",".join(
-                f"{k}={v}" for k, v in sorted(alert.labels.items())
-            )
-            state = "1" if alert.on else "0"
-            previous = await self._client.getset(marker, state)
-            await self._client.expire(marker, 86_400)
-            if (_text(previous) if previous is not None else "0") != state:
+        # One pipelined `SET ... EX GET` per alert: it was GETSET then EXPIRE, two serial round
+        # trips each (~3,700 per sample at 20 models x 30 deployments; GETSET is deprecated
+        # since Redis 6.2) (EN-9).
+        previous: list[Any] = []
+        for start in range(0, len(alerts), _ALERT_BATCH):
+            async with self._client.pipeline(transaction=False) as pipe:
+                for alert in alerts[start : start + _ALERT_BATCH]:
+                    pipe.set(_marker(self.keys, alert), _state(alert), ex=86_400, get=True)
+                previous += await pipe.execute()
+        for alert, before in zip(alerts, previous, strict=True):
+            state = _state(alert)
+            if (_text(before) if before is not None else "0") != state:
                 flipped.append(alert)
                 log = logger.error if alert.on else logger.info
                 log(
