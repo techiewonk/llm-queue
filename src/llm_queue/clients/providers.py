@@ -436,7 +436,7 @@ class OpenAIProvider:
         self, params: Mapping[str, Any], route: Route, timing: Timing
     ) -> AsyncGenerator[Any, None]:
         """Chat completion chunks of one attempt, each within the attempt timers."""
-        with self._pool.borrow_openai(route) as client:
+        async with self._pool.borrow_openai(route) as client:
             create = client.chat.completions.create
             request = split_params(
                 create,
@@ -486,7 +486,7 @@ class OpenAIProvider:
         return Result(body, _openai_usage(body.get("usage")))
 
     async def _embeddings(self, params: Mapping[str, Any], route: Route, timing: Timing) -> Result:
-        with self._pool.borrow_openai(route) as client:
+        async with self._pool.borrow_openai(route) as client:
             create = client.embeddings.create
             reply = await first(
                 create(**split_params(create, {**params, "model": route.model_id})),

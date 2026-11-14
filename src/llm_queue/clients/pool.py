@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import os
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from dataclasses import astuple, dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -25,6 +26,7 @@ from llm_queue.clients.hub import (
     identity_hash,
     pool_size_for,
 )
+from llm_queue.clients.timing import AttemptTimeout
 from llm_queue.errors import LLMQueueError, MissingExtra
 from llm_queue.tuning import BedrockOptions, OpenAIOptions, WarmOptions
 
@@ -148,6 +150,13 @@ def _metadata(extra: Mapping[str, Any], expiry: Any) -> dict[str, Any]:
     }
 
 
+# Set by `borrow_bedrock` for one attempt: `_single_flight` marks it when the attempt was
+# cancelled (its timer fired) while waiting for a credentials refresh (CL-8).
+_refresh_cut: contextvars.ContextVar[list[bool] | None] = contextvars.ContextVar(
+    "llmq_refresh_cut", default=None
+)
+
+
 def _single_flight(
     fetch: Callable[[], Awaitable[dict[str, Any]]],
 ) -> Callable[[], Awaitable[dict[str, Any]]]:
@@ -165,7 +174,13 @@ def _single_flight(
             running = asyncio.ensure_future(fetch())
             # Read the outcome even when every waiter was cancelled (no "never retrieved").
             running.add_done_callback(lambda t: t.cancelled() or t.exception())
-        return await asyncio.shield(running)
+        try:
+            return await asyncio.shield(running)
+        except asyncio.CancelledError:
+            # The attempt ran out waiting for credentials, not for the provider (CL-8).
+            if (cut := _refresh_cut.get()) is not None:
+                cut.append(True)
+            raise
 
     return refresh
 
@@ -272,12 +287,16 @@ class ClientPool:
         self._locks: dict[tuple[Any, ...], asyncio.Lock] = {}
         self._sizes: dict[tuple[str, str], int] = {}
         self._retiring: dict[asyncio.Task[None], list[Lease]] = {}
-        self._warned: set[tuple[str, str]] = set()
+        self._releasing: set[asyncio.Future[None]] = set()  # shielded releases running (N1)
+        self._warned: set[tuple[str, str, str]] = set()
 
-    def _warn_once(self, event: str, account: str, **fields: Any) -> None:
-        """Log a config problem once per (event, account): it would repeat on every build."""
-        if (event, account) not in self._warned:
-            self._warned.add((event, account))
+    def _warn_once(self, event: str, account: str, what: str = "", **fields: Any) -> None:
+        """Log a config problem once per (event, account, what): it would repeat on every build.
+
+        `what` tells apart problems of one account, such as its two secrets (`problems`).
+        """
+        if (event, account, what) not in self._warned:
+            self._warned.add((event, account, what))
             logger.warning(event, account=account, **fields)
 
     async def bedrock(self, route: Route) -> BedrockClient:
@@ -286,18 +305,33 @@ class ClientPool:
 
     @contextlib.asynccontextmanager
     async def borrow_bedrock(self, route: Route) -> AsyncIterator[BedrockClient]:
-        """The route's Bedrock client, counted as in use until the block ends (CL-3)."""
+        """The route's Bedrock client, counted as in use until the block ends (CL-3).
+
+        An attempt timer that fired while the call waited for a credentials refresh (a slow
+        STS or `credentials=` lookup) raises `CredentialsUnavailable`, not `AttemptTimeout`: the
+        region did nothing wrong (CL-8). A call still queued on botocore's refresh lock (not
+        yet in the refresh) reads as `AttemptTimeout`.
+        """
         lease = await self._bedrock_lease(route)
         lease.enter()
+        cut: list[bool] = []
+        token = _refresh_cut.set(cut)
         try:
             yield cast("BedrockClient", lease.client)
+        except AttemptTimeout as exc:
+            if not cut:
+                raise
+            raise CredentialsUnavailable(
+                f"account {route.account.name}: credentials refresh not done in time ({exc})"
+            ) from exc
         finally:
+            _refresh_cut.reset(token)
             lease.leave()
 
-    @contextlib.contextmanager
-    def borrow_openai(self, route: Route) -> Iterator[AsyncOpenAI]:
+    @contextlib.asynccontextmanager
+    async def borrow_openai(self, route: Route) -> AsyncIterator[AsyncOpenAI]:
         """The route's OpenAI-compatible client, counted as in use until the block ends."""
-        self.openai(route)
+        await self.openai(route)
         lease = self._openai[_identity(route.account)]
         lease.enter()
         try:
@@ -347,9 +381,15 @@ class ClientPool:
         transport = self._options.transport
         unknown = sorted(set(extra) - _AWS_KEYS)
         if transport == "aiohttp" and unknown and not account.role_arn and expiry is None:
-            # Never raise into a call for this (CL-6): botocore takes these keys.
+            # Never raise into a call for this (CL-6): botocore takes these keys. botocore
+            # follows redirects (CL-4), re-sending the signed request and session token to
+            # the new host, so the warning says so (N4).
             self._warn_once(
-                "bedrock_transport_fallback", account.name, keys=unknown, transport="botocore"
+                "bedrock_transport_fallback",
+                account.name,
+                keys=unknown,
+                transport="botocore",
+                caveat="the botocore transport follows HTTP redirects (aiohttp does not)",
             )
             transport = "botocore"
         options = (
@@ -480,6 +520,12 @@ class ClientPool:
         if account.external_id_ref:
             external_id = await asyncio.to_thread(self._secrets, account.external_id_ref)
         if account.external_id_ref and not external_id:
+            self._warn_once(
+                "account_secret_missing",
+                account.name,
+                account.external_id_ref,
+                secret=account.external_id_ref,
+            )
             raise CredentialsUnavailable(
                 f"account {account.name}: secret {account.external_id_ref} is not set"
             )
@@ -530,7 +576,7 @@ class ClientPool:
         self._roles[key] = session
         return session
 
-    def openai(self, route: Route) -> AsyncOpenAI:
+    async def openai(self, route: Route) -> AsyncOpenAI:
         """The OpenAI-compatible client of the route's account (its `base_url` and key)."""
         account = route.account
         ident = _identity(account)
@@ -542,12 +588,21 @@ class ClientPool:
             from openai._constants import DEFAULT_CONNECTION_LIMITS
         except ImportError as exc:
             raise MissingExtra("an openai account", "openai") from exc
-        # Sync (the provider builds the client in line): the lookup runs once per account.
-        key = self._secrets(account.api_key_ref) if account.api_key_ref else None
+        # In a thread: a Secrets Manager lookup must not block the loop (CL-8).
+        key = None
+        if account.api_key_ref:
+            key = await asyncio.to_thread(self._secrets, account.api_key_ref)
+        if (lease := self._openai.get(ident)) is not None:  # built while the lookup ran
+            return lease.client  # type: ignore[no-any-return]
         if account.api_key_ref and not key:
             # Not ConfigError (FATAL, `provider_error`): the worker forgets the route, backs off
             # and tries the next deployment, as for the Bedrock twin (CL-6).
-            self._warn_once("account_secret_missing", account.name, secret=account.api_key_ref)
+            self._warn_once(
+                "account_secret_missing",
+                account.name,
+                account.api_key_ref,
+                secret=account.api_key_ref,
+            )
             raise CredentialsUnavailable(
                 f"account {account.name}: secret {account.api_key_ref} is not set"
             )
@@ -631,7 +686,8 @@ class ClientPool:
         for route in routes:
             account = route.account
             for ref in (account.api_key_ref, account.external_id_ref):
-                if ref and (account.name, ref) not in self._warned and ref not in seen:
+                warned = ("account_secret_missing", account.name, ref or "")  # at a call (N2)
+                if ref and warned not in self._warned and ref not in seen:
                     seen.add(ref)
                     if not self._secrets(ref):
                         out.append(f"account {account.name}: secret {ref} is not set")
@@ -673,16 +729,22 @@ class ClientPool:
         await asyncio.gather(*(lease.wait_idle(RETIRE_MAX_SECS) for lease in leases))
         while leases:
             lease = leases.pop(0)
-            # Shielded: `aclose` cancelling this task must not cut a close half way.
-            await asyncio.shield(self._hub.release(lease))
+            # Shielded: `aclose` cancelling this task must not cut a close half way; `aclose`
+            # awaits it through `_releasing`, so it returns once the client is closed (N1).
+            release = asyncio.ensure_future(self._hub.release(lease))
+            self._releasing.add(release)
+            release.add_done_callback(self._releasing.discard)
+            await asyncio.shield(release)
 
     async def aclose(self) -> None:
         """Give every client back to the hub (the last holder closes it); safe to repeat."""
         tasks, lists = list(self._retiring), list(self._retiring.values())
         for task in tasks:  # give retired clients back now, not after the calls on them end
             task.cancel()
-        # Wait for the tasks first: one may be releasing a lease right now (CL-2).
+        # Wait for the tasks first: one may be releasing a lease right now (CL-2), and for the
+        # shielded release it started, which the cancel does not stop (N1).
         await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*self._releasing, return_exceptions=True)
         self._retiring.clear()
         retired = [lease for leases in lists for lease in leases]  # those not released yet
         leases = [*self._bedrock.values(), *self._openai.values(), *retired]

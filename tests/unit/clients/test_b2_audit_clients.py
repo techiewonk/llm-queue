@@ -24,7 +24,6 @@ from clients_testkit import TRANSPORTS, StartFake, http_session, registry_doc
 from fakellm import eventstream
 
 from llm_queue.clients import (
-    AttemptTimeout,
     ClientHub,
     ClientPool,
     CredentialsUnavailable,
@@ -225,7 +224,7 @@ async def test_a_missing_api_key_fails_over_and_is_listed_at_warm(
         await pool.warm([route])
         assert any("client_config_problem" in r.getMessage() for r in caplog.records)
         with pytest.raises(CredentialsUnavailable, match="LLMQ_ACCOUNT_VLLM_KEY"):
-            pool.openai(route)
+            await pool.openai(route)
     finally:
         await pool.aclose()
 
@@ -276,7 +275,8 @@ async def test_a_slow_refresh_is_not_cancelled_by_the_attempt_timer(
     """CL-8: each caller's attempt timeout cancelled the in-band refresh; it never landed.
 
     Inside the mandatory window every call refreshes first. The refresh (0.8 s) outlasts the
-    attempt timer (0.3 s): it now runs as one shared task, so a later call finds it done.
+    attempt timer (0.3 s): it now runs as one shared task, so a later call finds it done. The
+    calls cut while waiting raise `CredentialsUnavailable`, not `AttemptTimeout` (CL-8 verify).
     """
     asked: list[int] = []
 
@@ -296,15 +296,18 @@ async def test_a_slow_refresh_is_not_cancelled_by_the_attempt_timer(
     try:
         bedrock = providers.get("bedrock")
         await providers.pool.bedrock(_route(view))  # built outside the tight timer
-        ok = False
+        ok, messages = False, list[str]()
         for _ in range(30):
             try:
                 await bedrock.call("converse", CHAT, _route(view), tight)
-            except AttemptTimeout:
+            except CredentialsUnavailable as exc:
+                messages.append(str(exc))
                 continue
             ok = True
             break
         assert ok, "the refresh never landed"
+        assert messages  # the first call waited on the refresh and was cut
+        assert all("credentials refresh not done" in m for m in messages)
         assert len(asked) == 2  # one build, one refresh: callers shared it
     finally:
         await providers.aclose()
