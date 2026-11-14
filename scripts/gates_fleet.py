@@ -181,11 +181,16 @@ class FakeLLM:
                 time.sleep(0.1)
         raise RuntimeError("fakellm did not start")
 
+    @property
+    def url(self) -> str:
+        """Its base URL (`LLMQ_BEDROCK_ENDPOINT_URL`)."""
+        return f"http://127.0.0.1:{FAKE_PORT}"
+
     def stats(self) -> dict[str, dict[str, Any]]:
         """Per-key counters (`GET /admin/stats`): calls, ok, by_minute, duplicates ..."""
         import urllib.request
 
-        url = f"http://127.0.0.1:{FAKE_PORT}/admin/stats"
+        url = f"{self.url}/admin/stats"
         with urllib.request.urlopen(url, timeout=10) as reply:
             return dict(json.loads(reply.read())["models"])
 

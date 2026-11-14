@@ -1,14 +1,16 @@
 """Store failover drill: queue traffic on fakellm while a Valkey primary fails over.
 
-Starts a throwaway primary and replica in Docker (ports 6391 / 6392) and a TCP proxy on 6390
-that plays the store's DNS name, then sends 10 calls a second for 30 s and at 8 s:
+Starts a throwaway primary and replica in Docker and a TCP proxy that plays the store's DNS
+name (free ports picked per run), its own fakellm (which counts calls it saw twice), then sends
+10 calls a second for 30 s and at 8 s:
 
 - `failover`: FAILOVER (the primary becomes a replica); the name moves to the new primary.
 - `slowdns`: FAILOVER, but the name keeps pointing at the old primary for 6 s (READONLY).
 - `restart`: every connection drops and the node refuses new ones for 6 s.
 
 Pass mark: `failover` and `restart` lose no call. In `slowdns` only calls already in flight
-when the store stopped taking writes may fail (`deadline_exceeded`), at most 5 %.
+when the store stopped taking writes may fail (`deadline_exceeded`), at most 5 %. In every
+scenario no call runs twice at the provider (each request body is unique).
 
     python scripts/failover.py                  # all three
     python scripts/failover.py slowdns          # one
@@ -28,13 +30,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "scripts"))
 
-from llm_queue import CallFailed, LLMQueue  # noqa: E402  # needs the sys.path entry
+from gates_fleet import FakeLLM, free_port  # noqa: E402  # needs the sys.path entry
 
-NODES = {"a": ("llmqfo-a", 6391), "b": ("llmqfo-b", 6392)}
+from llm_queue import CallFailed, LLMQueue  # noqa: E402
+
+NODES = {"a": ("llmqfo-a", free_port()), "b": ("llmqfo-b", free_port())}
 NETWORK = "llmqfo"
 IMAGE = "valkey/valkey:8.1-alpine"
-PROXY_PORT = 6390
+PROXY_PORT = free_port()
 RUN_SECS = 30
 EVENT_AT_SECS = 8
 OUTAGE_SECS = 6
@@ -126,7 +131,7 @@ class Proxy:
         self.open.clear()
 
 
-def environment(prefix: str) -> dict[str, str]:
+def environment(prefix: str, fake_url: str) -> dict[str, str]:
     """`LLMQ_*` for the drill: the proxy as store, fakellm, quotas far above the load."""
     doc = json.loads((ROOT / "samples" / "registry.json").read_text(encoding="utf-8"))
     for model in doc["models"].values():
@@ -137,7 +142,8 @@ def environment(prefix: str) -> dict[str, str]:
         "LLMQ_QUEUE_PREFIX": prefix.replace(":", "-") + "-",
         "LLMQ_REGISTRY": json.dumps(doc),
         "LLMQ_METRICS_SINK": "none",
-        "LLMQ_BEDROCK_ENDPOINT_URL": "http://127.0.0.1:8080",
+        "LLMQ_ENVIRONMENT": "test",  # local store without TLS or a salt
+        "LLMQ_BEDROCK_ENDPOINT_URL": fake_url,
     }
 
 
@@ -149,7 +155,9 @@ async def drill(scenario: str) -> bool:
     await asyncio.to_thread(wait_link)
     proxy = Proxy()
     server = await asyncio.start_server(proxy.handle, "127.0.0.1", PROXY_PORT)
-    llmq = LLMQueue.from_env(environment(f"llmqfo:{uuid.uuid4().hex[:6]}"))
+    fake = FakeLLM({"defaults": {"latency_ms": {"p50": 150, "p95": 250}}})
+    await asyncio.to_thread(fake.start)
+    llmq = LLMQueue.from_env(environment(f"llmqfo:{uuid.uuid4().hex[:6]}", fake.url))
     await llmq.start()
     started = time.monotonic()
     ok: collections.Counter[int] = collections.Counter()
@@ -157,11 +165,12 @@ async def drill(scenario: str) -> bool:
     errors: collections.Counter[str] = collections.Counter()
     latencies: list[float] = []
 
-    async def one() -> None:
+    async def one(i: int) -> None:
         second = int(time.monotonic() - started)
         sent = time.monotonic()
+        request = {**REQUEST, "messages": [{"role": "user", "content": [{"text": f"fo {i}"}]}]}
         try:
-            await asyncio.wait_for(llmq.converse("gpt20b", REQUEST), 150)
+            await asyncio.wait_for(llmq.converse("gpt20b", request), 150)
             ok[second] += 1
             latencies.append(time.monotonic() - sent)
         except CallFailed as exc:
@@ -172,9 +181,9 @@ async def drill(scenario: str) -> bool:
             errors[type(exc).__name__] += 1
 
     async def traffic() -> None:
-        calls = []
+        calls: list[asyncio.Task[None]] = []
         while time.monotonic() - started < RUN_SECS:
-            calls.append(asyncio.create_task(one()))
+            calls.append(asyncio.create_task(one(len(calls))))
             await asyncio.sleep(0.1)
         await asyncio.gather(*calls)
 
@@ -200,9 +209,14 @@ async def drill(scenario: str) -> bool:
     try:
         await asyncio.gather(traffic(), event())
         health = await llmq.health()
+        await asyncio.sleep(1)  # the last attempts have ended
+        provider = await asyncio.to_thread(fake.stats)
     finally:
         await llmq.stop(drain_secs=1)
         server.close()
+        fake.stop()
+    twice = sum(int(m.get("duplicates", 0)) for m in provider.values())
+    provider_calls = sum(int(m.get("calls", 0)) for m in provider.values())
     total_ok, total_failed = sum(ok.values()), sum(failed.values())
     latencies.sort()
     timing = (
@@ -215,8 +229,13 @@ async def drill(scenario: str) -> bool:
         f"  {total_ok} ok, {total_failed} failed {dict(errors) or ''}; {timing}; "
         f"stores after: {health['stores']}"
     )
+    print(f"  provider: {provider_calls} calls, {twice} ran twice")
     allowed = 0 if scenario != "slowdns" else (total_ok + total_failed) // 20
-    passed = total_failed <= allowed and health["stores"] == {"state": "ok", "queue": "ok"}
+    passed = (
+        total_failed <= allowed
+        and health["stores"] == {"state": "ok", "queue": "ok"}
+        and twice == 0
+    )
     print(f"{'PASS' if passed else 'FAIL'}  {scenario}")
     return passed
 

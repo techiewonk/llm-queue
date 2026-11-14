@@ -1,8 +1,9 @@
-"""Table of real provider errors -> kind / retry-after / target flag, as classify.py sees them.
+"""Table of real provider errors -> kind, retry-after and the refinements classify.py makes.
 
 Bedrock rows are botocore `ClientError` / `EventStreamError` shapes with the service's own
-message text; OpenAI rows are openai SDK exceptions built on real httpx responses. Rows where
-today's answer is wrong (RESCAN C7, P5) are strict xfails: the fix flips them to passing.
+message text; OpenAI rows are openai SDK exceptions built on real httpx responses. Each row also
+pins the target flag, the auth flag (C7: signature and clock skew), the connection-reset flag
+and the request-error kind. The C7 and P5 rows failed before their fixes (strict xfails then).
 """
 
 from __future__ import annotations
@@ -21,8 +22,15 @@ from botocore.exceptions import (
     ReadTimeoutError,
 )
 
-from llm_queue.errors import ErrorKind
-from llm_queue.providers.classify import classify_bedrock, classify_openai, is_target_error
+from llm_queue.errors import ErrorInfo, ErrorKind
+from llm_queue.providers.classify import (
+    classify_bedrock,
+    classify_openai,
+    is_auth_error,
+    is_connection_reset,
+    is_target_error,
+    request_error_kind,
+)
 
 T, R, F = ErrorKind.THROTTLE, ErrorKind.RETRYABLE, ErrorKind.FATAL
 URL = "https://bedrock-runtime.ap-south-1.amazonaws.com/model/x/converse"
@@ -39,10 +47,6 @@ def _aws(code: str, status: int, message: str, headers: dict[str, str] | None = 
 def _in_stream(code: str, message: str) -> Any:
     """An exception event inside ConverseStream: botocore gives no HTTP metadata."""
     return EventStreamError({"Error": {"Code": code, "Message": message}}, "ConverseStream")
-
-
-def _fix(reason: str) -> Any:
-    return pytest.mark.xfail(strict=True, reason=f"fixed by {reason}")
 
 
 BEDROCK: list[Any] = [
@@ -201,10 +205,9 @@ BEDROCK: list[Any] = [
             "method.",
         ),
         F,
-        True,
+        False,
         None,
         id="signature-mismatch",
-        marks=_fix("C7"),
     ),
     pytest.param(
         _aws(
@@ -214,10 +217,9 @@ BEDROCK: list[Any] = [
             "earlier than 20261114T100600Z (20261114T101100Z - 5 min.)",
         ),
         F,
-        True,
+        False,
         None,
         id="clock-skew",
-        marks=_fix("C7"),
     ),
     pytest.param(
         _in_stream("throttlingException", "Too many tokens, please wait."),
@@ -276,14 +278,37 @@ BEDROCK: list[Any] = [
 ]
 
 
+# Rows (by id) with a refinement set; every other row has none.
+AUTH = {"unrecognized-client", "expired-token", "signature-mismatch", "clock-skew", "bad-key"}
+RESET = {"connection-closed", "connection-reset", "openai-stream-closed"}
+REQUEST_KIND = {
+    "input-too-long": "context_length_exceeded",
+    "stream-validation": "context_length_exceeded",
+    "context-length": "context_length_exceeded",
+    "bad-request": "invalid_request",
+    "422": "invalid_request",
+}
+
+
+def _refinements(row: str, exc: BaseException, info: ErrorInfo) -> None:
+    assert is_auth_error(exc, info) is (row in AUTH)
+    assert is_connection_reset(exc) is (row in RESET)
+    assert request_error_kind(exc, info) == REQUEST_KIND.get(row)
+
+
 @pytest.mark.parametrize(("exc", "kind", "target", "retry_after"), BEDROCK)
 def test_bedrock_errors(
-    exc: BaseException, kind: ErrorKind, target: bool, retry_after: float | None
+    exc: BaseException,
+    kind: ErrorKind,
+    target: bool,
+    retry_after: float | None,
+    request: pytest.FixtureRequest,
 ) -> None:
     info = classify_bedrock(exc)
     assert info.kind is kind
     assert is_target_error(exc, info) is target
     assert info.retry_after_secs == retry_after
+    _refinements(request.node.callspec.id, exc, info)
 
 
 # Any: openai 3 types its errors on httpx2; the SDK only reads attributes, so httpx works.
@@ -421,9 +446,9 @@ OPENAI: list[Any] = [
         R,
         False,
         None,
-        id="stream-closed",
+        id="openai-stream-closed",
     ),
-    pytest.param(httpx.ReadTimeout("read timed out"), R, False, None, id="stream-stall"),
+    pytest.param(httpx.ReadTimeout("read timed out"), R, False, None, id="openai-stream-stall"),
     pytest.param(
         # A `data: {"error": ...}` event mid-stream: APIError with no status code.
         openai.APIError(
@@ -435,16 +460,20 @@ OPENAI: list[Any] = [
         False,
         None,
         id="mid-stream-error",
-        marks=_fix("P5"),
     ),
 ]
 
 
 @pytest.mark.parametrize(("exc", "kind", "target", "retry_after"), OPENAI)
 def test_openai_errors(
-    exc: BaseException, kind: ErrorKind, target: bool, retry_after: float | None
+    exc: BaseException,
+    kind: ErrorKind,
+    target: bool,
+    retry_after: float | None,
+    request: pytest.FixtureRequest,
 ) -> None:
     info = classify_openai(exc)
     assert info.kind is kind
     assert is_target_error(exc, info) is target
     assert info.retry_after_secs == retry_after
+    _refinements(request.node.callspec.id, exc, info)

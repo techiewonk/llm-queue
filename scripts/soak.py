@@ -155,7 +155,13 @@ async def soak(profile: Profile, live: Path | None = None) -> bool:
         aws, region = live_env(live)
         doc = registry(
             {
-                "chat": {"rpm": rpm, "tpm": LIVE_TPM, "worker_slots": 4},
+                # Calls ask 50 output tokens; the registry checks TPM against the reservation.
+                "chat": {
+                    "rpm": rpm,
+                    "tpm": LIVE_TPM,
+                    "worker_slots": 4,
+                    "default_output_tokens": 50,
+                },
                 "titan": {"type": "embedding", "model_id": TITAN_ID, "rpm": LIVE_RPM},
             },
             accounts=1,

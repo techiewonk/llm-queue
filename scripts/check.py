@@ -31,7 +31,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PY = str(ROOT / ".venv" / ("Scripts" if os.name == "nt" else "bin") / "python")
+_VENV_PY = ROOT / ".venv" / ("Scripts" if os.name == "nt" else "bin") / "python"
+# The project venv, else the interpreter running this script.
+_FOUND = _VENV_PY.with_suffix(".exe" if os.name == "nt" else "").exists()
+PY = str(_VENV_PY) if _FOUND else sys.executable
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,7 @@ class Step:
     extra: tuple[tuple[str, ...], ...] = field(default=())
     quick: tuple[str, ...] = ()  # arguments added to `extra` commands with --quick
     in_all: bool = True
+    gating: bool = True  # False: the step reports its numbers but never fails the run
 
 
 STEPS: dict[str, Step] = {
@@ -52,6 +56,16 @@ STEPS: dict[str, Step] = {
         "Test prerequisites: fakellm accounts, TPM, speed, usage-missing, hang, streaming",
         sources=("tools/fakellm/fakellm", "scripts"),
         tests=("tests/unit/fakellm",),
+    ),
+    "tools": Step(
+        "Test tooling: provider error table, budget properties, 200-way contention",
+        sources=("tests/unit/providers", "tests/unit/engine", "scripts"),
+        tests=(
+            "tests/unit/providers",
+            "tests/unit/engine/test_budget_properties.py",
+            "tests/integration/engine/test_contention.py",
+        ),
+        needs_stack=True,
     ),
     "a1": Step(
         "Registry schema, settings, validation, resolve",
@@ -211,6 +225,15 @@ STEPS: dict[str, Step] = {
         needs_stack=True,
         extra=(("scripts/samples.py",),),
     ),
+    "bench": Step(
+        "Benchmark (start, first call, steady and stream overhead); numbers only, never fails",
+        sources=("scripts/bench.py",),
+        tests=(),
+        needs_stack=True,
+        extra=(("scripts/bench.py",),),
+        quick=("--reps", "2", "--idle", "10"),
+        gating=False,
+    ),
     **{
         f"soak{minutes}": Step(
             f"Soak {minutes} min ({use}): 8 worker processes, chaos (kill, store block, "
@@ -302,6 +325,9 @@ def run_step(name: str, step: Step, *, quick: bool = False) -> bool:
     for cmd in step.extra:
         full = [*cmd, *(step.quick if quick else ())]
         results.append(_run(name, " ".join(full), [PY, *full]))
+    if not step.gating and not all(results):
+        say(f"  (not gating: {name} reports numbers; its failure does not fail the run)")
+        return True
     return all(results)
 
 
