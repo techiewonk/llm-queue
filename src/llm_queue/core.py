@@ -177,6 +177,8 @@ class LLMQueue:
         self._sync: _SyncRunner | None = None
         self._sync_lock = threading.Lock()
         self._start_lock: asyncio.Lock | None = None  # made on the first start(), on its loop
+        self._start_loop: asyncio.AbstractEventLoop | None = None  # the loop of that lock
+        self._start_error: BaseException | None = None  # why a start failed (NB-4)
         self.started = False
         self._stopped = False  # stop() began: no second stop, no start
         self._closing = False  # stop()'s drain is over: no new calls (NB-1)
@@ -316,29 +318,52 @@ class LLMQueue:
 
         A second `start()` does nothing; a stopped queue cannot start again (build a new one).
         The first started queue of the process is the LangChain default and stays so. Starts
-        run one at a time; a start that fails part-way stops what it started (the queue is then
-        stopped) and re-raises.
+        run one at a time, on one event loop. A start that fails part-way stops what it
+        started and re-raises; the queue is then stopped (a stopped engine cannot start
+        again), and a later `start()` raises `LLMQueueError` naming that first error.
         """
         self._check()
-        if self._start_lock is None:
-            self._start_lock = asyncio.Lock()
+        self._refuse_if_stopped()
+        loop = asyncio.get_running_loop()
+        first = self._start_loop
+        if self._start_lock is None or first is None or (first is not loop and first.is_closed()):
+            self._start_lock, self._start_loop = asyncio.Lock(), loop
+        elif first is not loop:
+            # A start from a second loop contending for the lock got asyncio's RuntimeError
+            # ("bound to a different event loop") or waited on a future of the wrong loop (NB-4).
+            raise LLMQueueError(
+                "start() is already running on another event loop; build one LLMQueue per loop"
+            )
         async with self._start_lock:
             # Re-checked under the lock: two concurrent starts both passed an unlocked check
             # and started every background task twice (CO-5).
             if self.started:
                 return
-            if self._stopped:
-                raise LLMQueueError("this LLMQueue was stopped; build a new one to start again")
+            self._refuse_if_stopped()
             try:
                 await self._start()
-            except BaseException:
+            except BaseException as exc:
                 # The engine's tasks kept running with started=False, and a retry started them
-                # again (CO-5): stop everything this start began, then re-raise.
+                # again (CO-5): stop everything this start began, then re-raise. A retry then
+                # got "was stopped", which hid this error (NB-4): it is kept for the message.
+                self._start_error = exc
                 try:
                     await self.stop(drain_secs=0)
                 except Exception as cleanup:  # the start's own error is the one to raise
                     logger.warning("start_rollback_failed", error=repr(cleanup))
                 raise
+
+    def _refuse_if_stopped(self) -> None:
+        """Refuse to start a stopped queue, naming the failed start's error when there was one."""
+        if not self._stopped:
+            return
+        error = self._start_error
+        if error is None:
+            raise LLMQueueError("this LLMQueue was stopped; build a new one to start again")
+        raise LLMQueueError(
+            f"this LLMQueue failed to start ({error!r}) and was stopped; fix the cause and "
+            "build a new one"
+        ) from error
 
     async def _start(self) -> None:
         """The steps of `start()`, under its lock."""

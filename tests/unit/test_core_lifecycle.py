@@ -154,6 +154,56 @@ async def test_failed_start_stops_what_it_started() -> None:
         await queue.start()
 
 
+async def test_retry_after_a_failed_start_names_the_first_error() -> None:
+    """NB-4: a retried start() said only "was stopped; build a new one", hiding the cause.
+
+    The retry now names the error that failed the first start and chains it.
+    """
+    queue = _queue(_Engine(fail=("start",)))
+    with pytest.raises(RuntimeError, match="start failed"):
+        await queue.start()
+    with pytest.raises(LLMQueueError, match=r"failed to start.*start failed") as info:
+        await queue.start()
+    assert isinstance(info.value.__cause__, RuntimeError)
+
+
+async def test_start_from_a_second_loop_is_an_llmqueue_error() -> None:
+    """NB-4: a start from another event loop, while one ran, got asyncio's RuntimeError.
+
+    Contending for the start lock from a second loop raised "bound to a different event
+    loop" (or waited on a future of the wrong loop); it is now `LLMQueueError`.
+    """
+    engine = _Engine()
+    gate = asyncio.Event()
+    engine_start = engine.start
+
+    async def slow_start(**kw: Any) -> None:
+        await gate.wait()
+        await engine_start(**kw)
+
+    engine.start = slow_start  # type: ignore[method-assign]
+    queue = _queue(engine)
+    first = asyncio.create_task(queue.start())
+    await asyncio.sleep(0)  # the first start holds the lock, waiting on the gate
+
+    def other_loop() -> BaseException | None:
+        async def start() -> None:
+            await asyncio.wait_for(queue.start(), 5)
+
+        try:
+            asyncio.run(start())
+        except BaseException as exc:
+            return exc
+        return None
+
+    error = await asyncio.to_thread(other_loop)
+    gate.set()
+    await first
+    assert isinstance(error, LLMQueueError), repr(error)
+    assert "another event loop" in str(error)
+    await queue.stop()
+
+
 async def test_calls_after_stop_get_a_clear_error() -> None:
     """CO-13: a call after stop() went into a closed engine and failed on a closed pool."""
     queue = _queue(_Engine())
