@@ -20,6 +20,7 @@ from redis.exceptions import ResponseError
 
 from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.runtime import Engine
+from llm_queue.engine.streaming import ChunkWriter
 
 pytestmark = pytest.mark.integration
 
@@ -121,6 +122,44 @@ async def test_cancel_cleanup_never_runs_past_the_deadline(
             await asyncio.sleep(0.1)
     rids = [k async for k in engine.state.scan_iter(match=engine.keys.request("*", "cancel"))]
     assert len(rids) == 2  # the call and its retry on the store_down path
+
+
+async def test_store_lost_mid_stream_is_queue_unavailable(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scenario L2: the store failing under the chunk writer ended streams as `provider_error`.
+
+    The provider was fine; the worker's chunk write met a dropped store connection after the
+    first chunk had reached the caller. The stream must end with the store's kind and the
+    partial text, and never run again.
+    """
+    engine, fake = await make(
+        {"small": {"stream_flush_ms": 0}},
+        {"models": {f"{SMALL}@r1": {"output_tokens": 80, "tokens_per_s": 200}}},
+    )
+    real = ChunkWriter._write
+    failed: list[int] = []
+
+    async def flaky(self: ChunkWriter, kind: str, data: Any, **kw: Any) -> None:
+        if kind == "chunk" and self.sent and not failed:
+            failed.append(1)
+            raise StoreConnectionError("Connection closed by server.")
+        await real(self, kind, data, **kw)
+
+    monkeypatch.setattr(ChunkWriter, "_write", flaky)
+    seen: list[dict[str, Any]] = []
+
+    async def drain() -> None:
+        async for event in engine.stream("small", CHAT):
+            seen.append(event)
+
+    with pytest.raises(CallFailed) as info:
+        await drain()
+    assert seen
+    assert failed
+    assert info.value.kind == "queue_unavailable"
+    assert info.value.partial_text
+    assert stats(fake, f"{SMALL}@r1")["calls"] == 1  # never run again once chunks were sent
 
 
 async def test_model_loop_survives_an_unblocked_bell(

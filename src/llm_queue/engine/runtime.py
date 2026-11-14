@@ -2184,7 +2184,14 @@ class Engine:
                     outcome="none" if ours else "fail",
                     latency_ms=latency,
                 )
-                kind = "rate_limited" if info.kind is ErrorKind.THROTTLE else "provider_error"
+                # The store under the chunk writer is the store's kind, as a caller meets it:
+                # `provider_error` here failed scenario L2 (a store block cut streams).
+                if isinstance(exc, RedisError):
+                    kind = "queue_unavailable"
+                elif info.kind is ErrorKind.THROTTLE:
+                    kind = "rate_limited"
+                else:
+                    kind = "provider_error"
                 message = (
                     "stream above stream_max_bytes" if isinstance(exc, StreamTooLarge) else str(exc)
                 )
