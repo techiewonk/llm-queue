@@ -57,6 +57,11 @@ STEPS: dict[str, Step] = {
         sources=("tools/fakellm/fakellm", "scripts"),
         tests=("tests/unit/fakellm",),
     ),
+    "unit": Step(
+        "Every unit test (no stack): settings, validation, HTTP, front door, streaming, tuning",
+        sources=("src/llm_queue",),
+        tests=("tests/unit",),
+    ),
     "tools": Step(
         "Test tooling: provider error table, budget properties, 200-way contention",
         sources=("tests/unit/providers", "tests/unit/engine", "scripts"),
