@@ -314,7 +314,14 @@ class Engine:
         self._idle = asyncio.Event()
         self._static: dict[str, asyncio.Semaphore] = {}
         self._rng = random.Random()
-        self.chunks = ChunkReader(state, block_ms=self.settings.timings.stream_read_block_ms)
+        self.chunks = ChunkReader(
+            state,
+            block_ms=self.settings.timings.stream_read_block_ms,
+            wake_key=f"{self.keys.prefix}:chunkwake:{self.worker_id}",
+        )
+        # Call tasks of streams already read to their `end`: they finish here (result read,
+        # cleanup) while the caller has moved on.
+        self._tails: set[asyncio.Task[Reply]] = set()
         self._epoch: str | None = None  # the store's epoch this process last saw (RESCAN A2)
         self._worker = False
         self._model_tasks: dict[str, asyncio.Task[None]] = {}  # receive loop per model alias
@@ -414,11 +421,13 @@ class Engine:
                 held.run.cancel()
         if late:
             await asyncio.wait(set(late), timeout=5.0)
+        if self._tails:  # streams already delivered: their call tasks read the result
+            await asyncio.wait(set(self._tails), timeout=max(0.0, until - loop.time()))
         if self._waiters:
             self._idle.clear()
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._idle.wait(), max(0.0, until - loop.time()))
-        tasks = [*self._tasks, *self._model_tasks.values(), *self._running]
+        tasks = [*self._tasks, *self._model_tasks.values(), *self._running, *self._tails]
         for task in tasks:
             task.cancel()
         for task in tasks:
@@ -594,7 +603,7 @@ class Engine:
         task = asyncio.create_task(
             self.call(model, params, stream=True, stream_id=rid, request_id=app_id, **call)
         )
-        expected, started, attempt_id = 1, False, ""
+        expected, started, attempt_id, ended = 1, False, "", False
         try:
             while True:
                 if not queue.empty():  # already read: a slow consumer gets it (RESCAN S2)
@@ -659,10 +668,10 @@ class Engine:
                     for event in entry["d"]:
                         yield event
                 elif entry["t"] == "end":
-                    # Delivered in full: a result write that failed after `end` (the re-run
-                    # found the stream taken) is not the caller's error (RESCAN S11).
-                    with contextlib.suppress(CallFailed):
-                        await task
+                    # Delivered in full: the caller goes on now; the call task (its result read
+                    # and cleanup, ~80 ms more) finishes in the background, and a failure after
+                    # `end` (the re-run found the stream taken) is logged, never raised (S11).
+                    ended = True
                     return
                 else:
                     data = entry["d"]
@@ -674,10 +683,28 @@ class Engine:
                     )
         finally:
             self.chunks.close(key)
-            if not task.done():
-                task.cancel()  # the call's own handler cancels the request
-            with contextlib.suppress(BaseException):
-                await task
+            if ended:
+                self._tails.add(task)
+                task.add_done_callback(self._tail_done)
+            else:
+                if not task.done():
+                    task.cancel()  # the call's own handler cancels the request
+                with contextlib.suppress(BaseException):
+                    await task
+
+    def _tail_done(self, task: asyncio.Task[Reply]) -> None:
+        """A stream's call task ended after its `end` was read: log a failure, never raise it."""
+        self._tails.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning(
+                "stream_call_failed_after_end",
+                request_id=getattr(exc, "request_id", None),
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
 
     def hash_id(self, value: str) -> str:
         """Keyed hash (HMAC-SHA256, `LLMQ_ID_HASH_SALT`) of a user or session id, 16 hex chars.
