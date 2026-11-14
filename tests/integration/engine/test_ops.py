@@ -101,7 +101,7 @@ async def test_metrics_and_call_record(make: Make, caplog: pytest.LogCaptureFixt
     assert (point["model"], point["region"], point["outcome"]) == ("big", "r1", "ok")
     record = [entry for entry in logs if entry.get("event") == "llmq_call_finished"]
     assert len(record) == 1
-    assert record[0]["tenant"] == "desk"
+    assert record[0]["tenant"] != "desk"  # the tenant id is hashed too (RESCAN X10)
     assert record[0]["user"] != "ann"  # the user id is hashed
     assert record[0]["tokens_out"] is not None
 

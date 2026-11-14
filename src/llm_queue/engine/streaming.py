@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     import redis.asyncio
 
 logger = get_logger(__name__)
+END_TTL_SECS = 30  # a stream read to its `end` is kept this long more, not result TTL (S3)
 
 
 class StreamTooLarge(Exception):
@@ -103,31 +104,44 @@ class ChunkWriter:
         except Exception as exc:  # StreamTooLarge or a store error: raised by the next add()/end()
             self._failed = exc
 
-    async def _write(self, kind: str, data: Any) -> None:
+    async def _write(self, kind: str, data: Any, *, ttl_secs: int | None = None) -> None:
         payload = orjson.dumps(data, default=str)
-        self._bytes += len(payload)
-        if self._bytes > self._max_bytes:
+        size = self._bytes + len(payload)  # counted only once written, like the sequence
+        if size > self._max_bytes:
             raise StreamTooLarge(f"the stream is above {self._max_bytes} bytes")
         seq = self._seq + 1  # counted only once written: a failed write leaves no gap
         async with self._client.pipeline(transaction=False) as pipe:
             pipe.xadd(self.key, {"seq": seq, "att": self.attempt_id, "t": kind, "d": payload})
-            pipe.expire(self.key, self._ttl)  # every write: the first one may have failed
+            pipe.expire(self.key, ttl_secs or self._ttl)  # every write: the first may have failed
             await pipe.execute()
         self._seq = seq
+        self._bytes = size
         self._last = time.monotonic()
 
     async def _flush(self) -> None:
         async with self._lock:
             if self._buffer:
                 events, self._buffer = self._buffer, []
-                await self._write("chunk", events)
+                try:
+                    await self._write("chunk", events)
+                except Exception:
+                    # Kept for the next flush: dropped, the stream ended "ok" with chunks
+                    # missing (RESCAN S1).
+                    self._buffer = events + self._buffer
+                    raise
 
     async def end(self, usage: Mapping[str, Any]) -> None:
-        """Write what is left, then the `end` entry with the usage."""
+        """Write what is left, then the `end` entry; a background flush's failure raises here.
+
+        After `end` the stream lives `END_TTL_SECS` more: a read stream (up to 8 MB) stayed
+        for the result TTL plus the timeout (RESCAN S3).
+        """
         await self._stop_timer()
+        if self._failed is not None:
+            raise self._failed
         await self._flush()
         async with self._lock:
-            await self._write("end", {"usage": dict(usage)})
+            await self._write("end", {"usage": dict(usage)}, ttl_secs=END_TTL_SECS)
 
     async def error(self, kind: str, message: str) -> None:
         """End the stream with an error that carries the partial text (best effort)."""
@@ -199,17 +213,20 @@ class ChunkReader:
                 queue, last = self._open[key]
                 for entry_id, fields in entries:
                     last[0] = entry_id.decode() if isinstance(entry_id, bytes) else str(entry_id)
-                    entry = {
-                        (k.decode() if isinstance(k, bytes) else k): v for k, v in fields.items()
-                    }
-                    queue.put_nowait(
-                        {
+                    # One bad entry is skipped: it ended the reader shared by every stream of
+                    # this process (RESCAN S11); the stream's caller then sees a gap.
+                    try:
+                        entry = {_text(k): v for k, v in fields.items()}
+                        item = {
                             "seq": int(entry["seq"]),
                             "att": _text(entry.get("att", b"")),
                             "t": _text(entry["t"]),
                             "d": orjson.loads(entry["d"]),
                         }
-                    )
+                    except Exception as exc:
+                        logger.warning("chunk_entry_bad", error_type=type(exc).__name__)
+                        continue
+                    queue.put_nowait(item)
 
 
 def _text(value: Any) -> str:
