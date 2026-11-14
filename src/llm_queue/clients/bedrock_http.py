@@ -333,8 +333,14 @@ class BedrockHTTP:
         raw, url = self._url(model_id, action)
         request = AWSRequest(method="POST", url=raw, data=body, headers=headers)
         SigV4Auth(frozen, SIGNING_NAME, self.region).add_auth(request)
+        # Never follow a redirect (botocore does not): aiohttp would re-send the signed body,
+        # `X-Amz-Date` and `X-Amz-Security-Token` to the new host (CL-4). A 3xx is an error.
         return await self.session.post(
-            url, data=body, headers=dict(request.headers.items()), proxy=self.proxy
+            url,
+            data=body,
+            headers=dict(request.headers.items()),
+            proxy=self.proxy,
+            allow_redirects=False,
         )
 
     async def _fail(self, response: aiohttp.ClientResponse, operation: str) -> ClientError:
