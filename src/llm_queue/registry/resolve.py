@@ -66,6 +66,10 @@ class ResolvedRegistry:
     def __init__(self, registry: Registry) -> None:
         """Index the registry's models and deployments."""
         self.registry = registry
+        # Effective settings already resolved, by (model, name, deployment): the hot path asks
+        # the same ones for every call (~40 per call, each walking the levels). A reload builds
+        # a new view, so nothing here goes stale. Values are shared: never mutate one.
+        self._memo: dict[tuple[str, str, str | None], Effective] = {}
         self._deployments: dict[str, tuple[Deployment, ...]] = {}
         self._entries: dict[tuple[str, str], Mapping[str, Any]] = {}
         for alias, model in registry.models.items():
@@ -116,8 +120,17 @@ class ResolvedRegistry:
     def effective(self, model: str, name: str, deployment: str | None = None) -> Effective:
         """The value of setting `name` for a model (and one deployment), with its level.
 
-        Without `deployment`, the deployment and account levels are skipped.
+        Without `deployment`, the deployment and account levels are skipped. Resolved once per
+        view (memoised).
         """
+        memo_key = (model, name, deployment)
+        found = self._memo.get(memo_key)
+        if found is None:
+            found = self._memo[memo_key] = self._resolve(model, name, deployment)
+        return found
+
+    def _resolve(self, model: str, name: str, deployment: str | None) -> Effective:
+        """`effective` without the memo."""
         spec = SETTINGS[name]
         alias = self.registry.alias_of(model)
         entry = self.registry.models[alias]
