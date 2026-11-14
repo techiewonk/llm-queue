@@ -61,6 +61,12 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   credentials refreshed 5 minutes before expiry; `Tuning(openai=OpenAIOptions(...),
   warm=WarmOptions(...))`, both importable from `llm_queue` (`warm.connections` or
   `warm.refresh_secs` 0 turns warming or its repeats off).
+- **`OpenAIOptions(http="aiohttp")`:** OpenAI-compatible calls through the SDK's aiohttp client
+  (`DefaultAioHttpClient`) instead of httpx, with the same pool limits, keepalive and timeouts.
+  The `openai` extra adds `httpx-aiohttp` (needed on openai 1.x / 2.x; 3.x vendors it); without
+  it the client falls back to httpx and logs `openai_aiohttp_unavailable`. Default stays httpx.
+  A connection reset or refused connect classifies the same on both (aiohttp's transport reports
+  them as timeouts: `APIConnectionError`, and a reset gets its one quick retry).
 - **One `LLMQueue` per process guards:** a second started queue logs `second_llm_queue_started`
   (the first stays the LangChain default); calls from a forked child or another event loop
   raise a clear `LLMQueueError`. Sync calls run on the started queue's loop, else on one private
