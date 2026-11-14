@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import json
 import os
 import subprocess
@@ -33,7 +34,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from gates_fleet import FakeLLM, free_port  # noqa: E402  # needs the sys.path entry
+from gates_fleet import FakeLLM, FaultProxy, free_port  # noqa: E402  # needs the sys.path entry
 
 from llm_queue import CallFailed, LLMQueue  # noqa: E402
 
@@ -93,43 +94,27 @@ def nodes_down() -> None:
     docker("network", "rm", NETWORK, check=False)
 
 
-class Proxy:
-    """The store's DNS name: new connections go to `target`; old ones stay where they are."""
+class Proxy(FaultProxy):  # type: ignore[misc]  # gates_fleet is a script module
+    """The store's DNS name: new connections go to `target`; old ones stay where they are.
 
-    def __init__(self) -> None:
-        """Start on node a, taking connections."""
-        self.target = "a"
-        self.refuse = False
-        self.open: list[asyncio.StreamWriter] = []
+    A `FaultProxy` in its own process: the drill's queue is caller and worker here, and on the
+    proxy's old shared loop its own stalls looked like store latency (CO-2).
+    """
 
-    async def _pipe(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
-            while data := await reader.read(65536):
-                writer.write(data)
-                await writer.drain()
-        except OSError:
-            pass
-        finally:
-            writer.close()
+    def __init__(self, port: int = PROXY_PORT) -> None:
+        """On node a, taking connections, once `start()` is called."""
+        self._target = "a"
+        super().__init__(port, upstream=NODES["a"][1])
 
-    async def handle(self, client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter) -> None:
-        """Forward one client connection to the current target."""
-        if self.refuse:
-            client_w.close()
-            return
-        try:
-            node_r, node_w = await asyncio.open_connection("127.0.0.1", NODES[self.target][1])
-        except OSError:
-            client_w.close()
-            return
-        self.open += [client_w, node_w]
-        await asyncio.gather(self._pipe(client_r, node_w), self._pipe(node_r, client_w))
+    @property
+    def target(self) -> str:
+        """The node new connections go to (`a` or `b`)."""
+        return self._target
 
-    def drop_all(self) -> None:
-        """Close every open connection (a node restart)."""
-        for writer in self.open:
-            writer.close()
-        self.open.clear()
+    @target.setter
+    def target(self, node: str) -> None:
+        self.upstream = NODES[node][1]
+        self._target = node
 
 
 def environment(prefix: str, fake_url: str) -> dict[str, str]:
@@ -154,11 +139,22 @@ async def drill(scenario: str) -> bool:
         docker("exec", NODES["b"][0], "valkey-cli", "FAILOVER")
         await asyncio.sleep(2)
     await asyncio.to_thread(wait_link)
+    # Each resource is undone on its own, in reverse, even if a later start or an earlier
+    # undo fails: the proxy and fakellm leaked when llmq.start() raised (CO-17).
+    async with contextlib.AsyncExitStack() as stack:
+        return await _drill(scenario, stack)
+    raise AssertionError("unreachable: the exit stack swallows no exception")
+
+
+async def _drill(scenario: str, stack: contextlib.AsyncExitStack) -> bool:
     proxy = Proxy()
-    server = await asyncio.start_server(proxy.handle, "127.0.0.1", PROXY_PORT)
+    stack.push_async_callback(asyncio.to_thread, proxy.stop)
+    await asyncio.to_thread(proxy.start)
     fake = FakeLLM({"defaults": {"latency_ms": {"p50": 150, "p95": 250}}})
+    stack.callback(fake.stop)
     await asyncio.to_thread(fake.start)
     llmq = LLMQueue.from_env(environment(f"llmqfo:{uuid7().hex[-6:]}", fake.url))
+    stack.push_async_callback(llmq.stop, drain_secs=1)
     await llmq.start()
     started = time.monotonic()
     ok: collections.Counter[int] = collections.Counter()
@@ -193,10 +189,12 @@ async def drill(scenario: str) -> bool:
         at = f"[{time.monotonic() - started:.1f}s]"
         if scenario == "restart":
             proxy.refuse = True
-            proxy.drop_all()
-            print(f"  {at} node down: every connection dropped")
-            await asyncio.sleep(OUTAGE_SECS)
-            proxy.refuse = False
+            try:
+                proxy.drop_all()
+                print(f"  {at} node down: every connection dropped")
+                await asyncio.sleep(OUTAGE_SECS)
+            finally:
+                proxy.refuse = False
             print(f"  [{time.monotonic() - started:.1f}s] node back")
             return
         # In a thread: a blocking call here stalled the drill's own callers mid-traffic.
@@ -207,15 +205,11 @@ async def drill(scenario: str) -> bool:
         proxy.target = "b"
         print(f"  [{time.monotonic() - started:.1f}s] the name now points at b")
 
-    try:
-        await asyncio.gather(traffic(), event())
-        health = await llmq.health()
-        await asyncio.sleep(1)  # the last attempts have ended
-        provider = await asyncio.to_thread(fake.stats)
-    finally:
-        await llmq.stop(drain_secs=1)
-        server.close()
-        fake.stop()
+    await asyncio.gather(traffic(), event())
+    health = await llmq.health()
+    await asyncio.sleep(1)  # the last attempts have ended
+    provider = await asyncio.to_thread(fake.stats)
+    await stack.aclose()  # stopped before the report, as before
     twice = sum(int(m.get("duplicates", 0)) for m in provider.values())
     provider_calls = sum(int(m.get("calls", 0)) for m in provider.values())
     total_ok, total_failed = sum(ok.values()), sum(failed.values())
@@ -250,8 +244,8 @@ def main() -> int:
         return 2
     os.environ.update({"AWS_ACCESS_KEY_ID": "aws-main", "AWS_SECRET_ACCESS_KEY": "fake"})
     os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
-    nodes_up()
-    try:
+    try:  # a failed nodes_up still removes what it started (CO-17)
+        nodes_up()
         results = []
         for scenario in chosen:
             print(f"[{scenario}]")

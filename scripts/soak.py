@@ -54,9 +54,16 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import failover  # needs the sys.path entry
-from gates import Gate, Run, chat, registry
-from gates_fleet import TITAN_ID, free_port, log_dir, process_stats, setup_logging
+from gates import Gate, Run, chat, registry  # needs the sys.path entry
+from gates_fleet import (
+    TITAN_ID,
+    FaultProxy,
+    free_port,
+    lag_note,
+    log_dir,
+    process_stats,
+    setup_logging,
+)
 from uuid_utils import uuid7
 
 PROXY_PORT = free_port()
@@ -92,23 +99,6 @@ PROFILES = {
         20, chaos_secs=120, block_secs=20, edit_secs=30, status_ttl_secs=120, sample_secs=60
     ),
 }
-
-
-class StoreProxy(failover.Proxy):  # type: ignore[misc]  # failover is a script module
-    """In front of the stack's Valkey, so the soak can block the store."""
-
-    async def handle(self, client_r: Any, client_w: Any) -> None:
-        """Forward one connection to the stack's Valkey (or refuse while blocked)."""
-        if self.refuse:
-            client_w.close()
-            return
-        try:
-            node_r, node_w = await asyncio.open_connection("127.0.0.1", 6379)
-        except OSError:
-            client_w.close()
-            return
-        self.open += [client_w, node_w]
-        await asyncio.gather(self._pipe(client_r, node_w), self._pipe(node_r, client_w))
 
 
 LIVE_RPM = 10  # chat and titan each, on real Bedrock
@@ -172,8 +162,10 @@ async def soak(profile: Profile, live: Path | None = None) -> bool:
         for entry in doc["models"].values():
             entry["deployments"] = {"aws-0": {"confirmed": [region]}}
         print(f"  live: real Bedrock in {region}; chat {rpm} RPM / {LIVE_TPM} TPM, titan {rpm} RPM")
-    proxy = StoreProxy()
-    server = await asyncio.start_server(proxy.handle, "127.0.0.1", PROXY_PORT)
+    # In front of the stack's Valkey, so the soak can block the store; its own process, so
+    # the driver's 70 calls a second never show up as store latency (CO-2).
+    proxy = FaultProxy(PROXY_PORT)
+    await asyncio.to_thread(proxy.start)
     chaos_windows: list[tuple[float, float]] = []
     samples: list[dict[str, float]] = []
     processes: list[dict[str, float]] = []  # per-process samples (pid 0: this driver)
@@ -228,14 +220,19 @@ async def soak(profile: Profile, live: Path | None = None) -> bool:
                         victim.kill()
                         await gate.workers(1)
                     elif event == "block":
-                        proxy.refuse = True
-                        proxy.drop_all()
-                        await asyncio.sleep(profile.block_secs)
-                        proxy.refuse = False
+                        proxy.refuse = True  # off again whatever happens (CO-16)
+                        try:
+                            proxy.drop_all()
+                            await asyncio.sleep(profile.block_secs)
+                        finally:
+                            proxy.refuse = False
                     elif event == "edit":
-                        await queues[0].registry.set({"rpm": rpm // 2}, model="chat", actor="soak")
-                        await asyncio.sleep(profile.edit_secs)
-                        await queues[0].registry.set({"rpm": rpm}, model="chat", actor="soak")
+                        registry = queues[0].registry
+                        try:
+                            await registry.set({"rpm": rpm // 2}, model="chat", actor="soak")
+                            await asyncio.sleep(profile.edit_secs)
+                        finally:
+                            await registry.set({"rpm": rpm}, model="chat", actor="soak")
                     else:
                         victim = random.choice([w for w in gate.fleet if w.proc.poll() is None])
                         await gate.workers(1)
@@ -292,7 +289,8 @@ async def soak(profile: Profile, live: Path | None = None) -> bool:
                 print(f"  still in progress ({key}): {gate.store.client.zrange(key, 0, -1)}")
             held = sum(1 for w in gate.fleet if w.proc.poll() is None)  # live workers
     finally:
-        server.close()
+        await asyncio.to_thread(proxy.stop)
+    print(f"  {lag_note(proxy)}")
 
     def in_chaos(r: Any) -> bool:
         return any(a <= r.sent <= b for a, b in chaos_windows)

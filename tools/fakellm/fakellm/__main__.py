@@ -7,14 +7,15 @@ Docker image is configured from compose environment blocks only.
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import logging
 import os
-
-from aiohttp import web
 
 from fakellm.app import create_app
 from fakellm.behaviour import Engine
 from fakellm.scenario import Scenario, load_scenario
+from fakellm.serve import serve
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -33,7 +34,9 @@ def main(argv: list[str] | None = None) -> None:
     logging.info(
         "fakellm: scenario=%s seed=%s keys=%d", args.scenario, engine.seed, len(scenario.models)
     )
-    web.run_app(create_app(engine=engine), host=args.host, port=args.port)
+    # Not web.run_app: it never re-opens a listening socket asyncio closed (see serve.py).
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(serve(create_app(engine=engine), args.host, args.port))
 
 
 if __name__ == "__main__":

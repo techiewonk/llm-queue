@@ -3,22 +3,28 @@
 Workers are separate Python processes (`python scripts/gates_fleet.py worker`), like pods: each
 builds `LLMQueue.from_env()` with `LLMQ_MODE=worker`, counts its metrics into the store, and
 stops cleanly on a `stop` line (or dies at once on `kill()`). Callers can be processes too
-(`caller` mode, for the kill-switch gate) or queues in the driver itself.
+(`caller` mode, for the kill-switch gate) or queues in the driver itself. The store proxy the
+drills fault (`FaultProxy`) is a process too (`proxy` mode).
 """
 
 from __future__ import annotations
 
 import asyncio
 import collections
+import concurrent.futures
+import contextlib
 import json
 import logging
 import os
+import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -107,6 +113,21 @@ def account_keys(account: Any) -> dict[str, str]:
     return {"aws_access_key_id": str(account.name), "aws_secret_access_key": "fake"}
 
 
+def drill_tuning(env: dict[str, str] | None = None) -> Any:
+    """`Tuning` for a drill process, or None (the library's defaults).
+
+    `LLMQ_DRILL_STORE_READ_TIMEOUT_SECS` sets the store read timeout: scenario S5's fast
+    profile, so a half-open store is detected within its fault (CO-14).
+    """
+    raw = (os.environ if env is None else env).get("LLMQ_DRILL_STORE_READ_TIMEOUT_SECS")
+    if not raw:
+        return None
+    from llm_queue import Tuning
+    from llm_queue.tuning import StoreOptions
+
+    return Tuning(store=StoreOptions(read_timeout_secs=float(raw)))
+
+
 def process_stats() -> dict[str, float]:
     """This process: RSS, open asyncio tasks and threads (the soak's leak samples)."""
     import psutil
@@ -180,6 +201,7 @@ class FakeLLM:
                     return
             except OSError:
                 time.sleep(0.1)
+        self.stop()  # a process that never listened must not keep running (CO-3)
         raise RuntimeError("fakellm did not start")
 
     @property
@@ -196,10 +218,13 @@ class FakeLLM:
             return dict(json.loads(reply.read())["models"])
 
     def stop(self) -> None:
-        """Stop the process."""
-        if self.proc is not None:
-            self.proc.kill()
-            self.proc.wait(10)
+        """Stop the process and remove its scenario folder (a temp folder per run leaked)."""
+        try:
+            if self.proc is not None and self.proc.poll() is None:
+                self.proc.kill()
+                self.proc.wait(10)
+        finally:
+            shutil.rmtree(self.file.parent, ignore_errors=True)
 
 
 class Worker:
@@ -241,29 +266,49 @@ class Worker:
             return dict(json.loads(line)) if line.startswith(b"{") else None
 
     async def stop(self) -> None:
-        """Graceful: pause, drain, stop."""
+        """Graceful: pause, drain, stop; killed if it has not stopped within 60 s.
+
+        A stuck worker used to raise `TimeoutExpired` here and stay alive, and the gate's
+        teardown skipped fakellm and the key cleanup after it (CO-3).
+        """
         async with self._lock:
             if self.proc.poll() is None and self.proc.stdin is not None:
-                self.proc.stdin.write(b"stop\n")
-                self.proc.stdin.flush()
-                await asyncio.to_thread(self.proc.wait, 60)
+                try:
+                    self.proc.stdin.write(b"stop\n")
+                    self.proc.stdin.flush()
+                    await asyncio.to_thread(self.proc.wait, 60)
+                except (OSError, subprocess.TimeoutExpired):  # gone already, or stuck
+                    self.kill()
 
     def kill(self) -> None:
         """At once, no cleanup (a crashed pod)."""
-        self.proc.kill()
+        if self.proc.poll() is None:
+            self.proc.kill()
         self.proc.wait(10)
 
 
 async def workers(env: dict[str, str], count: int) -> list[Worker]:
-    """`count` started worker processes."""
+    """`count` started worker processes (all killed if one fails to start)."""
     fleet = [Worker(env) for _ in range(count)]
-    await asyncio.gather(*(w.ready() for w in fleet))
+    try:
+        await asyncio.gather(*(w.ready() for w in fleet))
+    except BaseException:  # the caller never sees this fleet, so nobody else would stop it
+        for worker in fleet:
+            worker.kill()
+        raise
     return fleet
 
 
 async def stop_all(fleet: list[Worker]) -> None:
-    """Stop every worker still alive."""
-    await asyncio.gather(*(w.stop() for w in fleet if w.proc.poll() is None))
+    """Stop every worker still alive; any left (a stop that raised) is killed."""
+    try:
+        await asyncio.gather(
+            *(w.stop() for w in fleet if w.proc.poll() is None), return_exceptions=True
+        )
+    finally:
+        for worker in fleet:
+            if worker.proc.poll() is None:
+                worker.kill()
 
 
 class Store:
@@ -314,6 +359,399 @@ class Store:
             for i in range(0, len(keys), 500):
                 self.client.delete(*keys[i : i + 500])
 
+    def close(self) -> None:
+        """Close the client's connections (it was never closed)."""
+        self.client.close()
+
+
+STACK_STORE_PORT = 6379  # the stack's Valkey, behind STORE
+
+
+class _ProxyLoop:
+    """The proxy itself, on its own thread and event loop (inside a `FaultProxy` process).
+
+    The switches apply on the proxy's loop (`call_soon_threadsafe`) and return once applied.
+    """
+
+    def __init__(self, port: int, upstream: int) -> None:
+        """Ready to `start()` on `port`, forwarding to `upstream`."""
+        self.port = port
+        self._upstream = upstream
+        self._refuse = False
+        self._freeze = False
+        self._thaw = asyncio.Event()  # set while not frozen (bound to the proxy's loop on use)
+        self._thaw.set()
+        self._delay_secs = 0.0
+        # Both writers of every live connection; each connection removes its own when it ends,
+        # so a long soak no longer keeps thousands of dead ones (CO-21).
+        self._open: set[asyncio.StreamWriter] = set()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._ready = threading.Event()
+        self._stop: asyncio.Event | None = None
+        self._error: BaseException | None = None
+        self.lag_max_secs = 0.0  # the proxy loop's worst lateness: should stay a few ms
+
+    @property
+    def refuse(self) -> bool:
+        """New connections are closed at once (a store that is down)."""
+        return self._refuse
+
+    @refuse.setter
+    def refuse(self, value: bool) -> None:
+        self._apply(lambda: setattr(self, "_refuse", value))
+
+    @property
+    def freeze(self) -> bool:
+        """Half-open: bytes are held (not read on, not dropped) until the thaw.
+
+        A real half-open link delays bytes or dies; it never loses some and carries on. Not
+        reading models TCP backpressure; a chunk read as the freeze began waits too (CO-14).
+        """
+        return self._freeze
+
+    @freeze.setter
+    def freeze(self, value: bool) -> None:
+        def change() -> None:
+            self._freeze = value
+            if value:
+                self._thaw.clear()
+            else:
+                self._thaw.set()
+
+        self._apply(change)
+
+    @property
+    def delay_secs(self) -> float:
+        """Added before each forwarded chunk (a slow store or network)."""
+        return self._delay_secs
+
+    @delay_secs.setter
+    def delay_secs(self, value: float) -> None:
+        self._apply(lambda: setattr(self, "_delay_secs", value))
+
+    @property
+    def upstream(self) -> int:
+        """The store port new connections go to; open ones stay where they are."""
+        return self._upstream
+
+    @upstream.setter
+    def upstream(self, port: int) -> None:
+        self._apply(lambda: setattr(self, "_upstream", port))
+
+    def drop_all(self) -> None:
+        """Close every open connection (a node restart)."""
+        self._apply(self._close_open)
+
+    def _close_open(self) -> None:
+        for writer in list(self._open):
+            writer.close()
+        self._open.clear()
+
+    def _apply(self, change: Callable[[], object]) -> None:
+        """Run `change` on the proxy's loop and wait until it ran (at once if not running)."""
+        loop = self._loop
+        if loop is None or not loop.is_running() or threading.current_thread() is self._thread:
+            change()
+            return
+        done: concurrent.futures.Future[None] = concurrent.futures.Future()
+
+        def run() -> None:
+            try:
+                change()
+                done.set_result(None)
+            except BaseException as exc:  # handed back to the calling thread
+                done.set_exception(exc)
+
+        try:
+            loop.call_soon_threadsafe(run)
+        except RuntimeError:  # the loop closed in between: nothing runs on it any more
+            change()
+            return
+        done.result(timeout=10)
+
+    def start(self) -> _ProxyLoop:
+        """Listen on `port` in a new thread; return once listening (or raise why not)."""
+        self._thread = threading.Thread(
+            target=self._run, name=f"fault-proxy-{self.port}", daemon=True
+        )
+        self._thread.start()
+        if not self._ready.wait(10):
+            raise RuntimeError(f"the store proxy on port {self.port} did not start")
+        if self._error is not None:
+            raise RuntimeError(f"the store proxy on port {self.port} failed") from self._error
+        return self
+
+    def stop(self) -> None:
+        """Close the listener and every connection; end the thread (safe to call twice)."""
+        loop, stop = self._loop, self._stop
+        if loop is not None and stop is not None and loop.is_running():
+            with contextlib.suppress(RuntimeError):  # the loop closed in between
+                loop.call_soon_threadsafe(stop.set)
+        if self._thread is not None:
+            self._thread.join(10)
+
+    def _run(self) -> None:
+        try:
+            asyncio.run(self._serve())
+        except BaseException as exc:  # start() reports it
+            self._error = exc
+        finally:
+            self._ready.set()
+
+    async def _serve(self) -> None:
+        """Keep the proxy listening, re-opening it if asyncio closed it.
+
+        On Windows a failed accept (WinError 64: a client gave up mid-accept while the store
+        was blocked) makes asyncio close the listening socket for good, and the store then
+        looked down forever (scenario X1, a harness fault).
+        """
+        self._loop = asyncio.get_running_loop()
+        self._stop = asyncio.Event()
+        server = await asyncio.start_server(self._handle, "127.0.0.1", self.port)
+        ticker = asyncio.create_task(self._measure_lag())
+        self._ready.set()
+        try:
+            while not self._stop.is_set():
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._stop.wait(), 0.2)
+                if not self._stop.is_set() and all(s.fileno() == -1 for s in server.sockets):
+                    server.close()
+                    server = await asyncio.start_server(self._handle, "127.0.0.1", self.port)
+        finally:
+            ticker.cancel()
+            server.close()
+            self._close_open()
+
+    async def _measure_lag(self) -> None:
+        """How late this loop wakes up: the forwarding delay a busy driver used to add."""
+        # perf_counter: monotonic ticks in 15.6 ms steps on Windows. The loop's own timer has
+        # that granularity too, so a few tens of ms here are the OS, not a stall.
+        step = 0.05
+        while True:
+            t0 = time.perf_counter()
+            await asyncio.sleep(step)
+            self.lag_max_secs = max(self.lag_max_secs, time.perf_counter() - t0 - step)
+
+    async def _handle(self, client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter) -> None:
+        """Forward one connection to the upstream store (or refuse it)."""
+        if self._refuse:
+            client_w.close()
+            return
+        try:
+            node_r, node_w = await asyncio.open_connection("127.0.0.1", self._upstream)
+        except OSError:
+            client_w.close()
+            return
+        self._open |= {client_w, node_w}
+        try:
+            await asyncio.gather(self._pipe(client_r, node_w), self._pipe(node_r, client_w))
+        finally:
+            self._open -= {client_w, node_w}
+
+    async def _pipe(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while True:
+                await self._thaw.wait()  # frozen: read nothing more (TCP backpressure)
+                data = await reader.read(65536)
+                if not data:
+                    break
+                await self._thaw.wait()  # read as the freeze began: held, not dropped
+                if self._delay_secs:
+                    await asyncio.sleep(self._delay_secs)
+                writer.write(data)
+                await writer.drain()
+        except OSError:
+            pass
+        finally:
+            writer.close()
+
+
+def _proxy_main(port: int, upstream: int) -> None:
+    """A store proxy process: forward on its own loop, take switches from stdin, one per line.
+
+    `set refuse|freeze 0|1`, `set delay_secs S`, `set upstream PORT`, `drop`, `lag` (answered
+    `ok [value]`) and `stop`. It ends on `stop` or when the driver is gone (stdin closed), so
+    it never outlives the driver; Ctrl-C is the driver's to handle (it stops this process).
+    """
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    proxy = _ProxyLoop(port, upstream).start()
+    print(f"ready {port}", flush=True)
+    try:
+        for line in sys.stdin:
+            words = line.split()
+            if not words or words[0] == "stop":
+                break
+            reply = "ok"
+            if words[0] == "drop":
+                proxy.drop_all()
+            elif words[0] == "lag":
+                reply = f"ok {proxy.lag_max_secs}"
+            elif words[:2] == ["set", "upstream"]:
+                proxy.upstream = int(words[2])
+            elif words[:2] == ["set", "delay_secs"]:
+                proxy.delay_secs = float(words[2])
+            elif words[0] == "set" and words[1] in ("refuse", "freeze"):
+                setattr(proxy, words[1], words[2] == "1")
+            else:
+                reply = f"unknown command {line.strip()!r}"
+            print(reply, flush=True)
+    finally:
+        proxy.stop()
+
+
+class FaultProxy:
+    """A TCP proxy in front of a store that the drills fault: refuse, drop, freeze, delay.
+
+    One class for every drill (scenarios, soak, failover, gates B23 / B95), run as its own
+    process (`gates_fleet.py proxy`). It used to share the driver's event loop with the
+    in-process callers under test, so a busy driver (thousands of call tasks at 300 % load)
+    delayed every forwarded store packet, workers' included, and the library looked slow for
+    a reason it did not cause (audit CO-2). A thread was not enough: with the driver busy in
+    Python for 2 s, round trips from another process through a proxy thread had p99 79-83 ms
+    (max 93-326 ms); through this process p99 1.4-3 ms (median 0.5 ms either way; Python
+    3.12, Windows, a loaded machine, measured 2026-11-15). Each switch is applied before its
+    setter returns.
+    """
+
+    def __init__(self, port: int | None = None, upstream: int = STACK_STORE_PORT) -> None:
+        """Ready to `start()` on `port` (a free one by default), forwarding to `upstream`."""
+        self.port = port or free_port()
+        self._upstream = upstream
+        self._refuse = False
+        self._freeze = False
+        self._delay_secs = 0.0
+        self._lag_secs = 0.0  # the last reading, kept once the process is gone
+        self._proc: subprocess.Popen[bytes] | None = None
+        self._lock = threading.Lock()  # one command and its answer at a time
+
+    def start(self) -> FaultProxy:
+        """Start the proxy process; return once it listens (or raise why not)."""
+        log = log_file("proxy")
+        self._proc = subprocess.Popen(
+            [PY, str(Path(__file__)), "proxy", str(self.port), str(self._upstream)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=log,
+        )
+        log.close()
+        assert self._proc.stdout is not None
+        line = self._proc.stdout.readline()
+        if not line.startswith(b"ready"):
+            self.stop()
+            raise RuntimeError(f"the store proxy on port {self.port} did not start: {line!r}")
+        for name, value in (("refuse", self._refuse), ("freeze", self._freeze)):
+            if value:  # set before start
+                self._send(f"set {name} 1")
+        if self._delay_secs:
+            self._send(f"set delay_secs {self._delay_secs}")
+        return self
+
+    def stop(self) -> None:
+        """End the process (killed if it does not stop at once); safe to call twice."""
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                with contextlib.suppress(OSError, RuntimeError, ValueError):
+                    self._lag_secs = float(self._send("lag") or 0.0)
+                with contextlib.suppress(OSError):
+                    assert proc.stdin is not None
+                    proc.stdin.write(b"stop\n")
+                    proc.stdin.flush()
+                try:
+                    proc.wait(5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(10)
+        finally:
+            for pipe in (proc.stdin, proc.stdout):
+                if pipe is not None:
+                    with contextlib.suppress(OSError):
+                        pipe.close()
+
+    def _send(self, command: str) -> str:
+        """One command; its answer's value (`ok <value>`)."""
+        with self._lock:
+            proc = self._proc
+            if proc is None or proc.poll() is not None:
+                raise RuntimeError(f"the store proxy on port {self.port} is not running")
+            assert proc.stdin is not None
+            assert proc.stdout is not None
+            proc.stdin.write(command.encode() + b"\n")
+            proc.stdin.flush()
+            reply = proc.stdout.readline().decode().strip()
+        if not reply.startswith("ok"):
+            raise RuntimeError(f"store proxy: {command!r} answered {reply!r}")
+        return reply[2:].strip()
+
+    def _running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    @property
+    def refuse(self) -> bool:
+        """New connections are closed at once (a store that is down)."""
+        return self._refuse
+
+    @refuse.setter
+    def refuse(self, value: bool) -> None:
+        if self._running():
+            self._send(f"set refuse {int(value)}")
+        self._refuse = value
+
+    @property
+    def freeze(self) -> bool:
+        """Half-open: bytes are held, not dropped, until the thaw (see `_ProxyLoop.freeze`)."""
+        return self._freeze
+
+    @freeze.setter
+    def freeze(self, value: bool) -> None:
+        if self._running():
+            self._send(f"set freeze {int(value)}")
+        self._freeze = value
+
+    @property
+    def delay_secs(self) -> float:
+        """Added before each forwarded chunk (a slow store or network)."""
+        return self._delay_secs
+
+    @delay_secs.setter
+    def delay_secs(self, value: float) -> None:
+        if self._running():
+            self._send(f"set delay_secs {value}")
+        self._delay_secs = value
+
+    @property
+    def upstream(self) -> int:
+        """The store port new connections go to; open ones stay (a DNS name moving)."""
+        return self._upstream
+
+    @upstream.setter
+    def upstream(self, port: int) -> None:
+        if self._running():
+            self._send(f"set upstream {port}")
+        self._upstream = port
+
+    def drop_all(self) -> None:
+        """Close every open connection (a node restart)."""
+        if self._running():
+            self._send("drop")
+
+    @property
+    def lag_max_secs(self) -> float:
+        """The proxy loop's worst lateness so far: the forwarding delay it added."""
+        if self._running():
+            with contextlib.suppress(OSError, RuntimeError, ValueError):
+                self._lag_secs = float(self._send("lag") or 0.0)
+        return self._lag_secs
+
+
+def lag_note(*proxies: FaultProxy | None) -> str:
+    """One line for a drill's report: the worst forwarding lateness of its store proxies."""
+    worst = max((p.lag_max_secs for p in proxies if p is not None), default=0.0)
+    return f"store proxy (own process): worst loop lag {worst * 1000:.0f} ms"
+
 
 class MetricsToStore:
     """A metrics sink that adds counts into one store hash every second (per worker process)."""
@@ -353,7 +791,7 @@ async def _worker_main() -> None:
 
     setup_logging()
     sink = MetricsToStore(os.environ["LLMQ_KEY_PREFIX"])
-    llmq = LLMQueue.from_env(metrics=sink, credentials=account_keys)
+    llmq = LLMQueue.from_env(metrics=sink, credentials=account_keys, tuning=drill_tuning())
     await llmq.start()
     client = redis.asyncio.Redis.from_url(STORE)
 
@@ -380,7 +818,7 @@ async def _caller_main(calls: int, model: str) -> None:
     """A caller process: run `calls` calls at once, print the outcome counts as JSON."""
     from llm_queue import CallFailed, LLMQueue
 
-    llmq = LLMQueue.from_env(credentials=account_keys)
+    llmq = LLMQueue.from_env(credentials=account_keys, tuning=drill_tuning())
     await llmq.start()
     print("ready", flush=True)
     await asyncio.to_thread(sys.stdin.readline)  # "go"
@@ -438,7 +876,7 @@ async def _client_main(spec: dict[str, Any]) -> None:
     events = _Events()
     logging.getLogger("llm_queue").addHandler(events)
     logging.getLogger("llm_queue").setLevel(logging.INFO)  # the registry events are INFO
-    llmq = LLMQueue.from_env(credentials=account_keys)
+    llmq = LLMQueue.from_env(credentials=account_keys, tuning=drill_tuning())
     await llmq.start()
     view = llmq.registry.current
     model = str(spec["model"])
@@ -501,3 +939,5 @@ if __name__ == "__main__":
         asyncio.run(_caller_main(int(sys.argv[2]), sys.argv[3]))
     elif sys.argv[1] == "client":
         asyncio.run(_client_main(json.loads(sys.argv[2])))
+    elif sys.argv[1] == "proxy":
+        _proxy_main(int(sys.argv[2]), int(sys.argv[3]))

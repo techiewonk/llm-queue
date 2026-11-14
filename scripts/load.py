@@ -61,9 +61,31 @@ def environment(prefix: str, rpm: int) -> dict[str, str]:
 async def workers(env: dict[str, str], count: int) -> list[LLMQueue]:
     """`count` started queues on one store, as separate pods would be."""
     queues = [LLMQueue.from_env(env) for _ in range(count)]
-    for queue in queues:
-        await queue.start()
+    try:
+        for queue in queues:
+            await queue.start()
+    except BaseException:  # the caller never gets them: stop the ones that started
+        try:
+            await stop_all(queues)
+        finally:
+            await cleanup(env["LLMQ_KEY_PREFIX"])
+        raise
     return queues
+
+
+async def stop_all(queues: list[LLMQueue]) -> None:
+    """Stop every queue, even after one fails to stop; the first error is raised after.
+
+    A raising stop used to skip the other stops and the key cleanup after them (CO-17).
+    """
+    errors = []
+    for queue in queues:
+        try:
+            await queue.stop(drain_secs=1)
+        except Exception as exc:  # reported once every queue had its turn
+            errors.append(exc)
+    if errors:
+        raise errors[0]
 
 
 async def still_held(queues: list[LLMQueue], secs: float = 3.0) -> int:
@@ -111,9 +133,10 @@ async def throughput(calls: int = 2000, min_rate: float = 40.0, concurrency: int
         secs = time.monotonic() - started
         held = await still_held(queues)
     finally:
-        for queue in queues:
-            await queue.stop(drain_secs=1)
-        await cleanup(prefix)
+        try:
+            await stop_all(queues)
+        finally:
+            await cleanup(prefix)
     ok = sum(served.values())
     print(f"  {ok}/{calls} ok in {secs:.1f}s ({ok / secs:.0f}/s); errors {dict(errors) or 0}")
     print(f"  served per worker: {sorted(served.values())}; still held: {held}")
@@ -146,9 +169,10 @@ async def rate_limit(calls: int = 300, rpm: int = 600) -> bool:
         await asyncio.gather(*(one(i) for i in range(calls)))
         held = await still_held(queues)
     finally:
-        for queue in queues:
-            await queue.stop(drain_secs=1)
-        await cleanup(prefix)
+        try:
+            await stop_all(queues)
+        finally:
+            await cleanup(prefix)
     early = sum(1 for t in served_at if t <= 10)
     bound = int(rpm * 0.1) + int(rpm / 60 * 10) + 5  # burst + 10 s of rate + clock slack
     print(
