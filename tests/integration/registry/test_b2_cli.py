@@ -23,9 +23,9 @@ pytestmark = pytest.mark.integration
 HOST = "127.0.0.1"
 
 
-def _env(prefix: str, doc: dict[str, Any], **extra: str) -> dict[str, str]:
+def _env(prefix: str, doc: dict[str, Any], port: int = 6379, **extra: str) -> dict[str, str]:
     return {
-        "LLMQ_STORE_URL": f"redis://{HOST}:6379/0",
+        "LLMQ_STORE_URL": f"redis://{HOST}:{port}/0",
         "LLMQ_STORE_PASSWORD": "localdev",
         "LLMQ_ENVIRONMENT": "test",
         "LLMQ_KEY_PREFIX": prefix,
@@ -37,7 +37,7 @@ def _env(prefix: str, doc: dict[str, Any], **extra: str) -> dict[str, str]:
 async def test_password_variable_and_confirmation(
     valkey: redis.asyncio.Redis, prefix: str, full: dict[str, Any]
 ) -> None:
-    env = _env(prefix, full)
+    env = _env(prefix, full, valkey.connection_pool.connection_kwargs["port"])
     # The URL has no password: the CLI reads LLMQ_STORE_PASSWORD as the queue does.
     assert (await amain(["registry", "publish"], env))["action"] == "published"
     for argv in (
@@ -60,7 +60,7 @@ async def test_password_variable_and_confirmation(
 async def test_gc_removes_queues_of_removed_models(
     valkey: redis.asyncio.Redis, prefix: str, full: dict[str, Any]
 ) -> None:
-    env = _env(prefix, full)
+    env = _env(prefix, full, valkey.connection_pool.connection_kwargs["port"])
     await amain(["registry", "publish"], env)
     keep = [f"{prefix}:{{q:llm-gpt20b}}:s", f"{prefix}:{{q:jobs-report}}:s"]
     drop = [

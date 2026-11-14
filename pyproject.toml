@@ -184,9 +184,9 @@ branch = true
 source = ["llm_queue"]
 
 [tool.coverage.report]
-# The unit + integration run in CI: 88 % measured 2026-11-14 (line + branch), rounded down.
+# The unit + integration run in CI: 89.85 % measured 2026-11-14 (line + branch), rounded down.
 # Raise it as tests are added; never lower it to get a change through.
-fail_under = 87
+fail_under = 89
 show_missing = false
 skip_covered = true
 
