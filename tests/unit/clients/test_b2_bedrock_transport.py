@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ssl
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -18,6 +19,7 @@ import orjson
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from botocore.exceptions import NoCredentialsError, ParamValidationError
 from botocore.serialize import create_serializer
 from botocore.session import get_session
 from clients_testkit import TRANSPORTS, StartFake, http_session, registry_doc
@@ -25,7 +27,7 @@ from fakellm import ERRORS
 from fakellm.scenario import STREAM_EXCEPTIONS
 
 from llm_queue.clients import ClientPool, Providers, Route, Timing, WarmOptions, route_for
-from llm_queue.clients.bedrock_http import BedrockHTTP
+from llm_queue.clients.bedrock_http import BedrockHTTP, default_endpoint
 from llm_queue.providers import is_auth_error, is_target_error, request_error_kind
 from llm_queue.registry import ResolvedRegistry, load_registry
 from llm_queue.tuning import BedrockOptions, Tuning
@@ -319,3 +321,26 @@ def test_request_bodies_match_botocore() -> None:
     assert request["messages"][0]["content"][2]["document"]["source"]["bytes"] == "plain text"
     sent = orjson.loads(ours)["messages"][0]["content"]
     assert base64.b64decode(sent[1]["image"]["source"]["bytes"]) == image
+
+
+async def test_public_endpoints_tls_and_refusals() -> None:
+    assert default_endpoint("us-east-1") == "https://bedrock-runtime.us-east-1.amazonaws.com"
+    assert default_endpoint("cn-north-1").endswith(".amazonaws.com.cn")
+    client = await BedrockHTTP.open(
+        region="us-east-1",
+        credentials=None,
+        read_timeout=5,
+        connect_timeout=5,
+        pool_size=10,
+        keepalive_secs=15,
+    )
+    try:
+        assert client.endpoint_url == default_endpoint("us-east-1")
+        connector: Any = client.session.connector
+        assert connector._ssl.verify_mode is ssl.CERT_REQUIRED  # verifying TLS
+        with pytest.raises(NoCredentialsError):  # as botocore: refused before any request
+            await client.converse(modelId=MODEL, **CHAT)
+        with pytest.raises(ParamValidationError, match="bogus"):  # never dropped silently
+            await client.invoke_model(modelId=MODEL, body=b"{}", bogus=1)
+    finally:
+        await client.close()
