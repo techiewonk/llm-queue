@@ -144,7 +144,7 @@ async def test_http_router_routes_and_auth(http: tuple[Engine, httpx.AsyncClient
 
 async def test_http_router_writes(http: tuple[Engine, httpx.AsyncClient]) -> None:
     engine, client = http
-    admin = {"x-admin": "yes", "x-user": "ann"}
+    admin = {"x-admin": "yes", "x-user": "ann", "x-llmq-admin": "1"}
     params = {"actor": "mallory", "model": "big"}  # a client-supplied actor is ignored
     assert (await client.post("/q/registry", json={"rpm": 5}, params=params)).status_code == 401
     done = await client.post("/q/registry", json={"rpm": 5}, params=params, headers=admin)
@@ -154,11 +154,11 @@ async def test_http_router_writes(http: tuple[Engine, httpx.AsyncClient]) -> Non
         "/q/registry", json={"deployments.aws-a.confirmed": ["r1"]}, params=params, headers=admin
     )
     assert refused.status_code == 400  # protected field
-    blocked = await client.post("/q/registry/block", params={"region": "r2"}, headers=admin)
+    blocked = await client.post("/q/registry/block", json={"region": "r2"}, headers=admin)
     assert blocked.json()["blocked_regions"] == ["r2"]
-    typo = await client.post("/q/registry/block", params={"region": "r9"}, headers=admin)
+    typo = await client.post("/q/registry/block", json={"region": "r9"}, headers=admin)
     assert typo.status_code == 400  # a region no deployment uses would block nothing
-    assert (await client.post("/q/registry/block", headers=admin)).status_code == 400
+    assert (await client.post("/q/registry/block", json={}, headers=admin)).status_code == 400
     log = await engine.registry.log(count=5)
     actors = {row.get("actor") for row in log}
     assert "http:ann" in actors

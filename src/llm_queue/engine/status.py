@@ -128,10 +128,14 @@ class StatusReader:
         cap = view.value(alias, "max_concurrency", dep) or 200
         limit = _num(raw_limit, cap) if _text(raw_limit) else cap
         disabled_until = health.get(f"{dep}|until")
+        routing = view.registry.routing
         return {
             "name": dep,
             "group": deployment.group,
             "enabled": bool(view.value(alias, "enabled", dep)),
+            "account_enabled": view.registry.accounts[deployment.account].enabled,
+            "blocked": deployment.region in routing.blocked_regions
+            or deployment.account in routing.blocked_accounts,
             "healthy": disabled_until is None,
             "next_probe": _num(disabled_until) / 1000 if disabled_until else None,
             "outside_residency": view.outside_residency(deployment),
@@ -207,29 +211,47 @@ class AlertEvaluator:
         self.keys = keys
 
     def evaluate(self, view: ResolvedRegistry, report: Mapping[str, Any]) -> list[Alert]:
-        """Every alert state of a report."""
+        """Every alert state of a report.
+
+        `model_unavailable`: no deployment is enabled (itself and its account), unblocked,
+        healthy, inside the residency list and with its breaker not open. `quota_near_limit`:
+        RPM or TPM use this minute at or above `alerts.quota_used_pct`.
+        """
         alerts: list[Alert] = []
         for model in report["models"]:
             alias = model["model"]
             thresholds = view.value(alias, "alerts")
             deps = model["deployments"]
             usable = [
-                d for d in deps if d["enabled"] and d["healthy"] and not d["outside_residency"]
+                d
+                for d in deps
+                if d["enabled"]
+                and d["account_enabled"]
+                and not d["blocked"]
+                and d["healthy"]
+                and not d["outside_residency"]
+                and d["breaker"] != "open"
             ]
             alerts.append(Alert("model_unavailable", not usable, {"model": alias}))
             for dep in deps:
                 labels = {"model": alias, "deployment": dep["name"]}
                 alerts.append(Alert("deployment_disabled", not dep["healthy"], labels))
-                limit = dep["rpm"]["limit"]
-                used_pct = 100 * dep["rpm"]["used"] / limit if limit else 0
+                used = {
+                    budget: 100 * dep[budget]["used"] / dep[budget]["limit"]
+                    for budget in ("rpm", "tpm")
+                    if dep[budget]["limit"]
+                }
+                worst = max(used, key=used.__getitem__, default="rpm")
+                used_pct = used.get(worst, 0.0)
                 alerts.append(
                     Alert(
                         "quota_near_limit",
                         used_pct >= thresholds["quota_used_pct"],
                         labels,
-                        f"{used_pct:.0f}%",
+                        f"{worst} {used_pct:.0f}%",
                     )
                 )
+                limit = dep["rpm"]["limit"]
                 quota_left = limit is None or dep["rpm"]["left"] > 0
                 alerts.append(
                     Alert(

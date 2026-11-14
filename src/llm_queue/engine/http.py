@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from llm_queue.engine.runtime import Engine
 
 _REDACT = frozenset({"role_arn", "external_id_ref", "api_key_ref"})
+ADMIN_HEADER = "X-LLMQ-Admin"
 Response = tuple[int, dict[str, Any]]
 
 
@@ -111,8 +112,11 @@ def status_router(
     """A FastAPI `APIRouter` with the handlers (`pip install 'llm-queue[http]'`).
 
     `dependencies` (the app's admin check) guard every route except `/health/live` and
-    `/health/ready`. Writes need `actor`: it gets the request and returns the authenticated
-    name the audit records (never a client-supplied value, which anyone could spoof).
+    `/health/ready`. Writes need `dependencies` and `actor`: `actor` gets the request and
+    returns the authenticated name the audit records (never a client-supplied value, which
+    anyone could spoof). Write routes take JSON bodies and need the `X-LLMQ-Admin` header: a
+    browser cannot send either cross-site without a CORS preflight, so a page an admin visits
+    cannot post a block or an edit with the admin's cookies.
     """
     try:
         from fastapi import APIRouter, Body, Depends, Request
@@ -125,11 +129,18 @@ def status_router(
     globals()["Request"] = Request
     if allow_writes and actor is None:
         raise ConfigError("allow_writes=True needs actor= (who made the edit, for the audit)")
+    if allow_writes and not dependencies:
+        raise ConfigError("allow_writes=True needs dependencies= (the app's admin check)")
 
     handlers = Handlers(engine, allow_writes=allow_writes)
 
     def who(request: Request) -> str:
         return actor(request) if actor is not None else "unknown"
+
+    def admin_header(request: Request) -> Response | None:
+        if not request.headers.get(ADMIN_HEADER, "").strip():
+            return 403, {"error": f"write routes need the {ADMIN_HEADER} header"}
+        return None
 
     router = APIRouter()
     guarded = [Depends(d) if callable(d) else d for d in dependencies]
@@ -164,15 +175,25 @@ def status_router(
         values: dict[str, Any] = Body(...),  # noqa: B008  # FastAPI's dependency style
         model: str | None = None,
     ) -> Any:
-        return reply(await handlers.set(values, actor=who(request), model=model))
+        refused = admin_header(request) if handlers.allow_writes else None
+        return reply(refused or await handlers.set(values, actor=who(request), model=model))
 
     @router.post("/registry/block", dependencies=guarded)
     async def block(
         request: Request,
-        region: str | None = None,
-        account: str | None = None,
-        on: bool = True,
+        body: dict[str, Any] = Body(...),  # noqa: B008  # {"region"|"account", "on"}
     ) -> Any:
+        refused = admin_header(request) if handlers.allow_writes else None
+        if refused:
+            return reply(refused)
+        region, account, on = body.get("region"), body.get("account"), body.get("on", True)
+        wrong = [k for k in body if k not in ("region", "account", "on")]
+        if (
+            wrong
+            or not isinstance(on, bool)
+            or not all(v is None or isinstance(v, str) for v in (region, account))
+        ):
+            return reply((400, {"error": "the body is {region?, account?, on: true|false}"}))
         return reply(
             await handlers.block(actor=who(request), region=region, account=account, on=on)
         )

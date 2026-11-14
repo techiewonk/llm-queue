@@ -7,13 +7,16 @@ primary (cluster mode is not supported), so the keys need not share a hash tag.
 
 from __future__ import annotations
 
-_COMMON = """
+# Audit entries kept at most (besides the age limit): a busy edit loop cannot fill the store.
+AUDIT_MAX_ENTRIES = 10_000
+
+_COMMON = f"""
 local t = redis.call('TIME')
 local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
 local now_ms = math.floor(now * 1000)
 local function audit(actor, op, version, diff, retention_ms)
-  redis.call('XADD', KEYS[3], '*', 'actor', actor, 'op', op, 'version', version,
-    'diff', diff, 'ts', tostring(now))
+  redis.call('XADD', KEYS[3], 'MAXLEN', '~', {AUDIT_MAX_ENTRIES}, '*', 'actor', actor,
+    'op', op, 'version', version, 'diff', diff, 'ts', tostring(now))
   redis.call('XTRIM', KEYS[3], 'MINID', tostring(now_ms - tonumber(retention_ms)))
 end
 local function write_models(first_key, first_arg, changes)
@@ -25,22 +28,29 @@ end
 
 # KEYS: doc, meta (hash), audit (stream), history (hash version -> doc), then one numbers key
 # per model. ARGV: doc, version, config hash, actor, diff JSON, audit retention ms, history size,
-# then one numbers JSON per model key.
+# the change counter the caller read, '1' to replace a stored document of the same version (it
+# was invalid: treated as missing), then one numbers JSON per model key.
 # Reply: {action, stored version, stored doc or ''} with action published | kept | not_bumped |
-# ignored. Rule (plan §3.8): higher replaces, equal keeps the stored one (and its live edits),
-# equal with another content hash keeps it and reports not_bumped, lower is ignored.
+# ignored | conflict. Rule (plan §3.8): higher replaces, equal keeps the stored one (and its live
+# edits), equal with another content hash keeps it and reports not_bumped, lower is ignored.
+# `conflict`: the registry changed after the caller read it (the routing it carried over and its
+# decision may be stale), so the caller reads again.
 PUBLISH = (
     _COMMON
     + """
 local version = tonumber(ARGV[2])
 local stored_version = tonumber(redis.call('HGET', KEYS[2], 'version') or '0')
 local stored_doc = redis.call('GET', KEYS[1])
-if stored_doc and stored_version >= version then
+local replace = ARGV[9] == '1' and stored_version == version
+if stored_doc and stored_version >= version and not replace then
   if stored_version > version then return {'ignored', stored_version, stored_doc} end
   if redis.call('HGET', KEYS[2], 'config_hash') == ARGV[3] then
     return {'kept', stored_version, stored_doc}
   end
   return {'not_bumped', stored_version, stored_doc}
+end
+if tonumber(redis.call('HGET', KEYS[2], 'changes') or '0') ~= tonumber(ARGV[8]) then
+  return {'conflict', stored_version, ''}
 end
 local changes = redis.call('HINCRBY', KEYS[2], 'changes', 1)
 redis.call('SET', KEYS[1], ARGV[1])
@@ -53,7 +63,7 @@ if #versions > keep then
   for i = 1, #versions - keep do redis.call('HDEL', KEYS[4], versions[i]) end
 end
 audit(ARGV[4], 'publish', version, ARGV[5], ARGV[6])
-write_models(5, 8, changes)
+write_models(5, 10, changes)
 return {'published', version, ''}
 """
 )
