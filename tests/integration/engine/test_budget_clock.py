@@ -7,7 +7,6 @@ the fixed window and of the smooth (GCRA) window.
 
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
 import pytest
@@ -15,6 +14,7 @@ import redis.asyncio
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from test_admission import Candidate, rig  # type: ignore[import-not-found]  # sibling module
+from uuid_utils import uuid7
 
 from llm_queue.engine.admission import Admission, Ask, owner_token
 from llm_queue.engine.keys import Keys
@@ -62,7 +62,7 @@ def _smooth_model(rpm: int, burst_pct: float, times: list[int]) -> list[bool]:
 
 
 async def _run(store: redis.asyncio.Redis, model: dict[str, Any], steps: list[int]) -> list[bool]:
-    prefix = f"llmqtest:clock:{uuid.uuid4().hex[:12]}"
+    prefix = f"llmqtest:clock:{uuid7().hex[-12:]}"
     try:
         r = await rig(store, prefix, model={"rpm": 10_000, **model})
         clock = [START_MS]

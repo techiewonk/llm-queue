@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import json
 import os
-import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 import redis.asyncio
+from uuid_utils import uuid7
 
 HOST = os.environ.get("LLMQ_TEST_REDIS_HOST", "127.0.0.1")
 PASSWORD = os.environ.get("LLMQ_TEST_REDIS_PASSWORD", "localdev")
@@ -34,7 +34,7 @@ async def valkey(request: pytest.FixtureRequest) -> AsyncIterator[redis.asyncio.
 @pytest.fixture
 async def prefix(valkey: redis.asyncio.Redis) -> AsyncIterator[str]:
     """Unique key prefix; every key under it is deleted at teardown."""
-    value = f"llmqtest:reg:{uuid.uuid4().hex[:12]}"
+    value = f"llmqtest:reg:{uuid7().hex[-12:]}"
     yield value
     keys = [k async for k in valkey.scan_iter(match=f"{value}:*", count=500)]
     if keys:

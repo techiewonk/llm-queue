@@ -7,7 +7,6 @@ Every test gets its own key prefix, deleted at teardown. The stack comes from
 from __future__ import annotations
 
 import os
-import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -15,6 +14,7 @@ import pytest
 import redis.asyncio
 from aiohttp.test_utils import TestServer
 from engine_testkit import FakeEngine, Make, Scenario, create_app, registry
+from uuid_utils import uuid7
 
 from llm_queue.clients import ClientPool, Providers
 from llm_queue.engine.runtime import Engine, EngineSettings
@@ -40,7 +40,7 @@ async def store(request: pytest.FixtureRequest) -> AsyncIterator[redis.asyncio.R
 @pytest.fixture
 async def prefix(store: redis.asyncio.Redis) -> AsyncIterator[str]:
     """Unique key prefix; every key under it is deleted at teardown."""
-    value = f"llmqtest:eng:{uuid.uuid4().hex[:12]}"
+    value = f"llmqtest:eng:{uuid7().hex[-12:]}"
     yield value
     keys = [k async for k in store.scan_iter(match=f"{value}:*", count=500)]
     if keys:

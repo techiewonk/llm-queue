@@ -19,9 +19,10 @@ import sys
 import tempfile
 import threading
 import time
-import uuid
 from pathlib import Path
 from typing import Any
+
+from uuid_utils import uuid7
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -152,7 +153,7 @@ def setup_logging() -> None:
 
 def new_prefix() -> str:
     """A fresh key prefix (deleted by `cleanup`)."""
-    return f"llmqgate:{uuid.uuid4().hex[:6]}"
+    return f"llmqgate:{uuid7().hex[-6:]}"
 
 
 class FakeLLM:
@@ -448,7 +449,7 @@ async def _client_main(spec: dict[str, Any]) -> None:
     every = int(spec.get("priority_every", 0))
 
     async def one(i: int) -> dict[str, Any]:
-        marker = f"{spec['tag']}-{i}-{uuid.uuid4().hex[:12]}"
+        marker = f"{spec['tag']}-{i}-{uuid7().hex[-12:]}"
         messages = [{"role": "user", "content": [{"text": f"marker {marker}"}]}]
         request = {"messages": messages, "inferenceConfig": {"maxTokens": 400}}
         want = expected_text(messages, spec.get("output_tokens"))

@@ -24,9 +24,10 @@ import json
 import os
 import sys
 import time
-import uuid
 from pathlib import Path
 from typing import Any
+
+from uuid_utils import uuid7
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -90,7 +91,7 @@ async def cleanup(prefix: str) -> None:
 
 async def throughput(calls: int = 2000, min_rate: float = 40.0, concurrency: int = 200) -> bool:
     """Every call succeeds across three workers at `min_rate` a second or more; none held."""
-    prefix = f"llmqload:{uuid.uuid4().hex[:6]}"
+    prefix = f"llmqload:{uuid7().hex[-6:]}"
     queues = await workers(environment(prefix, rpm=1_000_000), 3)
     gate = asyncio.Semaphore(concurrency)
     served: collections.Counter[str] = collections.Counter()
@@ -124,7 +125,7 @@ async def throughput(calls: int = 2000, min_rate: float = 40.0, concurrency: int
 
 async def rate_limit(calls: int = 300, rpm: int = 600) -> bool:
     """A burst over the budget: served within the bucket's bound, the rest `rate_limited`."""
-    prefix = f"llmqload:{uuid.uuid4().hex[:6]}"
+    prefix = f"llmqload:{uuid7().hex[-6:]}"
     queues = await workers(environment(prefix, rpm=rpm), 3)
     served_at: list[float] = []
     kinds: collections.Counter[str] = collections.Counter()

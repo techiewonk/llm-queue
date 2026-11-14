@@ -25,8 +25,9 @@ import os
 import subprocess
 import sys
 import time
-import uuid
 from pathlib import Path
+
+from uuid_utils import uuid7
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -157,7 +158,7 @@ async def drill(scenario: str) -> bool:
     server = await asyncio.start_server(proxy.handle, "127.0.0.1", PROXY_PORT)
     fake = FakeLLM({"defaults": {"latency_ms": {"p50": 150, "p95": 250}}})
     await asyncio.to_thread(fake.start)
-    llmq = LLMQueue.from_env(environment(f"llmqfo:{uuid.uuid4().hex[:6]}", fake.url))
+    llmq = LLMQueue.from_env(environment(f"llmqfo:{uuid7().hex[-6:]}", fake.url))
     await llmq.start()
     started = time.monotonic()
     ok: collections.Counter[int] = collections.Counter()

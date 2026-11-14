@@ -28,9 +28,10 @@ import subprocess
 import sys
 import tempfile
 import time
-import uuid
 from pathlib import Path
 from urllib.parse import quote
+
+from uuid_utils import uuid7
 
 ROOT = Path(__file__).resolve().parent.parent
 SAMPLES = ROOT / "samples"
@@ -101,7 +102,7 @@ def environment(live: bool, env_file: Path, prefix: str, store: str) -> dict[str
     if store == LOCAL_STORE_URL:  # no TLS, no salt: only allowed in a test environment
         env["LLMQ_ENVIRONMENT"] = "test"
     else:  # strict, as in an app: a salt from its secrets; here a fresh one per run
-        env.setdefault("LLMQ_ID_HASH_SALT", uuid.uuid4().hex)
+        env.setdefault("LLMQ_ID_HASH_SALT", uuid7().hex)
     where = "local Valkey" if store == LOCAL_STORE_URL else "the env file's store (TLS)"
     if store.startswith("redis://") and store != LOCAL_STORE_URL:
         where = "the env file's store (no TLS)"
@@ -142,7 +143,7 @@ def main() -> int:
     if unknown:
         print(f"unknown sample(s): {', '.join(unknown)}; have {', '.join(found)}")
         return 2
-    prefix = f"llmqsample:{uuid.uuid4().hex[:8]}"
+    prefix = f"llmqsample:{uuid7().hex[-8:]}"  # a v7 starts with the time: take its tail
     store = store_url(args.store, args.env_file)
     env = environment(args.live, args.env_file, prefix, store)
     failed = []

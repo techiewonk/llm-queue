@@ -37,13 +37,13 @@ import re
 import subprocess
 import sys
 import time
-import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import httpx
+from uuid_utils import uuid7
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -192,7 +192,7 @@ def collect(proc: subprocess.Popen[str], timeout: float) -> dict[str, float]:
 
 def phase_start(reps: int, deployments: int, prefixes: list[str]) -> dict[str, Any]:
     """Pod start and cold first call: one priming process (dropped), then `reps` fresh ones."""
-    prefix = f"llmqbench:{uuid.uuid4().hex[:8]}"
+    prefix = f"llmqbench:{uuid7().hex[-8:]}"
     prefixes.append(prefix)
     env = environment(prefix, deployments)
     collect(spawn("start", env), timeout=120)  # publishes the registry, as an earlier pod did
@@ -211,7 +211,7 @@ def phase_idle(reps: int, deployments: int, idle: float, prefixes: list[str]) ->
     """One call after `idle` seconds: `reps` processes in parallel, each on its own prefix."""
     procs = []
     for _ in range(reps):
-        prefix = f"llmqbench:{uuid.uuid4().hex[:8]}"
+        prefix = f"llmqbench:{uuid7().hex[-8:]}"
         prefixes.append(prefix)
         procs.append(spawn("idle", environment(prefix, deployments), idle))
         time.sleep(0.5)  # stagger, so the calls after the idle wait do not all land at once
@@ -290,7 +290,7 @@ async def in_process(args: argparse.Namespace, prefixes: list[str]) -> dict[str,
     from llm_queue import LLMQueue
 
     counter = Counter()
-    prefix = f"llmqbench:{uuid.uuid4().hex[:8]}"
+    prefix = f"llmqbench:{uuid7().hex[-8:]}"
     prefixes.append(prefix)
     queue = LLMQueue.from_env(environment(prefix, args.deployments), credentials=account_keys)
     await queue.start()

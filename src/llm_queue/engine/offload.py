@@ -12,11 +12,11 @@ import asyncio
 import contextlib
 import hashlib
 import threading
-import uuid
 from typing import TYPE_CHECKING, Any, Protocol
 
 from llm_queue._logging import get_logger
 from llm_queue.errors import LLMQueueError
+from llm_queue.ids import new_id
 
 if TYPE_CHECKING:
     from aiobotocore.session import AioSession
@@ -96,7 +96,7 @@ class S3Offload:
         """Write the object under a hashed, unique name; returns that name."""
         s3 = await self._s3()
         digest = hashlib.sha256(key.encode()).hexdigest()
-        name = f"{self.prefix}{digest}-{uuid.uuid4().hex}"
+        name = f"{self.prefix}{digest}-{new_id()}"
         extra: dict[str, Any] = {"ServerSideEncryption": self._sse, **self._owner}
         if self._kms_key_id:
             extra["SSEKMSKeyId"] = self._kms_key_id

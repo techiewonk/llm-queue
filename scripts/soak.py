@@ -49,7 +49,6 @@ import random
 import statistics
 import sys
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import failover  # needs the sys.path entry
 from gates import Gate, Run, chat, registry
 from gates_fleet import TITAN_ID, free_port, log_dir, process_stats, setup_logging
+from uuid_utils import uuid7
 
 PROXY_PORT = free_port()
 # After a chaos event ends: reconnect backoff, a registry reload, a breaker cooldown (15 s).
@@ -181,7 +181,7 @@ async def soak(profile: Profile, live: Path | None = None) -> bool:
     try:
         # Status records expire within the run (default 30 min), so the key count levels off
         # and growth after that is a leak, not retention.
-        name = f"llmqsoak-{uuid.uuid4().hex[:8]}"  # CLIENT LIST counts this run's connections
+        name = f"llmqsoak-{uuid7().hex[-8:]}"  # CLIENT LIST counts this run's connections
         store = f"redis://:localdev@127.0.0.1:{PROXY_PORT}/0?client_name={name}"
         ttl = str(profile.status_ttl_secs)
         async with Gate(doc, LLMQ_STORE_URL=store, LLMQ_STATUS_TTL_SECS=ttl) as gate:
