@@ -941,8 +941,13 @@ class Engine:
             data = message["data"]
             rid = data.decode() if isinstance(data, bytes) else str(data)
             held = self._held.get(rid)
-            if held is not None and held.run is not None and not held.run.done():
-                held.cancelled = True
+            if held is None:
+                continue
+            # Flagged even before its run task started: a cancel read between the grant and
+            # the task's first step was dropped, and the attempt ran to its end unless the
+            # heartbeat's key check (a third of the lease) caught it first.
+            held.cancelled = True
+            if held.run is not None and not held.run.done():
                 held.run.cancel()
 
     async def _check_cancels(self) -> None:
@@ -1891,6 +1896,8 @@ class Engine:
         slots = self._slots.get(held.envelope.model)
         held.run = asyncio.current_task()
         try:
+            if held.cancelled:  # its cancel arrived before this task ran
+                raise asyncio.CancelledError
             if slots is None:
                 await self._attempts(held, decision, attempt, alias)
             else:
