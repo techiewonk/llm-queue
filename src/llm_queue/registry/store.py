@@ -11,8 +11,10 @@ republishes the config when the stored registry was lost or invalid (and not new
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 import os
+import random
 import socket
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -24,10 +26,11 @@ from redis.exceptions import RedisError
 from llm_queue._logging import get_logger
 from llm_queue._version import __version__
 from llm_queue.engine.store_guard import store_op
-from llm_queue.errors import ConfigError
+from llm_queue.errors import ConfigError, LLMQueueError, StoreUnavailable
 from llm_queue.registry import _lua
 from llm_queue.registry.resolve import ResolvedRegistry
 from llm_queue.registry.schema import LIVE_EDIT_MODES, needs_newer_lib
+from llm_queue.registry.settings import SETTINGS
 from llm_queue.registry.validate import RegistryError, check
 
 if TYPE_CHECKING:
@@ -40,9 +43,19 @@ logger = get_logger(__name__)
 AUDIT_RETENTION_DAYS = 90
 _SECRET_FIELDS = frozenset({"role_arn", "external_id_ref", "api_key_ref"})
 _ACTOR_MAX = 200
+# First retry of a lost publish / edit waits up to 40 ms, doubling per try (jittered, CO-10).
+_CONFLICT_BACKOFF_SECS = 0.02
+# A reload loop that failed waits up to this long (doubling from its interval) before the next.
+_RELOAD_BACKOFF_MAX_SECS = 30.0
 # Live routing switches a publish carries over from the stored document (an emergency block must
 # not be undone by the next deploy; only a live unblock lifts it).
 _CARRIED_LISTS = ("blocked_regions", "blocked_accounts")
+# Why each setting marked `protected` in `SETTINGS` is (a unit test keeps the two in step).
+_PROTECTED_WHY = {
+    "debug_capture": "it stores prompt text",
+    "model_fallback": "it sets where calls may go",
+    "params": "deployment params are sent with each call",
+}
 # Settings whose value goes into a model's resolved numbers (read by the admission script).
 ADMISSION_SETTINGS = (
     "enabled",
@@ -73,7 +86,10 @@ MODEL_ADMISSION_SETTINGS = (
 
 
 class RegistryConflict(ConfigError):
-    """A live edit lost a race with another edit three times in a row."""
+    """A publish or live edit lost the race with other writes on every try it had.
+
+    The number of tries is `Tuning.registry.edit_retries`.
+    """
 
 
 class LiveEditRefused(ConfigError):
@@ -126,30 +142,58 @@ def audit_diff(before: Mapping[str, Any], after: Mapping[str, Any]) -> list[dict
     ]
 
 
+def _setting_of(path: Path) -> str | None:
+    """The registry setting a changed path sets (`defaults.rpm`, `models.m.rpm`, ...), or None.
+
+    Settings sit under `defaults`, an account's `settings`, a model, and a deployment's
+    `overrides.<region>`.
+    """
+    name: str | None = None
+    if path[:1] == ("defaults",) and len(path) >= 2:
+        name = path[1]
+    elif path[:1] == ("accounts",) and len(path) >= 4 and path[2] == "settings":
+        name = path[3]
+    elif path[:1] == ("models",) and len(path) >= 3:
+        if path[2] != "deployments":
+            name = path[2]
+        elif len(path) >= 7 and path[4] == "overrides":
+            name = path[6]
+    return name if name in SETTINGS else None
+
+
 def _deploy_only(path: Path) -> str | None:
-    """Why a changed path needs a deploy (a new `registry_version`), or None."""
+    """Why a changed path needs a deploy (a new `registry_version`), or None.
+
+    Settings marked `deploy_only` in `SETTINGS` come from that table (CO-11: the flag was
+    set but never read, and the same rule was written out here by name); the document's
+    structure (versions, models, model fields, queue names) is listed here.
+    """
     if path[:1] in (("registry_version",), ("min_lib_version",), ("live_edit",)):
         return "changes with a deploy"
     if path[:1] == ("models",) and len(path) == 2:
         return "adding or removing a model needs a new registry_version"
     if path[:1] == ("models",) and len(path) >= 3:
-        if path[2] in ("type", "provider", "model_id", "worker_slots"):
+        if path[2] in ("type", "provider", "model_id"):
             return f"`{path[2]}` changes only with a deploy"
         if path[2:4] == ("queue", "name"):
             return "a queue name changes only with a deploy"
-    if path[:2] == ("defaults", "worker_slots"):
-        return "`worker_slots` changes only with a deploy"
+    name = _setting_of(path)
+    if name is not None and SETTINGS[name].deploy_only:
+        return f"`{name}` changes only with a deploy"
     return None
 
 
 def _protected(path: Path) -> str | None:
-    """Why a changed path is protected under `registry_live_edit=safe`, or None."""
+    """Why a changed path is protected under `registry_live_edit=safe`, or None.
+
+    Settings marked `protected` in `SETTINGS` come from that table (CO-11); the rest are
+    structural (residency, accounts, region lists) or part of one setting (`inference.extra`).
+    """
+    name = _setting_of(path)
+    if name is not None and SETTINGS[name].protected:
+        return f"`{name}` changes only with a deploy ({_PROTECTED_WHY[name]})"
     if "residency" in path:
         return "residency changes only with a deploy"
-    if path[-1:] == ("debug_capture",):
-        return "debug_capture (stores prompt text) changes only with a deploy"
-    if "model_fallback" in path:
-        return "model_fallback (where calls may go) changes only with a deploy"
     if "inference" in path and path[path.index("inference") + 1 :][:1] == ("extra",):
         return "inference.extra (fields sent to the provider) changes only with a deploy"
     if path[:1] == ("accounts",):
@@ -157,18 +201,16 @@ def _protected(path: Path) -> str | None:
             return "adding or removing an account changes only with a deploy"
         if len(path) >= 3 and path[2] in ("kind", "base_url", *_SECRET_FIELDS):
             return f"account `{path[2]}` changes only with a deploy"
-    if path[:1] == ("models",) and len(path) >= 4 and path[2] == "deployments":
-        if len(path) == 4 or path[4] in ("confirmed", "fallback"):
-            return "region lists change only with a deploy"
-        if "params" in path:
-            return "deployment params change only with a deploy"
+    in_deployments = path[:1] == ("models",) and len(path) >= 4 and path[2] == "deployments"
+    if in_deployments and (len(path) == 4 or path[4] in ("confirmed", "fallback")):
+        return "region lists change only with a deploy"
     return None
 
 
 def refused_edits(before: Mapping[str, Any], after: Mapping[str, Any], mode: str) -> list[str]:
     """Reasons a live edit from `before` to `after` is refused under `registry_live_edit=mode`."""
-    if mode not in LIVE_EDIT_MODES:
-        raise ValueError(f"registry_live_edit must be one of {', '.join(LIVE_EDIT_MODES)}")
+    if mode not in LIVE_EDIT_MODES:  # ConfigError: one error family (CO-24)
+        raise ConfigError(f"registry_live_edit must be one of {', '.join(LIVE_EDIT_MODES)}")
     changes = diff(dict(before), dict(after))
     if mode == "off" and changes:
         return ["live edits are off (registry_live_edit=off)"]
@@ -396,7 +438,10 @@ class RegistryStore:
     def current(self) -> ResolvedRegistry:
         """Last good registry; raises `ConfigError` before the first successful load."""
         if self._current is None:
-            raise ConfigError("the registry has not been loaded yet")
+            raise ConfigError(
+                "the registry has not been loaded yet; call LLMQueue.start() "
+                "(or RegistryStore.boot / load) first"
+            )
         return self._current
 
     @property
@@ -506,7 +551,10 @@ class RegistryStore:
         registry, errors, warnings = check(doc, strict=True, allowed_hosts=self._hosts)
         if registry is None:
             raise RegistryError(errors, warnings)
-        for _ in range(self._edit_retries + 2):
+        tries = self._edit_retries + 2
+        for attempt in range(tries):
+            if attempt:
+                await self._backoff(attempt)
             stored, meta = await self._read()
             replace = False
             if stored is not None:
@@ -555,7 +603,9 @@ class RegistryStore:
                 logger.info("llmq_registry_audit", actor=actor, op="publish", diff=changes)
             await self._load()  # a fresh read, never one that started before the write
             return PublishResult(action, version)
-        raise RegistryConflict("the registry kept changing during a publish; try again")
+        raise RegistryConflict(
+            f"the registry kept changing during a publish ({tries} tries); try again"
+        )
 
     def _run_on_config(self) -> ResolvedRegistry:
         """Run on this process's own document (the stored one is unreachable or refused)."""
@@ -596,10 +646,13 @@ class RegistryStore:
         """Apply `change` to the stored document as a live edit: validated, checked, audited.
 
         Compare-and-set on the change counter; on a race the document is read again and the
-        change re-applied (up to three times).
+        change re-applied, up to `Tuning.registry.edit_retries` tries with a jittered backoff
+        between them; `RegistryConflict` when every try lost.
         """
         check_actor(actor)
-        for _ in range(self._edit_retries):
+        for attempt in range(self._edit_retries):
+            if attempt:
+                await self._backoff(attempt)
             doc, meta = await self._read()
             if doc is None:
                 raise ConfigError("no registry is stored; publish one first")
@@ -636,9 +689,22 @@ class RegistryStore:
             if _text(reply[0]) == "ok":
                 logger.info("llmq_registry_audit", actor=actor, op="edit", diff=changes)
                 loaded = await self._load()
-                assert loaded is not None
+                if loaded is None:  # was an assert: AssertionError, or None under -O (CO-12)
+                    raise StoreUnavailable(
+                        "the registry vanished right after the edit (was the store flushed?)"
+                    )
                 return loaded
-        raise RegistryConflict("the registry kept changing; try again")
+        raise RegistryConflict(
+            f"the registry kept changing ({self._edit_retries} tries); try again"
+        )
+
+    async def _backoff(self, attempt: int) -> None:
+        """Wait a jittered, doubling time before try `attempt` (1 = the first retry).
+
+        Retrying a lost compare-and-set at once made concurrent editors collide again and use
+        up their tries together (CO-10).
+        """
+        await self._sleep(random.uniform(0, _CONFLICT_BACKOFF_SECS * 2**attempt))
 
     @store_op
     async def set(
@@ -688,9 +754,9 @@ class RegistryStore:
             accounts = set(view.registry.raw.get("accounts", {}))
             regions = {d.region for alias in view.registry.models for d in view.deployments(alias)}
             if account and account not in accounts:
-                raise ConfigError(f"unknown account {account!r}")
+                raise ConfigError(f"unknown account {account!r}{_known(account, accounts)}")
             if region and region not in regions:
-                raise ConfigError(f"no deployment uses region {region!r}")
+                raise ConfigError(f"no deployment uses region {region!r}{_known(region, regions)}")
 
         def change(doc: dict[str, Any]) -> None:
             routing = doc.setdefault("routing", {})
@@ -706,13 +772,24 @@ class RegistryStore:
 
     @store_op
     async def log(self, count: int = 20, path_prefix: str = "") -> list[dict[str, Any]]:
-        """Latest audit entries, newest first; `path_prefix` keeps entries that touch it."""
-        entries = await self._client.xrevrange(self.audit_key, count=max(count * 5, count))
+        """Latest audit entries, newest first; `path_prefix` keeps entries that touch it.
+
+        Best effort: it looks at the newest `count * 5` entries, so a narrow `path_prefix` can
+        return fewer than `count`; unreadable entries are skipped (logged).
+        """
+        entries = await self._client.xrevrange(self.audit_key, count=count * 5)
         out: list[dict[str, Any]] = []
         for entry_id, fields in entries or ():
             row = {_text(k): _text(v) for k, v in (fields or {}).items()}
-            changes = orjson.loads(row.get("diff", "[]"))
-            if path_prefix and not any(c["path"].startswith(path_prefix) for c in changes):
+            try:
+                changes = orjson.loads(row.get("diff", "[]"))
+                paths = [str(c["path"]) for c in changes]
+            except (orjson.JSONDecodeError, TypeError, KeyError):
+                # One malformed entry (a manual XADD, an older format) failed the whole read
+                # with a non-LLMQueueError (CO-19).
+                logger.warning("audit_entry_unreadable", id=_text(entry_id))
+                continue
+            if path_prefix and not any(p.startswith(path_prefix) for p in paths):
                 continue
             out.append({"id": _text(entry_id), **row, "diff": changes})
             if len(out) == count:
@@ -726,14 +803,36 @@ class RegistryStore:
 
     @store_op
     async def rollback(self, version: int, *, actor: str) -> PublishResult:
-        """Publish the content of an earlier version as a new, higher version."""
+        """Publish the content of an earlier version as a new, higher version.
+
+        The new version is the stored one plus one; when a deploy publishes in between (the
+        rollback comes back `ignored` or `not_bumped`), it is read and tried again, up to
+        `Tuning.registry.edit_retries` tries, then `RegistryConflict`.
+        """
+        check_actor(actor)
         raw = await self._client.hget(self.history_key, str(version))
         if raw is None:
             raise ConfigError(f"version {version} is not kept any more")
-        doc = orjson.loads(raw)
-        _, meta = await self._read()
-        doc["registry_version"] = int(meta.get("version", "0")) + 1
-        return await self.publish(doc, actor=f"{actor} (rollback to {version})")
+        try:
+            kept = orjson.loads(raw)
+        except orjson.JSONDecodeError as exc:
+            raise ConfigError(f"version {version} is stored unreadable: {exc}") from exc
+        if not isinstance(kept, dict):
+            raise ConfigError(f"version {version} is stored unreadable: not a JSON object")
+        note = f" (rollback to {version})"
+        composed = actor[: _ACTOR_MAX - len(note)] + note  # a long actor went past the limit
+        for attempt in range(self._edit_retries):
+            if attempt:
+                await self._backoff(attempt)
+            _, meta = await self._read()
+            doc = {**kept, "registry_version": int(meta.get("version", "0")) + 1}
+            result = await self.publish(doc, actor=composed)
+            # A version read before a deploy's publish lost to it and did nothing (CO-18).
+            if result.action not in ("ignored", "not_bumped"):
+                return result
+        raise RegistryConflict(
+            f"the registry kept changing during a rollback ({self._edit_retries} tries); try again"
+        )
 
     @store_op
     async def diff_with_config(self) -> list[dict[str, Any]]:
@@ -772,20 +871,62 @@ class RegistryStore:
         own_version = own if isinstance(own, int) else 0
         if doc is None or (not self.stored_refused and stored < held):
             logger.error("registry_reset_live_edits_lost", stored=stored, held=held)
-            await self.publish(self.config, actor=process_actor("restore"))
+            await self._restore(self.config)
         elif self.stored_refused and not self.lib_too_old and own_version >= stored:
             logger.error("registry_invalid_restoring_config", stored=stored, own=own_version)
-            await self.publish(self.config, actor=process_actor("restore"))
+            await self._restore(self.config)
         return self._current
 
+    async def _restore(self, config: Mapping[str, Any]) -> None:
+        """Republish this process's config; a failure is logged and the next reload retries.
+
+        `refresh()` also runs on the call path (admission on `no_config`), where a
+        `RegistryConflict` or `StoreUnavailable` from the publish reached the caller as a
+        config error instead of `CallFailed` (CO-9).
+        """
+        try:
+            await self.publish(config, actor=process_actor("restore"))
+        except (LLMQueueError, RedisError, OSError) as exc:
+            logger.error("registry_restore_failed", error=repr(exc))
+
     async def run(self, interval_secs: float) -> None:
-        """Reload every `interval_secs` until cancelled; errors never end the loop."""
+        """Reload every `interval_secs` until cancelled; errors never end the loop.
+
+        After a failed reload the wait doubles, up to 30 s (or the interval when longer),
+        and goes back to the interval after a good one.
+        """
+        failures = 0
         while True:
             try:
                 await self.refresh()
+                failures = 0
             except (RedisError, OSError, ConfigError) as exc:
-                logger.warning("registry_reload_failed", error=str(exc))
-            await self._sleep(interval_secs)
+                failures += 1
+                logger.warning("registry_reload_failed", error=repr(exc), failures=failures)
+            except Exception as exc:
+                # Anything else (a corrupt meta counter, a bug in a check) ended the task for
+                # good, silently: the pod never saw a live edit or kill switch again (CO-4).
+                failures += 1
+                logger.error(
+                    "registry_reload_failed", error=repr(exc), failures=failures, exc_info=True
+                )
+            await self._sleep(_reload_wait(interval_secs, failures))
+
+
+def _reload_wait(interval_secs: float, failures: int) -> float:
+    """The reload loop's next wait: the interval, doubling per failure in a row up to a cap."""
+    if not failures:
+        return interval_secs
+    cap = max(interval_secs, _RELOAD_BACKOFF_MAX_SECS)
+    return float(min(interval_secs * 2 ** min(failures, 16), cap))
+
+
+def _known(name: str, names: Any) -> str:
+    """`; did you mean ...?; known: ...` for a name that is not among `names` (CO-27)."""
+    ordered = sorted(names)
+    close = difflib.get_close_matches(name, ordered, n=1)
+    hint = f"; did you mean {close[0]!r}?" if close else ""
+    return f"{hint}; known: {', '.join(ordered) or '(none)'}"
 
 
 def _text(value: Any) -> str:
