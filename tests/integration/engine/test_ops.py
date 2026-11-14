@@ -162,7 +162,7 @@ async def test_command_line(make: Make, store: redis.asyncio.Redis, prefix: str)
     assert await run("dlq", "list", "--model", "big") == []
     queues = await run("queues", "list")
     assert any(name.endswith("llm-big-priority") for name in queues)
-    drained = await run("drain", "small", "--wait", "--timeout", "2")
+    drained = await run("drain", "small", "--wait", "--timeout", "2", "--yes")
     assert drained == {"model": "small", "enabled": False, "drained": True}
 
 
