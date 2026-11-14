@@ -176,6 +176,20 @@ local state = redis.call('HGET', job_key, 'state')
 if state == 'done' or state == 'failed' or state == 'expired' or state == 'cancelled' then
   return cjson.encode({r = 'done'})
 end
+-- A call just received (req.callers = the caller TTL): `gone` when every caller of it is gone,
+-- unless the store came back less than a TTL ago (their keys not renewed yet). It was a script
+-- of its own (CALLERS_ALIVE in requests.py), one more round trip per call.
+if present(req.callers) then
+  local epoch = tonumber(redis.call('GET', P .. ':epoch') or '')
+  if epoch and tonumber(t[1]) - epoch >= num(req.callers, 30) then
+    local members = redis.call('SMEMBERS', P .. ':{r:' .. rid .. '}:callers')
+    local alive = #members == 0
+    for _, caller in ipairs(members) do
+      if redis.call('EXISTS', P .. ':caller:' .. caller) == 1 then alive = true break end
+    end
+    if not alive then return cjson.encode({r = 'gone'}) end
+  end
+end
 -- Running under another worker with a fresh heartbeat (on another model, or between its
 -- retries when no entry exists): a redelivered message is a duplicate, not a new run.
 -- The job owner is `worker@tag` (tag: the message id), so a second delivery of one id to the
@@ -191,8 +205,10 @@ end
 local held = redis.call('HGET', entry_key, 'owner')
 if held then
   if held == req.owner then
-    return cjson.encode({r = 'granted', dep = redis.call('HGET', entry_key, 'dep'),
-      minute = hnum(entry_key, 'minute', minute), repeat_ = true})
+    local again = {r = 'granted', dep = redis.call('HGET', entry_key, 'dep'),
+      minute = hnum(entry_key, 'minute', minute), repeat_ = true}
+    if req.chunks then again.streamed = redis.call('XLEN', P .. ':{r:' .. rid .. '}:chunks') end
+    return cjson.encode(again)
   end
   local holder = redis.call('HGET', entry_key, 'worker')
   local hb = hnum(job_key, 'hb', 0)
@@ -215,14 +231,18 @@ end
 local foreign = present(req.foreign)
 local wait_keys = {p = mk(alias, 'wait:p'), n = mk(alias, 'wait:n')}
 local info_key = mk(alias, 'waitinfo')
-for _, c in ipairs({'p', 'n'}) do
-  for _, id in ipairs(redis.call('ZRANGE', wait_keys[c], 0, 49)) do
-    local raw = redis.call('HGET', info_key, id)
-    if not raw or num(cjson.decode(raw).exp, 0) < now then
-      redis.call('ZREM', wait_keys[c], id)
-      redis.call('HDEL', info_key, id)
-    end
+-- Expired waiters go: `waitexp` scores each by its expiry (member `cls|id`), so finding them
+-- reads only those (the first 50 of each class were decoded on every call before).
+local exp_key = mk(alias, 'waitexp')
+for _, member in ipairs(redis.call('ZRANGEBYSCORE', exp_key, '-inf', '(' .. now, 'LIMIT', 0, 100)) do
+  local c, id = string.match(member, '^(%a)|(.*)$')
+  local raw = c and redis.call('HGET', info_key, id)
+  -- A waiter refreshed since (its expiry moved on) stays; only its stale member goes.
+  if c and (not raw or num(cjson.decode(raw).exp, 0) < now) then
+    redis.call('ZREM', wait_keys[c], id)
+    redis.call('HDEL', info_key, id)
   end
+  redis.call('ZREM', exp_key, member)
 end
 if foreign then
   -- Only live waiters count: expired ones past the first 50 (cleaned above) blocked fallback.
@@ -497,9 +517,11 @@ if not chosen then
   -- Refused: register (or refresh) as a waiter, with the deployments it can use.
   local deps = {}
   for _, cand in ipairs(req.candidates) do table.insert(deps, cand.key) end
+  local exp = now + num(req.waiter_ms, 2000)
   redis.call('ZADD', wait_keys[cls], pos, rid)
-  redis.call('HSET', info_key, rid, cjson.encode({r = cost_r, t = cost_t, deps = deps,
-    exp = now + num(req.waiter_ms, 2000)}))
+  redis.call('HSET', info_key, rid, cjson.encode({r = cost_r, t = cost_t, deps = deps, exp = exp}))
+  redis.call('ZADD', exp_key, exp, cls .. '|' .. rid)
+  redis.call('PEXPIRE', exp_key, KEY_MS)
   return cjson.encode({r = 'wait', ms = math.max(1, math.floor(best_wait or num(T.wait_ms, 100))),
     reason = best_reason or 'slot'})
 end
@@ -538,9 +560,18 @@ if req.claim or redis.call('EXISTS', job_key) == 1 then
 end
 redis.call('ZREM', wait_keys[cls], rid)
 redis.call('HDEL', info_key, rid)
+redis.call('ZREM', exp_key, cls .. '|' .. rid)
 if foreign and present(req.foreign.from_alias) then
   redis.call('ZREM', mk(req.foreign.from_alias, 'wait:' .. cls), rid)
   redis.call('HDEL', mk(req.foreign.from_alias, 'waitinfo'), rid)
+  redis.call('ZREM', mk(req.foreign.from_alias, 'waitexp'), cls .. '|' .. rid)
+end
+-- A first attempt counts for the retry budget (req.count_first: the minute of its key, from
+-- the worker's clock as the budget check reads it): a pipeline of its own before.
+if present(req.count_first) then
+  local retries = mk(alias, 'retries:' .. req.count_first)
+  redis.call('HINCRBY', retries, 'first', 1)
+  redis.call('EXPIRE', retries, 180)
 end
 if sticky_key then
   redis.call('SET', sticky_key, chosen.key, 'PX', num(req.sticky.ttl_ms, 1800000))
@@ -549,8 +580,12 @@ if req.strategy == 'round_robin' then
   local rot = mk(alias, 'rot')
   redis.call('HSET', rot, 'rr|' .. chosen.key, redis.call('HINCRBY', rot, 'rr_seq', 1))
 end
-return cjson.encode({r = 'granted', dep = chosen.key, minute = minute, limit = res.limit,
-  tier = chosen.tier})
+local granted = {r = 'granted', dep = chosen.key, minute = minute, limit = res.limit,
+  tier = chosen.tier}
+-- A stream's call: how far its chunk stream got (another worker may have begun it, R19); an
+-- XLEN of its own before.
+if req.chunks then granted.streamed = redis.call('XLEN', P .. ':{r:' .. rid .. '}:chunks') end
+return cjson.encode(granted)
 """
 )
 
@@ -763,6 +798,19 @@ for _, owner in ipairs(redis.call('ZRANGEBYSCORE', inprog, '-inf', now, 'LIMIT',
     end
   end
   removed = removed + 1
+end
+-- Waiters that expired with no `waitexp` member (written by an older library): a batch per
+-- sweep, so the waiter sets never keep them for good.
+local info_key = mk(req.alias, 'waitinfo')
+for _, c in ipairs({'p', 'n'}) do
+  local wait_key = mk(req.alias, 'wait:' .. c)
+  for _, id in ipairs(redis.call('ZRANGE', wait_key, 0, 99)) do
+    local raw = redis.call('HGET', info_key, id)
+    if not raw or num(cjson.decode(raw).exp, 0) < now then
+      redis.call('ZREM', wait_key, id)
+      redis.call('HDEL', info_key, id)
+    end
+  end
 end
 return removed
 """

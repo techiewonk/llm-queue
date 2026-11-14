@@ -206,6 +206,7 @@ class _Held:
     shutdown: bool = False  # the drain ran out: give it back, do not fail it (plan C3)
     refused: bool = False  # an admission refusal was counted for this call (RESCAN O4)
     model_retried: bool = False  # its one free retry after a model error was used (P9)
+    check_callers: bool = False  # its first admission also checks its callers are alive
 
     @property
     def position(self) -> float:
@@ -314,7 +315,14 @@ class Engine:
         self._idle = asyncio.Event()
         self._static: dict[str, asyncio.Semaphore] = {}
         self._rng = random.Random()
-        self.chunks = ChunkReader(state, block_ms=self.settings.timings.stream_read_block_ms)
+        self.chunks = ChunkReader(
+            state,
+            block_ms=self.settings.timings.stream_read_block_ms,
+            wake_key=f"{self.keys.prefix}:chunkwake:{self.worker_id}",
+        )
+        # Call tasks of streams already read to their `end`: they finish here (result read,
+        # cleanup) while the caller has moved on.
+        self._tails: set[asyncio.Task[Reply]] = set()
         self._epoch: str | None = None  # the store's epoch this process last saw (RESCAN A2)
         self._worker = False
         self._model_tasks: dict[str, asyncio.Task[None]] = {}  # receive loop per model alias
@@ -414,11 +422,13 @@ class Engine:
                 held.run.cancel()
         if late:
             await asyncio.wait(set(late), timeout=5.0)
+        if self._tails:  # streams already delivered: their call tasks read the result
+            await asyncio.wait(set(self._tails), timeout=max(0.0, until - loop.time()))
         if self._waiters:
             self._idle.clear()
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._idle.wait(), max(0.0, until - loop.time()))
-        tasks = [*self._tasks, *self._model_tasks.values(), *self._running]
+        tasks = [*self._tasks, *self._model_tasks.values(), *self._running, *self._tails]
         for task in tasks:
             task.cancel()
         for task in tasks:
@@ -594,7 +604,7 @@ class Engine:
         task = asyncio.create_task(
             self.call(model, params, stream=True, stream_id=rid, request_id=app_id, **call)
         )
-        expected, started, attempt_id = 1, False, ""
+        expected, started, attempt_id, ended = 1, False, "", False
         try:
             while True:
                 if not queue.empty():  # already read: a slow consumer gets it (RESCAN S2)
@@ -659,10 +669,10 @@ class Engine:
                     for event in entry["d"]:
                         yield event
                 elif entry["t"] == "end":
-                    # Delivered in full: a result write that failed after `end` (the re-run
-                    # found the stream taken) is not the caller's error (RESCAN S11).
-                    with contextlib.suppress(CallFailed):
-                        await task
+                    # Delivered in full: the caller goes on now; the call task (its result read
+                    # and cleanup, ~80 ms more) finishes in the background, and a failure after
+                    # `end` (the re-run found the stream taken) is logged, never raised (S11).
+                    ended = True
                     return
                 else:
                     data = entry["d"]
@@ -674,10 +684,28 @@ class Engine:
                     )
         finally:
             self.chunks.close(key)
-            if not task.done():
-                task.cancel()  # the call's own handler cancels the request
-            with contextlib.suppress(BaseException):
-                await task
+            if ended:
+                self._tails.add(task)
+                task.add_done_callback(self._tail_done)
+            else:
+                if not task.done():
+                    task.cancel()  # the call's own handler cancels the request
+                with contextlib.suppress(BaseException):
+                    await task
+
+    def _tail_done(self, task: asyncio.Task[Reply]) -> None:
+        """A stream's call task ended after its `end` was read: log a failure, never raise it."""
+        self._tails.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning(
+                "stream_call_failed_after_end",
+                request_id=getattr(exc, "request_id", None),
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
 
     def hash_id(self, value: str) -> str:
         """Keyed hash (HMAC-SHA256, `LLMQ_ID_HASH_SALT`) of a user or session id, 16 hex chars.
@@ -714,29 +742,53 @@ class Engine:
     ) -> Reply:
         rid = envelope.request_id
         user_id, session_id = envelope.user_id, envelope.session_id
-        user_hash = self.hash_id(user_id or session_id or "")
-        found = await self.requests.register(
-            rid,
-            caller=self.worker_id,
-            user_hash=user_hash,
-            params_hash=params_hash({"m": alias, "p": params}),
-            model=alias,
-            priority=priority,
-            app_id=request_id is not None,
-        )
-        if found.outcome == "conflict":
+        record: dict[str, Any] = {
+            "caller": self.worker_id,
+            "user_hash": self.hash_id(user_id or session_id or ""),
+            "params_hash": params_hash({"m": alias, "p": params}),
+            "model": alias,
+            "priority": priority,
+            "app_id": request_id is not None,
+        }
+        # Queues in the state store: register, send and confirm are one script (3 round trips
+        # before). Not with `queue_wait_replicas`: that send needs its own WAIT.
+        combined = not direct and self.queues_shared and not self.settings.queue_wait_replicas
+
+        async def register() -> tuple[str, bool]:
+            """The registration's outcome, and whether the call was sent with it."""
+            if not combined:
+                return (await self.requests.register(rid, **record)).outcome, False
+            name = self._queue_name(view, alias, priority)
+            settings = QueueSettings(max_waiting=int(view.value(alias, "max_waiting")))
+            try:
+                found = await self.requests.register_send(
+                    rid,
+                    **record,
+                    queue=name,
+                    queue_keys=self.queues.queue_keys(name),
+                    bell=self.queues.bell(name),
+                    body=envelope.dumps(),
+                    max_waiting=settings.max_waiting,
+                    retention_secs=settings.retention_secs,
+                    keep_secs=call_secs,
+                )
+            except QueueFull as exc:
+                raise CallFailed("queue_full", str(exc), retry_after_secs=5) from exc
+            return found.outcome, found.outcome in ("new", "takeover")
+
+        outcome, sent = await register()
+        if outcome == "conflict":
             raise CallFailed(
                 "request_id_conflict", "the id was used with other params", request_id=rid
             )
-        if found.outcome == "expired":
+        if outcome == "expired":
             raise CallFailed("result_expired", "the id finished earlier", request_id=rid)
         waiter = self._waiters.setdefault(rid, asyncio.get_running_loop().create_future())
         loop = asyncio.get_running_loop()
         until = loop.time() + call_secs + self.settings.caller_margin_secs
-        outcome = found.outcome
         try:
             while True:
-                if outcome in ("new", "takeover"):
+                if outcome in ("new", "takeover") and not sent:
                     if direct:
                         await self.requests.confirm(rid, keep_secs=call_secs)
                         task = asyncio.create_task(self._direct(envelope))
@@ -756,16 +808,7 @@ class Engine:
                 if reply is not None:
                     return reply
                 # The send this caller attached to never happened: register again.
-                again = await self.requests.register(
-                    rid,
-                    caller=self.worker_id,
-                    user_hash=user_hash,
-                    params_hash=params_hash({"m": alias, "p": params}),
-                    model=alias,
-                    priority=priority,
-                    app_id=request_id is not None,
-                )
-                outcome = again.outcome
+                outcome, sent = await register()
                 if outcome == "conflict":
                     raise CallFailed("request_id_conflict", "the id was used with other params")
         finally:
@@ -1184,10 +1227,13 @@ class Engine:
 
         Idle, it blocks on its queues' doorbell (a send wakes one worker at once) for 50 ms at a
         time, then 1 s after a second with nothing: polling idle loops made ~96 receive
-        scripts/s per pod with 4 models (measured); a busy loop never waits.
+        scripts/s per pod with 4 models (measured); a busy loop never waits. With no free worker
+        slot it waits for one (`_run` wakes it), not on the doorbell; a token it took but cannot
+        serve (no slot, or that class held) goes back, so another pod's worker wakes for it.
         """
         empty = 0
         wake = self._wake.setdefault(alias, asyncio.Event())
+        rung: str | None = None  # the queue whose doorbell token this loop took last
         while not self._stopping:
             if alias not in self.registry.current.registry.models:
                 return  # removed by a reload; `_sync_model_loops` starts it again if it returns
@@ -1204,6 +1250,16 @@ class Engine:
                     self._store_trouble("receive")
                 await asyncio.sleep(1)
                 continue
+            view = self.registry.current
+            names = {self._queue_name(view, alias, p): "p" if p else "n" for p in (True, False)}
+            if (
+                rung is not None
+                and not got
+                and (got is None or (alias, names.get(rung)) in self._held_class)
+            ):
+                with contextlib.suppress(*STORE_ERRORS):
+                    await self.queues.ring_again(rung)
+            rung = None
             held = (alias, "p") in self._held_class or (alias, "n") in self._held_class
             # Idle only when the queues were empty, not when a class waits on its held call.
             empty = 0 if got or held else empty + 1
@@ -1212,19 +1268,22 @@ class Engine:
                 pause = (
                     pace.idle_poll_secs if empty < pace.idle_after_empty else pace.idle_slow_secs
                 )
-                if held:  # a held call ending (granted or settled) wakes it at once
+                if held or got is None:  # a held call ending, or a slot freed, wakes it at once
                     with contextlib.suppress(TimeoutError):
                         await asyncio.wait_for(wake.wait(), pause)
                 else:  # a send rings the doorbell: one idle worker wakes per call
-                    view = self.registry.current
-                    names = [self._queue_name(view, alias, p) for p in (True, False)]
                     try:
-                        await self.queues.wait_bell(names, pause)
+                        rung = await self.queues.wait_bell(list(names), pause)
                     except STORE_ERRORS:
                         self._store_trouble("bell")  # (was swallowed unseen)
                 wake.clear()
 
-    async def _receive_once(self, alias: str) -> bool:
+    async def _receive_once(self, alias: str) -> bool | None:
+        """Receive and admit this model's next calls: True if any came, None with no free slot.
+
+        One script reads the priority queue, then the normal one (classes waiting on a held
+        call are skipped): two round trips per poll before.
+        """
         view = self.registry.current
         if alias not in view.registry.models:
             await asyncio.sleep(1)
@@ -1232,38 +1291,31 @@ class Engine:
         slots = self._slots[alias]
         free = slots._value  # free worker slots of this model, read only
         if free <= 0:
-            await asyncio.sleep(0.02)
-            return False
+            return None
         settings = self._queue_settings(view, alias)
-        got_any = False
-        for priority in (True, False):
-            cls = "p" if priority else "n"
-            if (alias, cls) in self._held_class:
-                continue
-            name = self._queue_name(view, alias, priority)
-            messages, dead = await self.queues.receive(
-                name, min(free, self.settings.receive_batch), settings
-            )
-            for letter in dead:
-                await self._dead_lettered(letter.body)
-            if not messages:
-                continue
-            got_any = True
-            for index, message in enumerate(messages):
-                try:
-                    held = await self._admit_new(alias, message)
-                except Exception:
-                    for rest in messages[index + 1 :]:  # not seen: back to the queue now
-                        with contextlib.suppress(Exception):
-                            await self.queues.return_(rest)
-                    raise
-                if held:
-                    for rest in messages[index + 1 :]:
+        names = [
+            self._queue_name(view, alias, priority)
+            for priority in (True, False)
+            if (alias, "p" if priority else "n") not in self._held_class
+        ]
+        messages, dead = await self.queues.receive_first(
+            names, min(free, self.settings.receive_batch), settings
+        )
+        for letter in dead:
+            await self._dead_lettered(letter.body)
+        for index, message in enumerate(messages):
+            try:
+                held = await self._admit_new(alias, message)
+            except Exception:
+                for rest in messages[index + 1 :]:  # not seen: back to the queue now
+                    with contextlib.suppress(Exception):
                         await self.queues.return_(rest)
-                    break
-            if got_any:
+                raise
+            if held:
+                for rest in messages[index + 1 :]:
+                    await self.queues.return_(rest)
                 break
-        return got_any
+        return bool(messages)
 
     def _queue_settings(self, view: ResolvedRegistry, alias: str) -> QueueSettings:
         queue = view.value(alias, "queue")
@@ -1318,25 +1370,24 @@ class Engine:
         held = _Held(
             message,
             env,
-            first_seen=self.clock.now(),
+            # The store's time at receive: the wait is measured on one clock (the local view
+            # of the store clock drifted between syncs).
+            first_seen=message.received_ms / 1000 if message.received_ms else self.clock.now(),
             position_ms=message.position_ms,
             tag=message.id,
         )
         self._held[env.request_id] = held
+        # Its first admission checks that a caller still waits (plan §3.18 R24), in the same
+        # script: dropped as `caller_gone` when none does.
+        held.check_callers = self._callers_judgeable()
         try:
-            if not await self._caller_alive(env):
-                # A warning: a dropped call is worth seeing (the soak and scenario S5 found
-                # calls dropped wrongly, and INFO logs alone did not show it).
-                logger.warning("caller_gone", request_id=env.request_id, model=env.model)
-                await self._finish_call(held, "cancelled", "caller_gone", final="cancelled")
-                return False
             return await self._try(held, attempt=1)
         except Exception:
             await self._release(held)
             raise
 
-    async def _caller_alive(self, env: Envelope) -> bool:
-        """False when every caller of this call is gone (plan §3.18 R24).
+    def _callers_judgeable(self) -> bool:
+        """False while lapsed caller keys prove nothing: the store was out of reach lately.
 
         After a store outage the callers' liveness keys may have expired only because nobody
         could renew them: for a caller TTL and a heartbeat after this process last saw the
@@ -1345,21 +1396,12 @@ class Engine:
         Judged from this process's own heartbeat too: a half-open store hung every command for
         the read timeout, the doorbell wait swallowed its error, and calls were dropped the
         moment the store came back (scenario S5). A heartbeat that is late or just recovered
-        from a gap means the store was out of reach here as well, so a lapsed key proves
-        nothing.
+        from a gap means the store was out of reach here as well.
         """
         beat = self.settings.lease_secs / 3
         grace = self.settings.caller_ttl_secs + beat + 5
         now = time.monotonic()
-        if now - self._store_trouble_at < grace or now - self._beat_ok_at > 2 * beat + 1:
-            return True
-        try:
-            return await self.requests.callers_alive(
-                env.request_id, prefix=self.keys.prefix, caller_ttl=self.settings.caller_ttl_secs
-            )
-        except STORE_ERRORS:
-            self._store_trouble("callers")
-            return True
+        return not (now - self._store_trouble_at < grace or now - self._beat_ok_at > 2 * beat + 1)
 
     def _store_trouble(self, where: str) -> None:
         """Note a store failure seen here: callers count as alive for a while; metric."""
@@ -1486,6 +1528,9 @@ class Engine:
             foreign_from=foreign_from,
             require_pct=require_pct,
             tag=held.tag,
+            callers_ttl=self.settings.caller_ttl_secs if held.check_callers else None,
+            count_first=int(self.clock.now() // 60) if attempt == 1 else None,
+            chunks=env.stream and env.op in ("converse", "chat"),
         )
         held.estimates[(alias, ask.owner)] = estimate
         return ask
@@ -1681,6 +1726,13 @@ class Engine:
         if decision.kind == "no_config":  # the store lost the numbers: restore, then once more
             await self.registry.refresh()
             decision = await self.admission.pick_take(ask, self.registry.changes)
+        held.check_callers = False  # checked once, on its first admission
+        if decision.kind == "gone":
+            # A warning: a dropped call is worth seeing (the soak and scenario S5 found calls
+            # dropped wrongly, and INFO logs alone did not show it).
+            logger.warning("caller_gone", request_id=held.envelope.request_id, model=alias)
+            await self._finish_call(held, "cancelled", "caller_gone", final="cancelled")
+            return None
         if decision.kind in ("no_config", "stale_config"):
             # Still no usable numbers. Before, the call stayed held and hidden for good.
             logger.error("admission_config_missing", model=alias, kind=decision.kind)
@@ -1864,6 +1916,9 @@ class Engine:
             await self._release(held)
             if held.message is None:
                 raise
+        finally:
+            if slots is not None and (event := self._wake.get(held.envelope.model)) is not None:
+                event.set()  # a worker slot is free: the model's loop receives at once
 
     async def _attempts(self, held: _Held, decision: Decision, attempt: int, alias: str) -> None:
         throttles = 0
@@ -1876,7 +1931,7 @@ class Engine:
             owner = self._owner(held, attempt)
             held.grants.add((alias, owner))
             outcome, reply_or_error = await self._attempt(
-                view, alias, held, dep_key, owner, attempt
+                view, alias, held, dep_key, owner, attempt, decision.extra.get("streamed")
             )
             held.grants.discard((alias, owner))
             if outcome == "ok":
@@ -1981,18 +2036,6 @@ class Engine:
         )
         return used <= allowed
 
-    async def _count_first(self, alias: str) -> None:
-        """Count a first attempt for the retry budget, under the model that serves it.
-
-        The key lives 3 minutes (the sliding window reads the previous one); it got no TTL in
-        a minute without a retry and stayed for good (RESCAN A3).
-        """
-        key = self.keys.model(alias, f"retries:{int(self.clock.now() // 60)}")
-        async with self.state.pipeline(transaction=False) as pipe:
-            pipe.hincrby(key, "first", 1)
-            pipe.expire(key, 180)
-            await pipe.execute()
-
     async def _attempt(
         self,
         view: ResolvedRegistry,
@@ -2001,8 +2044,13 @@ class Engine:
         dep_key: str,
         owner: str,
         attempt: int,
+        streamed: int | None = None,
     ) -> tuple[str, Any]:
-        """One provider attempt and its settlement: ('ok', None) or (outcome, (kind, info, exc))."""
+        """One provider attempt and its settlement: ('ok', None) or (outcome, (kind, info, exc)).
+
+        `streamed`: the chunk stream's length its grant reported (read here when None). A first
+        attempt was counted for the retry budget by its grant (PICK_TAKE, `count_first`).
+        """
         env = held.envelope
         entry = view.registry.models[alias]
         deployment = next(d for d in view.deployments(alias) if d.key == dep_key)
@@ -2041,8 +2089,6 @@ class Engine:
             "cost_r": 1,
             "cost_t": estimate.total,
         }
-        if attempt == 1:
-            await self._count_first(alias)
         writer = held.writer = None
         if env.stream and env.op in ("converse", "chat"):
             writer = held.writer = ChunkWriter(
@@ -2053,7 +2099,9 @@ class Engine:
                 max_bytes=int(view.value(alias, "stream_max_bytes")),
                 ttl_secs=self.settings.result_ttl_secs + int(env.timeout_secs),
             )
-            if await self.state.xlen(writer.key):
+            if streamed is None:
+                streamed = await self.state.xlen(writer.key)
+            if streamed:
                 # Another worker already streamed part of this answer (plan R19).
                 await self.admission.finish(
                     alias,
@@ -2211,17 +2259,6 @@ class Engine:
             count_cached=bool(view.value(alias, "tpm_count_cached", dep_key)),
         )
         refund = tokens.refund(estimate, "ok", used)
-        await self.admission.finish(
-            alias,
-            owner,
-            env.request_id,
-            refund_r=refund.requests,
-            refund_t=refund.tokens,
-            outcome="ok",
-            latency_ms=latency,
-        )
-        held.grants.discard((alias, owner))  # settled: a failure below must not renew it
-        self._bad_accounts.pop((deployment.account, deployment.region), None)  # (plan A4)
         meta = Meta(
             served_model=alias,
             deployment=dep_key,
@@ -2236,21 +2273,38 @@ class Engine:
             worker=self.worker_id,
         )
         reply = Reply(request_id=env.request_id, ok=True, response=result.response, meta=meta)
-        await self.requests.put_result(reply, final_state="done")
-        await self._count_target_errors(held, succeeded=True)
+        self._bad_accounts.pop((deployment.account, deployment.region), None)  # (plan A4)
         self._record(held, alias, deployment.account, deployment.region, "ok", meta)
         if self.settings.debug_capture_allowed and view.value(alias, "debug_capture"):
-            await self._debug(env.request_id, params, result.response)
-        await self.requests.set_status(
-            env.request_id,
-            "done",
-            deployment=dep_key,
-            served_model=alias,
-            attempts=attempt,
-            tokens_in=result.usage.input_tokens,
-            tokens_out=result.usage.output_tokens,
+            await self._debug(env.request_id, params, result.response)  # (never in prod)
+        # The caller first: its result, with the final status in the same script. Then the
+        # grant and the message are settled together (four round trips one after another
+        # before the caller was woken, before).
+        await self.requests.put_result(
+            reply,
+            final_state="done",
+            status={
+                "deployment": dep_key,
+                "served_model": alias,
+                "attempts": attempt,
+                "tokens_in": result.usage.input_tokens,
+                "tokens_out": result.usage.output_tokens,
+            },
         )
-        await self._ack(held)
+        await asyncio.gather(
+            self.admission.finish(
+                alias,
+                owner,
+                env.request_id,
+                refund_r=refund.requests,
+                refund_t=refund.tokens,
+                outcome="ok",
+                latency_ms=latency,
+            ),
+            self._ack(held),
+        )
+        held.grants.discard((alias, owner))  # settled: a failure below must not renew it
+        await self._count_target_errors(held, succeeded=True)
         return "ok", None
 
     async def _target_error(
@@ -2295,15 +2349,20 @@ class Engine:
         while True:
             await asyncio.sleep(5)
             try:
-                view = self.registry.current
-                for alias in view.registry.models:
-                    lock = await self.state.set(
-                        f"{self.keys.prefix}:lock:probe:{alias}", self.worker_id, nx=True, ex=5
-                    )
-                    if lock:
-                        await self.probe_due(alias)
+                # One lock for every model (one SET per model per 5 s from every pod before).
+                lock = await self.state.set(
+                    f"{self.keys.prefix}:lock:probe", self.worker_id, nx=True, ex=5
+                )
             except Exception as exc:
                 logger.warning("prober_failed", error=str(exc))
+                continue
+            if not lock:
+                continue
+            for alias in self.registry.current.registry.models:
+                try:
+                    await self.probe_due(alias)
+                except Exception as exc:  # one model's failure does not skip the others
+                    logger.warning("prober_failed", model=alias, error=str(exc))
 
     async def probe_due(self, alias: str) -> dict[str, str]:
         """Probe every disabled deployment of a model that is due; their outcomes."""
@@ -2368,8 +2427,7 @@ class Engine:
             partial_text=partial or None,
             meta=Meta(served_model=env.model, worker=self.worker_id),
         )
-        await self.requests.put_result(reply, final_state=final)
-        await self.requests.set_status(env.request_id, final, error=kind)
+        await self.requests.put_result(reply, final_state=final, status={"error": kind})
 
     async def _finish_call(
         self,
@@ -2696,21 +2754,27 @@ class Engine:
                 self._store_trouble("heartbeat")
                 beat = 1.0  # renew the caller key as soon as the store is back
             view = self.registry.current
+            holds: list[tuple[Message, float]] = []
             for held in list(self._held.values()):
                 if held.message is None:
                     continue
-                self._beat_ran_at = time.monotonic()  # progress, even on a slow store (O2)
                 try:
                     visibility = float(view.value(held.envelope.model, "queue")["visibility_secs"])
-                    beat = min(beat, visibility / 3)
-                    await self.queues.extend(held.message, visibility)
-                except Exception as exc:
+                except Exception as exc:  # e.g. a model removed by a reload: skip only this one
                     logger.warning(
                         "heartbeat_failed",
                         step="extend",
                         request_id=held.envelope.request_id,
                         error=str(exc),
                     )
+                    continue
+                beat = min(beat, visibility / 3)
+                holds.append((held.message, visibility))
+            self._beat_ran_at = time.monotonic()  # progress, even on a slow store (O2)
+            try:
+                await self.queues.extend_many(holds)  # every hold in one call
+            except Exception as exc:
+                logger.warning("heartbeat_failed", step="extend", error=str(exc))
             try:
                 await self.clock.sync(self.state)
                 await self._check_epoch()

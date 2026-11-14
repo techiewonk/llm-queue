@@ -526,6 +526,7 @@ async def test_a_store_out_of_memory_is_a_call_failure(make: Make) -> None:
         raise OutOfMemoryError("command not allowed when used memory > 'maxmemory'.")
 
     engine.requests.register = refuse
+    engine.requests.register_send = refuse  # the send folded in (plan B4)
     with pytest.raises(CallFailed) as info:
         await engine.call("small", CHAT)
     assert info.value.kind == "queue_unavailable"

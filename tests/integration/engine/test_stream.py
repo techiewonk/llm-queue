@@ -7,6 +7,7 @@ failure before any chunk, a stream another worker began (`worker_lost`) and the 
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -49,7 +50,12 @@ async def test_events_arrive_in_order_and_early(make: Make) -> None:
     assert len(_text(events)) == 320
     assert first is not None
     assert first < total / 2  # the first chunk is never held back
-    status = await engine.requests.status("s-order")
+    # The stream returns on its `end` entry (plan B2): the worker's result write comes after.
+    for _ in range(40):
+        status = await engine.requests.status("s-order")
+        if status.get("state") == "done":
+            break
+        await asyncio.sleep(0.05)
     assert status["state"] == "done"
 
 

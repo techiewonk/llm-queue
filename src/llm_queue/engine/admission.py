@@ -75,6 +75,12 @@ class Ask:
     foreign_from: str | None = None
     require_pct: int = 0
     tag: str = ""
+    # Folded in (one round trip each before): the caller TTL to check the call's callers are
+    # alive with (`gone` when none is), the minute of the retry-budget key a first attempt
+    # counts in, and whether to report the call's chunk stream length (`streamed`).
+    callers_ttl: int | None = None
+    count_first: int | None = None
+    chunks: bool = False
 
     @property
     def job_owner(self) -> str:
@@ -92,7 +98,8 @@ class Decision:
     """What the script decided.
 
     `kind`: granted, wait, duplicate, done, cancelled, stale_config, no_config, none (no
-    deployment usable), busy (another model refused a fallback call).
+    deployment usable), busy (another model refused a fallback call), gone (every caller of a
+    call asked with `callers_ttl` is gone).
     """
 
     kind: str
@@ -190,6 +197,12 @@ class Admission:
             }
         if ask.foreign_from is not None:
             body["foreign"] = {"from_alias": ask.foreign_from, "require_pct": ask.require_pct}
+        if ask.callers_ttl is not None:
+            body["callers"] = ask.callers_ttl
+        if ask.count_first is not None:
+            body["count_first"] = ask.count_first
+        if ask.chunks:
+            body["chunks"] = True
         raw = orjson.loads(await self._call(self._pick, body))
         kind = str(raw.pop("r"))
         return Decision(
