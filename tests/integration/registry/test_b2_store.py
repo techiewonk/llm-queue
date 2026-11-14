@@ -193,3 +193,38 @@ async def test_boot_actor_names_the_process_and_loads_share_one_read(
     monkeypatch.setattr(store, "_read", counted)
     await asyncio.gather(*(store.load() for _ in range(20)))
     assert reads == 1
+
+
+async def test_publish_deletes_numbers_of_removed_models(
+    valkey: redis.asyncio.Redis, prefix: str, full: dict[str, Any]
+) -> None:
+    """CO-20: a deploy that removed a model left its `{m:alias}:cfg` key forever (no TTL)."""
+    store = _store(valkey, prefix, full)
+    await store.boot()
+    assert await valkey.exists(store.numbers_key("embed-cohere"))
+    newer = copy.deepcopy(full)
+    newer["registry_version"] = 2
+    del newer["models"]["embed-cohere"]
+    assert (await store.publish(newer, actor="t")).action == "published"
+    assert not await valkey.exists(store.numbers_key("embed-cohere"))
+    assert await valkey.exists(store.numbers_key("gpt20b"))
+    assert (await store.publish(newer, actor="t")).action == "kept"  # no document sent back
+
+
+async def test_concurrent_live_edits_all_succeed(
+    valkey: redis.asyncio.Redis, prefix: str, full: dict[str, Any]
+) -> None:
+    """CO-10: concurrent editors retried a lost race at once and used up their tries together.
+
+    With a jittered backoff and enough tries, 20 concurrent edits of different values all land.
+    """
+    store = RegistryStore(valkey, prefix, config=full, edit_retries=20)
+    await store.boot()
+    changes = store.changes
+    await asyncio.gather(
+        *(store.set({"rpm": 100 + i}, model="gpt20b", actor=f"op{i}") for i in range(20))
+    )
+    await store.load()
+    assert store.changes == changes + 20
+    edits = [e for e in await store.log(50, path_prefix="models.gpt20b.rpm") if e["op"] == "edit"]
+    assert len(edits) == 20

@@ -242,6 +242,8 @@ class Spec:
 
     `default` may be a callable taking the model type (`chat` / `embedding`); `merge` objects
     combine key by key across levels instead of the most specific one replacing the rest.
+    `deploy_only` settings never change by live edit; `protected` ones only with
+    `registry_live_edit=all` (both read by `registry.store`).
     """
 
     levels: frozenset[str]
@@ -335,6 +337,7 @@ SETTINGS: Mapping[str, Spec] = {
             {"on": _causes, "after_secs": number(0), "models": _fallback_models},
             required=("on", "models"),
         ),
+        protected=True,
     ),
     "store_down": _spec("D,M", one_of("pause", "static_cap", "fail_fast"), "pause"),
     "queue_pct": _spec("D,M", _PCT, 100),
@@ -393,7 +396,7 @@ SETTINGS: Mapping[str, Spec] = {
     "fallback_policy": _spec("D,M", hook_name),
     "token_estimator": _spec("D,M", hook_name),
     "probe": _spec("D,M", hook_name),
-    "debug_capture": _spec("M", boolean, False),
+    "debug_capture": _spec("M", boolean, False, protected=True),
 }
 
 # Defaults of the optional fields inside the two fallback rules.

@@ -11,12 +11,13 @@ about, a forked child or another event loop gets a clear error instead of hangin
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import os
 import socket
 import threading
 import weakref
-from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any, NotRequired, TypedDict, TypeVar, cast, overload
@@ -45,6 +46,10 @@ _T = TypeVar("_T")
 # Store connections of the private engine that serves sync calls when no queue is started
 # (Celery workers, scripts): a caller-only engine needs few (D1).
 SYNC_STORE_CONNECTIONS = 20
+# A sync call on a started queue's loop checks this often that the loop still runs (CO-26).
+_LOOP_CHECK_SECS = 1.0
+# How long closing the private engine of the sync calls may take before it is logged and left.
+_SYNC_CLOSE_SECS = 10.0
 
 
 # ------------------------------------------------------------------- typed results (O6)
@@ -171,6 +176,7 @@ class LLMQueue:
         self._offload = offload
         self._sync: _SyncRunner | None = None
         self._sync_lock = threading.Lock()
+        self._start_lock: asyncio.Lock | None = None  # made on the first start(), on its loop
         self.started = False
         self._stopped = False
         self._pid: int | None = None
@@ -275,8 +281,16 @@ class LLMQueue:
 
     # ---------------------------------------------------------------- guards (C2)
 
-    def _check(self, *, same_loop: bool = True) -> None:
-        """Refuse a call from a forked child or (async calls) from another event loop."""
+    def _check(self, *, same_loop: bool = True, work: bool = False) -> None:
+        """Refuse a call from a forked child or (async calls) from another event loop.
+
+        `work` marks a method that starts new work (a call, a stream, a job): it is refused
+        once `stop()` has begun, instead of failing later on a closed pool (CO-6, CO-13).
+        """
+        if work and self._stopped:
+            raise LLMQueueError(
+                "this LLMQueue is stopping or stopped; build and start a new one to make calls"
+            )
         if self._inherited or (self._pid is not None and self._pid != os.getpid()):
             raise LLMQueueError(
                 f"this LLMQueue was started in process {self._pid} and this process is a fork "
@@ -300,13 +314,33 @@ class LLMQueue:
         """Publish / load the registry; run the worker side unless `mode=caller`.
 
         A second `start()` does nothing; a stopped queue cannot start again (build a new one).
-        The first started queue of the process is the LangChain default and stays so.
+        The first started queue of the process is the LangChain default and stays so. Starts
+        run one at a time; a start that fails part-way stops what it started (the queue is then
+        stopped) and re-raises.
         """
         self._check()
-        if self.started:
-            return
-        if self._stopped:
-            raise LLMQueueError("this LLMQueue was stopped; build a new one to start again")
+        if self._start_lock is None:
+            self._start_lock = asyncio.Lock()
+        async with self._start_lock:
+            # Re-checked under the lock: two concurrent starts both passed an unlocked check
+            # and started every background task twice (CO-5).
+            if self.started:
+                return
+            if self._stopped:
+                raise LLMQueueError("this LLMQueue was stopped; build a new one to start again")
+            try:
+                await self._start()
+            except BaseException:
+                # The engine's tasks kept running with started=False, and a retry started them
+                # again (CO-5): stop everything this start began, then re-raise.
+                try:
+                    await self.stop(drain_secs=0)
+                except Exception as cleanup:  # the start's own error is the one to raise
+                    logger.warning("start_rollback_failed", error=repr(cleanup))
+                raise
+
+    async def _start(self) -> None:
+        """The steps of `start()`, under its lock."""
         if any(q.started and not q._inherited for q in _QUEUES if q is not self):
             logger.warning(
                 "second_llm_queue_started",
@@ -337,7 +371,9 @@ class LLMQueue:
         """Shut down in order (plan §3.18) and close every client; a second call does nothing.
 
         `drain_secs` (default `LLMQ_DRAIN_SECS`) bounds the whole wait: jobs first (they make
-        calls), then running calls get what is left of it.
+        calls), then running calls get what is left of it. Every step runs even when an earlier
+        one fails (each failure is logged) and the first failure is raised at the end; if the
+        stop is cancelled, the steps left still close their clients, without draining.
         """
         from llm_queue.langchain import get_default_queue, set_default_queue
 
@@ -352,11 +388,34 @@ class LLMQueue:
         loop = asyncio.get_running_loop()
         drain = self.engine.settings.drain_secs if drain_secs is None else drain_secs
         until = loop.time() + drain
-        await self.jobs.stop(drain_secs=drain)
-        await self.engine.stop(drain_secs=max(0.0, until - loop.time()))
-        await asyncio.to_thread(self.close_sync)  # blocking: off the event loop
-        await self.engine.aclose()
-        await _close_offload(self._offload)
+        # One step that raised skipped every later one, and `_stopped` made a second stop()
+        # return at once, so store pools, provider sessions and the S3 client leaked (CO-1).
+        cancelled = False
+        steps: list[tuple[str, Callable[[], Awaitable[Any]]]] = [
+            ("jobs", lambda: self.jobs.stop(drain_secs=0 if cancelled else drain)),
+            (
+                "engine",
+                lambda: self.engine.stop(
+                    drain_secs=0 if cancelled else max(0.0, until - loop.time())
+                ),
+            ),
+            ("sync", lambda: asyncio.to_thread(self.close_sync)),  # blocking: off the loop
+            ("engine_close", self.engine.aclose),
+            ("offload", lambda: _close_offload(self._offload)),
+        ]
+        failures: list[Exception] = []
+        for name, step in steps:
+            try:
+                await step()
+            except asyncio.CancelledError:
+                cancelled = True  # close the rest, then let the cancellation through
+            except Exception as exc:
+                logger.warning("stop_step_failed", step=name, error=repr(exc))
+                failures.append(exc)
+        if cancelled:
+            raise asyncio.CancelledError
+        if failures:
+            raise failures[0]
 
     # ---------------------------------------------------------------- calls
 
@@ -375,7 +434,7 @@ class LLMQueue:
         self, model: str, params: Mapping[str, Any], *, priority: bool | None = None, **kw: Any
     ) -> Reply:
         """Any operation of a model (`converse`, `chat`, `invoke_model`, `embeddings`)."""
-        self._check()
+        self._check(work=True)
         return await self.engine.call(model, params, **self._call_kwargs(priority, **kw))
 
     async def converse(
@@ -398,7 +457,7 @@ class LLMQueue:
         Bedrock models yield ConverseStream events, OpenAI-compatible ones chat completion
         chunks. A failure after events were yielded raises `CallFailed` with `partial_text`.
         """
-        self._check()
+        self._check(work=True)
         kwargs = self._call_kwargs(priority, **kw)
         async for event in self.engine.stream(model, request, **kwargs):
             yield event
@@ -420,7 +479,7 @@ class LLMQueue:
         `partial=True` keeps the batches that succeeded (see `EmbedResult.errors`); by default
         one failed batch fails the call. `request_id=X` names batch n `X:n`.
         """
-        self._check()
+        self._check(work=True)
         return await _embed(
             self.engine, model, texts, input_type, partial, False, self._call_kwargs(priority, **kw)
         )
@@ -429,7 +488,7 @@ class LLMQueue:
 
     def _run_sync(self, make: Callable[[Engine], Coroutine[Any, Any, _T]]) -> _T:
         """Run a call from sync code: on the started queue's loop, else on the private loop."""
-        self._check(same_loop=False)
+        self._check(same_loop=False, work=True)
         loop = self._loop
         if self.started and loop is not None and not loop.is_closed():
             with contextlib.suppress(RuntimeError):
@@ -438,7 +497,7 @@ class LLMQueue:
                         "a sync call on the thread that runs this queue's event loop would "
                         "deadlock; await converse / chat / embed there instead"
                     )
-            return asyncio.run_coroutine_threadsafe(make(self.engine), loop).result()
+            return _wait_on_loop(asyncio.run_coroutine_threadsafe(make(self.engine), loop), loop)
         return self._sync_runner().run(make)
 
     def _sync_runner(self) -> _SyncRunner:
@@ -450,6 +509,10 @@ class LLMQueue:
             if self._builder is None:
                 raise LLMQueueError("sync calls need LLMQueue.from_env (a second, private engine)")
             with self._sync_lock:  # threads making their first sync call together build one
+                if self._stopped:  # stop() closed the runner; a new one would leak (CO-6)
+                    raise LLMQueueError(
+                        "this LLMQueue is stopping or stopped; build a new one to make calls"
+                    )
                 if self._sync is None:
                     self._sync = _SyncRunner(self._builder, self._offload)
                 runner = self._sync
@@ -512,7 +575,7 @@ class LLMQueue:
         `CallFailed("queue_full")` when 10,000 jobs of this name already wait (it raised the
         queue's internal `QueueFull` before).
         """
-        self._check()
+        self._check(work=True)
         try:
             return await self.jobs.send(name, payload, job_id=job_id)
         except QueueFull as exc:
@@ -595,8 +658,30 @@ async def _close_offload(offload: ResultOffload | None) -> None:
     """Close the offload's client of the running loop, if it has one (S3Offload does)."""
     close = getattr(offload, "aclose", None)
     if close is not None:
-        with contextlib.suppress(Exception):
+        try:
             await close()
+        except Exception as exc:  # logged, not raised: a failing S3 close vanished (CO-8)
+            logger.warning("offload_close_failed", error=repr(exc))
+
+
+def _wait_on_loop(future: Future[_T], loop: asyncio.AbstractEventLoop) -> _T:
+    """Wait for a call sent to a started queue's loop, or fail when that loop stops running.
+
+    A loop that was stopped (not closed) never runs the call, and `.result()` with no
+    timeout blocked the sync caller forever (CO-26).
+    """
+    while True:
+        try:
+            return future.result(timeout=_LOOP_CHECK_SECS)
+        except TimeoutError:
+            if loop.is_running():
+                continue
+            future.cancel()
+            raise CallFailed(
+                "worker_shutdown", "the event loop of this LLMQueue stopped running"
+            ) from None
+        except concurrent.futures.CancelledError as exc:
+            raise CallFailed("cancelled", "the call was cancelled on the queue's loop") from exc
 
 
 class _PrivateLoop:
@@ -636,6 +721,7 @@ class _SyncRunner:
         self._private = _private_loop()
         self._offload = offload
         self._closing = False
+        self._lock = threading.Lock()
         self._calls: set[Future[Any]] = set()
 
         async def boot() -> Engine:
@@ -647,12 +733,18 @@ class _SyncRunner:
 
     def run(self, fn: Callable[[Engine], Coroutine[Any, Any, _T]]) -> _T:
         """Run one call on the private loop and wait for it."""
-        if self._closing:
-            raise LLMQueueError("the sync runner is closed")
-        future = self._private.submit(fn(self._engine))
-        self._calls.add(future)
+        # The check and the add are one step under the lock that close() takes: a call
+        # submitted after close() took its snapshot ran on the stopped engine (CO-7).
+        with self._lock:
+            if self._closing:
+                raise LLMQueueError("the sync runner is closed; build a new LLMQueue")
+            future = self._private.submit(fn(self._engine))
+            self._calls.add(future)
         try:
             return future.result()
+        except concurrent.futures.CancelledError as exc:
+            # A plain Exception outside the one error family (CO-7).
+            raise CallFailed("cancelled", "the sync runner was closed") from exc
         finally:
             self._calls.discard(future)
 
@@ -662,17 +754,25 @@ class _SyncRunner:
         Their callers get the error: before, a call running at close never returned. The
         loop itself stays for the other queues of the process.
         """
-        self._closing = True
-        for future in list(self._calls):
+        with self._lock:
+            self._closing = True
+            calls = list(self._calls)
+        for future in calls:
             future.cancel()
 
         async def stop() -> None:
-            await self._engine.stop(drain_secs=1)
-            await self._engine.aclose()
-            await _close_offload(self._offload)
+            try:
+                await self._engine.stop(drain_secs=1)
+            finally:
+                try:
+                    await self._engine.aclose()
+                finally:
+                    await _close_offload(self._offload)
 
-        with contextlib.suppress(Exception):
-            self._private.submit(stop()).result(timeout=10)
+        try:
+            self._private.submit(stop()).result(timeout=_SYNC_CLOSE_SECS)
+        except Exception as exc:  # logged: a failed or timed-out close vanished (CO-8)
+            logger.warning("sync_engine_close_failed", error=repr(exc))
 
 
 def _after_fork_in_child() -> None:

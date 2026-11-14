@@ -165,6 +165,42 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 - Docs: eight statements that did not match the code (readiness probe, invalid stored registry,
   older services, the `all` live-edit mode, account kinds, `ConfigError` timing, the exception
   tree).
+- `LLMQueue.stop()` skipped every later close step when one failed, and a second `stop()` did
+  nothing, so store pools, provider sessions and the S3 client leaked; every step now runs and
+  the first failure is raised at the end. `start()` is serialised (two concurrent starts doubled
+  every background task) and a start that fails part-way stops what it started.
+- Calls, streams, jobs and sync calls after `stop()` raise a clear `LLMQueueError` (they failed
+  on a closed pool, and a sync call built a new private engine that nothing closed). A sync
+  call cancelled by `close_sync()` raises `CallFailed("cancelled")`, not
+  `concurrent.futures.CancelledError`; a sync call to a loop that was stopped but not closed
+  fails with `CallFailed("worker_shutdown")` instead of blocking forever. Offload and sync-engine
+  close failures are logged instead of swallowed.
+- The registry reload loop ended for good, silently, on any error other than a store or config
+  error (a corrupt change counter); it now logs it and backs off, up to 30 s.
+- A failing registry restore on the call path raised a config error into the call; it is logged
+  and the next reload retries. Publishes and live edits that lose a race retry with a jittered,
+  doubling backoff (concurrent editors used up their tries together), and `RegistryConflict`
+  says how many tries ran.
+- Rollback did nothing when a deploy published between its version read and its publish; it now
+  retries. A long actor no longer goes past the actor limit, and a corrupt history entry or
+  audit entry raises `ConfigError` or is skipped instead of a JSON error.
+- An edit followed by a flushed store raised `AssertionError`; it raises `StoreUnavailable`.
+- A publish deletes the resolved numbers of models the deploy removed (they stayed forever) and
+  no longer sends the stored registry back on every pod boot (reply 3682 -> 12 bytes).
+- Deploy-only and protected registry settings are read from the `SETTINGS` table
+  (`Spec.deploy_only` / `Spec.protected` were never read); `debug_capture` and `model_fallback`
+  are marked there. `refused_edits` raises `ConfigError` for an unknown mode (was `ValueError`).
+- `block()` of an unknown account or region lists the known names and a close match; reading the
+  registry before it was loaded says to call `LLMQueue.start()` first.
+- A log field value with a newline printed as two lines (a forged entry); such values are
+  rendered with `repr()`. `Tuning` choice fields are checked by `section.field`.
+
+### Performance
+
+- Log calls below the logger's level are dropped before the message is built: a disabled `info`
+  call 9.2 -> 5.3 us (Python 3.12.13, Windows, 2026-11-15).
+- `alias_of(model_id)` is one dict lookup instead of a scan of every model: 2674 -> 241 ns with
+  55 models (Python 3.12.13, 2026-11-15).
 
 ### Security
 

@@ -159,3 +159,23 @@ def test_admission_script_timings_are_checked() -> None:
     assert Tuning(engine=EngineTimings(admission_probe_wait_ms=0)).problems() == [
         "engine.admission_probe_wait_ms must be above 0"
     ]
+
+
+def test_choice_fields_are_keyed_by_section(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CO-23: `_CHOICES` was keyed by bare field name.
+
+    A number field named `http` or `transport` in another section would have been checked as
+    a choice. The option classes now also use slots, like the package's other dataclasses.
+    """
+    from dataclasses import make_dataclass
+
+    from llm_queue import tuning as tuning_module
+
+    bad = Tuning(bedrock=BedrockOptions(transport="x")).problems()
+    assert bad == ["bedrock.transport must be one of botocore, aiohttp"]
+    assert not hasattr(Tuning(), "__dict__")
+    assert not hasattr(EngineTimings(), "__dict__")
+    section = make_dataclass("EngineTimings", [("http", int)], frozen=True)
+    monkeypatch.setattr(tuning_module, "EngineTimings", section)  # an engine field `http`
+    assert tuning_module._check_part(section(http=-1)) == ["engine.http must be above 0"]
+    assert tuning_module._check_part(section(http=5)) == []

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, fields
 from typing import Any, Literal
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class StoreOptions:
     """The Valkey / Redis client of every process (`engine/store_client.py`).
 
@@ -31,7 +31,7 @@ class StoreOptions:
     pool_wait_secs: float = 10.0  # a burst waits this long for a free connection
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class BedrockOptions:
     """The Bedrock and STS clients (`clients/pool.py`)."""
 
@@ -44,7 +44,7 @@ class BedrockOptions:
     transport: str = "aiohttp"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class OpenAIOptions:
     """The OpenAI-compatible clients' timeouts, connection pool and HTTP client (one per account).
 
@@ -61,7 +61,7 @@ class OpenAIOptions:
     http: Literal["httpx", "aiohttp"] = "aiohttp"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class WarmOptions:
     """Warm connections per Bedrock client (E4); pass `connections=0` to turn it off.
 
@@ -77,7 +77,7 @@ class WarmOptions:
     keepalive_secs: float = 15.0  # aiohttp keeps an idle pooled connection this long
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class EngineTimings:
     """Pacing of the engine's loops (`engine/runtime.py`, `engine/streaming.py`)."""
 
@@ -108,7 +108,7 @@ class EngineTimings:
     job_ttl_ms: int = 3_600_000  # a claim record made by a worker lives this long
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RegistryOptions:
     """The registry store (`registry/store.py`).
 
@@ -119,7 +119,7 @@ class RegistryOptions:
     edit_retries: int = 3  # a live edit that raced another one is retried this often
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Tuning:
     """All of the above; `Tuning()` is the defaults. Passed to `LLMQueue.from_env(tuning=)`."""
 
@@ -192,8 +192,10 @@ class Tuning:
 BEDROCK_TRANSPORTS = ("botocore", "aiohttp")
 # Fields where 0 is valid: no store retries; no warm connections, or no refresh (off).
 _ZERO_OK = frozenset({"retries", "connections", "refresh_secs"})
-# Fields that name a choice instead of a number: `bedrock.transport`, `openai.http`.
-_CHOICES = {"transport": BEDROCK_TRANSPORTS, "http": ("httpx", "aiohttp")}
+# Fields that name a choice instead of a number, by `section.field`: keyed by the bare field
+# name, a future number field called `http` or `transport` in another section was checked as
+# a choice (CO-23).
+_CHOICES = {"bedrock.transport": BEDROCK_TRANSPORTS, "openai.http": ("httpx", "aiohttp")}
 
 
 def _check_part(part: Any) -> list[str]:
@@ -211,7 +213,7 @@ def _check_part(part: Any) -> list[str]:
         value = getattr(part, spec.name)
         name = f"{section}.{spec.name}"
         whole = spec.type in ("int", int)
-        if (choices := _CHOICES.get(spec.name)) is not None:
+        if (choices := _CHOICES.get(name)) is not None:
             if value not in choices:
                 out.append(f"{name} must be one of {', '.join(choices)}")
         elif isinstance(value, bool) or not isinstance(value, int | float):
