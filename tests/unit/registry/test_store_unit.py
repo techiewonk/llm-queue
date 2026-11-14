@@ -103,9 +103,7 @@ class _Client:
         return self.history.get(field)
 
 
-def _store(
-    client: _Client, *, sleeps: list[float] | None = None, **kw: Any
-) -> RegistryStore:
+def _store(client: _Client, *, sleeps: list[float] | None = None, **kw: Any) -> RegistryStore:
     async def sleep(secs: float) -> None:
         if sleeps is not None:
             sleeps.append(secs)
@@ -199,7 +197,8 @@ def test_deploy_only_and_protected_come_from_the_settings_table(full: dict[str, 
     """
     deploy_only = [n for n, s in SETTINGS.items() if s.deploy_only]
     protected = [n for n, s in SETTINGS.items() if s.protected]
-    assert deploy_only and protected
+    assert deploy_only
+    assert protected
     assert set(protected) == set(_PROTECTED_WHY)  # every protected setting says why
     for name in deploy_only:
         for path in (("defaults", name), ("models", "gpt20b", name)):
@@ -242,7 +241,7 @@ async def test_edit_conflict_retries_with_backoff_then_raises(
     sleeps: list[float] = []
     store = _store(client, sleeps=sleeps, edit_retries=4)
     script = _Script(lambda: [b"conflict", 1])
-    store._edit = script
+    store._edit = script  # type: ignore[assignment]  # a fake script
     with pytest.raises(RegistryConflict, match="4 tries"):
         await store.set({"rpm": 5}, model="gpt20b", actor="op")
     assert len(script.calls) == 4
@@ -257,7 +256,7 @@ async def test_publish_conflict_retries_with_backoff_then_raises(
     sleeps: list[float] = []
     store = _store(client, sleeps=sleeps, edit_retries=1)
     script = _Script(lambda: [b"conflict", 1])
-    store._publish = script
+    store._publish = script  # type: ignore[assignment]  # a fake script
     with pytest.raises(RegistryConflict, match="3 tries"):
         await store.publish(full, actor="op")
     assert len(script.calls) == 3
@@ -273,7 +272,7 @@ async def test_edit_then_flushed_store_is_store_unavailable(full: dict[str, Any]
         client.doc, client.meta = None, {}
         return [b"ok", 2]
 
-    store._edit = _Script(flush)
+    store._edit = _Script(flush)  # type: ignore[assignment]  # a fake script
     with pytest.raises(StoreUnavailable, match="vanished"):
         await store.set({"rpm": 5}, model="gpt20b", actor="op")
 
@@ -373,10 +372,10 @@ async def test_block_of_an_unknown_name_lists_the_known_ones(full: dict[str, Any
     """CO-27: `unknown account 'x'` gave no hint of the names the registry does use."""
     client = _Client(full, _meta())
     store = _store(client)
-    with pytest.raises(ConfigError, match="call LLMQueue.start"):
+    with pytest.raises(ConfigError, match=r"call LLMQueue.start"):
         _ = store.current
     await store.load()
-    with pytest.raises(ConfigError, match="did you mean 'aws-main'.*known: aws-dr, aws-main"):
+    with pytest.raises(ConfigError, match=r"did you mean 'aws-main'.*known: aws-dr, aws-main"):
         await store.block(account="aws-mian", on=True, actor="op")
-    with pytest.raises(ConfigError, match="known: .*ap-south-1"):
+    with pytest.raises(ConfigError, match=r"known: .*ap-south-1"):
         await store.block(region="mars-1", on=True, actor="op")

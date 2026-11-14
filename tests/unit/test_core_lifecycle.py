@@ -173,10 +173,15 @@ async def test_calls_after_stop_get_a_clear_error() -> None:
 async def test_sync_call_after_stop_builds_no_new_engine() -> None:
     """CO-6: `converse_sync` after stop() built a new private engine that nothing closed."""
     built: list[bool] = []
+
+    def build() -> Any:
+        built.append(True)
+        return _Engine()
+
     queue = LLMQueue(
         _Engine(),  # type: ignore[arg-type]  # a fake
         settings=SimpleNamespace(mode="caller"),  # type: ignore[arg-type]
-        builder=lambda: built.append(True) or _Engine(),  # type: ignore[arg-type, func-returns-value]
+        builder=build,
     )
     await queue.start()
     await queue.stop()

@@ -171,7 +171,7 @@ def test_choice_fields_are_keyed_by_section(monkeypatch: pytest.MonkeyPatch) -> 
 
     from llm_queue import tuning as tuning_module
 
-    bad = Tuning(bedrock=BedrockOptions(transport="x")).problems()  # type: ignore[arg-type]
+    bad = Tuning(bedrock=BedrockOptions(transport="x")).problems()
     assert bad == ["bedrock.transport must be one of botocore, aiohttp"]
     assert not hasattr(Tuning(), "__dict__")
     assert not hasattr(EngineTimings(), "__dict__")
