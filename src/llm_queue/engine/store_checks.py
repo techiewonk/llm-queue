@@ -8,11 +8,12 @@ scripts fail on their first call. `check_store` warns on the first and refuses t
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from redis.exceptions import RedisError
 
 from llm_queue._logging import get_logger
+from llm_queue.engine._codec import text as _text
 from llm_queue.errors import ConfigError
 
 if TYPE_CHECKING:
@@ -21,10 +22,6 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 UNKNOWN = "unknown"
-
-
-def _text(value: Any) -> str:
-    return value.decode() if isinstance(value, bytes) else str(value)
 
 
 async def eviction_policy(client: redis.asyncio.Redis) -> str:
@@ -38,14 +35,14 @@ async def eviction_policy(client: redis.asyncio.Redis) -> str:
         for key, value in (reply or {}).items():
             if _text(key) == "maxmemory-policy" and value:
                 return _text(value)
-    except (RedisError, OSError):
-        pass
+    except (RedisError, OSError) as exc:  # a trace, not silence (EN-22)
+        logger.debug("store_check_skipped", check="config_get", error=type(exc).__name__)
     try:
         info = await client.info("memory")
         if info.get("maxmemory_policy"):
             return _text(info["maxmemory_policy"])
-    except (RedisError, OSError):
-        pass
+    except (RedisError, OSError) as exc:
+        logger.debug("store_check_skipped", check="info_memory", error=type(exc).__name__)
     return UNKNOWN
 
 
@@ -63,8 +60,9 @@ async def cluster_enabled(client: redis.asyncio.Redis) -> bool:
     """True when the store runs in cluster mode (`INFO cluster`: `cluster_enabled:1`)."""
     try:
         info = await client.info("cluster")
-    except (RedisError, OSError):
-        return False  # unreadable: the first script call reports it
+    except (RedisError, OSError) as exc:  # unreadable: the first script call reports it
+        logger.debug("store_check_skipped", check="info_cluster", error=type(exc).__name__)
+        return False
     return _text(info.get("cluster_enabled", 0)) == "1"
 
 

@@ -217,6 +217,64 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   registry before it was loaded says to call `LLMQueue.start()` first.
 - A log field value with a newline printed as two lines (a forged entry); such values are
   rendered with `repr()`. `Tuning` choice fields are checked by `section.field`.
+- `llmq_grants_lost_total` was counted with labels `(model, step)` on finish but `(step)` on
+  the heartbeat; with the Prometheus sink the second form raised, after the provider had
+  answered. Both now use `(model, step)`, and `PrometheusSink` logs and drops a point whose
+  labels do not fit instead of raising into a call (EN-1).
+- `Admission.undo` skips (returns False, logs `undo_skipped`) when the store is unreachable,
+  like `finish`, instead of raising (EN-16). A re-settled owner no longer stops the pruning of
+  the settled-owner memory (EN-17).
+- A custom `token_estimator` that raises falls back to characters / 4 with one `hook_failed`
+  warning, and a request with `"inferenceConfig": None` (or `additionalModelRequestFields:
+  None`) gets the defaults filled in. Both used to raise into the worker loop, which returned the
+  message at once with no failure counted, so it spun until its deadline (EN-2). A
+  `token_estimator` name that is not registered now warns once (EN-15).
+- A large result is offloaded to S3 once even when its store write is retried through an
+  outage (each 0.5 s retry uploaded it again, up to ~120 orphaned objects). An offload write
+  that fails keeps the result inline (up to 64 MB) instead of raising a botocore error, which
+  released the message and ran a call the provider had already answered a second time (EN-3).
+- A store blip after an offloaded result was read no longer loses it: the read-marker cleanup
+  is skipped with a warning, where the caller used to read again, find the object deleted and
+  get `result_expired` (EN-4).
+- `S3Offload.get` reads a result as gone only on S3's `NoSuchKey` / `404` error code; any error
+  whose text held "404" (a request id, a host) was reported as `result_expired` (EN-11).
+- An embedding reply the parser cannot read is a `CallFailed("provider_error")`; a raw
+  `KeyError` / `ValueError` aborted every batch of `embed_partial` and reached the app outside
+  `LLMQueueError` (EN-6).
+- Job runner: `stop()` lets each loop finish a receive in flight before cancelling it (a cancel
+  inside RECEIVE hid the message it took for the visibility time and charged it a failure,
+  EN-8); a cancelled `stop()` now raises `CancelledError` instead of returning normally, and
+  task errors are logged (EN-7); an idle loop sleeps on the jobs queue's doorbell instead of
+  polling RECEIVE about 7 times a second (EN-29); a job whose ack failed every try logs
+  `job_ack_gave_up` and counts `llmq_job_ack_failed_total` (EN-32).
+- Chunk streams: stopping a writer's flush timer or closing a reader no longer swallows the
+  caller's own cancellation (EN-7); a failed background flush is logged when it happens
+  (EN-19); during a store outage the reader logs the first failure and the recovery and backs
+  off to 5 s (it warned every 0.5 s), and `aclose` also cancels pending wake-ups (EN-18).
+- `llm-queue redrive` drops (and reports) a dead letter without a body instead of failing
+  part-way with some letters already moved, rings the queue's doorbell so an idle worker takes
+  the redriven calls at once, and trims the stream like a send (EN-12). `ring_again` sets the
+  doorbell's cap and TTL; it could create a bell with no TTL (EN-13).
+- A failed health probe doubles the last wait (starting from the model's `probe_after_secs`)
+  instead of jumping to at least 60 s; `Health.probed(probe_after_secs=)` sets the floor
+  (EN-23).
+- The alert loop writes its change markers with one pipelined `SET ... EX GET` per alert (500
+  per pipeline) instead of `GETSET` then `EXPIRE`: 2 x N serial round trips per sample became
+  N / 500 (about 1,840 alerts at 20 models x 30 deployments; time saved unverified) (EN-9).
+  `Alert` is frozen (EN-25).
+- The HTTP status, request, registry and write routes answer 503 `state store unavailable`
+  during a store outage; redis-py's `ConnectionError` reached FastAPI as a 500 (EN-10).
+- `llm-queue`: a store error prints one line and exits 1 instead of a traceback; both store
+  clients are closed even when the first close raises; `registry gc` escapes glob characters of
+  `LLMQ_KEY_PREFIX` in its SCAN pattern and deletes with pipelined `UNLINK` (EN-30).
+- The store checks log (debug) why the eviction or cluster check could not run (EN-22).
+  `FreshPassword` reads the secret in a worker thread on the asyncio client, so a slow lookup
+  no longer blocks the event loop on every reconnect; `secrets` should still cache (EN-31).
+- The store client retries a command whose connection dropped, even when the server already
+  ran it. FAIL now ends its receipt (generation + 1, like RETURN), so a replay is `stale` and
+  one failure is counted, not two. A replayed RECEIVE still takes a second batch (the first is
+  hidden for the visibility time and charged one failure) and a replayed plain SEND appends
+  twice; both are rare and bounded, and are documented in `store_client.py` (EN-5).
 
 ### Performance
 

@@ -42,11 +42,24 @@ class InferenceRejected(LLMQueueError):
 
 
 def _get(params: Mapping[str, Any], path: tuple[str, str]) -> Any:
-    return (params.get(path[0]) or {}).get(path[1])
+    section = params.get(path[0])
+    return section.get(path[1]) if isinstance(section, Mapping) else None
+
+
+def _section(params: dict[str, Any], name: str) -> dict[str, Any]:
+    """The sub-dict `name` of a request, made a dict first.
+
+    A request may carry `"inferenceConfig": None`: `setdefault` returned that None and the
+    write raised `TypeError` into the call loop (EN-2).
+    """
+    current = params.get(name)
+    section = dict(current) if isinstance(current, Mapping) else {}
+    params[name] = section
+    return section
 
 
 def _set(params: dict[str, Any], path: tuple[str, str], value: Any) -> None:
-    params.setdefault(path[0], {})[path[1]] = value
+    _section(params, path[0])[path[1]] = value
 
 
 def apply(
@@ -73,7 +86,7 @@ def apply(
                 _set(out, path, value)
         extra = defaults.get("extra")
         if extra:
-            fields = out.setdefault("additionalModelRequestFields", {})
+            fields = _section(out, "additionalModelRequestFields")
             for key, value in extra.items():
                 fields.setdefault(key, value)
         cap = limits.get("max_tokens")

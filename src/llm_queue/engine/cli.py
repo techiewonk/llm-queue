@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import getpass
 import json
 import os
@@ -20,7 +21,9 @@ from typing import Any
 
 import orjson
 import redis.asyncio
+from redis.exceptions import RedisError
 
+from llm_queue.engine._codec import text as _text
 from llm_queue.engine.http import redacted
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import StreamQueues
@@ -31,9 +34,12 @@ from llm_queue.errors import ConfigError, LLMQueueError
 from llm_queue.registry.store import RegistryStore
 from llm_queue.tuning import Tuning
 
+_GC_BATCH = 500  # keys per UNLINK pipeline in `registry gc`
 
-def _text(value: Any) -> str:
-    return value.decode() if isinstance(value, bytes) else str(value)
+
+def _glob_escape(text: str) -> str:
+    """`text` matched literally in a SCAN pattern (glob characters and backslash escaped)."""
+    return "".join(f"\\{c}" if c in "*?[]\\" else c for c in text)
 
 
 def _value(text: str) -> Any:
@@ -217,7 +223,9 @@ class Cli:
         prefix = self.keys.prefix
         doomed: list[tuple[Any, str]] = []
         removed: set[str] = set()
-        async for key in self.client.scan_iter(match=f"{prefix}:{{m:*", count=500):
+        # The prefix is escaped: a `[`, `*` or `?` in LLMQ_KEY_PREFIX widened the match (EN-30).
+        glob = _glob_escape(prefix)
+        async for key in self.client.scan_iter(match=f"{glob}:{{m:*", count=500):
             alias = _text(key).split("{m:", 1)[1].split("}", 1)[0]
             if alias not in known:
                 doomed.append((self.client, _text(key)))
@@ -235,16 +243,21 @@ class Cli:
         gone = {self.settings.queue_prefix + name for name in names - live}
         gone |= {f"{name}-priority" for name in gone}
         queue_client = self.queue_client or self.client
-        async for key in queue_client.scan_iter(match=f"{prefix}:{{q:*", count=500):
+        async for key in queue_client.scan_iter(match=f"{glob}:{{q:*", count=500):
             if _text(key).split("{q:", 1)[1].split("}", 1)[0] in gone:
                 doomed.append((queue_client, _text(key)))
         for name in sorted(gone):
             bell = self.queues.bell(name)
             if await queue_client.exists(bell):
                 doomed.append((queue_client, bell))
-        if go:
-            for client, key in doomed:
-                await client.delete(key)
+        if go:  # UNLINK in pipelined batches: one DEL round trip per key before (EN-30)
+            for client in {id(c): c for c, _ in doomed}.values():
+                mine = [key for c, key in doomed if c is client]
+                for start in range(0, len(mine), _GC_BATCH):
+                    async with client.pipeline(transaction=False) as pipe:
+                        for key in mine[start : start + _GC_BATCH]:
+                            pipe.unlink(key)
+                        await pipe.execute()
         out: dict[str, Any] = {"deleted_keys" if go else "would_delete": len(doomed)}
         out["queues"] = sorted(gone)
         return out
@@ -350,13 +363,13 @@ async def amain(argv: Sequence[str], environ: Mapping[str, str] | None = None) -
         if settings.queue_store_url
         else None
     )
-    try:
+    # An exit stack: when the first close raised, the queue client was never closed (EN-30).
+    async with contextlib.AsyncExitStack() as stack:
+        if queue_client is not None:
+            stack.push_async_callback(queue_client.aclose)
+        stack.push_async_callback(client.aclose)
         cli = Cli(settings, client, args.actor or getpass.getuser(), queue_client)
         return await cli.run(args)
-    finally:
-        await client.aclose()
-        if queue_client is not None:
-            await queue_client.aclose()
 
 
 def main(argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = None) -> int:
@@ -365,6 +378,9 @@ def main(argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = 
         result = asyncio.run(amain(sys.argv[1:] if argv is None else argv, environ))
     except (LLMQueueError, KeyError) as exc:  # a bad name or edit: one line, not a traceback
         print(str(exc), file=sys.stderr)
+        return 1
+    except RedisError as exc:  # an outage printed redis-py's traceback (EN-30)
+        print(f"state store error ({type(exc).__name__}): {exc}", file=sys.stderr)
         return 1
     print(json.dumps(result, indent=2, default=str))
     return 0

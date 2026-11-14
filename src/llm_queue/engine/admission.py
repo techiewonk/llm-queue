@@ -262,10 +262,18 @@ class Admission:
         return settled
 
     async def undo(self, alias: str, owner: str, request_id: str) -> bool:
-        """Give a grant back entirely, without learning (lost reply, refused claim)."""
+        """Give a grant back entirely, without learning (lost reply, refused claim).
+
+        Like `finish`, skipped (False, logged) when the store is unreachable: the lease expires
+        and SWEEP frees the slot. Callers no longer blanket-suppress its errors (EN-16).
+        """
         self._settle(owner)
         body = {"alias": alias, "owner": owner, "request_id": request_id}
-        return bool(await self._call(self._undo, body))
+        try:
+            return bool(await self._call(self._undo, body))
+        except (StoreConnectionError, StoreTimeoutError, ReadOnlyError, OSError) as exc:
+            logger.warning("undo_skipped", model=alias, request_id=request_id, error=str(exc))
+            return False
 
     async def renew(self, items: Sequence[tuple[str, str, str]]) -> int:
         """Extend leases of held grants: (alias, owner, request id) each; how many were held."""
@@ -296,12 +304,23 @@ class Admission:
         )
         if lost:
             logger.warning("grant_lost", step="renew", count=len(lost))
-            self.metrics.count("llmq_grants_lost_total", float(len(lost)), step="renew")
+            # Same label set as `finish` (model, step): prometheus fixes a metric's label
+            # names on first use, and the other form raised there (EN-1).
+            alias_of = {owner: alias for alias, owner, _ in items}
+            per_model: dict[str, int] = {}
+            for owner in lost:
+                alias = alias_of.get(owner, "*")
+                per_model[alias] = per_model.get(alias, 0) + 1
+            for alias, n in per_model.items():
+                self.metrics.count("llmq_grants_lost_total", float(n), model=alias, step="renew")
         return int(raw.get("n", 0)), lost
 
     def _settle(self, owner: str) -> None:
         """Remember a settled owner (before its script runs) for two leases, then forget it."""
         now = time.monotonic()
+        # Re-settling moves the owner to the end; it kept its old place and stopped the
+        # pruning below until it aged out (EN-17).
+        self._settled.pop(owner, None)
         self._settled[owner] = now
         horizon = now - 2 * self.lease_ms / 1000
         while (oldest := next(iter(self._settled))) != owner and self._settled[oldest] < horizon:

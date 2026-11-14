@@ -125,7 +125,14 @@ async def embed_partial(
             raise CallFailed(
                 "provider_error", f"{alias}: no embedding body", request_id=reply.request_id
             )
-        vectors = vectors_of(entry.provider, reply.response)
+        try:
+            vectors = vectors_of(entry.provider, reply.response)
+        except (KeyError, ValueError, TypeError, IndexError) as exc:
+            # A raw parse error is not a `CallFailed`: with `partial` it aborted every batch,
+            # and the app got an exception outside `LLMQueueError` (EN-6).
+            raise CallFailed(
+                "provider_error", f"{alias}: unreadable embedding body", request_id=reply.request_id
+            ) from exc
         if len(vectors) != len(group):
             message = f"{alias}: {len(group)} texts gave {len(vectors)} vectors"
             raise CallFailed("provider_error", message, request_id=reply.request_id)

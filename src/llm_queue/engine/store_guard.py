@@ -20,7 +20,8 @@ from llm_queue.errors import StoreUnavailable
 P = ParamSpec("P")
 R = TypeVar("R")
 
-_DOWN = (StoreConnectionError, StoreTimeoutError, ReadOnlyError, OSError)
+# Store trouble an admin path reports as "unavailable" (http.py and the CLI catch it too).
+STORE_DOWN = (StoreConnectionError, StoreTimeoutError, ReadOnlyError, OutOfMemoryError, OSError)
 
 
 def store_op(fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
@@ -32,7 +33,7 @@ def store_op(fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
             return await fn(*args, **kwargs)
         except OutOfMemoryError as exc:
             raise StoreUnavailable("the state store is out of memory") from exc
-        except _DOWN as exc:
+        except STORE_DOWN as exc:
             if isinstance(exc, StoreUnavailable):
                 raise
             raise StoreUnavailable(f"the state store is unreachable: {exc}") from exc

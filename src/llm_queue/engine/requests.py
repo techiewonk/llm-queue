@@ -1,11 +1,12 @@
 """Per-request records: the duplicate-id claim, the result and the request status.
 
-A call's record is written only if absent when it is sent and confirmed only after the send
-succeeded, so a failed send never leaves a phantom (plan §3.18 R23). Results are written once
-(and announced to the caller in the same script); a library id's result is deleted on its
-first read, an app id's kept `result_ttl_secs`. A final status is never replaced. Scripts use
-the store's clock.
+Results are written once and announced to the caller in the same script; a final status is
+never replaced. Used by the runtime on both the caller and the worker side.
 """
+
+# A call's record is written only if absent when it is sent and confirmed only after the send
+# succeeded, so a failed send never leaves a phantom (plan §3.18 R23). A library id's result is
+# deleted on its first read, an app id's kept `result_ttl_secs`. Scripts use the store's clock.
 
 from __future__ import annotations
 
@@ -14,7 +15,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import orjson
+from redis.exceptions import ConnectionError as StoreConnectionError
+from redis.exceptions import ReadOnlyError
+from redis.exceptions import TimeoutError as StoreTimeoutError
 
+from llm_queue._logging import get_logger
+from llm_queue.engine._codec import text as _text
 from llm_queue.engine.envelope import Reply
 from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.keys import Keys
@@ -25,7 +31,14 @@ from llm_queue.errors import ConfigError
 if TYPE_CHECKING:
     import redis.asyncio
 
+logger = get_logger(__name__)
 FINAL_STATES = ("done", "failed", "expired", "cancelled")
+_STORE_ERRORS = (StoreConnectionError, StoreTimeoutError, ReadOnlyError, OSError)
+# A result whose offload write failed is kept inline up to this size (the store takes 512 MB;
+# a result lives `result_ttl_secs`). Above it the caller gets `result_expired`.
+_INLINE_MAX_BYTES = 64 * 1024 * 1024
+# Prepared bodies of results whose store write failed, kept for the retry (oldest dropped).
+_UNSENT_MAX = 64
 
 _NOW_MS = """
 local t = redis.call('TIME')
@@ -249,13 +262,14 @@ class RequestStore:
             )
         self._client = client
         self.keys = keys
-        self.result_ttl = result_ttl_secs
-        self.dedupe = result_dedupe_secs
-        self.status_ttl = status_ttl_secs
-        self.unconfirmed = unconfirmed_secs
-        self.takeover_grace = takeover_grace_secs
+        self.result_ttl_secs = result_ttl_secs
+        self.result_dedupe_secs = result_dedupe_secs
+        self.status_ttl_secs = status_ttl_secs
+        self.unconfirmed_secs = unconfirmed_secs
+        self.takeover_grace_secs = takeover_grace_secs
         self.offload = offload
         self.offload_bytes = offload_bytes
+        self._unsent: dict[str, tuple[Reply, bytes]] = {}
         self._register = client.register_script(REGISTER)
         self._register_send = client.register_script(REGISTER_SEND)
         self._confirm = client.register_script(CONFIRM)
@@ -292,11 +306,11 @@ class RequestStore:
                 user_hash,
                 params_hash,
                 caller,
-                self.unconfirmed,
-                self.status_ttl,
+                self.unconfirmed_secs,
+                self.status_ttl_secs,
                 model,
                 "1" if priority else "0",
-                self.takeover_grace,
+                self.takeover_grace_secs,
                 "1" if app_id else "0",
             ],
         )
@@ -331,17 +345,17 @@ class RequestStore:
                 user_hash,
                 params_hash,
                 caller,
-                self.unconfirmed,
-                self.status_ttl,
+                self.unconfirmed_secs,
+                self.status_ttl_secs,
                 model,
                 "1" if priority else "0",
-                self.takeover_grace,
+                self.takeover_grace_secs,
                 "1" if app_id else "0",
                 body,
                 max_waiting,
                 retention_secs * 1000,
                 bell,
-                int(keep_secs) + self.status_ttl,
+                int(keep_secs) + self.status_ttl_secs,
             ],
         )
         outcome = _text(reply[0])
@@ -352,7 +366,7 @@ class RequestStore:
     async def confirm(self, request_id: str, *, keep_secs: float) -> None:
         """The send succeeded: keep the record until the deadline plus the status TTL."""
         job, callers, _, _ = self._req(request_id)
-        await self._confirm([job, callers], [int(keep_secs) + self.status_ttl])
+        await self._confirm([job, callers], [int(keep_secs) + self.status_ttl_secs])
 
     async def abandon(self, request_id: str, *, caller: str) -> None:
         """The send failed: remove this caller's unconfirmed record."""
@@ -365,24 +379,65 @@ class RequestStore:
         """Store a result once and wake its callers; False when one was already stored.
 
         With `status`, the request status is set to `final_state` with these fields in the
-        same script (as `set_status` would; None values are left out).
+        same script (as `set_status` would; None values are left out). Safe to call again
+        with the same `reply` after a store error: the body is offloaded only once.
         """
         job, callers, status_key, result = self._req(reply.request_id)
-        data = reply.dumps()
-        if self.offload is not None and self.offload_bytes and len(data) > self.offload_bytes:
-            data = MARKER + (await self.offload.put(reply.request_id, data)).encode()
+        data = await self._prepared(reply)
         args: list[Any] = [
             data,
-            self.result_ttl,
+            self.result_ttl_secs,
             final_state,
-            self.status_ttl,
+            self.status_ttl_secs,
             f"{self.keys.prefix}:done:",
             reply.request_id,
         ]
         if status is not None:
-            args += ["1", self.status_ttl, *_pairs(status)]
-        written = await self._put([result, job, callers, status_key], args)
+            args += ["1", self.status_ttl_secs, *_pairs(status)]
+        try:
+            written = await self._put([result, job, callers, status_key], args)
+        except BaseException:
+            # The runtime writes a result through a store outage by calling again every 0.5 s:
+            # keep the prepared body, or each try uploaded the result again (EN-3).
+            self._unsent[reply.request_id] = (reply, data)
+            while len(self._unsent) > _UNSENT_MAX:
+                self._unsent.pop(next(iter(self._unsent)))
+            raise
+        self._unsent.pop(reply.request_id, None)
         return bool(written)
+
+    async def _prepared(self, reply: Reply) -> bytes:
+        """The stored form of a reply: its JSON, or an offload marker when it is large.
+
+        An offload failure never raises: a botocore error was not a store error, so the call
+        the provider already answered was released and run again (EN-3). The body is kept
+        inline instead, up to `_INLINE_MAX_BYTES`; above that the caller gets a failure.
+        """
+        held = self._unsent.get(reply.request_id)
+        if held is not None and held[0] is reply:
+            return held[1]
+        data = reply.dumps()
+        if self.offload is None or not self.offload_bytes or len(data) <= self.offload_bytes:
+            return data
+        try:
+            return MARKER + (await self.offload.put(reply.request_id, data)).encode()
+        except Exception as exc:
+            logger.warning(
+                "offload_put_failed",
+                request_id=reply.request_id,
+                size_bytes=len(data),
+                error_type=type(exc).__name__,
+            )
+        if len(data) <= _INLINE_MAX_BYTES:
+            return data
+        failed = Reply(
+            request_id=reply.request_id,
+            ok=False,
+            error="result_expired",
+            message="the result could not be stored (offload failed)",
+            meta=reply.meta,
+        )
+        return failed.dumps()
 
     async def take_result(self, request_id: str) -> Reply | None:
         """A stored result; a library id's is then deleted (or kept `result_dedupe_secs`).
@@ -393,7 +448,7 @@ class RequestStore:
         """
         job, _, _, result = self._req(request_id)
         marker = MARKER if self.offload is not None else b""
-        raw = await self._take([result, job], [self.dedupe, marker])
+        raw = await self._take([result, job], [self.result_dedupe_secs, marker])
         if raw is None:
             return None
         if self.offload is not None and raw.startswith(MARKER):
@@ -409,14 +464,22 @@ class RequestStore:
                 raise CallFailed(
                     "result_expired", "the offloaded result is gone", request_id=request_id
                 )
-            await self._drop_read([result, job], [self.dedupe])
+            try:
+                await self._drop_read([result, job], [self.result_dedupe_secs])
+            except _STORE_ERRORS as exc:
+                # The body is in hand and the offload may have deleted it on read: raising
+                # here made the caller read again, find it gone and get `result_expired`
+                # (EN-4). The marker expires with the result TTL.
+                logger.warning(
+                    "result_drop_skipped", request_id=request_id, error_type=type(exc).__name__
+                )
             raw = body
         return Reply.model_validate(orjson.loads(raw))
 
     async def set_status(self, request_id: str, state: str, **fields: Any) -> bool:
         """Write a status (False when a final state was already there)."""
         done = await self._status(
-            [self.keys.status(request_id)], [state, self.status_ttl, *_pairs(fields)]
+            [self.keys.status(request_id)], [state, self.status_ttl_secs, *_pairs(fields)]
         )
         return bool(done)
 
@@ -440,7 +503,3 @@ def _pairs(fields: Mapping[str, Any]) -> list[str]:
     return [
         part for name, value in fields.items() if value is not None for part in (name, str(value))
     ]
-
-
-def _text(value: Any) -> str:
-    return value.decode() if isinstance(value, bytes) else str(value)

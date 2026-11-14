@@ -1,15 +1,18 @@
 """The store client (Valkey / Redis) every process builds: one place for its failover options.
 
-A managed store (ElastiCache) fails over by promoting the replica and moving the endpoint's DNS
-name. Pooled connections still reach the old primary, now a replica, and every write gets
-`READONLY`; redis-py keeps such a connection, so without these options the queue stayed down
-after a failover until the process restarted (measured, CHANGELOG 0.3.0). Here `READONLY`, like
-a dropped connection, closes the connection and retries on a new one, which resolves the name
-again. Used by `LLMQueue.from_env` and the `llm-queue` CLI.
+`READONLY`, like a dropped connection, closes the connection and retries on a new one.
+Used by `LLMQueue.from_env` and the `llm-queue` CLI.
 """
+
+# A managed store (ElastiCache) fails over by promoting the replica and moving the endpoint's
+# DNS name. Pooled connections still reach the old primary, now a replica, and every write gets
+# `READONLY`; redis-py keeps such a connection, so without these options the queue stayed down
+# after a failover until the process restarted (measured, CHANGELOG 0.3.0). A new connection
+# resolves the name again.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
 
@@ -49,6 +52,14 @@ def store_client(
         # failover drill. redis-py's Retry retries TimeoutError by default and
         # `retry_on_error` only adds to that list, so the list is given to Retry itself
         # (measured: a half-open store hung a command 60 s with the default, 15 s without).
+        # A connection reset mid-reply is retried too, and the script may already have run
+        # (EN-5). Scripts with a receipt or owner check are safe to replay (ACK, RETURN,
+        # EXTEND, FAIL, which ends its receipt, the admission scripts, REGISTER_SEND). Two are
+        # not: a replayed RECEIVE takes a second batch (the first stays hidden for the
+        # visibility time and is charged one failure when it lapses, within max_receives), and
+        # a replayed plain SEND appends twice (jobs run at least once; a call's duplicate finds
+        # its request id claimed). Both are rare and bounded; removing them needs a retry-free
+        # connection or a per-call token write on every RECEIVE (not done: unmeasured).
         "retry": Retry(
             EqualJitterBackoff(cap=1.0, base=0.05),
             opts.retries,
@@ -81,6 +92,14 @@ class FreshPassword(CredentialProvider):
         """The password as the secret holds it now (redis-py asks per new connection)."""
         password = self._secrets(self._name) or ""
         return (self._username, password) if self._username else (password,)
+
+    async def get_credentials_async(self) -> tuple[str] | tuple[str, str]:
+        """`get_credentials` in a worker thread: the asyncio client asks this one.
+
+        A network-backed `secrets` lookup ran on the event loop on every reconnect, stalling
+        every call during a failover (EN-31). `secrets` should still cache its values.
+        """
+        return await asyncio.to_thread(self.get_credentials)
 
 
 def secret_store_client(

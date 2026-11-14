@@ -102,10 +102,16 @@ def get(kind: str, name: str | None) -> Callable[..., Any] | None:
     if not name:
         return None
     fn = _HOOKS[kind].get(name)
-    if fn is None and ("missing", kind, name) not in _WARNED:
+    if fn is None:
+        warn_missing(kind, name)
+    return fn
+
+
+def warn_missing(kind: str, name: str) -> None:
+    """Log once per (kind, name) that a name the registry uses is not registered."""
+    if ("missing", kind, name) not in _WARNED:
         _WARNED.add(("missing", kind, name))
         logger.warning("hook_not_registered", kind=kind, name=name)
-    return fn
 
 
 def call_safely(kind: str, name: str, fn: Callable[..., Any], *args: Any, default: Any) -> Any:
