@@ -98,7 +98,7 @@ async def test_metrics_and_call_record(make: Make, caplog: pytest.LogCaptureFixt
     assert (point["model"], point["region"], point["outcome"]) == ("big", "r1", "ok")
     record = [entry for entry in logs if entry.get("event") == "llmq_call_finished"]
     assert len(record) == 1
-    assert record[0]["tenant"] == "desk"
+    assert record[0]["tenant"] != "desk"  # the tenant id is hashed too (RESCAN X10)
     assert record[0]["user"] != "ann"  # the user id is hashed
     assert record[0]["tokens_out"] is not None
 
@@ -138,6 +138,7 @@ async def test_command_line(make: Make, store: redis.asyncio.Redis, prefix: str)
     port = store.connection_pool.connection_kwargs["port"]
     env = {
         "LLMQ_STORE_URL": f"redis://:localdev@127.0.0.1:{port}/0",
+        "LLMQ_ENVIRONMENT": "test",
         "LLMQ_KEY_PREFIX": prefix,
         "LLMQ_REGISTRY": json.dumps(dict(engine.registry.current.registry.raw)),
     }
@@ -158,12 +159,14 @@ async def test_command_line(make: Make, store: redis.asyncio.Redis, prefix: str)
     assert await run("dlq", "list", "--model", "big") == []
     queues = await run("queues", "list")
     assert any(name.endswith("llm-big-priority") for name in queues)
-    drained = await run("drain", "small", "--wait", "--timeout", "2")
+    drained = await run("drain", "small", "--wait", "--timeout", "2", "--yes")
     assert drained == {"model": "small", "enabled": False, "drained": True}
 
 
 def test_environment_settings() -> None:
-    ok = InfraSettings.from_env({"LLMQ_STORE_URL": "redis://localhost:6379/0"})
+    ok = InfraSettings.from_env(
+        {"LLMQ_STORE_URL": "redis://localhost:6379/0", "LLMQ_ENVIRONMENT": "dev"}
+    )
     assert ok.registry_live_edit == "safe"
     with pytest.raises(ConfigError) as info:
         InfraSettings.from_env(

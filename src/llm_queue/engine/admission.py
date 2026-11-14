@@ -21,6 +21,7 @@ from redis.exceptions import TimeoutError as StoreTimeoutError
 from llm_queue._logging import get_logger
 from llm_queue.engine import _admission_lua as lua
 from llm_queue.engine.keys import Keys
+from llm_queue.engine.metrics import Metrics, NullSink
 from llm_queue.tuning import EngineTimings
 
 if TYPE_CHECKING:
@@ -30,6 +31,15 @@ Class = Literal["p", "n"]
 Outcome = Literal["ok", "throttle", "fail", "none"]
 
 logger = get_logger(__name__)
+
+# Script pacing not (yet) in `EngineTimings`: a throttled deployment is skipped for a jittered
+# backoff from 1-2 s doubling to 30 s per throttle in a row (or Retry-After when longer); a
+# latency average not updated for 5 minutes no longer marks a deployment slow; a claim record
+# made by a worker lives an hour.
+THROTTLE_BASE_MS = 1000
+THROTTLE_MAX_MS = 30_000
+SLOW_STALE_MS = 300_000
+JOB_TTL_MS = 3_600_000
 
 
 def owner_token(request_id: str, worker: str, attempt: int) -> str:
@@ -76,10 +86,14 @@ class Ask:
     tag: str = ""
 
     @property
+    def job_owner(self) -> str:
+        """Who runs the call, in its claim record: `worker@tag` (one delivery of one pod)."""
+        return f"{self.worker}@{self.tag}" if self.tag else self.worker
+
+    @property
     def owner(self) -> str:
         """The owner token of this attempt's grant (`tag` tells two deliveries apart)."""
-        worker = f"{self.worker}@{self.tag}" if self.tag else self.worker
-        return owner_token(self.request_id, worker, self.attempt)
+        return owner_token(self.request_id, self.job_owner, self.attempt)
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,17 +126,20 @@ class Admission:
         waiter_secs: float = 2.0,
         rng: random.Random | None = None,
         timings: EngineTimings | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         """Register the scripts; no I/O until the first call.
 
         `timings` (`Tuning.engine`) carries the scripts' pacing: probe and slot waits, the
         limiter's cut, budget key lifetime; each script falls back to the same defaults.
+        `metrics` counts grants found lost when settled or renewed.
         """
         self._client = client
         self.keys = keys
         self.lease_ms = int(lease_secs * 1000)
         self.waiter_ms = int(waiter_secs * 1000)
         self._rng = rng or random.Random()
+        self.metrics: Metrics = metrics or NullSink()
         pace = timings or EngineTimings()
         self._t = {
             "probe_wait_ms": pace.admission_probe_wait_ms,
@@ -132,6 +149,10 @@ class Admission:
             "limiter_cut_ms": pace.limiter_cut_ms,
             "limiter_cut_factor": pace.limiter_cut_factor,
             "budget_key_ms": pace.budget_key_ms,
+            "throttle_base_ms": THROTTLE_BASE_MS,
+            "throttle_max_ms": THROTTLE_MAX_MS,
+            "slow_stale_ms": SLOW_STALE_MS,
+            "job_ttl_ms": JOB_TTL_MS,
         }
         self._pick = client.register_script(lua.PICK_TAKE)
         self._finish = client.register_script(lua.FINISH)
@@ -151,6 +172,7 @@ class Admission:
             "request_id": ask.request_id,
             "owner": ask.owner,
             "worker": ask.worker,
+            "job_owner": ask.job_owner,
             "cls": ask.cls,
             "pos": ask.position,
             "cost_r": ask.cost_r,
@@ -194,12 +216,14 @@ class Admission:
         refund_t: int,
         outcome: Outcome,
         latency_ms: float = -1,
+        retry_after_secs: float | None = None,
     ) -> bool:
         """Settle a grant: give back what was not used, release the slot, learn the outcome.
 
-        `refund_t` may be negative (the call used more than it reserved). If the store is
-        unreachable this is skipped (False): the grant's lease expires and SWEEP frees the slot,
-        so a store blip after the provider answered never throws the answer away.
+        `refund_t` may be negative (the call used more than it reserved). A `throttle` keeps the
+        deployment out for every pod until max(`retry_after_secs`, the throttle backoff). If the
+        store is unreachable this is skipped (False): the grant's lease expires and SWEEP frees
+        the slot, so a store blip after the provider answered never throws the answer away.
         """
         body = {
             "alias": alias,
@@ -209,12 +233,18 @@ class Admission:
             "refund_t": refund_t,
             "outcome": outcome,
             "latency_ms": latency_ms,
+            "retry_after_ms": int((retry_after_secs or 0) * 1000),
+            "rand": self._rng.random(),
         }
         try:
-            return bool(await self._call(self._finish, body))
+            settled = bool(await self._call(self._finish, body))
         except (StoreConnectionError, StoreTimeoutError, ReadOnlyError, OSError) as exc:
             logger.warning("finish_skipped", model=alias, request_id=request_id, error=str(exc))
             return False
+        if not settled:  # swept as dead, taken over, or lost with the store (RESCAN A6)
+            logger.warning("grant_lost", model=alias, request_id=request_id, step="finish")
+            self.metrics.count("llmq_grants_lost_total", model=alias, step="finish")
+        return settled
 
     async def undo(self, alias: str, owner: str, request_id: str) -> bool:
         """Give a grant back entirely, without learning (lost reply, refused claim)."""
@@ -222,14 +252,33 @@ class Admission:
         return bool(await self._call(self._undo, body))
 
     async def renew(self, items: Sequence[tuple[str, str, str]]) -> int:
-        """Extend leases of held grants: (alias, owner, request id) each."""
-        if not items:
-            return 0
+        """Extend leases of held grants: (alias, owner, request id) each; how many were held."""
+        renewed, _ = await self.renew_all(items)
+        return renewed
+
+    async def renew_all(
+        self,
+        items: Sequence[tuple[str, str, str]],
+        jobs: Sequence[tuple[str, str]] = (),
+    ) -> tuple[int, list[str]]:
+        """The heartbeat: extend grants, refresh the claims of `jobs` (request id, job owner).
+
+        Returns how many grants were renewed and the owners whose entry was gone (lost).
+        """
+        if not items and not jobs:
+            return 0, []
         body = {
             "lease_ms": self.lease_ms,
             "items": [{"alias": a, "owner": o, "request_id": r} for a, o, r in items],
+            "jobs": [{"request_id": r, "owner": o} for r, o in jobs],
         }
-        return int(await self._call(self._renew, body))
+        raw = orjson.loads(await self._call(self._renew, body))
+        lost = raw.get("lost") or []
+        lost = [str(owner) for owner in lost] if isinstance(lost, list) else []
+        if lost:
+            logger.warning("grant_lost", step="renew", count=len(lost))
+            self.metrics.count("llmq_grants_lost_total", float(len(lost)), step="renew")
+        return int(raw.get("n", 0)), lost
 
     async def reregister(self, items: Sequence[dict[str, Any]]) -> int:
         """After a store reset, put back the slots and entries of running calls."""

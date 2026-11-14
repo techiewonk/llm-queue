@@ -29,9 +29,7 @@
     },
     "alerts": {
       "quota_used_pct": 90,
-      "quota_used_mins": 5,
-      "spill_pct": 20,
-      "waiting_age_secs": 60
+      "dlq_messages": 1
     }
   },
   "routing": {
@@ -41,7 +39,8 @@
   "residency": {
     "allowed_regions": [
       "ap-south-1",
-      "ap-south-2"
+      "ap-south-2",
+      "dc1"
     ]
   },
   "accounts": {
@@ -55,7 +54,7 @@
       "kind": "aws",
       "enabled": true,
       "role_arn": "arn:aws:iam::222222222222:role/llmq-bedrock",
-      "external_id_ref": "LLMQ_DR_EXTERNAL_ID",
+      "external_id_ref": "LLMQ_ACCOUNT_DR_EXTERNAL_ID",
       "settings": {
         "attempt_timeout_secs": 45
       }
@@ -63,7 +62,7 @@
     "vllm-dc1": {
       "kind": "openai",
       "base_url": "https://vllm.internal/v1",
-      "api_key_ref": "LLMQ_VLLM_API_KEY"
+      "api_key_ref": "LLMQ_ACCOUNT_VLLM_API_KEY"
     }
   },
   "models": {

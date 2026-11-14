@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from redis.exceptions import ConnectionError as StoreConnectionError
-from redis.exceptions import OutOfMemoryError, ResponseError
+from redis.exceptions import OutOfMemoryError, RedisError, ResponseError
 from redis.exceptions import ReadOnlyError as StoreReadOnlyError
 from redis.exceptions import TimeoutError as StoreTimeoutError
 
@@ -53,9 +53,9 @@ from llm_queue.engine.queue import (
 from llm_queue.engine.requests import RequestStore
 from llm_queue.engine.status import AlertEvaluator, StatusReader
 from llm_queue.engine.streaming import ChunkReader, ChunkWriter, StreamTooLarge
-from llm_queue.errors import ErrorKind, UnsupportedEnvelopeError
+from llm_queue.errors import ConfigError, ErrorKind, UnsupportedEnvelopeError
 from llm_queue.ids import new_id
-from llm_queue.providers.classify import is_target_error
+from llm_queue.providers.classify import error_family, is_target_error
 from llm_queue.tuning import EngineTimings
 
 if TYPE_CHECKING:
@@ -66,6 +66,12 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 OPS = {("bedrock", "chat"): "converse", ("bedrock", "embedding"): "invoke_model"}
+HEALTH_PROBE_EVERY_SECS = 5.0  # the background store probe behind readiness (RESCAN O1)
+# Request fields a fallback model may not understand (another family's knobs): dropped from the
+# caller's params when the call is served by another model (RESCAN P6). The target's own
+# `inference` defaults are applied after, so its own extra fields still go in.
+_MODEL_SPECIFIC = ("additionalModelRequestFields",)
+_TOOL_FIELDS = ("toolConfig", "tools", "tool_choice")
 
 
 def _probe_params(provider: str, kind: str, model_id: str) -> dict[str, Any]:
@@ -109,7 +115,7 @@ class EngineSettings:
     receive_batch: int = 10
     caller_margin_secs: float = 5.0
     local_limit_cap: int = 10
-    drain_secs: float = 45.0
+    drain_secs: float = 25.0  # k8s grace 30 s: calls still running then are given back (C3)
     id_hash_salt: str = ""  # LLMQ_ID_HASH_SALT: the key of every user / session id hash
     cfg_reload_secs: float = 30.0  # LLMQ_CFG_RELOAD_SECS: how often the registry is re-read
     queue_failover_secs: float = 5.0  # queue-store errors this long before calls run direct
@@ -129,6 +135,10 @@ for i = 2, #ARGV do
 end
 return out
 """
+
+
+def _text(value: Any) -> str:
+    return value.decode() if isinstance(value, bytes) else str(value)
 
 
 def _refusal(exc: BaseException) -> str:
@@ -170,6 +180,13 @@ class _Held:
     # Model-level request and estimate, built once per registry view (a deep copy of the
     # prompt each time: ~0.7 ms for 200 KB, and it was rebuilt in _ask, _decide and _attempt).
     charged: tuple[Any, str, tokens.Estimate] | None = None
+    # The estimate each grant was charged with, by (alias, owner): refunds settle that one, not
+    # one rebuilt from a registry reloaded meanwhile (RESCAN A4).
+    estimates: dict[tuple[str, str], tokens.Estimate] = field(default_factory=dict)
+    writer: ChunkWriter | None = None  # the running attempt's chunk writer (streams)
+    shutdown: bool = False  # the drain ran out: give it back, do not fail it (plan C3)
+    refused: bool = False  # an admission refusal was counted for this call (RESCAN O4)
+    model_retried: bool = False  # its one free retry after a model error was used (P9)
 
     @property
     def position(self) -> float:
@@ -229,6 +246,7 @@ class Engine:
         self.registry = registry
         self.providers = providers
         self._queue_store = queue_store
+        self.metrics: Metrics = metrics or NullSink()
         self.queues = StreamQueues(queue_store or state, self.keys)
         self.requests = RequestStore(
             state,
@@ -245,6 +263,7 @@ class Engine:
             lease_secs=self.settings.lease_secs,
             waiter_secs=self.settings.waiter_secs,
             timings=self.settings.timings,
+            metrics=self.metrics,
         )
         self.worker_id = worker_id or new_id()[-14:]  # the random tail: the head is time
         self.clock = StoreClock()
@@ -266,7 +285,6 @@ class Engine:
         self.ready = False
         self._direct_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.health = Health(state, self.keys)
-        self.metrics: Metrics = metrics or NullSink()
         self.status_reader = StatusReader(state, self.keys, self.queues, self.settings.queue_prefix)
         self.alerts = AlertEvaluator(state, self.keys)
         # Credentials that failed in this process, per account and region: (account, region)
@@ -278,6 +296,12 @@ class Engine:
         self._static: dict[str, asyncio.Semaphore] = {}
         self._rng = random.Random()
         self.chunks = ChunkReader(state, block_ms=self.settings.timings.stream_read_block_ms)
+        self._epoch: str | None = None  # the store's epoch this process last saw (RESCAN A2)
+        self._worker = False
+        self._model_tasks: dict[str, asyncio.Task[None]] = {}  # receive loop per model alias
+        self._reload: asyncio.Task[Any] | None = None  # the one registry reload in flight (R10)
+        self._stores: tuple[float, dict[str, str]] | None = None  # cached store probe (O1)
+        self._beat_ran_at = time.monotonic()  # the heartbeat loop last made progress (O2)
 
     # ================================================================ lifecycle
 
@@ -287,6 +311,7 @@ class Engine:
         try:
             await self.clock.sync(self.state)
             await self.state.set(self.keys.epoch, str(self.clock.now()), nx=True)
+            self._epoch = _text(await self.state.get(self.keys.epoch))
         except STORE_ERRORS as exc:
             # Start anyway (plan §3.18): calls follow each model's `store_down` rule and
             # the background loops keep retrying until the store answers.
@@ -296,10 +321,8 @@ class Engine:
             self._tasks.append(asyncio.create_task(self._result_reader()))
             self._tasks.append(asyncio.create_task(self._result_sweep()))
         if worker:
-            for alias in self.registry.current.registry.models:
-                slots = int(self.registry.current.value(alias, "worker_slots"))
-                self._slots[alias] = asyncio.Semaphore(slots)
-                self._tasks.append(asyncio.create_task(self._model_loop(alias)))
+            self._worker = True
+            self._sync_model_loops()
             self._tasks.append(asyncio.create_task(self._sweeper()))
             self._tasks.append(asyncio.create_task(self._prober()))
             self._tasks.append(asyncio.create_task(self._alert_loop()))
@@ -307,8 +330,26 @@ class Engine:
             self._tasks.append(asyncio.create_task(self._cancel_reader()))
             self._tasks.append(asyncio.create_task(self._warm_clients()))
         self._tasks.append(asyncio.create_task(self._heartbeat()))
+        self._tasks.append(asyncio.create_task(self._store_prober()))
         self._tasks.append(asyncio.create_task(self.registry.run(self.settings.cfg_reload_secs)))
         self.ready = True
+
+    def _sync_model_loops(self) -> None:
+        """One receive loop per model of the current registry (RESCAN R3).
+
+        Called at start and on every heartbeat: a model a newer registry added gets its loop
+        (before, loops started only at start); a removed model's loop ends by itself.
+        """
+        if not self._worker or self._stopping:
+            return
+        view = self.registry.current
+        for alias in view.registry.models:
+            task = self._model_tasks.get(alias)
+            if task is not None and not task.done():
+                continue
+            if alias not in self._slots:
+                self._slots[alias] = asyncio.Semaphore(int(view.value(alias, "worker_slots")))
+            self._model_tasks[alias] = asyncio.create_task(self._model_loop(alias))
 
     def pause_receiving(self) -> None:
         """Not ready, and take no new calls from the queues; running and held calls go on.
@@ -337,13 +378,24 @@ class Engine:
                 self._drop(held)  # else the heartbeat hides it again for the whole drain
         if self._running:
             await asyncio.wait(set(self._running), timeout=max(0.0, until - loop.time()))
+        # The drain ran out (plan C3): calls still running are given back, not failed: grants
+        # refunded, message returned at once (another pod runs it); a stream that already sent
+        # chunks ends with `worker_shutdown` (it cannot be resumed elsewhere).
+        late = [h.run for h in list(self._held.values()) if h.run is not None and not h.run.done()]
+        for held in list(self._held.values()):
+            if held.run is not None and not held.run.done():
+                held.shutdown = True
+                held.run.cancel()
+        if late:
+            await asyncio.wait(set(late), timeout=5.0)
         if self._waiters:
             self._idle.clear()
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._idle.wait(), max(0.0, until - loop.time()))
-        for task in [*self._tasks, *self._running]:
+        tasks = [*self._tasks, *self._model_tasks.values(), *self._running]
+        for task in tasks:
             task.cancel()
-        for task in [*self._tasks, *self._running]:
+        for task in tasks:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         await self.chunks.aclose()
@@ -482,8 +534,12 @@ class Engine:
         """
         view = self.registry.current
         alias = view.registry.alias_of(model)
+        kind = view.registry.models[alias].type
+        if kind != "chat":  # it returned nothing at all before (RESCAN S11)
+            raise ConfigError(f"{alias} is an {kind} model; stream() needs a chat model")
         idle = float(view.value(alias, "stream_idle_secs"))
-        rid = call.pop("request_id", None) or new_id()
+        app_id = call.pop("request_id", None)  # an app id keeps its app-id behaviour (S11)
+        rid = app_id or new_id()
         key = self.keys.request(rid, "chunks")
         queue = self.chunks.open(key)
         # The call's own deadline, as `call` computes it: the idle wait between chunks
@@ -493,64 +549,78 @@ class Engine:
         timeout = min(timeout, float(view.value(alias, "timeout_max_secs")))
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout + self.settings.caller_margin_secs
-        task = asyncio.create_task(self.call(model, params, stream=True, stream_id=rid, **call))
-        expected, started = 1, False
+        task = asyncio.create_task(
+            self.call(model, params, stream=True, stream_id=rid, request_id=app_id, **call)
+        )
+        expected, started, attempt_id = 1, False, ""
         try:
             while True:
-                left = deadline - loop.time()
-                if left <= 0:
-                    raise CallFailed("deadline_exceeded", "no reply in time", request_id=rid)
-                getter = asyncio.ensure_future(queue.get())
-                finished = task.done()
-                done, _ = await asyncio.wait(
-                    {getter} if finished else {getter, task},
-                    timeout=min(idle, left) if started or finished else left,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if getter not in done:
-                    getter.cancel()
-                    if not done and deadline - loop.time() <= 0:  # the deadline, not idleness
+                if not queue.empty():  # already read: a slow consumer gets it (RESCAN S2)
+                    entry = queue.get_nowait()
+                else:
+                    left = deadline - loop.time()
+                    if left <= 0:
                         raise CallFailed("deadline_exceeded", "no reply in time", request_id=rid)
-                    if task in done:
-                        if not started:
-                            # The store may be down too: then nothing can be replayed, and
-                            # the call's own failure is the answer (scenario L2: this read
-                            # raised redis-py's ConnectionError to the app).
-                            try:
-                                pending = await self.state.xlen(key)
-                            except STORE_ERRORS:
-                                task.result()  # the call's failure, if it failed
-                                raise CallFailed(
-                                    "queue_unavailable",
-                                    "the store is unreachable; the stream cannot be read",
-                                    request_id=rid,
-                                ) from None
-                            if not pending:
-                                task.result()  # raises the call's failure (nothing streamed)
-                                return  # a finished call whose chunks expired
-                        continue  # its last entries are still on the way
-                    if finished:
-                        task.result()
-                        raise CallFailed(
-                            "worker_lost", "the stream ended without its end entry", request_id=rid
-                        )
-                    raise CallFailed(
-                        "deadline_exceeded",
-                        f"no chunk for {idle:g} s (stream_idle_secs)",
-                        request_id=rid,
+                    getter = asyncio.ensure_future(queue.get())
+                    finished = task.done()
+                    done, _ = await asyncio.wait(
+                        {getter} if finished else {getter, task},
+                        timeout=min(idle, left) if started or finished else left,
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
-                entry = getter.result()
+                    if getter not in done:
+                        getter.cancel()
+                        if not done and deadline - loop.time() <= 0:  # the deadline, not idleness
+                            raise CallFailed(
+                                "deadline_exceeded", "no reply in time", request_id=rid
+                            )
+                        if task in done:
+                            if not started:
+                                # The store may be down too: then nothing can be replayed, and
+                                # the call's own failure is the answer (scenario L2: this read
+                                # raised redis-py's ConnectionError to the app).
+                                try:
+                                    pending = await self.state.xlen(key)
+                                except STORE_ERRORS:
+                                    task.result()  # the call's failure, if it failed
+                                    raise CallFailed(
+                                        "queue_unavailable",
+                                        "the store is unreachable; the stream cannot be read",
+                                        request_id=rid,
+                                    ) from None
+                                if not pending:
+                                    task.result()  # raises the call's failure (nothing streamed)
+                                    return  # a finished call whose chunks expired
+                            continue  # its last entries are still on the way
+                        if finished:
+                            task.result()
+                            raise CallFailed(
+                                "worker_lost",
+                                "the stream ended without its end entry",
+                                request_id=rid,
+                            )
+                        raise CallFailed(
+                            "deadline_exceeded",
+                            f"no chunk for {idle:g} s (stream_idle_secs)",
+                            request_id=rid,
+                        )
+                    entry = getter.result()
+                if entry["seq"] < expected and entry["att"] == attempt_id:
+                    continue  # the same entry read twice (a re-read): not a gap (S11)
                 if entry["seq"] != expected:
                     raise CallFailed(
                         "worker_lost", f"gap in the stream at {expected}", request_id=rid
                     )
                 expected += 1
-                started = True
+                started, attempt_id = True, entry["att"]
                 if entry["t"] == "chunk":
                     for event in entry["d"]:
                         yield event
                 elif entry["t"] == "end":
-                    await task
+                    # Delivered in full: a result write that failed after `end` (the re-run
+                    # found the stream taken) is not the caller's error (RESCAN S11).
+                    with contextlib.suppress(CallFailed):
+                        await task
                     return
                 else:
                     data = entry["d"]
@@ -767,6 +837,8 @@ class Engine:
                 if not subscribed:
                     await self._cancels.subscribe(self.keys.cancel_channel)
                     subscribed = True
+                    # Cancels published while unsubscribed were missed: read the keys (C9).
+                    await self._check_cancels()
                 message = await self._cancels.get_message(
                     ignore_subscribe_messages=True, timeout=1.0
                 )
@@ -783,6 +855,22 @@ class Engine:
             rid = data.decode() if isinstance(data, bytes) else str(data)
             held = self._held.get(rid)
             if held is not None and held.run is not None and not held.run.done():
+                held.cancelled = True
+                held.run.cancel()
+
+    async def _check_cancels(self) -> None:
+        """Stop running calls whose cancel key is set: one MGET for all (plan C9).
+
+        The safety net behind the cancel channel: a cancel published while the subscriber was
+        reconnecting was lost, and its call ran to the end.
+        """
+        running = [h for h in list(self._held.values()) if h.run is not None and not h.run.done()]
+        if not running:
+            return
+        keys = [self.keys.request(h.envelope.request_id, "cancel") for h in running]
+        flags = await self.state.mget(keys)
+        for held, flag in zip(running, flags, strict=True):
+            if flag is not None and held.run is not None and not held.run.done():
                 held.cancelled = True
                 held.run.cancel()
 
@@ -1047,6 +1135,8 @@ class Engine:
         empty = 0
         wake = self._wake.setdefault(alias, asyncio.Event())
         while not self._stopping:
+            if alias not in self.registry.current.registry.models:
+                return  # removed by a reload; `_sync_model_loops` starts it again if it returns
             if self._paused:
                 await asyncio.sleep(0.2)
                 continue
@@ -1057,7 +1147,7 @@ class Engine:
                 if isinstance(exc, STORE_ERRORS):
                     # Not only the heartbeat (every lease/3): a block between two beats went
                     # unseen, and callers whose keys lapsed in it were dropped as gone (soak).
-                    self._store_trouble_at = time.monotonic()
+                    self._store_trouble("receive")
                 await asyncio.sleep(1)
                 continue
             held = (alias, "p") in self._held_class or (alias, "n") in self._held_class
@@ -1077,7 +1167,7 @@ class Engine:
                     try:
                         await self.queues.wait_bell(names, pause)
                     except STORE_ERRORS:
-                        self._store_trouble_at = time.monotonic()  # (was swallowed unseen)
+                        self._store_trouble("bell")  # (was swallowed unseen)
                 wake.clear()
 
     async def _receive_once(self, alias: str) -> bool:
@@ -1146,8 +1236,22 @@ class Engine:
             await self.queues.return_(message, delay_secs=5)
             return False
         except Exception as exc:
-            logger.warning("bad_message", queue=message.queue, error=str(exc))
-            await self.queues.fail(message, QueueSettings())
+            # The type only: the validation text can quote the prompt (RESCAN X10). The model's
+            # own queue settings decide when it is dead-lettered (A12).
+            logger.warning("bad_message", queue=message.queue, error_type=type(exc).__name__)
+            self.metrics.count("llmq_bad_messages_total", model=alias)
+            await self.queues.fail(message, self._queue_settings(self.registry.current, alias))
+            return False
+        current = self._held.get(env.request_id)
+        if current is not None:
+            # Already held here (RESCAN A1): its hold lapsed and the same message came back, or
+            # a second copy arrived. A new record overwrote the running one (heartbeat lost,
+            # slot leaked, call run twice): the running record keeps the new receipt instead.
+            if current.message is not None and current.message.id == message.id:
+                current.message = message
+                logger.warning("redelivered_while_held", request_id=env.request_id)
+            else:
+                await self.queues.return_(message, delay_secs=self.settings.lease_secs / 2)
             return False
         held = _Held(
             message,
@@ -1192,8 +1296,13 @@ class Engine:
                 env.request_id, prefix=self.keys.prefix, caller_ttl=self.settings.caller_ttl_secs
             )
         except STORE_ERRORS:
-            self._store_trouble_at = time.monotonic()
+            self._store_trouble("callers")
             return True
+
+    def _store_trouble(self, where: str) -> None:
+        """Note a store failure seen here: callers count as alive for a while; metric."""
+        self._store_trouble_at = time.monotonic()
+        self.metrics.count("llmq_store_errors_total", where=where)
 
     # ================================================================ worker: admission
 
@@ -1296,7 +1405,7 @@ class Engine:
                 key = hooks.call_safely("sticky_key", name, fn, ctx, default=None) if fn else None
             if key:
                 sticky_hash = self.hash_id(str(key))
-        return Ask(
+        ask = Ask(
             alias=alias,
             request_id=env.request_id,
             worker=self.worker_id,
@@ -1316,6 +1425,8 @@ class Engine:
             require_pct=require_pct,
             tag=held.tag,
         )
+        held.estimates[(alias, ask.owner)] = estimate
+        return ask
 
     def _custom_order(
         self,
@@ -1360,13 +1471,28 @@ class Engine:
     def _params(
         self, view: ResolvedRegistry, alias: str, env: Envelope, dep: str | None
     ) -> dict[str, Any]:
+        """The provider request for `alias` (and deployment `dep`): defaults, limits, params.
+
+        Served by a fallback model (`alias` is not the call's model, RESCAN P6), the caller's
+        model-specific fields are dropped (`additionalModelRequestFields`; tool fields too
+        when the target's `supports_tools` is false) and an output above the target's limit is
+        clamped, never rejected: the caller asked another model for it.
+        """
         entry = view.registry.models[alias]
+        params: Mapping[str, Any] = env.params or {}
+        limits = view.value(alias, "inference_limits", dep) or {}
+        if alias != env.model:
+            dropped: tuple[str, ...] = _MODEL_SPECIFIC
+            if not getattr(entry, "supports_tools", True):
+                dropped = (*dropped, *_TOOL_FIELDS)
+            params = {k: v for k, v in params.items() if k not in dropped}
+            limits = {**limits, "on_exceed": "clamp"}
         request = inference.apply(
             entry.provider,
             env.op,
-            env.params or {},
+            params,
             view.value(alias, "inference", dep) or {},
-            view.value(alias, "inference_limits", dep) or {},
+            limits,
         )
         extra = view.value(alias, "params", dep) if dep else None
         return inference.merge_params(request, extra or {})
@@ -1455,7 +1581,13 @@ class Engine:
         failed: frozenset[str],
     ) -> Decision | None:
         """One admission call and the terminal outcomes; None when the call was settled."""
-        ask = self._ask(view, alias, held, attempt, failed)
+        try:
+            ask = self._ask(view, alias, held, attempt, failed)
+        except inference.InferenceRejected as exc:
+            # `on_exceed: reject`: the request itself is refused. It raised out of the worker
+            # and the message looped until dead-lettered (RESCAN P4).
+            await self._finish_call(held, "invalid_request", str(exc))
+            return None
         if ask is None:
             if self._bad_accounts and any(
                 (d.account, d.region) in self._bad_accounts for d in view.deployments(alias)
@@ -1477,10 +1609,11 @@ class Engine:
             await self._finish_call(held, "request_too_large", "input above the token budget")
             return None
         decision = await self.admission.pick_take(ask, self.registry.changes)
-        if decision.kind == "wait":
+        if decision.kind == "wait" and not held.refused:  # once per call, not per poll (O4)
+            held.refused = True
             self.metrics.count("llmq_admission_refusals_total", model=alias, reason=decision.reason)
         if decision.kind == "stale_config":
-            await self.registry.load()
+            await self._reload_registry(decision.changes)
             decision = await self.admission.pick_take(ask, self.registry.changes)
         if decision.kind == "no_config":  # the store lost the numbers: restore, then once more
             await self.registry.refresh()
@@ -1578,7 +1711,7 @@ class Engine:
                 wait = decision.wait_secs
         except Exception as exc:  # never leave the call held with nobody working on it
             if isinstance(exc, STORE_ERRORS):
-                self._store_trouble_at = time.monotonic()
+                self._store_trouble("hold")
             logger.warning("hold_failed", request_id=held.envelope.request_id, error=str(exc))
             await self._release(held)
         finally:
@@ -1640,9 +1773,12 @@ class Engine:
                 async with slots:
                     await self._attempts(held, decision, attempt, alias)
         except asyncio.CancelledError:
+            if held.shutdown:  # the drain ran out (`stop`): give it back, never fail it
+                await asyncio.shield(self._shutdown_call(held))
+                return
             if not held.cancelled:
                 raise
-            # Cancelled by a caller: give the grant back as a cut attempt, reply `cancelled`.
+            # Cancelled by a caller: give the grant back, reply `cancelled`.
             try:
                 await self._give_back(held)
                 await self._finish_call(held, "cancelled", "cancelled", final="cancelled")
@@ -1654,8 +1790,8 @@ class Engine:
             # with nobody working on it (the heartbeat would hide its message for good): give
             # the grants back and return the message, so it runs again (at least once; a stored
             # result is reused). A direct call has no message: its caller gets the error.
-            if isinstance(exc, STORE_ERRORS):
-                self._store_trouble_at = time.monotonic()
+            if isinstance(exc, (*STORE_ERRORS, RedisError)):
+                self._store_trouble("run")
             logger.warning(
                 "run_failed",
                 request_id=held.envelope.request_id,
@@ -1683,15 +1819,28 @@ class Engine:
             if outcome == "ok":
                 return
             kind, info, exc = reply_or_error
-            if outcome == "stream_failed":  # never switched silently once chunks were sent
+            if outcome in ("stream_failed", "invalid"):  # never switched once chunks were sent
                 await self._finish_call(held, kind, str(exc), partial=info)
                 return
-            entry = view.registry.models[alias]
+            # A move to a deployment this call has not tried is free: it is failover, not a
+            # retry storm (bounded by the deployments and max_attempts). Counting it failed
+            # calls as retry_budget_exhausted while another region was healthy (scenario P3:
+            # 20 of 60 calls with one region hanging).
+            tried = frozenset(failed | {dep_key})
+            age = self.clock.now() - held.position_ms / 1000.0
+            untried = any(
+                not c.last
+                for c in self._candidates(view, alias, held.envelope, age, tried, "error")
+            )
             if outcome == "throttle":
-                retry_secs = 0.0  # a throttle moves on at once (a 5xx's backoff is not reused)
+                # The throttled deployment is out for every pod until its window ends (P2, in
+                # FINISH): another one is tried at once; with none left the call waits for it.
+                # Throttles count in the retry budget (always counted, enforced like a 5xx's).
+                retry_secs = 0.0
                 throttles += 1
                 limit = int(view.value(alias, "throttle_retry_attempts", dep_key))
-                if throttles > limit:
+                budget_ok = await self._retry_allowed(alias, view)
+                if throttles > limit or (not budget_ok and not untried):
                     await self._finish_call(
                         held, "rate_limited", "the provider kept throttling", retry_after=info
                     )
@@ -1701,20 +1850,19 @@ class Engine:
                 if outcome == "fatal" or tries >= int(view.value(alias, "max_attempts")):
                     await self._finish_call(held, "provider_error", str(exc))
                     return
-                # A move to a deployment this call has not tried is free: it is failover, not
-                # a retry storm (bounded by the deployments and max_attempts). Counting it
-                # failed calls as retry_budget_exhausted while another region was healthy
-                # (scenario P3: 20 of 60 calls with one region hanging).
-                tried = frozenset(failed | {dep_key})
-                age = self.clock.now() - held.position_ms / 1000.0
-                untried = any(
-                    not c.last
-                    for c in self._candidates(view, alias, held.envelope, age, tried, "error")
-                )
+                if kind == "target" and not untried:
+                    # The model is missing on the only deployment left: it refuses again however
+                    # long the backoff (RESCAN P10).
+                    await self._finish_call(held, "provider_error", str(exc))
+                    return
                 if not untried and not await self._retry_allowed(alias, view):
                     await self._finish_call(held, "retry_budget_exhausted", str(exc))
                     return
-                retry_secs = self._backoff(view, alias, dep_key, tries)
+                # A target or model error moves to another deployment at once: the backoff is
+                # for a struggling deployment, and this one is not tried again (P9, P10).
+                quick = kind in ("target", "model_error") and untried
+                retry_secs = 0.0 if quick else self._backoff(view, alias, dep_key, tries)
+            self.metrics.count("llmq_retries_total", model=alias, reason=str(kind))
             failed.add(dep_key)
             attempt += 1
             if retry_secs:  # never past the deadline: the caller is told in time
@@ -1734,7 +1882,6 @@ class Engine:
                     await self._finish_call(held, "rate_limited", "fallback model is busy")
                     return
                 await asyncio.sleep(min(next_decision.wait_secs, 1.0))
-            del entry
 
     def _backoff(self, view: ResolvedRegistry, alias: str, dep: str, tries: int) -> float:
         base = float(view.value(alias, "retry_base_secs", dep))
@@ -1747,19 +1894,40 @@ class Engine:
         )
 
     async def _retry_allowed(self, alias: str, view: ResolvedRegistry) -> bool:
-        minute = int(self.clock.now() // 60)
+        """Count one retry; True when it fits the model's retry budget over a sliding minute.
+
+        The previous minute's counts weigh by the part of it still inside the last 60 s: a
+        fixed minute let a burst of retries through at every minute turn (RESCAN P10).
+        """
+        now = self.clock.now()
+        minute = int(now // 60)
+        weight = 1.0 - (now % 60) / 60
         key = self.keys.model(alias, f"retries:{minute}")
         async with self.state.pipeline(transaction=False) as pipe:
             pipe.hincrby(key, "retries", 1)
             pipe.hget(key, "first")
-            pipe.expire(key, 120)
-            retries, first, _ = await pipe.execute()
-        first_n = int(first or 0)
+            pipe.expire(key, 180)
+            pipe.hmget(self.keys.model(alias, f"retries:{minute - 1}"), ["retries", "first"])
+            retries, first, _, (old_retries, old_first) = await pipe.execute()
+        used = int(retries) + int(old_retries or 0) * weight
+        first_n = int(first or 0) + int(old_first or 0) * weight
         allowed = max(
-            int(view.value(alias, "retry_budget_min")),
-            first_n * int(view.value(alias, "retry_budget_pct")) // 100,
+            float(view.value(alias, "retry_budget_min")),
+            first_n * int(view.value(alias, "retry_budget_pct")) / 100,
         )
-        return int(retries) <= allowed
+        return used <= allowed
+
+    async def _count_first(self, alias: str) -> None:
+        """Count a first attempt for the retry budget, under the model that serves it.
+
+        The key lives 3 minutes (the sliding window reads the previous one); it got no TTL in
+        a minute without a retry and stayed for good (RESCAN A3).
+        """
+        key = self.keys.model(alias, f"retries:{int(self.clock.now() // 60)}")
+        async with self.state.pipeline(transaction=False) as pipe:
+            pipe.hincrby(key, "first", 1)
+            pipe.expire(key, 180)
+            await pipe.execute()
 
     async def _attempt(
         self,
@@ -1775,18 +1943,24 @@ class Engine:
         entry = view.registry.models[alias]
         deployment = next(d for d in view.deployments(alias) if d.key == dep_key)
         route = route_for(view, deployment)
-        params = self._params(view, alias, env, dep_key)
-        # Refunds settle what admission charged: `_ask`'s estimate from model-level params. One
-        # from this deployment's params (e.g. a larger account max_tokens) refunded more than
-        # was taken, and TPM stopped holding (found in the 0.3.0 review).
-        estimate = self._charged(view, alias, held)
+        # Refunds settle what admission charged: the estimate kept for this grant (`_ask`, from
+        # model-level params). One from this deployment's params (a larger account max_tokens)
+        # or from a registry reloaded since refunded more than was taken (0.3.0 review, A4).
+        estimate = held.estimates.get((alias, owner)) or self._charged(view, alias, held)
+        try:
+            params = self._params(view, alias, env, dep_key)
+        except inference.InferenceRejected as exc:  # this deployment's own limit (RESCAN P4)
+            await self.admission.finish(
+                alias, owner, env.request_id, refund_r=1, refund_t=estimate.total, outcome="none"
+            )
+            return "invalid", ("invalid_request", None, exc)
         remaining = max(0.1, self._deadline(held) - self.clock.now())
         attempt_budget = float(view.value(alias, "attempt_timeout_secs", dep_key))
+        # One first-response budget, never shortened below `attempt_timeout_secs` but by the
+        # deadline itself: a timer halved for the deadline was not the provider's failure, so a
+        # hung region never tripped its breaker (RESCAN P3).
         timing = Timing(
-            first_response_secs=min(
-                attempt_budget,
-                remaining / 2 if attempt == 1 else remaining,
-            ),
+            first_response_secs=min(attempt_budget, remaining),
             idle_secs=float(view.value(alias, "stream_idle_secs")),
         )
         provider = self.providers.get(entry.provider)
@@ -1800,11 +1974,10 @@ class Engine:
             "cost_t": estimate.total,
         }
         if attempt == 1:
-            minute = int(self.clock.now() // 60)
-            await self.state.hincrby(self.keys.model(env.model, f"retries:{minute}"), "first", 1)
-        writer = None
+            await self._count_first(alias)
+        writer = held.writer = None
         if env.stream and env.op in ("converse", "chat"):
-            writer = ChunkWriter(
+            writer = held.writer = ChunkWriter(
                 self.state,
                 self.keys.request(env.request_id, "chunks"),
                 owner,
@@ -1827,11 +2000,12 @@ class Engine:
                 await writer.error("worker_lost", lost)
                 return "stream_failed", ("worker_lost", None, RuntimeError(lost))
         started = time.monotonic()
+        outer = asyncio.timeout(remaining)  # the call's own deadline
         try:
-            result = await asyncio.wait_for(
-                provider.call(env.op, params, route, timing, sink=writer.add if writer else None),
-                remaining,
-            )
+            async with outer:
+                result = await provider.call(
+                    env.op, params, route, timing, sink=writer.add if writer else None
+                )
             if writer is not None:
                 await writer.end(
                     {
@@ -1842,6 +2016,9 @@ class Engine:
         except Exception as exc:
             latency = (time.monotonic() - started) * 1000
             info = provider.classify(exc)
+            # Not the provider's doing (RESCAN P9): the stream's size cap, or the store under
+            # the chunk writer. Counted as failures they opened healthy deployments' breakers.
+            ours = isinstance(exc, StreamTooLarge | RedisError)
             if writer is not None and writer.sent:
                 # Chunks reached the caller: end the stream with the partial text (plan §3.13).
                 refund = tokens.refund(estimate, "cut")
@@ -1851,7 +2028,7 @@ class Engine:
                     env.request_id,
                     refund_r=refund.requests,
                     refund_t=refund.tokens,
-                    outcome="fail",
+                    outcome="none" if ours else "fail",
                     latency_ms=latency,
                 )
                 kind = "rate_limited" if info.kind is ErrorKind.THROTTLE else "provider_error"
@@ -1861,16 +2038,23 @@ class Engine:
                 with contextlib.suppress(Exception):
                     await writer.error(kind, message)
                 return "stream_failed", (kind, writer.partial_text, exc)
+            if ours:  # nothing sent: the call is given back and runs again (`_run`)
+                await self.admission.finish(
+                    alias,
+                    owner,
+                    env.request_id,
+                    refund_r=1,
+                    refund_t=estimate.total,
+                    outcome="none",
+                )
+                held.grants.discard((alias, owner))
+                raise
             cut = isinstance(exc, AttemptTimeout) and "chunk" in str(exc)
-            # The caller's own deadline cut this attempt (the outer timer, or a first-response
-            # timer shortened below `attempt_timeout_secs`): not the provider's fault. Counted
-            # as a failure, late grants under a rate limit opened the breaker and turned the
-            # rest into model_unavailable (found by scripts/load.py).
-            deadline_cut = isinstance(exc, TimeoutError) and (
-                not isinstance(exc, AttemptTimeout)
-                or ("first response" in str(exc) and timing.first_response_secs < attempt_budget)
-            )
-            if deadline_cut:
+            # The call's own deadline (the outer timer) cut this attempt: not the provider's
+            # fault. Counted as a failure, late grants under a rate limit opened the breaker
+            # (scripts/load.py). Only that timer: an attempt's own first-response or idle
+            # timeout is the provider's, so a hung region trips its breaker (RESCAN P3).
+            if outer.expired():
                 await self.admission.finish(
                     alias,
                     owner,
@@ -1891,8 +2075,24 @@ class Engine:
                     refund_t=refund.tokens,
                     outcome="throttle",
                     latency_ms=-1,
+                    retry_after_secs=info.retry_after_secs,
                 )
                 return "throttle", ("throttled", info.retry_after_secs, exc)
+            model_error = error_family(info.code) in ("modelerror", "modeltimeout")
+            if info.kind is ErrorKind.RETRYABLE and model_error and not held.model_retried:
+                # ModelErrorException / ModelTimeoutException: the model's answer failed, not the
+                # region; one retry on another deployment, without charging the breaker (P9).
+                held.model_retried = True
+                refund = tokens.refund(estimate, "fail")
+                await self.admission.finish(
+                    alias,
+                    owner,
+                    env.request_id,
+                    refund_r=refund.requests,
+                    refund_t=refund.tokens,
+                    outcome="none",
+                )
+                return "retry", ("model_error", None, exc)
             if info.kind is ErrorKind.RETRYABLE or isinstance(exc, TimeoutError):
                 refund = tokens.refund(estimate, "cut" if cut else "fail")
                 await self.admission.finish(
@@ -1946,6 +2146,8 @@ class Engine:
             outcome="ok",
             latency_ms=latency,
         )
+        held.grants.discard((alias, owner))  # settled: a failure below must not renew it
+        self._bad_accounts.pop((deployment.account, deployment.region), None)  # (plan A4)
         meta = Meta(
             served_model=alias,
             deployment=dep_key,
@@ -2137,7 +2339,7 @@ class Engine:
             queue_wait_ms=int(wait * 1000),
             provider_ms=meta.provider_ms if meta else None,
             user=user,
-            tenant=env.tenant_id,
+            tenant=self.hash_id(env.tenant_id) if env.tenant_id else None,  # (RESCAN X10)
         )
 
     async def _debug(
@@ -2165,12 +2367,25 @@ class Engine:
         """Status of one call (empty when unknown or expired)."""
         return await self.status_reader.request(request_id)
 
-    async def health_check(self) -> dict[str, Any]:
-        """Liveness and readiness (plan E124): ready = registry loaded and not draining.
+    async def health_check(self, *, fresh: bool = False) -> dict[str, Any]:
+        """Liveness and readiness (plan E124), answered from cached state at once.
 
-        The stores' state is reported but never makes the process unready. It is checked with a
-        short-lived write, not PING: a replica answers PING but refuses writes (`read_only`).
+        Ready = registry loaded and not draining; the stores' state is reported but never
+        makes the process unready. It comes from `_store_prober` every few seconds (`fresh`:
+        probe now), so a slow store never makes a readiness probe slow (RESCAN O1). Live is
+        false when a background loop died or the heartbeat stopped making progress (O2).
         """
+        cached = self._stores
+        stale = cached is None or time.monotonic() - cached[0] > 3 * HEALTH_PROBE_EVERY_SECS
+        if fresh or stale or cached is None:
+            stores = await self._probe_stores()
+        else:
+            stores = cached[1]
+        loaded = self.registry._current is not None
+        return {"live": self._live(), "ready": bool(self.ready and loaded), "stores": stores}
+
+    async def _probe_stores(self) -> dict[str, str]:
+        """Each store's state from a short-lived write (a replica answers PING, refuses writes)."""
         probe = f"{self.keys.prefix}:health:{self.worker_id}"
 
         async def check(client: Any) -> str:
@@ -2181,8 +2396,8 @@ class Engine:
                 )
             except StoreReadOnlyError:
                 return "read_only"
-            except (*STORE_ERRORS, TimeoutError):
-                return "down"
+            except (*STORE_ERRORS, ResponseError, TimeoutError):
+                return "down"  # a refusal too (out of memory): it raised and readiness gave 500
             return "ok"
 
         if self._queue_store is None:
@@ -2190,8 +2405,43 @@ class Engine:
         else:
             state, queue = await asyncio.gather(check(self.state), check(self._queue_store))
         stores = {"state": state, "queue": queue}
-        loaded = self.registry._current is not None
-        return {"live": True, "ready": bool(self.ready and loaded), "stores": stores}
+        self._stores = (time.monotonic(), stores)
+        return stores
+
+    async def _store_prober(self) -> None:
+        """Keep the stores' state for `health_check` fresh (one probe per few seconds)."""
+        while True:
+            with contextlib.suppress(Exception):
+                await self._probe_stores()
+            await asyncio.sleep(HEALTH_PROBE_EVERY_SECS)
+
+    def _live(self) -> bool:
+        """False when a background loop died, or the heartbeat made no progress for 3 beats."""
+        if self._stopping:
+            return True
+        for task in [*self._tasks, *self._model_tasks.values()]:
+            if task.done() and (task.cancelled() or task.exception() is not None):
+                return False
+        return time.monotonic() - self._beat_ran_at <= self.settings.lease_secs  # 3 x lease/3
+
+    def _report_gauges(self, report: Mapping[str, Any]) -> None:
+        """Gauges of every model from one status report (RESCAN O4: 6 metrics were not enough)."""
+        gauge = self.metrics.gauge
+        for model in report["models"]:
+            alias = str(model["model"])
+            for cls, count in model["waiting"].items():
+                gauge("llmq_queue_waiting", float(count), model=alias, priority=str(cls))
+            gauge("llmq_in_progress", float(model["in_progress"]), model=alias)
+            gauge("llmq_dead_letters", float(model["dead_letters"]), model=alias)
+            for dep in model["deployments"]:
+                labels = {"model": alias, "deployment": str(dep["name"])}
+                gauge("llmq_breaker_open", 1.0 if dep["breaker"] == "open" else 0.0, **labels)
+                gauge("llmq_rpm_used", float(dep["rpm"]["used"]), **labels)
+                gauge("llmq_tpm_used", float(dep["tpm"]["used"]), **labels)
+                gauge("llmq_concurrency_in_use", float(dep["concurrency"]["in_use"]), **labels)
+                gauge("llmq_throttles_1m", float(dep["throttles_1m"]), **labels)
+                if dep["latency_ms"] is not None:
+                    gauge("llmq_provider_latency_ms", float(dep["latency_ms"]), **labels)
 
     async def _alert_loop(self) -> None:
         """Every 30 s one process evaluates alerts: gauges every time, a log line per change."""
@@ -2205,6 +2455,7 @@ class Engine:
                     continue
                 view = self.registry.current
                 report = await self.status_reader.report(view)
+                self._report_gauges(report)
                 alerts = self.alerts.evaluate(view, report)
                 for alert in alerts:
                     self.metrics.gauge(
@@ -2225,13 +2476,41 @@ class Engine:
             del self._held[held.envelope.request_id]
 
     async def _give_back(self, held: _Held) -> None:
-        """Settle every grant of a call as a cut attempt (nothing learned, unused budget back)."""
+        """Give every grant of a call back in full, the estimate it took (nothing learned).
+
+        It refunded nothing before (RESCAN A11): a cancelled or released call kept its whole
+        reservation charged.
+        """
         for served, owner in list(held.grants):
             with contextlib.suppress(Exception):
-                await self.admission.finish(
-                    served, owner, held.envelope.request_id, refund_r=0, refund_t=0, outcome="none"
-                )
+                await self.admission.undo(served, owner, held.envelope.request_id)
         held.grants.clear()
+
+    async def _shutdown_call(self, held: _Held) -> None:
+        """The drain ran out mid-call (plan C3): give it back; no failure is counted.
+
+        Grants are refunded and the message returned at once, so another pod runs it. A stream
+        that already sent chunks cannot move: it ends with `worker_shutdown`.
+        """
+        try:
+            await self._give_back(held)
+            writer = held.writer
+            if writer is not None and writer.sent:
+                message = "the worker shut down mid-stream"
+                with contextlib.suppress(Exception):
+                    await writer.error("worker_shutdown", message)
+                await self._finish_call(
+                    held, "worker_shutdown", message, partial=writer.partial_text
+                )
+            elif held.message is not None:
+                self._drop(held)
+                await self.queues.return_(held.message)
+            else:  # a direct call: its caller is in this process, which is stopping
+                await self._finish_call(held, "worker_shutdown", "the worker shut down")
+        except Exception as exc:
+            logger.warning(
+                "shutdown_give_back_failed", request_id=held.envelope.request_id, error=str(exc)
+            )
 
     async def _release(self, held: _Held, delay_secs: float = 0.0) -> None:
         """Let go of a call after an unexpected error: grants back, not held, message returned."""
@@ -2281,29 +2560,47 @@ class Engine:
         """
         while True:
             beat = self.settings.lease_secs / 3
+            self._beat_ran_at = time.monotonic()
             self._free_stuck()
+            try:
+                self._sync_model_loops()
+            except Exception as exc:
+                logger.warning("heartbeat_failed", step="loops", error=str(exc))
             try:
                 await self.state.set(
                     self.keys.caller(self.worker_id), "1", ex=self.settings.caller_ttl_secs
                 )
+                held_now = list(self._held.values())
                 items = [
                     (alias, owner, held.envelope.request_id)
-                    for held in list(self._held.values())
+                    for held in held_now
                     for alias, owner in list(held.grants)
                 ]
-                await self.admission.renew(items)
+                # Calls held between grants (waiting, or between retries) keep their claim
+                # fresh, so a redelivered copy elsewhere is a duplicate, not a second run (A1).
+                jobs = [
+                    (held.envelope.request_id, f"{self.worker_id}@{held.tag}")
+                    for held in held_now
+                    if not held.grants
+                ]
+                _, lost = await self.admission.renew_all(items, jobs)
+                if lost:  # swept, or lost with the store: still running here (A2, A6)
+                    await self._reregister(set(lost))
                 now = time.monotonic()
                 if now - self._beat_ok_at > 2 * beat + 1:  # a gap: the store was out of reach
                     self._store_trouble_at = now
                 self._beat_ok_at = now
+                self._beat_ran_at = now
+                await self._check_cancels()
             except Exception as exc:  # the heartbeat must survive store hiccups
                 logger.warning("heartbeat_failed", step="renew", error=str(exc))
-                self._store_trouble_at = time.monotonic()
+                self._store_trouble("heartbeat")
                 beat = 1.0  # renew the caller key as soon as the store is back
             view = self.registry.current
             for held in list(self._held.values()):
                 if held.message is None:
                     continue
+                self._beat_ran_at = time.monotonic()  # progress, even on a slow store (O2)
                 try:
                     visibility = float(view.value(held.envelope.model, "queue")["visibility_secs"])
                     beat = min(beat, visibility / 3)
@@ -2323,24 +2620,56 @@ class Engine:
             await asyncio.sleep(max(0.2, beat))
 
     async def _check_epoch(self) -> None:
-        """The store lost its data (restart, failover): re-register running calls (T10)."""
-        if await self.state.exists(self.keys.epoch):
-            return
-        logger.error("state_store_reset_detected")
-        await self.state.set(self.keys.epoch, str(self.clock.now()), nx=True)
-        await self.state.set(
-            f"{self.keys.prefix}:reset_minute", int(self.clock.now() // 60), ex=120
-        )
+        """The store lost its data (restart, failover): re-register running calls (T10).
+
+        Each process remembers the epoch it saw and re-registers when it is missing or changed
+        (RESCAN A2): only the first process to notice re-registered before; the others found
+        the new epoch and did nothing.
+        """
+        value = await self.state.get(self.keys.epoch)
+        missing = value is None
+        if missing:
+            logger.error("state_store_reset_detected")
+            await self.state.set(self.keys.epoch, str(self.clock.now()), nx=True)
+            await self.state.set(
+                f"{self.keys.prefix}:reset_minute", int(self.clock.now() // 60), ex=120
+            )
+            value = await self.state.get(self.keys.epoch)
+        seen, self._epoch = self._epoch, None if value is None else _text(value)
+        if missing or (seen is not None and seen != self._epoch):
+            if not missing:
+                logger.error("state_store_reset_detected", by="epoch_changed")
+            await self._reregister()
+
+    async def _reregister(self, owners: set[str] | None = None) -> None:
+        """Put back the slots and entries of this process's running grants (all, or `owners`)."""
         items = [
             meta
             for held in list(self._held.values())
             for owner, meta in held.meta.items()
-            if any(owner == o for _, o in held.grants)
+            if any(owner == o for _, o in held.grants) and (owners is None or owner in owners)
         ]
-        await self.admission.reregister(items)
+        if items:
+            done = await self.admission.reregister(items)
+            logger.warning("grants_reregistered", count=done, asked=len(items))
+
+    async def _reload_registry(self, wanted: int | None) -> None:
+        """Reload the registry once for every call that met `stale_config` (RESCAN R10).
+
+        Each such call reloaded on its own: one publish under load was a reload storm. A call
+        joins the reload in flight, and starts one more only if that one missed `wanted`.
+        """
+        task = self._reload
+        if task is None or task.done():
+            task = self._reload = asyncio.ensure_future(self.registry.load())
+            await asyncio.shield(task)
+            return
+        await asyncio.shield(task)  # it may have started before the publish
+        if wanted is not None and self.registry.changes != wanted:
+            await self._reload_registry(None)
 
     async def _sweeper(self) -> None:
-        """One process at a time removes in-progress entries of dead owners."""
+        """One process at a time removes in-progress entries of dead owners and old dead letters."""
         while True:
             await asyncio.sleep(self.settings.sweep_secs)
             try:
@@ -2348,10 +2677,17 @@ class Engine:
                     f"{self.keys.prefix}:lock:sweep",
                     self.worker_id,
                     nx=True,
-                    ex=int(self.settings.sweep_secs),
+                    px=max(1, int(self.settings.sweep_secs * 1000)),  # ex=0 for < 1 s (A13)
                 )
                 if lock:
-                    for alias in self.registry.current.registry.models:
+                    view = self.registry.current
+                    for alias in view.registry.models:
                         await self.admission.sweep(alias)
+                        # Dead letters age out on a timer too: only the next dead letter trimmed
+                        # them, so a quiet queue kept its prompts for good (RESCAN X10).
+                        keep = int(view.value(alias, "queue")["dlq_retention_secs"])
+                        for priority in (True, False):
+                            name = self._queue_name(view, alias, priority)
+                            await self.queues.trim_dead(name, keep)
             except Exception as exc:
                 logger.warning("sweep_failed", error=str(exc))

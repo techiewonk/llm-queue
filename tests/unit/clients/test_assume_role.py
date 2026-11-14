@@ -55,10 +55,13 @@ async def make(start_fake: StartFake, sts_url: str) -> AsyncIterator[Any]:
         doc["accounts"]["aws-b"] = {
             "kind": "aws",
             "role_arn": ROLE,
-            "external_id_ref": "AWS_B_EXTERNAL_ID",
+            "external_id_ref": "LLMQ_ACCOUNT_B_EXTERNAL_ID",
         }
         view = load_registry(doc)
-        secrets = {"VLLM_KEY": "k", **({"AWS_B_EXTERNAL_ID": external} if external else {})}
+        secrets = {
+            "LLMQ_ACCOUNT_VLLM_KEY": "k",
+            **({"LLMQ_ACCOUNT_B_EXTERNAL_ID": external} if external else {}),
+        }
         pool = ClientPool(
             bedrock_endpoint_url=url,
             credentials=lambda account: {
@@ -103,7 +106,7 @@ async def test_role_session_is_reused_and_forgotten(make: Any) -> None:
 
 async def test_missing_external_id_secret_is_a_credential_failure(make: Any) -> None:
     route, providers = await make(external=None)
-    with pytest.raises(CredentialsUnavailable, match="AWS_B_EXTERNAL_ID"):
+    with pytest.raises(CredentialsUnavailable, match="LLMQ_ACCOUNT_B_EXTERNAL_ID"):
         await providers.pool.bedrock(route)
 
 

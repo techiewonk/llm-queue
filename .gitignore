@@ -40,3 +40,6 @@ site/
 
 # Internal working notes (release and test plans): kept locally, never published
 docs/internal/
+
+# Claude Code agent worktrees
+.claude/

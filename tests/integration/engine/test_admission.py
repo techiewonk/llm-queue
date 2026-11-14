@@ -130,7 +130,7 @@ async def test_smooth_window_burst(store: redis.asyncio.Redis, prefix: str) -> N
 
 
 async def test_tpm_and_correction(store: redis.asyncio.Redis, prefix: str) -> None:
-    r = await rig(store, prefix, model={"tpm": 100})
+    r = await rig(store, prefix, model={"tpm": 100, "default_output_tokens": 50})
     one = [Candidate("aws-a/r1")]
     first = await r.ask("a", candidates=one, cost_t=80)
     assert first.kind == "granted"
@@ -167,7 +167,7 @@ async def test_slots_per_class(store: redis.asyncio.Redis, prefix: str) -> None:
 
 
 async def test_reservation_for_older_waiters(store: redis.asyncio.Redis, prefix: str) -> None:
-    r = await rig(store, prefix, model={"tpm": 100})
+    r = await rig(store, prefix, model={"tpm": 100, "default_output_tokens": 50})
     one = [Candidate("aws-a/r1")]
     assert (await r.ask("x", pos=1, candidates=one, cost_t=60)).kind == "granted"
     waiter = await r.ask("w", pos=2, candidates=one, cost_t=50)
@@ -194,7 +194,7 @@ async def test_waiter_only_holds_its_own_deployments(
 
 
 async def test_dead_waiter_expires(store: redis.asyncio.Redis, prefix: str) -> None:
-    r = await rig(store, prefix, model={"tpm": 100}, waiter_secs=0.3)
+    r = await rig(store, prefix, model={"tpm": 100, "default_output_tokens": 50}, waiter_secs=0.3)
     one = [Candidate("aws-a/r1")]
     await r.ask("x", pos=1, candidates=one, cost_t=60)
     assert (await r.ask("w", pos=2, candidates=one, cost_t=50)).kind == "wait"

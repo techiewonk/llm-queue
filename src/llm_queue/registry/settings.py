@@ -147,6 +147,44 @@ def _stop(value: Any) -> str | None:
     return None if isinstance(value, str) or text_list(value) is None else "must be text or a list"
 
 
+_EXTRA_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+# Names the OpenAI SDK reads as its own arguments (headers, body, query, timeout), names that
+# change what the provider keeps (`store` saves prompt and answer), and the request's own
+# fields: an `inference.extra` entry must never reach any of them.
+EXTRA_REFUSED = frozenset(
+    {
+        "extra_headers",
+        "extra_body",
+        "extra_query",
+        "timeout",
+        "store",
+        "metadata",
+        "user",
+        "model",
+        "messages",
+        "input",
+        "stream",
+        "stream_options",
+        "api_key",
+        "base_url",
+        "tools",
+        "tool_choice",
+    }
+)
+
+
+def _extra(value: Any) -> str | None:
+    """Provider-specific inference fields: plain lowercase names, never an SDK argument."""
+    if not isinstance(value, dict):
+        return "must be an object"
+    for key in value:
+        if not _EXTRA_NAME_RE.match(key):
+            return f"`{key}` is not a plain lowercase name"
+        if key in EXTRA_REFUSED:
+            return f"`{key}` is refused (an SDK argument or a request field, not a model option)"
+    return None
+
+
 # Inference parameters and the model type they belong to (rules of §3.9).
 CHAT_INFERENCE: Mapping[str, Check] = {
     "max_tokens": number(1, integer=True),
@@ -157,7 +195,7 @@ CHAT_INFERENCE: Mapping[str, Check] = {
     "seed": number(integer=True),
     "frequency_penalty": number(-2, 2),
     "presence_penalty": number(-2, 2),
-    "extra": any_object,
+    "extra": _extra,
 }
 EMBED_INFERENCE: Mapping[str, Check] = {
     "dimensions": number(1, integer=True),
@@ -184,14 +222,9 @@ HEALTH_DEFAULTS = {
     "slow_min_secs": 5,
     "slow_min_samples": 20,
 }
-ALERT_DEFAULTS = {
-    "quota_used_pct": 90,
-    "quota_used_mins": 5,
-    "spill_pct": 20,
-    "spill_window_secs": 300,
-    "waiting_age_secs": 60,
-    "dlq_messages": 1,
-}
+ALERT_DEFAULTS = {"quota_used_pct": 90, "dlq_messages": 1}
+# A queue's messages and dead letters (which hold the prompt) live at most two weeks.
+MAX_RETENTION_SECS = 1_209_600
 QUEUE_DEFAULTS = {
     "visibility_secs": 60,
     "max_receives": 10,
@@ -271,6 +304,12 @@ SETTINGS: Mapping[str, Spec] = {
     "retry_budget_min": _spec("D,M", number(0, integer=True), 10),
     "stream_idle_secs": _spec("D,M", _POS, 30),
     "stream_max_bytes": _spec("M", number(1024, integer=True), 8_388_608),
+    # A call whose messages (inline images and documents included) are larger fails as
+    # `invalid_request` before it is queued.
+    "max_message_bytes": _spec("D,M", number(1024, integer=True), 4_194_304),
+    # Non-stream chat calls: plain Converse (IAM `bedrock:InvokeModel`), or ConverseStream
+    # (`bedrock:InvokeModelWithResponseStream`) for its first-response timer.
+    "converse_api": _spec("D,M", one_of("converse", "stream"), "converse"),
     "max_waiting": _spec("D,M", number(0, integer=True), 50_000),
     "sticky_move_after_secs": _spec("D,M", _POS, 1),
     "require_headroom_pct": _spec("D,M", _PCT, 20),
@@ -304,8 +343,8 @@ SETTINGS: Mapping[str, Spec] = {
                 "name": text,
                 "visibility_secs": number(1, 43_200, integer=True),
                 "max_receives": number(1, integer=True),
-                "retention_secs": number(60, integer=True),
-                "dlq_retention_secs": number(60, integer=True),
+                "retention_secs": number(60, MAX_RETENTION_SECS, integer=True),
+                "dlq_retention_secs": number(60, MAX_RETENTION_SECS, integer=True),
             }
         ),
         QUEUE_DEFAULTS,
@@ -343,7 +382,7 @@ SETTINGS: Mapping[str, Spec] = {
     ),
     "alerts": _spec(
         "D,M",
-        obj({key: number(0) for key in ALERT_DEFAULTS}),
+        obj({"quota_used_pct": number(1, 100), "dlq_messages": number(1, integer=True)}),
         ALERT_DEFAULTS,
         merge=True,
     ),

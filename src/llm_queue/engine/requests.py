@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 import orjson
 
 from llm_queue.engine.envelope import Reply
+from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.offload import MARKER, ResultOffload
 
@@ -46,6 +47,11 @@ REGISTER = """
 local job = redis.call('HGETALL', KEYS[1])
 local clock = redis.call('TIME')
 local now = tonumber(clock[1])
+-- The callers set lives as long as the record: an attach made it a set with no TTL (S9).
+local function keep_callers()
+  local ttl = redis.call('TTL', KEYS[1])
+  if ttl > 0 then redis.call('EXPIRE', KEYS[2], ttl) end
+end
 if #job == 0 then
   redis.call('HSET', KEYS[1], 'state', 'queued', 'user', ARGV[1], 'params', ARGV[2],
     'caller', ARGV[3], 'confirmed', '0', 'created', now)
@@ -68,6 +74,7 @@ if fields['params'] == nil then
   redis.call('HSET', KEYS[1], 'user', ARGV[1], 'params', ARGV[2], 'caller', ARGV[3],
     'confirmed', '1', 'created', now)
   redis.call('SADD', KEYS[2], ARGV[3])
+  keep_callers()
   return 'attached'
 end
 if fields['user'] ~= ARGV[1] or fields['params'] ~= ARGV[2] then return 'conflict' end
@@ -80,9 +87,11 @@ end
 if fields['confirmed'] == '0' and now - tonumber(fields['created'] or '0') >= tonumber(ARGV[8]) then
   redis.call('HSET', KEYS[1], 'caller', ARGV[3], 'created', now)
   redis.call('SADD', KEYS[2], ARGV[3])
+  keep_callers()
   return 'takeover'
 end
 redis.call('SADD', KEYS[2], ARGV[3])
+keep_callers()
 return 'attached'
 """
 
@@ -117,15 +126,14 @@ end
 for _, caller in ipairs(redis.call('SMEMBERS', KEYS[3])) do
   redis.call('PUBLISH', ARGV[5] .. caller, ARGV[6])
 end
+redis.call('EXPIRE', KEYS[3], tonumber(ARGV[4]))  -- (S9) no-op when the set is gone
 if written then return 1 end
 return 0
 """
 
-# KEYS: result, job. ARGV: dedupe secs. Read without deleting; after the first read a result
-# of a library-made id lives only `dedupe secs` more (an app-supplied id keeps its TTL).
-RESULT_TAKE = """
-local value = redis.call('GET', KEYS[1])
-if not value then return false end
+# KEYS: result, job. ARGV: dedupe secs. After its first read a result of a library-made id lives
+# only `dedupe secs` more (an app-supplied id keeps its TTL).
+_DROP_READ = """
 if redis.call('HGET', KEYS[2], 'app') ~= '1' then
   -- A library id has one reader, and the job record still says `done` to any redelivery:
   -- with no dedupe window the body goes at once (bulk embeddings kept ~2 MB a call: B97).
@@ -136,8 +144,20 @@ if redis.call('HGET', KEYS[2], 'app') ~= '1' then
     if ttl > tonumber(ARGV[1]) then redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1])) end
   end
 end
-return value
 """
+
+# KEYS: result, job. ARGV: dedupe secs, offload marker. Read a result (and drop it as above);
+# an offloaded one is only read: it is dropped once the offload read worked (RESULT_DROP).
+RESULT_TAKE = (
+    """
+local value = redis.call('GET', KEYS[1])
+if not value then return false end
+if ARGV[2] ~= '' and string.sub(value, 1, #ARGV[2]) == ARGV[2] then return value end
+"""
+    + _DROP_READ
+    + "return value\n"
+)
+RESULT_DROP = _DROP_READ + "return 1\n"
 
 # KEYS: status. ARGV: state, ttl, then field / value pairs. A final state is never replaced; the
 # TTL only grows; every write stamps the store's time as `<state>_at`.
@@ -198,6 +218,7 @@ class RequestStore:
         self._abandon = client.register_script(ABANDON)
         self._put = client.register_script(RESULT_PUT)
         self._take = client.register_script(RESULT_TAKE)
+        self._drop_read = client.register_script(RESULT_DROP)
         self._status = client.register_script(STATUS_SET)
         self._alive = client.register_script(CALLERS_ALIVE)
 
@@ -271,15 +292,32 @@ class RequestStore:
         return bool(written)
 
     async def take_result(self, request_id: str) -> Reply | None:
-        """A stored result; a library id's is then deleted (or kept `result_dedupe_secs`)."""
+        """A stored result; a library id's is then deleted (or kept `result_dedupe_secs`).
+
+        An offloaded result is deleted only after its offload read worked (RESCAN S4): it was
+        deleted first, and a blip in that read lost it. A failed or empty read raises
+        `CallFailed("result_expired")`, not the offload's raw error.
+        """
         job, _, _, result = self._req(request_id)
-        raw = await self._take([result, job], [self.dedupe])
+        marker = MARKER if self.offload is not None else b""
+        raw = await self._take([result, job], [self.dedupe, marker])
         if raw is None:
             return None
-        if raw.startswith(MARKER) and self.offload is not None:
-            raw = await self.offload.get(raw[len(MARKER) :].decode())
-            if raw is None:
-                return None
+        if self.offload is not None and raw.startswith(MARKER):
+            try:
+                body = await self.offload.get(raw[len(MARKER) :].decode())
+            except Exception as exc:
+                raise CallFailed(
+                    "result_expired",
+                    "the offloaded result could not be read",
+                    request_id=request_id,
+                ) from exc
+            if body is None:
+                raise CallFailed(
+                    "result_expired", "the offloaded result is gone", request_id=request_id
+                )
+            await self._drop_read([result, job], [self.dedupe])
+            raw = body
         return Reply.model_validate(orjson.loads(raw))
 
     async def set_status(self, request_id: str, state: str, **fields: Any) -> bool:

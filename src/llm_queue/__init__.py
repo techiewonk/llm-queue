@@ -41,21 +41,49 @@ from llm_queue.tuning import (
 )
 
 if TYPE_CHECKING:
+    from llm_queue.clients.hub import WarmOptions, run
+    from llm_queue.clients.pool import OpenAIOptions
     from llm_queue.clients.providers import register_provider
-    from llm_queue.core import EmbedResult, LLMQueue
+    from llm_queue.core import (
+        EmbedResult,
+        Health,
+        LLMQueue,
+        ModelStatus,
+        RequestStatus,
+        StatusReport,
+    )
     from llm_queue.engine.envelope import Meta, Reply
+    from llm_queue.engine.metrics import EmfSink, Metrics, NullSink, PrometheusSink
+    from llm_queue.engine.offload import ResultOffload, S3Offload
     from llm_queue.engine.tokens import register_token_estimator
     from llm_queue.registry import RegistryError, register_account_kind
+    from llm_queue.registry.store import LiveEditRefused, RegistryConflict, RegistryStore
 
 # Loaded on first access: these pull in redis, pydantic models or the SDK layer.
 _LAZY = {
     "LLMQueue": "llm_queue.core",
     "EmbedResult": "llm_queue.core",
+    "Health": "llm_queue.core",
+    "ModelStatus": "llm_queue.core",
+    "RequestStatus": "llm_queue.core",
+    "StatusReport": "llm_queue.core",
     "Reply": "llm_queue.engine.envelope",
     "Meta": "llm_queue.engine.envelope",
+    "Metrics": "llm_queue.engine.metrics",
+    "EmfSink": "llm_queue.engine.metrics",
+    "NullSink": "llm_queue.engine.metrics",
+    "PrometheusSink": "llm_queue.engine.metrics",
+    "ResultOffload": "llm_queue.engine.offload",
+    "S3Offload": "llm_queue.engine.offload",
     "RegistryError": "llm_queue.registry",
+    "RegistryStore": "llm_queue.registry.store",
+    "RegistryConflict": "llm_queue.registry.store",
+    "LiveEditRefused": "llm_queue.registry.store",
     "register_account_kind": "llm_queue.registry",
     "register_provider": "llm_queue.clients.providers",
+    "OpenAIOptions": "llm_queue.clients.pool",
+    "WarmOptions": "llm_queue.clients.hub",
+    "run": "llm_queue.clients.hub",
     "register_token_estimator": "llm_queue.engine.tokens",
 }
 
@@ -67,20 +95,35 @@ __all__ = [
     "ConfigError",
     "DeploymentView",
     "EmbedResult",
+    "EmfSink",
     "EngineTimings",
+    "Health",
     "LLMQueue",
     "LLMQueueError",
+    "LiveEditRefused",
     "Meta",
+    "Metrics",
     "MissingExtra",
+    "ModelStatus",
+    "NullSink",
+    "OpenAIOptions",
+    "PrometheusSink",
+    "RegistryConflict",
     "RegistryError",
     "RegistryOptions",
+    "RegistryStore",
     "Reject",
     "Reply",
     "RequestContext",
+    "RequestStatus",
+    "ResultOffload",
+    "S3Offload",
+    "StatusReport",
     "StoreOptions",
     "StoreUnavailable",
     "Tuning",
     "UnknownModel",
+    "WarmOptions",
     "__version__",
     "current_context",
     "register_account_kind",
@@ -92,6 +135,7 @@ __all__ = [
     "register_sticky_key",
     "register_token_estimator",
     "request_context",
+    "run",
 ]
 
 

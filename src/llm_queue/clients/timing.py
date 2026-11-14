@@ -21,10 +21,15 @@ class AttemptTimeout(TimeoutError):
 
 @dataclass(frozen=True, slots=True)
 class Timing:
-    """Limits of one attempt: until the first response, and between later chunks."""
+    """Limits of one attempt: until the first response, between later chunks, and in total.
+
+    `attempt_secs` bounds a non-streamed call (plain Converse), whose first response is the
+    whole answer; while it is None, Bedrock chat streams underneath (first-response timer).
+    """
 
     first_response_secs: float = 60.0
     idle_secs: float = 30.0
+    attempt_secs: float | None = None
 
 
 async def first(awaitable: Awaitable[_T], secs: float, what: str) -> _T:

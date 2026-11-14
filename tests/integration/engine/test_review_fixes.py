@@ -162,7 +162,9 @@ def test_settings_refuse_unsafe_values(env: dict[str, str], problem: str) -> Non
 
 
 def test_settings_accept_valkey_urls_and_hide_the_password() -> None:
-    settings = InfraSettings.from_env({"LLMQ_STORE_URL": "valkey://:secret@localhost:6379/0"})
+    settings = InfraSettings.from_env(
+        {"LLMQ_STORE_URL": "valkey://:secret@localhost:6379/0", "LLMQ_ENVIRONMENT": "dev"}
+    )
     assert "secret" not in repr(settings)
 
 
@@ -174,6 +176,7 @@ async def test_start_twice_and_restart(make: Make, store: Any, prefix: str) -> N
     port = store.connection_pool.connection_kwargs["port"]
     env = {
         "LLMQ_STORE_URL": f"redis://:localdev@127.0.0.1:{port}/0",
+        "LLMQ_ENVIRONMENT": "test",
         "LLMQ_KEY_PREFIX": prefix,
         "LLMQ_REGISTRY": json.dumps(dict(engine.registry.current.registry.raw)),
         "LLMQ_METRICS_SINK": "none",
@@ -199,6 +202,7 @@ async def test_first_sync_calls_from_many_threads_build_one_runner(
     port = store.connection_pool.connection_kwargs["port"]
     env = {
         "LLMQ_STORE_URL": f"redis://:localdev@127.0.0.1:{port}/0",
+        "LLMQ_ENVIRONMENT": "test",
         "LLMQ_KEY_PREFIX": prefix,
         "LLMQ_REGISTRY": json.dumps(dict(engine.registry.current.registry.raw)),
         "LLMQ_METRICS_SINK": "none",
