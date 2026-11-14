@@ -33,15 +33,44 @@ Each process publishes its registry at `start()` by `registry_version`:
 
 | This process's version vs the store's | What happens |
 |---|---|
-| Higher | It is published and replaces the stored one |
+| Higher | It is published and replaces the stored one; live routing blocks and the kill switch of the stored one are carried over |
 | Equal, same content | The stored one is kept, with its live edits |
 | Equal, other content | The stored one is kept; the process logs `registry_version_not_bumped` |
 | Lower | The stored one is used; the process logs `registry_older_ignored` |
+| Stored one invalid for this pod, its version not above this one | This pod's document replaces it (`registry_invalid_replaced`) |
+| Stored one needs a newer library (`min_lib_version`) | Never replaced; this pod keeps its own document and logs `registry_needs_newer_library` |
 
 So during a rolling deploy of one service, its new pods publish the new version and the old pods
 of every service pick it up on their next reload (`LLMQ_CFG_RELOAD_SECS`, 30 s). Raise
-`registry_version` with every deployed change, and ship the new document to every service; a
-service with an old document keeps working on the stored, newer one.
+`registry_version` with every deployed change, and ship the new document to every service.
+
+What a service on an older document gets from a newer stored one:
+
+- **Changed settings and deployments** of models it knows: used at the next reload.
+- **New models**: running pods start a receive loop for them at the next reload, so their calls
+  are served; the service's own code can call them by alias once it knows the name.
+- **Settings it does not know** (written by a newer library): read as warnings and ignored by
+  this pod; the newer pods apply them.
+- **A `min_lib_version` above its library**: the pod stays up on its own registry, never
+  publishes over the stored one, and warns. Upgrade the library.
+
+Emergency routing blocks (`llm-queue block`) and the kill switch are carried into every publish:
+a deploy never undoes them; only an explicit unblock does.
+
+<!-- verify after merge: running pods start receive loops for models added by a newer registry (RESCAN R3); behaviour for removed models. -->
+
+```mermaid
+flowchart TD
+  S([start / reload]) --> R{Stored registry}
+  R -- "missing" --> P[Publish own document]
+  R -- "needs newer library" --> K[Keep own / last good<br/>never publish, warn]
+  R -- "invalid for this pod" --> V{Own version >= stored?}
+  V -- yes --> P
+  V -- no --> K
+  R -- "valid" --> C{Own version vs stored}
+  C -- higher --> P2[Publish, carry live blocks]
+  C -- "equal / lower" --> U[Use the stored one]
+```
 
 ## Fairness between clients
 
@@ -59,5 +88,13 @@ To keep latency-sensitive callers moving:
 ## Library versions
 
 Services may run different llm-queue versions for a while. Queue messages carry a format
-version; a worker that gets a message newer than it understands returns it to the queue, never
-drops it, so a newer worker can take it. See the [stability policy](../project/stability.md).
+version; a worker that gets a message newer than it understands passes it on to the queue,
+never drops it (and does not spin on it), so a newer worker can take it. Set the registry's
+`min_lib_version` when a registry change needs a newer library: older pods then stay up but
+never publish over that registry. See the [stability policy](../project/stability.md).
+
+<!-- verify after merge: "does not spin on it" — PLAN C5: newer-envelope messages are passed on without the 5 s hot loop. -->
+
+Each service also needs its own process settings right: the same `LLMQ_ENVIRONMENT` class
+(strict or dev) everywhere, since a strict process refuses plain-TCP stores and a missing salt
+([Environment variables](../reference/environment.md)).
