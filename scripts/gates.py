@@ -8,6 +8,7 @@ it applies. Nothing calls a real LLM.
     python scripts/gates.py B17 B95        # some
     python scripts/gates.py --quick        # all but the slow calibration gates (about 14 minutes)
     python scripts/gates.py --list
+    python scripts/gates.py B34 --record-baseline   # store this machine's B34 numbers
 
 `--quick` leaves out B17 (fixed windows over whole minutes), B91 (20 models x 30 deployments),
 and B92 (3 minutes idle); run every gate before a release.
@@ -34,13 +35,17 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gates_fleet import (  # needs the sys.path entry
+    CHAT_ID,
     EMBED_ID,
     PY,
+    REGIONS,
     TITAN_ID,
     FakeLLM,
     Store,
     Worker,
+    account_keys,
     environment,
+    free_port,
     log_dir,
     new_prefix,
     registry,
@@ -52,6 +57,8 @@ from gates_fleet import (  # needs the sys.path entry
 from llm_queue import CallFailed, LLMQueue
 
 FAST = {"defaults": {"latency_ms": {"p50": 150, "p95": 250}}}
+BASELINE = Path(__file__).resolve().parent / "baselines" / "perf.json"
+RECORD_BASELINE = "--record-baseline" in sys.argv  # B34 writes BASELINE instead of reading it
 
 
 def chat(text: str = "hi", *, tools: bool = False) -> dict[str, Any]:
@@ -146,7 +153,7 @@ async def callers(env: dict[str, str], count: int = 2) -> list[LLMQueue]:
     """Caller-only queues in this process."""
     queues = []
     for _ in range(count):
-        queue = LLMQueue.from_env({**env, "LLMQ_MODE": "caller"})
+        queue = LLMQueue.from_env({**env, "LLMQ_MODE": "caller"}, credentials=account_keys)
         await queue.start()
         queues.append(queue)
     return queues
@@ -218,17 +225,20 @@ def verdict(name: str, checks: dict[str, bool], lines: list[str]) -> bool:
 async def b17() -> bool:
     """10K mixed calls on 3 accounts x 3 regions (scaled: ~5,000 over 2.5 min).
 
-    Pass: no deployment over its RPM in any minute; served >= 0.9 x the quota in the full
-    minute; priority wait p95 <= 2 s.
+    Pass: no deployment over its RPM in any minute, by the store's counters and by the
+    provider's (fakellm counts each deployment's calls per wall-clock minute); served >= 0.9 x
+    the quota in the full minute; priority wait p95 <= 2 s.
     """
     rpm = 200  # per deployment, fixed minute: 9 x 200 = 1,800 a minute
+    deployments = [f"{CHAT_ID}@aws-{a}/{r}" for a in range(3) for r in REGIONS[:3]]
+    scenario = {**FAST, "models": {key: {} for key in deployments}}  # one fakellm key each
     doc = registry(
         {
             "chat": {"rpm": rpm, "rate_window": "fixed", "balance": "headroom"},
             "titan": {"type": "embedding", "model_id": TITAN_ID, "rpm": 100_000},
         }
     )
-    async with Gate(doc) as gate:
+    async with Gate(doc, scenario) as gate:
         await gate.workers(4)
         queues = await gate.callers(2)
         run = Run()
@@ -266,6 +276,13 @@ async def b17() -> bool:
         await paced(47.5, 150, one)
         stop.set()
         await sampler
+        provider = await asyncio.to_thread(gate.fake.stats)
+    # A call granted in the last instant of a minute may reach the provider in the next one:
+    # two calls of slack per deployment-minute for that, no more.
+    provider_over = max(
+        (n for key in deployments for n in (provider.get(key) or {}).get("by_minute", {}).values()),
+        default=0,
+    )
     chats = [r for r in run.results if r.model == "chat"]
     minutes = sorted({m for m, _ in used})
     full = minutes[1] if len(minutes) > 2 else minutes[0]  # a minute the run covered whole
@@ -277,11 +294,14 @@ async def b17() -> bool:
         f"{len(run.results)} calls ({chat_served} chat served); failures {run.kinds() or 0}",
         f"served in the full minute: {served_full} of {9 * rpm}; max per deployment-minute "
         f"{over} (limit {rpm}); priority wait p95 {priority_wait:.2f}s",
+        f"provider: max calls per deployment-minute {provider_over}",
     ]
     return verdict(
         "B17",
         {
             "no deployment over its RPM in a minute": over <= rpm,
+            "provider: no deployment over its RPM in a minute (+2 at the boundary)": provider_over
+            <= rpm + 2,
             "throughput >= 0.9 x quota": served_full >= 0.9 * 9 * rpm,
             "priority wait p95 <= 2 s": priority_wait <= 2.0,
         },
@@ -512,7 +532,7 @@ async def b95() -> bool:
 
     doc = registry({"chat": {"rpm": 600}}, accounts=1, regions=1)
     proxy = StoreProxy()
-    proxy_port = 6388
+    proxy_port = free_port()
     server = await asyncio.start_server(proxy.handle, "127.0.0.1", proxy_port)
     try:
         async with Gate(doc, LLMQ_STORE_URL=f"redis://:localdev@127.0.0.1:{proxy_port}/0") as gate:
@@ -537,7 +557,7 @@ async def b95() -> bool:
     return verdict(
         "B95",
         {
-            "0 calls dropped as caller_gone": "cancelled" not in kinds,
+            "0 calls dropped as caller_gone": "caller_gone" not in kinds,
             "all served": all(r.ok for r in run.results),
         },
         [f"{sum(r.ok for r in run.results)}/500 served; failures {kinds or 0}"],
@@ -690,33 +710,55 @@ async def b33() -> bool:
 
     Here 3K / min and one version.
 
-    Pass: 0 lost, 0 failed priority calls; registry version never goes
-    back.
+    Pass: 0 lost, 0 failed priority calls; with a live edit at each restart, the
+    registry version each caller sees never goes back and ends at the last edit.
     """
     doc = registry({"chat": {"rpm": 1_000_000}}, accounts=1, regions=1)
     async with Gate(doc) as gate:
         await gate.workers(4)
         queues = await gate.callers(2)
         run = Run()
-        versions: list[int] = []
+        seen: list[list[int]] = [[], []]  # versions each caller saw, sampled
+        done = asyncio.Event()
+        edits = 0
 
         async def restarts() -> None:
-            for worker in list(gate.fleet):
-                await asyncio.sleep(6)
-                await gate.workers(1)
-                await worker.stop()
-                versions.append(int(queues[0].registry.current.registry.version))
+            nonlocal edits
+            try:
+                for n, worker in enumerate(list(gate.fleet)):
+                    await asyncio.sleep(6)
+                    await gate.workers(1)
+                    edit = queues[0].registry.set(
+                        {"rpm": 1_000_000 - n - 1}, model="chat", actor="b33"
+                    )
+                    await asyncio.gather(worker.stop(), edit)  # an edit mid-restart
+                    edits += 1
+            finally:
+                done.set()
+
+        async def sample() -> None:
+            while not done.is_set():
+                for k, queue in enumerate(queues):
+                    seen[k].append(int(queue.registry.current.registry.version))
+                await asyncio.sleep(0.2)
 
         load = paced(50, 40, lambda i: run.call(queues[i % 2], "chat", chat(), priority=i % 4 == 0))
-        await asyncio.gather(load, restarts())
+        await asyncio.gather(load, restarts(), sample())
+        await asyncio.sleep(2)  # LLMQ_CFG_RELOAD_SECS default: every caller has the last edit
+        final = [int(q.registry.current.registry.version) for q in queues]
+    start = seen[0][0] if seen[0] else 0
     return verdict(
         "B33",
         {
             "0 lost": all(r.ok for r in run.results),
             "0 failed priority calls": all(r.ok for r in run.results if r.priority),
-            "registry version never goes back": versions == sorted(versions),
+            "registry version never goes back": all(v == sorted(v) for v in seen),
+            "every caller ends on the last edit": final == [start + edits] * 2,
         },
-        [f"{len(run.results)} calls during 4 restarts; failures {run.kinds() or 0}"],
+        [
+            f"{len(run.results)} calls during 4 restarts and {edits} live edits; "
+            f"failures {run.kinds() or 0}; versions seen {[sorted(set(v)) for v in seen]}"
+        ],
     )
 
 
@@ -728,8 +770,9 @@ def _ramp_call(run: Run, queues: list[LLMQueue], i: int) -> Coroutine[Any, Any, 
 async def b34() -> bool:
     """Ramp until something saturates; queue overhead.
 
-    Pass: the ceiling and store memory are
-    recorded; with no backlog the queue path adds <= 20 ms at p95 over a direct call.
+    Pass: with no backlog the queue path adds <= 20 ms at p95 over a direct call; against
+    the stored baseline (`scripts/baselines/perf.json`, `--record-baseline` writes it), the
+    queued p95 is within 25 % + 10 ms and the ceiling at least 80 %.
     """
     fixed = {"defaults": {"latency_ms": {"p50": 100, "p95": 100}}}
     doc = registry({"chat": {"rpm": 10_000_000, "worker_slots": 200}}, accounts=1, regions=1)
@@ -756,12 +799,26 @@ async def b34() -> bool:
                 break
             ceiling = len(ok) / 8
         memory = gate.store.memory_mb()
-    added = p95([r.total_secs for r in queued.results]) - p95(
-        [r.total_secs for r in direct.results]
-    )
+    queued_ms = p95([r.total_secs for r in queued.results]) * 1000
+    added = queued_ms / 1000 - p95([r.total_secs for r in direct.results])
+    numbers = {"queued_p95_ms": round(queued_ms, 1), "ceiling_per_s": ceiling}
+    checks = {"queue path adds <= 20 ms at p95": added <= 0.020}
+    if RECORD_BASELINE:
+        BASELINE.parent.mkdir(exist_ok=True)
+        BASELINE.write_text(json.dumps(numbers, indent=2) + "\n", encoding="utf-8")
+        print(f"  baseline recorded: {numbers}")
+    elif BASELINE.exists():
+        base = json.loads(BASELINE.read_text(encoding="utf-8"))
+        checks["queued p95 within 25 % + 10 ms of the baseline"] = (
+            queued_ms <= base["queued_p95_ms"] * 1.25 + 10
+        )
+        checks["ceiling >= 0.8 x the baseline"] = ceiling >= 0.8 * base["ceiling_per_s"]
+        print(f"  baseline: {base}")
+    else:
+        checks["a baseline exists (record one with --record-baseline)"] = False
     return verdict(
         "B34",
-        {"queue path adds <= 20 ms at p95": added <= 0.020},
+        checks,
         [f"queued p95 {p95([r.total_secs for r in queued.results]) * 1000:.0f} ms, direct p95 "
          f"{p95([r.total_secs for r in direct.results]) * 1000:.0f} ms (+{added * 1000:.0f} ms)",
          f"ceiling on this machine: {ceiling:.0f} calls/s with queue wait p95 <= 1 s "
@@ -773,11 +830,13 @@ async def b23() -> bool:
     """Queue store primary killed mid-run, `queue_wait_replicas` off and on.
 
     Pass: lost sends
-    and duplicates recorded; with it on, losses not higher than with it off.
+    and duplicates (a call the provider ran twice: every body is unique) recorded; with it on,
+    losses and duplicates not higher than with it off.
     """
     import failover
 
     losses: dict[str, int] = {}
+    dups: dict[str, int] = {}
     for wait in (0, 1):
         failover.nodes_up()
         proxy = failover.Proxy()
@@ -817,22 +876,31 @@ async def b23() -> bool:
                     lambda i: run.call(  # noqa: B023  # awaited within this iteration
                         queues[i % 2],  # noqa: B023
                         "chat",
-                        chat(),
+                        chat(f"b23 {wait} {i}"),  # noqa: B023  # unique: fakellm counts repeats
                         timeout_secs=20,
                     ),
                 )
                 await asyncio.gather(load, chaos())
+                provider = await asyncio.to_thread(gate.fake.stats)
         finally:
             server.close()
             failover.nodes_down()
         lost = sum(1 for r in run.results if not r.ok and r.kind == "deadline_exceeded")
         losses["on" if wait else "off"] = lost
+        dups["on" if wait else "off"] = sum(int(m.get("duplicates", 0)) for m in provider.values())
+        side = "on" if wait else "off"
         print(f"  queue_wait_replicas={wait}: {len(run.results)} calls, lost {lost}, "
-              f"failures {run.kinds() or 0}")  # fmt: skip
+              f"duplicates {dups[side]}, failures {run.kinds() or 0}")  # fmt: skip
     return verdict(
         "B23",
-        {"losses with the wait on <= with it off": losses["on"] <= losses["off"]},
-        [f"lost sends: off {losses['off']}, on {losses['on']}"],
+        {
+            "losses with the wait on <= with it off": losses["on"] <= losses["off"],
+            "duplicates with the wait on <= with it off": dups["on"] <= dups["off"],
+        },
+        [
+            f"lost sends: off {losses['off']}, on {losses['on']}; "
+            f"duplicates: off {dups['off']}, on {dups['on']}"
+        ],
     )
 
 
@@ -860,7 +928,14 @@ def main() -> int:
     """Run the chosen gates; exit 1 if any fails."""
     setup_logging()
     print(f"  logs of worker processes: {log_dir()}", flush=True)
-    args = sys.argv[1:]
+    args = [a for a in sys.argv[1:] if a != "--record-baseline"]
+    seed = random.randrange(2**31)
+    if "--seed" in args:
+        at = args.index("--seed")
+        seed = int(args[at + 1])
+        del args[at : at + 2]
+    random.seed(seed)
+    print(f"  seed {seed} (replay with --seed {seed})", flush=True)
     if args == ["--list"]:
         for name, fn in GATES.items():
             print(f"{name:4} {(fn.__doc__ or '').splitlines()[0]}")

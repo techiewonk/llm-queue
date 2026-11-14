@@ -89,7 +89,9 @@ async def test_max_concurrency_throttles_excess() -> None:
     assert errors.count(None) == 3
     assert errors.count("ThrottlingException") == 7
     stats = engine.stats["k"].public()
+    assert sum(stats.pop("by_minute").values()) == 10
     assert stats == {
+        "duplicates": 0,  # no body given
         "calls": 10,
         "ok": 3,
         "concurrent": 0,

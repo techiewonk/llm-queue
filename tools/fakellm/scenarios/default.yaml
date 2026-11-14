@@ -10,7 +10,14 @@
 # tpm (reserves input + max_tokens at the start, settles to usage at the end, like Bedrock),
 # throttle_rate, error_rate_5xx, timeout_rate, tool_calls (echo|none), dims, force_error,
 # retry_after_s, tokens_per_s (output pace, 0 = instant), output_tokens (fixed reply length),
-# usage_missing (no usage in replies), hang (never answers).
+# usage_missing (no usage in replies), hang (never answers), force_message (replaces any error's
+# text), reasoning (none|text|redacted|both: reasoning blocks before the answer), tail_rate +
+# tail_ms (heavy latency tail), latency_per_1k_input_ms (latency grows with the prompt),
+# cache_read_tokens / cache_write_tokens (prompt-cache usage), cut_after_chunks + cut_with
+# (end a stream after N text chunks with modelStreamErrorException, throttlingException,
+# internalServerException, serviceUnavailableException, validationException, stall or close).
+# Error names beyond the AWS ones: InvalidSignatureClockSkew (InvalidSignatureException, clock
+# skew text); ServiceQuotaExceededException is insufficient_quota on the OpenAI front.
 # Streaming: Bedrock ConverseStream (/converse-stream) and OpenAI chat with stream=true.
 seed: 42
 strict_models: false

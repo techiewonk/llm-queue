@@ -89,7 +89,9 @@ async def test_stats_and_reset(start_fake: StartFake) -> None:
         await call(fake, "POST", "/v1/chat/completions", CHAT)
     status, body = await call(fake, "GET", "/admin/stats")
     assert status == 200
+    assert sum(body["models"]["m"].pop("by_minute").values()) == 2  # per wall-clock minute
     assert body["models"]["m"] == {
+        "duplicates": 1,  # the same body twice
         "calls": 2,
         "ok": 2,
         "concurrent": 0,

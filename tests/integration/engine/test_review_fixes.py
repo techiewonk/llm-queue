@@ -12,7 +12,7 @@ import threading
 from typing import Any
 
 import pytest
-from engine_testkit import CHAT, Make
+from engine_testkit import CHAT, Make, away_from_minute_end
 from redis.exceptions import ConnectionError as StoreConnectionError
 from redis.exceptions import ResponseError
 
@@ -85,14 +85,13 @@ async def test_refund_matches_the_charge(make: Make) -> None:
     doc["accounts"]["aws-a"]["settings"] = {"inference": {"max_tokens": 4096}}
     doc["registry_version"] = int(doc["registry_version"]) + 1
     await engine.registry.publish(doc, actor="test")
-    minute = engine.clock.now() // 60
+    await away_from_minute_end(engine.clock.now)  # counters are per calendar minute
     reply = await engine.call("small", CHAT)
     status = await engine.status("small")
     used = status["deployments"][0]["tpm"]["used"]
-    if engine.clock.now() // 60 == minute:  # counters are per calendar minute
-        assert reply.meta.tokens_in is not None
-        assert used >= 0, "a refund larger than the charge drove the counter negative"
-        assert used <= (reply.meta.tokens_in or 0) + (reply.meta.tokens_out or 0) + 10
+    assert reply.meta.tokens_in is not None
+    assert used >= 0, "a refund larger than the charge drove the counter negative"
+    assert used <= (reply.meta.tokens_in or 0) + (reply.meta.tokens_out or 0) + 10
 
 
 async def test_missing_admission_numbers_do_not_hang(make: Make) -> None:
@@ -223,8 +222,9 @@ async def test_first_sync_calls_from_many_threads_build_one_runner(
         assert len({id(r) for r in runners}) == 1
     finally:
         await asyncio.to_thread(queue.close_sync)
+    # E2: one private loop per process, shared by every queue; it outlives a closed runner.
     alive = [t for t in threading.enumerate() if t.name == "llmq-sync"]
-    assert not alive
+    assert len(alive) <= 1
 
 
 async def test_store_error_after_send_waits_instead_of_running_twice(

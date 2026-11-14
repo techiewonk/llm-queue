@@ -212,7 +212,7 @@ async def providers(start_fake: StartFake) -> AsyncIterator[tuple[Any, Providers
         ClientPool(
             bedrock_endpoint_url=url,
             credentials=lambda a: {"aws_access_key_id": a.name, "aws_secret_access_key": "x"},
-            secrets={"VLLM_KEY": "key-v"}.get,
+            secrets={"LLMQ_ACCOUNT_VLLM_KEY": "key-v"}.get,
         )
     )
     yield view, built

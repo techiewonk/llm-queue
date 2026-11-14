@@ -21,6 +21,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: System :: Distributed Computing",
@@ -76,11 +77,18 @@ Changelog = "https://github.com/techiewonk/llm-queue/blob/main/CHANGELOG.md"
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
+    # A hung test fails after `timeout` (below) instead of stalling CI for 6 hours.
+    "pytest-timeout>=2.3",
+    "pytest-cov>=6",
+    # Property tests of the budget math (tests/unit/engine/test_budget_properties.py).
+    "hypothesis>=6.100",
+    # Per-process RSS / connection sampling in scripts/soak.py.
+    "psutil>=6",
+    "types-psutil",
     "ruff>=0.6",
     "mypy>=1.11",
     "types-aiobotocore[s3,bedrock-runtime,sts]",
     "moto[server]>=5",
-    "fakeredis>=2.26",
     # extras installed for development and tests of the provider/adapter layers
     # The dev env is on the LangChain 1.x line; the 0.3 line is checked in CI (langchain-03 job).
     "openai>=1.40,<4",
@@ -163,11 +171,24 @@ filterwarnings = [
 ]
 pythonpath = ["src"]
 testpaths = ["tests/unit"]
+# Per test (pytest-timeout); the slowest stack test takes ~40 s.
+timeout = 120
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "integration: needs the Docker stack (docker/compose.yaml)",
 ]
+
+[tool.coverage.run]
+branch = true
+source = ["llm_queue"]
+
+[tool.coverage.report]
+# The unit + integration run in CI: 89.85 % measured 2026-11-14 (line + branch), rounded down.
+# Raise it as tests are added; never lower it to get a change through.
+fail_under = 89
+show_missing = false
+skip_covered = true
 
 [tool.repo-review]
 ignore = [

@@ -153,12 +153,16 @@ async def test_region_discrimination(start_fake: StartFake, make_bedrock: MakeBe
     with pytest.raises(ClientError):
         await virginia.converse(modelId=GPT, messages=MSGS)
     stats = fake.engine.snapshot()["models"]
+    assert isinstance(stats, dict)
+    for entry in stats.values():
+        assert sum(entry.pop("by_minute").values()) == entry["calls"]
     assert stats == {
         f"{GPT}@ap-south-1": {
             **_zero(),
             "calls": 2,
             "ok": 2,
             "max_concurrent_seen": 1,
+            "duplicates": 1,  # the same body twice
             "tokens": stats[f"{GPT}@ap-south-1"]["tokens"],
         },
         f"{GPT}@us-east-1": {**_zero(), "calls": 1, "errors": 1},
@@ -188,7 +192,7 @@ async def test_every_error_parses_in_botocore(
     with pytest.raises(ClientError) as info:
         await client.converse(modelId=GPT, messages=MSGS)
     error = info.value.response
-    assert error["Error"]["Code"] == name
+    assert error["Error"]["Code"] == ERRORS[name].wire_code(name)
     assert error["Error"]["Message"] == ERRORS[name].message
     assert error["ResponseMetadata"]["HTTPStatusCode"] == ERRORS[name].status
 
@@ -205,5 +209,14 @@ async def test_strict_models_unknown_key_is_not_found(
 
 
 def _zero() -> dict[str, int]:
-    keys = ("calls", "ok", "concurrent", "max_concurrent_seen", "throttled", "errors", "tokens")
+    keys = [
+        "calls",
+        "ok",
+        "concurrent",
+        "max_concurrent_seen",
+        "throttled",
+        "errors",
+        "tokens",
+        "duplicates",
+    ]
     return dict.fromkeys(keys, 0)
