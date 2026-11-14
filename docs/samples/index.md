@@ -87,6 +87,8 @@ An app sets the same environment the runner sets, from its own secrets:
 
 | Variable | Runner value | In an app |
 |---|---|---|
+| `LLMQ_ENVIRONMENT` | `dev` | unset or your environment's name (strict) |
+| `LLMQ_ID_HASH_SALT` | | from your secrets (required when strict) |
 | `LLMQ_STORE_URL` | `redis://:localdev@127.0.0.1:6379/0` | `rediss://...` of the ElastiCache Valkey |
 | `LLMQ_KEY_PREFIX`, `LLMQ_QUEUE_PREFIX` | per run | per environment, e.g. `llmq:prod` |
 | `LLMQ_REGISTRY` | `samples/registry.json`, region set | the app's registry document |
@@ -101,10 +103,13 @@ async def lifespan(app):
     await llmq.start()              # a failure here should fail the pod: queued models need it
     yield
     llmq.pause_receiving()          # not ready; no new queued work (also from a preStop /drain)
-    await llmq.stop(drain_secs=20)  # one budget for running jobs and calls together
+    await llmq.stop()               # LLMQ_DRAIN_SECS (25 s) for running jobs and calls together
 ```
 
-Outside dev, `LLMQ_STORE_URL` must be `rediss://` and `LLMQ_ID_HASH_SALT` must be set.
+Unless `LLMQ_ENVIRONMENT` is `dev`, `local`, `test` or `ci` (unset counts as strict),
+`LLMQ_STORE_URL` must be `rediss://` and `LLMQ_ID_HASH_SALT` must be set.
+
+<!-- verify after merge: scripts/samples.py sets LLMQ_ENVIRONMENT=dev (or a salt) for fakellm / local runs; with the 0.1.0b2 strict default it otherwise fails at from_env. -->
 
 ## Measured on real Bedrock
 
