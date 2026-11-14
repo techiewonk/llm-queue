@@ -978,39 +978,42 @@ class Engine:
         tries = 0
         while True:
             try:
-                await self.queues.send(
-                    self._queue_name(view, alias, priority),
-                    body,
-                    settings,
-                    wait_replicas=self.settings.queue_wait_replicas,
-                    wait_ms=self.settings.queue_wait_ms,
-                )
-                break
-            except QueueFull as exc:
-                await self.requests.abandon(rid, caller=self.worker_id)
-                raise CallFailed("queue_full", str(exc), retry_after_secs=5) from exc
+                try:
+                    await self.queues.send(
+                        self._queue_name(view, alias, priority),
+                        body,
+                        settings,
+                        wait_replicas=self.settings.queue_wait_replicas,
+                        wait_ms=self.settings.queue_wait_ms,
+                    )
+                    break
+                except STORE_ERRORS:
+                    if not self.queues_shared and loop.time() < give_up:
+                        tries += 1
+                        await asyncio.sleep(self._store_retry_secs(tries))
+                        continue
+                    raise
             except NotReplicated as exc:
                 # A failed send (plan B23): the call runs direct now, under this same record
                 # (re-registering raced the unreplicated copy's claim into a conflict). Not
                 # re-sent: each try would add a copy; the copy meets a claimed job and stops.
                 logger.warning("send_not_replicated", request_id=rid, error=str(exc))
                 raise _SendNotReplicated from exc
-            except ResponseError as exc:
-                await self.requests.abandon(rid, caller=self.worker_id)
-                if isinstance(exc, OutOfMemoryError) or "OOM" in str(exc):
-                    raise CallFailed("queue_unavailable", _refusal(exc)) from exc
-                raise
-            except STORE_ERRORS as exc:
-                if not self.queues_shared and loop.time() < give_up:
-                    tries += 1
-                    await asyncio.sleep(self._store_retry_secs(tries))
-                    continue
-                await self.requests.abandon(rid, caller=self.worker_id)
-                if self.queues_shared:
-                    raise
-                raise _QueueDown from exc
-            except BaseException:
-                await self.requests.abandon(rid, caller=self.worker_id)
+            except BaseException as exc:
+                # One cleanup for every failure, cancels included: four handlers awaited the
+                # abandon bare, so its own store error replaced the original (a cancel turned
+                # into a store error) and a cancel waited out the client's retries (RT-9).
+                await self._abandon(rid)
+                if isinstance(exc, QueueFull):
+                    raise CallFailed(
+                        "queue_full", str(exc), retry_after_secs=5, request_id=rid
+                    ) from exc
+                if isinstance(exc, ResponseError) and (
+                    isinstance(exc, OutOfMemoryError) or "OOM" in str(exc)
+                ):
+                    raise CallFailed("queue_unavailable", _refusal(exc), request_id=rid) from exc
+                if isinstance(exc, STORE_ERRORS) and not self.queues_shared:
+                    raise _QueueDown from exc
                 raise
         try:
             await self.requests.confirm(rid, keep_secs=keep_secs)
@@ -2219,8 +2222,14 @@ class Engine:
                 continue
             decision = await self.admission.pick_take(ask, self.registry.changes)
             if decision.kind == "granted":
-                await self.requests.set_status(env.request_id, "in_progress", served_model=other)
+                # The run (and its grant in `held.grants`) first; the status is informational,
+                # written behind. A failed status write before it left the grant neither run
+                # nor given back, holding a slot until its lease ended (audit RT-10).
                 self._start_run(held, decision, attempt, served=other)
+                self._spawn(
+                    self.requests.set_status(env.request_id, "in_progress", served_model=other),
+                    "fallback_status",
+                )
                 return True
         return False
 
@@ -2247,18 +2256,28 @@ class Engine:
         self._running.add(task)
         task.add_done_callback(self._running.discard)
 
-    def _spawn(self, work: Awaitable[Any]) -> None:
+    def _spawn(self, work: Awaitable[Any], what: str = "background_write") -> asyncio.Task[None]:
         """Run a best-effort store write behind, tracked (stopped by `stop`), errors logged."""
 
         async def run() -> None:
             try:
                 await work
             except Exception as exc:
-                logger.warning("background_write_failed", error=str(exc))
+                logger.warning(f"{what}_failed", error=str(exc), error_type=type(exc).__name__)
 
         task = asyncio.create_task(run())
         self._running.add(task)
         task.add_done_callback(self._running.discard)
+        return task
+
+    async def _abandon(self, rid: str) -> None:
+        """Drop this caller's unconfirmed record after a failed send: best effort, bounded.
+
+        Its failure is logged, never raised over the send's own error; a cancelled caller
+        waits for it at most the probe timer (it goes on behind).
+        """
+        task = self._spawn(self.requests.abandon(rid, caller=self.worker_id), "abandon")
+        await asyncio.wait({task}, timeout=self.settings.timings.health_probe_secs)
 
     async def _run(self, held: _Held, decision: Decision, attempt: int, alias: str) -> None:
         slots = self._slots.get(held.envelope.model)
@@ -2671,8 +2690,6 @@ class Engine:
         reply = Reply(request_id=env.request_id, ok=True, response=result.response, meta=meta)
         self._bad_accounts.pop((deployment.account, deployment.region), None)  # (plan A4)
         self._record(held, alias, deployment.account, deployment.region, "ok", meta)
-        if self.settings.debug_capture_allowed and view.value(alias, "debug_capture"):
-            await self._debug(env.request_id, params, result.response)  # (never in prod)
         # The caller first: its result, with the final status in the same script. Then the
         # grant and the message are settled together (four round trips one after another
         # before the caller was woken, before).
@@ -2692,7 +2709,12 @@ class Engine:
                 },
             )
         )
-        await asyncio.gather(
+        # Settled from here: a failure below must neither renew the grant nor refund the whole
+        # estimate of a call that succeeded (`_release`). `return_exceptions`: a FINISH refused
+        # (out of memory) raised out of the gather while the ack ran on as an orphan, and the
+        # grant was still listed, so the call was refunded in full and run again (RT-11).
+        held.grants.discard((alias, owner))
+        finished, acked = await asyncio.gather(
             self.admission.finish(  # skipped on a store error: SWEEP frees its slot
                 alias,
                 owner,
@@ -2703,8 +2725,25 @@ class Engine:
                 latency_ms=latency,
             ),
             self._through_outage(lambda: self._ack(held)),
+            return_exceptions=True,
         )
-        held.grants.discard((alias, owner))  # settled: a failure below must not renew it
+        if isinstance(finished, BaseException):  # SWEEP frees the slot after its lease
+            logger.warning(
+                "finish_failed",
+                model=alias,
+                request_id=env.request_id,
+                error=str(finished),
+                error_type=type(finished).__name__,
+            )
+        if isinstance(acked, BaseException):
+            raise acked
+        if self.settings.debug_capture_allowed and view.value(alias, "debug_capture"):
+            # After the result, and never failing the call: a store error here released a
+            # call that had succeeded, and it ran again at the provider (audit RT-12).
+            try:
+                await self._debug(env.request_id, params, result.response)  # (never in prod)
+            except Exception as exc:
+                logger.warning("debug_capture_failed", request_id=env.request_id, error=str(exc))
         await self._count_target_errors(held, succeeded=True)
         return "ok", None
 

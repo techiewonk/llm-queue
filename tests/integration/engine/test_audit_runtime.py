@@ -13,7 +13,7 @@ import time
 from typing import Any
 
 import pytest
-from engine_testkit import CHAT, Make, away_from_minute_end
+from engine_testkit import CHAT, SMALL, Make, away_from_minute_end, stats
 from redis.exceptions import ConnectionError as StoreConnectionError
 from redis.exceptions import ResponseError
 
@@ -454,3 +454,110 @@ async def test_rt8_a_failed_dead_letter_reply_skips_only_itself(
     assert reply.ok
     assert sent
     assert time.monotonic() - started < 3
+
+
+# ---------------------------------------------------------------- RT-9 to RT-12
+
+
+@pytest.mark.parametrize("failure", [asyncio.CancelledError(), StoreConnectionError("cut")])
+async def test_rt9_a_failed_abandon_never_replaces_the_send_error(
+    make: Make, monkeypatch: pytest.MonkeyPatch, failure: BaseException
+) -> None:
+    """Audit RT-9: `_send` awaited `abandon` bare in its handlers.
+
+    Its store error replaced the original (a cancel turned into a store error).
+    """
+    engine, _ = await make()
+    view = engine.registry.current
+
+    async def send(*args: Any, **kwargs: Any) -> Any:
+        raise failure
+
+    async def abandon(*args: Any, **kwargs: Any) -> None:
+        raise StoreConnectionError("abandon failed too")
+
+    monkeypatch.setattr(engine.queues, "send", send)
+    monkeypatch.setattr(engine.requests, "abandon", abandon)
+    env = _a_held(engine, "r-send").envelope
+    with pytest.raises(type(failure)) as info:
+        await engine._send("r-send", env, view, "small", False, 10.0)
+    assert info.value is failure
+
+
+async def test_rt10_model_fallback_status_failure_keeps_the_grant_running(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit RT-10: a failed status write after a fallback grant left the grant unrun.
+
+    It was neither run nor given back and held its slot until the lease sweep.
+    """
+    engine, _ = await make(
+        {
+            "big": {
+                "rpm": 1,
+                "rate_window": "smooth",
+                "deployments": {"aws-a": {"confirmed": ["r1"]}},
+                "model_fallback": {"on": ["exhausted"], "after_secs": 0, "models": ["small"]},
+            }
+        }
+    )
+    assert (await engine.call("big", CHAT)).ok
+
+    async def status(*args: Any, **kwargs: Any) -> bool:
+        raise StoreConnectionError("status write failed")
+
+    monkeypatch.setattr(engine.requests, "set_status", status)
+    second = await engine.call("big", CHAT, timeout_secs=8)
+    assert second.meta.served_model == "small"
+
+
+async def test_rt11_a_refused_finish_keeps_a_successful_call_done(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit RT-11: a FINISH refused (out of memory) after success refunded and re-ran it.
+
+    It raised out of the gather while the ack ran as an orphan; the grant was still listed, so
+    `_release` gave back the whole estimate and returned the message.
+    """
+    from redis.exceptions import OutOfMemoryError
+
+    engine, fake = await make()
+    undone: list[str] = []
+    real_undo = engine.admission.undo
+
+    async def finish(*args: Any, **kwargs: Any) -> bool:
+        raise OutOfMemoryError("OOM command not allowed")
+
+    async def undo(alias: str, owner: str, rid: str) -> bool:
+        undone.append(rid)
+        return bool(await real_undo(alias, owner, rid))
+
+    monkeypatch.setattr(engine.admission, "finish", finish)
+    monkeypatch.setattr(engine.admission, "undo", undo)
+    reply = await engine.call("small", CHAT)
+    assert reply.ok
+    await asyncio.sleep(0.5)  # a second run, if any, would have reached the provider by now
+    assert not undone
+    assert stats(fake, f"{SMALL}@r1")["calls"] == 1
+    await _until(lambda: not engine._held, what="nothing held")
+
+
+async def test_rt12_debug_capture_failure_never_reruns_the_call(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit RT-12: a store error writing the debug capture released a call that succeeded.
+
+    It ran again at the provider. The capture now comes after the result and never fails it.
+    """
+    engine, fake = await make({"small": {"debug_capture": True}})
+    engine.settings = dataclasses.replace(engine.settings, debug_capture_allowed=True)
+
+    async def debug(*args: Any, **kwargs: Any) -> None:
+        raise StoreConnectionError("debug write failed")
+
+    monkeypatch.setattr(engine, "_debug", debug)
+    reply = await engine.call("small", CHAT)
+    assert reply.ok
+    await asyncio.sleep(0.5)
+    assert stats(fake, f"{SMALL}@r1").get("duplicates", 0) == 0
+    assert stats(fake, f"{SMALL}@r1")["calls"] == 1
