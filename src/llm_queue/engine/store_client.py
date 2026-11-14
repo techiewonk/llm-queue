@@ -10,6 +10,7 @@ again. Used by `LLMQueue.from_env` and the `llm-queue` CLI.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
 
@@ -81,6 +82,14 @@ class FreshPassword(CredentialProvider):
         """The password as the secret holds it now (redis-py asks per new connection)."""
         password = self._secrets(self._name) or ""
         return (self._username, password) if self._username else (password,)
+
+    async def get_credentials_async(self) -> tuple[str] | tuple[str, str]:
+        """`get_credentials` in a worker thread: the asyncio client asks this one.
+
+        A network-backed `secrets` lookup ran on the event loop on every reconnect, stalling
+        every call during a failover (EN-31). `secrets` should still cache its values.
+        """
+        return await asyncio.to_thread(self.get_credentials)
 
 
 def secret_store_client(

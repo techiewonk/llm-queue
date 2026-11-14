@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
+from llm_queue.engine.store_guard import STORE_DOWN
 from llm_queue.errors import ConfigError, MissingExtra
 from llm_queue.registry.store import LiveEditRefused, audit_diff
 from llm_queue.registry.validate import RegistryError
@@ -21,6 +22,8 @@ if TYPE_CHECKING:
 _REDACT = frozenset({"role_arn", "external_id_ref", "api_key_ref"})
 ADMIN_HEADER = "X-LLMQ-Admin"
 Response = tuple[int, dict[str, Any]]
+# A store outage was a 500 with redis-py's traceback; it is a 503 like the readiness probe (EN-10).
+_UNAVAILABLE: Response = (503, {"error": "state store unavailable"})
 
 
 def redacted(doc: Any) -> Any:
@@ -51,24 +54,33 @@ class Handlers:
         return (200 if health["ready"] else 503), health
 
     async def status(self, model: str | None = None) -> Response:
-        """Status of a model or of everything."""
+        """Status of a model or of everything (503 while the store is unreachable)."""
         try:
             return 200, await self.engine.status(model)
         except KeyError:
             return 404, {"error": f"unknown model {model}"}
+        except STORE_DOWN:
+            return _UNAVAILABLE
 
     async def request(self, request_id: str) -> Response:
-        """Status of one call."""
-        found = await self.engine.request_status(request_id)
+        """Status of one call (503 while the store is unreachable)."""
+        try:
+            found = await self.engine.request_status(request_id)
+        except STORE_DOWN:
+            return _UNAVAILABLE
         return (200, found) if found else (404, {"error": "unknown or expired request"})
 
     async def registry(self) -> Response:
         """The live registry, secrets hidden, with what is live but not in config."""
         store = self.engine.registry
+        try:
+            live_edits = await store.diff_with_config()
+        except STORE_DOWN:
+            return _UNAVAILABLE
         return 200, {
             "registry": redacted(dict(store.current.registry.raw)),
             "changes": store.changes,
-            "live_edits": redacted(await store.diff_with_config()),
+            "live_edits": redacted(live_edits),
         }
 
     async def set(
@@ -82,6 +94,8 @@ class Handlers:
             view = await self.engine.registry.set(values, actor=f"http:{actor}", model=model)
         except (LiveEditRefused, RegistryError, ConfigError) as exc:
             return 400, {"error": str(exc)}
+        except STORE_DOWN:
+            return _UNAVAILABLE
         return 200, {"diff": redacted(audit_diff(before, dict(view.registry.raw)))}
 
     async def block(
@@ -96,6 +110,8 @@ class Handlers:
             )
         except ConfigError as exc:
             return 400, {"error": str(exc)}
+        except STORE_DOWN:
+            return _UNAVAILABLE
         routing = self.engine.registry.current.registry.routing
         return 200, {
             "blocked_regions": list(routing.blocked_regions),

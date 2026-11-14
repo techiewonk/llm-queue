@@ -210,6 +210,14 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   per pipeline) instead of `GETSET` then `EXPIRE`: 2 x N serial round trips per sample became
   N / 500 (about 1,840 alerts at 20 models x 30 deployments; time saved unverified) (EN-9).
   `Alert` is frozen (EN-25).
+- The HTTP status, request, registry and write routes answer 503 `state store unavailable`
+  during a store outage; redis-py's `ConnectionError` reached FastAPI as a 500 (EN-10).
+- `llm-queue`: a store error prints one line and exits 1 instead of a traceback; both store
+  clients are closed even when the first close raises; `registry gc` escapes glob characters of
+  `LLMQ_KEY_PREFIX` in its SCAN pattern and deletes with pipelined `UNLINK` (EN-30).
+- The store checks log (debug) why the eviction or cluster check could not run (EN-22).
+  `FreshPassword` reads the secret in a worker thread on the asyncio client, so a slow lookup
+  no longer blocks the event loop on every reconnect; `secrets` should still cache (EN-31).
 
 ### Security
 
