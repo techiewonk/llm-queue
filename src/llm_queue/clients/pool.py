@@ -135,10 +135,14 @@ async def _keep_warm(client: Any, warm: WarmOptions) -> None:
     """
     import aiohttp
 
-    http = getattr(getattr(client, "_endpoint", None), "http_session", None)
-    get_session = getattr(http, "_get_session", None)
-    url = client.meta.endpoint_url
-    if get_session is None or warm.connections <= 0:
+    from llm_queue.clients.bedrock_http import BedrockHTTP
+
+    own = client if isinstance(client, BedrockHTTP) else None
+    http: Any = getattr(getattr(client, "_endpoint", None), "http_session", None)
+    get_session: Any = getattr(http, "_get_session", None)
+    # The aiohttp transport has its own session and proxy.
+    url = own.endpoint_url if own is not None else client.meta.endpoint_url
+    if (own is None and get_session is None) or warm.connections <= 0:
         return
     timeout = aiohttp.ClientTimeout(total=15)
 
@@ -148,8 +152,11 @@ async def _keep_warm(client: Any, warm: WarmOptions) -> None:
 
     while True:
         try:
-            proxy = http._proxy_config.proxy_url_for(url)  # type: ignore[union-attr]
-            session = await get_session(proxy)
+            if own is not None:
+                proxy, session = own.proxy, own.session
+            else:
+                proxy = http._proxy_config.proxy_url_for(url)
+                session = await get_session(proxy)
             if not getattr(session.connector, "_acquired", None):
                 await asyncio.gather(*(head(session, proxy) for _ in range(warm.connections)))
         except Exception as exc:  # warm-up is best effort: a call meets real errors itself
@@ -249,10 +256,20 @@ class ClientPool:
             role = (self._sts_endpoint, self._session_name, self._options.role_session_secs)
             who = (*who, "role", role)
         size = self._sizes.get((account.name, route.region), self._options.max_pool_connections)
-        options = (self._endpoint, self._read, self._connect, size, self._warm.keepalive_secs)
+        transport = self._options.transport
+        options = (
+            self._endpoint,
+            self._read,
+            self._connect,
+            size,
+            self._warm.keepalive_secs,
+            transport,
+        )
         hub_key = ("bedrock", identity_hash(*who), route.region, options)
 
         async def build() -> tuple[Any, Callable[[], Awaitable[Any]]]:
+            if transport == "aiohttp":
+                return await self._build_http(route, extra, expiry, size)
             config = AioConfig(
                 read_timeout=self._read,
                 connect_timeout=self._connect,
@@ -286,6 +303,54 @@ class ClientPool:
         if not lease.tasks and lease.refs == 1 and self._warm.connections > 0:
             self._hub.spawn(lease, _keep_warm(lease.client, self._warm))
         return lease
+
+    async def _build_http(
+        self, route: Route, extra: dict[str, Any], expiry: Any, size: int
+    ) -> tuple[Any, Callable[[], Awaitable[Any]]]:
+        """A `BedrockHTTP` client (transport "aiohttp") with the credentials botocore would use.
+
+        The same sources as the botocore clients: an assumed role or `credentials=` with an
+        expiry (both refreshable), static keys, else the pod's credential chain.
+        """
+        from botocore.credentials import Credentials
+
+        from llm_queue.clients.bedrock_http import BedrockHTTP
+
+        account = route.account
+        credentials: Any
+        if account.role_arn:
+            credentials = await (await self._role_session(route)).get_credentials()
+        elif expiry is not None:
+            credentials = await self._refreshing_session(account, extra, expiry).get_credentials()
+        elif extra:
+            unknown = set(extra) - {
+                "aws_access_key_id",
+                "aws_secret_access_key",
+                "aws_session_token",
+            }
+            if unknown:
+                raise ConfigError(
+                    f"account {account.name}: the aiohttp Bedrock transport takes only AWS keys "
+                    f"from credentials=, not {', '.join(sorted(unknown))}"
+                )
+            credentials = Credentials(
+                str(extra.get("aws_access_key_id") or ""),
+                str(extra.get("aws_secret_access_key") or ""),
+                extra.get("aws_session_token"),
+            )
+        else:
+            assert self._session is not None
+            credentials = await self._session.get_credentials()
+        client = await BedrockHTTP.open(
+            region=route.region,
+            credentials=credentials,
+            endpoint_url=self._endpoint,
+            read_timeout=self._read,
+            connect_timeout=self._connect,
+            pool_size=size,
+            keepalive_secs=self._warm.keepalive_secs,
+        )
+        return client, client.close
 
     def _refreshing_session(self, account: Account, extra: dict[str, Any], expiry: Any) -> Any:
         """A session for `credentials=` values with an expiry: asked again before it passes."""

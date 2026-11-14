@@ -39,6 +39,9 @@ class BedrockOptions:
     connect_timeout_secs: float = 10.0
     max_pool_connections: int = 100  # per client (one per account x region)
     role_session_secs: int = 3600  # assumed-role session; 3600 is the role-chaining maximum
+    # How Bedrock calls are sent: "botocore" (aiobotocore clients) or "aiohttp" (orjson body,
+    # botocore only for credentials, SigV4 and stream frames: `clients/bedrock_http.py`).
+    transport: str = "botocore"
 
 
 @dataclass(frozen=True)
@@ -174,12 +177,17 @@ class Tuning:
         idle = {"engine.idle_poll_secs", "engine.idle_slow_secs"}
         if not idle & bad and engine.idle_poll_secs > engine.idle_slow_secs:
             out.append("engine.idle_poll_secs must not be above engine.idle_slow_secs")
+        if self.bedrock.transport not in BEDROCK_TRANSPORTS:
+            out.append(f"bedrock.transport must be one of {', '.join(BEDROCK_TRANSPORTS)}")
         session = self.bedrock.role_session_secs
         if "bedrock.role_session_secs" not in bad and not 900 <= session <= 43200:
             out.append("bedrock.role_session_secs must be 900 to 43200 (STS limits)")
         return out
 
 
+BEDROCK_TRANSPORTS = ("botocore", "aiohttp")
+# Fields checked by name in `problems()`, not as numbers.
+_CHOICES = frozenset({"transport"})
 # Fields where 0 is valid: no store retries; no warm connections, or no refresh (off).
 _ZERO_OK = frozenset({"retries", "connections", "refresh_secs"})
 
@@ -196,6 +204,8 @@ def _check_part(part: Any) -> list[str]:
     }[type(part)]
     out: list[str] = []
     for spec in fields(part):
+        if spec.name in _CHOICES:
+            continue
         value = getattr(part, spec.name)
         name = f"{section}.{spec.name}"
         whole = spec.type in ("int", int)
