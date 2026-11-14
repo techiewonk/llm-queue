@@ -988,6 +988,13 @@ async def embeds_faulted(ctx: Ctx) -> None:
     sys.path.insert(0, str(ROOT / "tools" / "fakellm"))
     from fakellm.synth import embedding
 
+    def in_order(vectors: list[list[float]], texts: list[str]) -> bool:
+        for v, t in zip(vectors, texts, strict=True):
+            want = embedding(t, 1024)
+            if abs(v[0] - want[0]) >= 1e-6 or abs(v[1] - want[1]) >= 1e-6:
+                return False
+        return True
+
     outcomes: list[tuple[str, float, bool]] = []  # kind ("" ok), secs, vectors in order
     done = asyncio.Event()
 
@@ -996,10 +1003,11 @@ async def embeds_faulted(ctx: Ctx) -> None:
         t0 = time.monotonic()
         try:
             result = await ctx.queues[i % 2].embed("cohere", texts, input_type="search_document")
-            ordered = len(result.vectors) == len(texts) and all(
-                abs(v[0] - embedding(t, 1024)[0]) < 1e-6
-                and abs(v[1] - embedding(t, 1024)[1]) < 1e-6
-                for v, t in zip(result.vectors, texts, strict=False)
+            # In a thread: 288 expected vectors took ~0.45 s of this process's event loop per
+            # call, which also runs the chat calls under test; several such stalls in a row made
+            # their answers look late (16.5 s for a 16 s limit).
+            ordered = len(result.vectors) == len(texts) and await asyncio.to_thread(
+                in_order, result.vectors, texts
             )
             outcomes.append(("", time.monotonic() - t0, ordered))
         except CallFailed as exc:

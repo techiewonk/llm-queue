@@ -564,11 +564,23 @@ class Engine:
         except asyncio.CancelledError:
             # The awaiting task was cancelled: cancel the call unless others wait on its id,
             # in other processes or in this one (they share this process's caller entry).
-            with contextlib.suppress(Exception):
-                callers = await asyncio.shield(self.requests.callers(rid))
-                alone_here = self._local_callers.get(rid, 0) <= 1
-                if alone_here and set(callers) <= {self.worker_id}:
-                    await asyncio.shield(self.cancel(rid))
+            alone_here = self._local_callers.get(rid, 0) <= 1
+
+            async def cancel_unless_shared() -> None:
+                with contextlib.suppress(Exception):
+                    callers = await self.requests.callers(rid)
+                    if alone_here and set(callers) <= {self.worker_id}:
+                        await self.cancel(rid)
+
+            # Waited for until the deadline at most, then it goes on behind: a slow store (its
+            # client's retries) held the cancellation up to 1.9 s past the deadline (scenario
+            # L4: a deadline cancelling the call retried on the store_down path).
+            cleanup = asyncio.create_task(cancel_unless_shared())
+            self._running.add(cleanup)
+            cleanup.add_done_callback(self._running.discard)
+            remaining = deadline - asyncio.get_running_loop().time()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait({cleanup}, timeout=max(0.0, remaining))
             raise
         finally:
             left = self._local_callers.get(rid, 1) - 1
@@ -992,11 +1004,15 @@ class Engine:
                     await self.state.ping()
                 except STORE_ERRORS:
                     continue
+                left = until - loop.time()
+                if left <= 0:
+                    break
+                # Only the time left: at least 1 s (as before) ran the retry past the deadline.
                 return await self.call(
                     alias,
                     envelope.params or {},
                     priority=envelope.priority,
-                    timeout_secs=max(1.0, until - loop.time()),
+                    timeout_secs=left,
                     request_id=envelope.request_id if envelope.app_request_id else None,
                     session_id=envelope.session_id,
                     user_id=envelope.user_id,
