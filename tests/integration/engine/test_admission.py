@@ -323,6 +323,25 @@ async def test_renew_and_sweep(store: redis.asyncio.Redis, prefix: str) -> None:
     assert left == [owner_token("kept", "w1", 1).encode()]
 
 
+async def test_l4_sweep_removes_a_lapsed_lease_whose_entry_is_gone(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """Scenario L4: a lease outlived its in-progress entry (gone after two leases) for good.
+
+    SWEEP removed a lease only through the entry; with the entry expired (a store block or a
+    sweep gap that long) the lease stayed on a deployment no call picked again.
+    """
+    r = await rig(store, prefix, lease_secs=0.3)
+    granted = await r.ask("dead")
+    assert granted.kind == "granted"
+    await store.delete(f"{prefix}:{{m:m}}:inprog:dead")  # the entry expired meanwhile
+    leases = [k async for k in store.scan_iter(match=f"{prefix}:{{m:m}}:lease:*")]
+    assert leases
+    await asyncio.sleep(0.4)  # past the lease
+    await r.admission.sweep("m", [str(granted.deployment)])
+    assert sum([await store.zcard(k) for k in leases]) == 0  # 1 before the fix
+
+
 async def test_breaker_counts_recent_failures_only(store: redis.asyncio.Redis, prefix: str) -> None:
     """Bug (0.3.0 review): failures counted forever until a success, so failures spread over
     hours opened the breaker; a failure more than 60 s after the last now starts again."""

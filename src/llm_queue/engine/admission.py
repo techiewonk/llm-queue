@@ -338,6 +338,11 @@ class Admission:
         body = {"lease_ms": self.lease_ms, "items": list(items)}
         return int(await self._call(self._reregister, body))
 
-    async def sweep(self, alias: str) -> int:
-        """Remove in-progress entries of owners that stopped renewing."""
-        return int(await self._call(self._sweep, {"alias": alias}))
+    async def sweep(self, alias: str, deployments: Sequence[str] = ()) -> int:
+        """Remove in-progress entries of owners that stopped renewing; lapsed leases too.
+
+        `deployments`: the model's deployment keys, whose leases past their end are removed
+        even when their in-progress entry is already gone (scenario L4 left such leases).
+        """
+        body = {"alias": alias, "deps": list(deployments)}
+        return int(await self._call(self._sweep, body))
