@@ -9,6 +9,7 @@ tokens and learns; `undo` gives a grant back; `renew` is the heartbeat; `sweep` 
 from __future__ import annotations
 
 import random
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
@@ -141,6 +142,9 @@ class Admission:
         self._rng = rng or random.Random()
         self.metrics: Metrics = metrics or NullSink()
         self._clock_ms = clock_ms
+        # Owners this process settled (FINISH or UNDO sent), oldest first: a heartbeat that
+        # found one lost re-registered it, a slot nobody freed until its lease ran out.
+        self._settled: dict[str, float] = {}
         pace = timings or EngineTimings()
         self._t = {
             "probe_wait_ms": pace.admission_probe_wait_ms,
@@ -235,6 +239,7 @@ class Admission:
         store is unreachable this is skipped (False): the grant's lease expires and SWEEP frees
         the slot, so a store blip after the provider answered never throws the answer away.
         """
+        self._settle(owner)
         body = {
             "alias": alias,
             "owner": owner,
@@ -258,6 +263,7 @@ class Admission:
 
     async def undo(self, alias: str, owner: str, request_id: str) -> bool:
         """Give a grant back entirely, without learning (lost reply, refused claim)."""
+        self._settle(owner)
         body = {"alias": alias, "owner": owner, "request_id": request_id}
         return bool(await self._call(self._undo, body))
 
@@ -273,7 +279,8 @@ class Admission:
     ) -> tuple[int, list[str]]:
         """The heartbeat: extend grants, refresh the claims of `jobs` (request id, job owner).
 
-        Returns how many grants were renewed and the owners whose entry was gone (lost).
+        Returns how many grants were renewed and the owners whose entry was gone (lost). An
+        owner settled while this beat ran is not lost (its entry went with its FINISH or UNDO).
         """
         if not items and not jobs:
             return 0, []
@@ -284,14 +291,29 @@ class Admission:
         }
         raw = orjson.loads(await self._call(self._renew, body))
         lost = raw.get("lost") or []
-        lost = [str(owner) for owner in lost] if isinstance(lost, list) else []
+        lost = (
+            [str(o) for o in lost if str(o) not in self._settled] if isinstance(lost, list) else []
+        )
         if lost:
             logger.warning("grant_lost", step="renew", count=len(lost))
             self.metrics.count("llmq_grants_lost_total", float(len(lost)), step="renew")
         return int(raw.get("n", 0)), lost
 
+    def _settle(self, owner: str) -> None:
+        """Remember a settled owner (before its script runs) for two leases, then forget it."""
+        now = time.monotonic()
+        self._settled[owner] = now
+        horizon = now - 2 * self.lease_ms / 1000
+        while (oldest := next(iter(self._settled))) != owner and self._settled[oldest] < horizon:
+            del self._settled[oldest]
+
     async def reregister(self, items: Sequence[dict[str, Any]]) -> int:
-        """After a store reset, put back the slots and entries of running calls."""
+        """After a store reset, put back the slots and entries of running calls.
+
+        An owner this process already settled is skipped: its call ended while the heartbeat
+        found its entry gone, and putting it back held a slot nobody frees until the lease ends.
+        """
+        items = [item for item in items if item["owner"] not in self._settled]
         if not items:
             return 0
         body = {"lease_ms": self.lease_ms, "items": list(items)}
