@@ -34,7 +34,9 @@ dependencies = [
     # Upper bound: the pool reads aiobotocore internals (refreshable credentials).
     "aiobotocore>=2.23,<4",
     # Queues, budgets, registry and results on any Redis-protocol store (Valkey, Redis).
-    "redis>=5.0.1,<9",
+    # 6+: TLS connections check the host name by default (off before), and the URL parser
+    # the settings check uses matches the client's.
+    "redis>=6,<9",
     # C RESP parser, picked up by redis-py: Lua array replies and stream reads parse 39-75x
     # faster than redis-py's pure-Python parser (measured 2026-11-13).
     "hiredis>=3,<4",

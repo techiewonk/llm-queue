@@ -141,6 +141,7 @@ async def test_command_line(make: Make, store: redis.asyncio.Redis, prefix: str)
     port = store.connection_pool.connection_kwargs["port"]
     env = {
         "LLMQ_STORE_URL": f"redis://:localdev@127.0.0.1:{port}/0",
+        "LLMQ_ENVIRONMENT": "test",
         "LLMQ_KEY_PREFIX": prefix,
         "LLMQ_REGISTRY": json.dumps(dict(engine.registry.current.registry.raw)),
     }
@@ -166,7 +167,9 @@ async def test_command_line(make: Make, store: redis.asyncio.Redis, prefix: str)
 
 
 def test_environment_settings() -> None:
-    ok = InfraSettings.from_env({"LLMQ_STORE_URL": "redis://localhost:6379/0"})
+    ok = InfraSettings.from_env(
+        {"LLMQ_STORE_URL": "redis://localhost:6379/0", "LLMQ_ENVIRONMENT": "dev"}
+    )
     assert ok.registry_live_edit == "safe"
     with pytest.raises(ConfigError) as info:
         InfraSettings.from_env(

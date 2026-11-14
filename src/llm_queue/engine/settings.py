@@ -12,35 +12,75 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+import orjson
+from redis.connection import parse_url, to_bool
 
 from llm_queue.errors import ConfigError
+from llm_queue.registry.validate import parse_document
 
 PREFIX = "LLMQ_"
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 STORE_SCHEMES = ("redis", "rediss", "valkey", "valkeys")
 TLS_SCHEMES = ("rediss", "valkeys")
 METRICS_SINKS = ("emf", "prometheus", "none")
-# Environments where the store must use verified TLS and ids a keyed hash (fail closed: any
-# name that is not clearly a developer's own is treated as holding real data).
+# The only environments where the store may skip verified TLS, ids may go unkeyed and debug
+# capture may run. Anything else, `LLMQ_ENVIRONMENT` unset included, is treated as holding real
+# data (fail closed): a forgotten variable must not switch the checks off.
 DEV_ENVIRONMENTS = ("dev", "local", "test", "ci")
+# What strict mode asks of a TLS store connection, written into the URL so every client built
+# from it (the queue's, the CLI's) verifies the certificate and the host name explicitly.
+_TLS_REQUIRED = {"ssl_cert_reqs": "required", "ssl_check_hostname": "true"}
 
 
-def _store_url_problems(name: str, url: str, strict: bool) -> list[str]:
-    """What is wrong with one store URL; `strict` (not a dev environment) requires verified TLS."""
+def _store_url(name: str, url: str, strict: bool) -> tuple[str, list[str]]:
+    """The store URL to use and what is wrong with it; `strict` requires verified TLS.
+
+    The URL is read with redis-py's own parser (`parse_url`, `to_bool`), so the check sees what
+    the client will do: redis-py takes the first of repeated query names, which a check of the
+    last one missed, so repeats are refused outright.
+    """
     parts = urlsplit(url)
     if parts.scheme not in STORE_SCHEMES:
-        return [f"{name} must be a redis:// or rediss:// URL"]
+        return url, [f"{name} must be a redis:// or rediss:// URL"]
+    names = [key for key, _ in parse_qsl(parts.query, keep_blank_values=True)]
+    if len(names) != len(set(names)):
+        return url, [f"{name} repeats a query parameter"]
     if not strict:
-        return []
-    query = {k.lower(): v for k, v in parse_qs(parts.query).items()}
-    if parts.scheme not in TLS_SCHEMES and (parts.hostname or "") not in LOCAL_HOSTS:
-        return [f"{name} must use TLS (rediss://) outside dev"]
-    if query.get("ssl_cert_reqs", ["required"])[-1].lower() in ("none", "optional"):
-        return [f"{name} must verify the store's certificate outside dev (ssl_cert_reqs)"]
-    if query.get("ssl_check_hostname", ["true"])[-1].lower() in ("false", "0", "no"):
-        return [f"{name} must check the store's host name outside dev (ssl_check_hostname)"]
-    return []
+        return url, []
+    redis_url = "redis" + url[len("valkey") :] if url.startswith("valkey") else url
+    try:
+        options = parse_url(redis_url)  # type: ignore[no-untyped-call]  # redis-py untyped
+    except ValueError as exc:
+        return url, [f"{name}: {exc}"]
+    if parts.scheme not in TLS_SCHEMES:
+        if options.get("host", "") not in LOCAL_HOSTS:
+            return url, [f"{name} must use TLS (rediss://) outside dev"]
+        return url, []
+    if str(options.get("ssl_cert_reqs", "required")).lower() in ("none", "optional"):
+        return url, [f"{name} must verify the store's certificate outside dev (ssl_cert_reqs)"]
+    hostname = to_bool(options.get("ssl_check_hostname", "true"))  # type: ignore[no-untyped-call]
+    if hostname is False:
+        return url, [f"{name} must check the store's host name outside dev (ssl_check_hostname)"]
+    query = [*parse_qsl(parts.query, keep_blank_values=True)]
+    query += [(k, v) for k, v in _TLS_REQUIRED.items() if k not in names]
+    return urlunsplit(parts._replace(query=urlencode(query))), []
+
+
+def _read_document(registry: str | None, registry_file: str | None) -> str:
+    """The registry JSON from the variable or the file, refused when it repeats a key."""
+    if registry:
+        text = registry
+    elif registry_file:
+        try:
+            text = Path(registry_file).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ConfigError(f"LLMQ_REGISTRY_FILE cannot be read: {exc}") from exc
+    else:
+        raise ConfigError("no registry: set LLMQ_REGISTRY or LLMQ_REGISTRY_FILE")
+    parse_document(text)  # RegistryError (a ConfigError) for bad JSON or a repeated key
+    return text
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,18 +103,23 @@ class InfraSettings:
     audit_retention_days: int = 90
     lease_secs: float = 60.0
     caller_ttl_secs: int = 30
-    drain_secs: float = 45.0
+    drain_secs: float = 25.0  # inside the default Kubernetes grace period of 30 s
     local_limit_cap: int = 10
     metrics_sink: str = "emf"
     mode: str = "both"
     bedrock_endpoint_url: str | None = None
     sts_endpoint_url: str | None = None
-    id_hash_salt: str | None = None
-    environment: str = "dev"
+    id_hash_salt: str | None = field(default=None, repr=False)
+    environment: str = "unset"
     queue_failover_secs: float = 5.0
     queue_wait_replicas: int = 0
     queue_wait_ms: int = 100
     debug_capture_from_config: bool = False
+
+    @property
+    def strict(self) -> bool:
+        """True outside the dev environments: verified TLS, keyed ids, no debug capture."""
+        return self.environment not in DEV_ENVIRONMENTS
 
     @classmethod
     def from_env(
@@ -95,19 +140,38 @@ class InfraSettings:
 
         problems: list[str] = []
         store = get("STORE_URL")
-        environment = str(get("ENVIRONMENT", "dev")).strip().lower()
+        environment = str(get("ENVIRONMENT", "") or "").strip().lower() or "unset"
         if environment == "production":
             environment = "prod"
         strict = environment not in DEV_ENVIRONMENTS
         if not store:
             problems.append("LLMQ_STORE_URL is required (redis:// or rediss://)")
-        urls = (("LLMQ_STORE_URL", store), ("LLMQ_QUEUE_STORE_URL", get("QUEUE_STORE_URL")))
-        for name, url in urls:
-            if url:
-                problems += _store_url_problems(name, str(url), strict)
+        urls: dict[str, str | None] = {}
+        for name in ("STORE_URL", "QUEUE_STORE_URL"):
+            raw = get(name)
+            urls[name] = None
+            if raw:
+                urls[name], found = _store_url(PREFIX + name, str(raw), strict)
+                problems += found
         registry, registry_file = get("REGISTRY"), get("REGISTRY_FILE")
+        hosts = tuple(
+            h.strip() for h in str(get("BASE_URL_ALLOWED_HOSTS", "")).split(",") if h.strip()
+        )
         if registry and registry_file:
             problems.append("set one of LLMQ_REGISTRY and LLMQ_REGISTRY_FILE, not both")
+        elif registry or registry_file:
+            try:
+                document = orjson.loads(_read_document(registry, registry_file))
+            except ConfigError as exc:
+                problems.append(str(exc))
+            else:
+                accounts = document.get("accounts") if isinstance(document, dict) else None
+                kinds = [a.get("kind") for a in (accounts or {}).values() if isinstance(a, dict)]
+                if strict and "openai" in kinds and not hosts:
+                    problems.append(
+                        "LLMQ_BASE_URL_ALLOWED_HOSTS is required outside dev when the registry "
+                        f"has an `openai` account ({environment})"
+                    )
         salt = get("ID_HASH_SALT")
         if strict and not salt:
             problems.append(f"LLMQ_ID_HASH_SALT is required outside dev ({environment})")
@@ -115,8 +179,11 @@ class InfraSettings:
         if debug_capture not in ("true", "false", "1", "0", "yes", "no", "on", "off"):
             problems.append("LLMQ_DEBUG_CAPTURE_FROM_CONFIG must be true or false")
         capture = debug_capture in ("true", "1", "yes", "on")
-        if capture and environment == "prod":
-            problems.append("LLMQ_DEBUG_CAPTURE_FROM_CONFIG is refused in prod (prompt text)")
+        if capture and strict:
+            problems.append(
+                f"LLMQ_DEBUG_CAPTURE_FROM_CONFIG is refused outside dev ({environment}): it "
+                "stores prompt text"
+            )
         sink = str(get("METRICS_SINK", "emf"))
         if sink not in METRICS_SINKS:
             problems.append("LLMQ_METRICS_SINK must be emf, prometheus or none")
@@ -141,26 +208,35 @@ class InfraSettings:
                 problems.append(f"LLMQ_{name} must be {'0 or more' if zero else 'above 0'}")
             return value
 
+        lease = number("LEASE_SECS", 60.0)
+        caller_ttl = number("CALLER_TTL_SECS", 30, int)
+        # The caller key is renewed every lease / 3; it must outlive one beat with room for a
+        # slow store, or a live caller is taken for gone and its calls are failed.
+        beat = lease / 3
+        if caller_ttl < beat + max(5.0, beat / 2):
+            problems.append(
+                f"LLMQ_CALLER_TTL_SECS ({caller_ttl}) must be at least "
+                f"{math.ceil(beat + max(5.0, beat / 2))}: the heartbeat renews it every "
+                f"LLMQ_LEASE_SECS / 3 ({beat:g} s), plus a margin"
+            )
         settings = cls(
-            store_url=str(store or ""),
-            queue_store_url=get("QUEUE_STORE_URL"),
+            store_url=urls["STORE_URL"] or str(store or ""),
+            queue_store_url=urls["QUEUE_STORE_URL"],
             store_max_connections=number("STORE_MAX_CONNECTIONS", 200, int),
             key_prefix=str(get("KEY_PREFIX", "llmq")),
             queue_prefix=str(get("QUEUE_PREFIX", "")),
             registry=registry,
             registry_file=registry_file,
             registry_live_edit=live_edit,
-            base_url_allowed_hosts=tuple(
-                h.strip() for h in str(get("BASE_URL_ALLOWED_HOSTS", "")).split(",") if h.strip()
-            ),
+            base_url_allowed_hosts=hosts,
             cfg_reload_secs=number("CFG_RELOAD_SECS", 30.0),
             result_ttl_secs=number("RESULT_TTL_SECS", 300, int),
             result_dedupe_secs=number("RESULT_DEDUPE_SECS", 0, int, zero=True),
             status_ttl_secs=number("STATUS_TTL_SECS", 1800, int),
             audit_retention_days=number("AUDIT_RETENTION_DAYS", 90, int),
-            lease_secs=number("LEASE_SECS", 60.0),
-            caller_ttl_secs=number("CALLER_TTL_SECS", 30, int),
-            drain_secs=number("DRAIN_SECS", 45.0),
+            lease_secs=lease,
+            caller_ttl_secs=caller_ttl,
+            drain_secs=number("DRAIN_SECS", 25.0),
             local_limit_cap=number("LOCAL_LIMIT_CAP", 10, int),
             metrics_sink=sink,
             mode=mode,
@@ -178,9 +254,9 @@ class InfraSettings:
         return settings
 
     def registry_document(self) -> str:
-        """The registry JSON from `LLMQ_REGISTRY` or the file `LLMQ_REGISTRY_FILE`."""
-        if self.registry:
-            return self.registry
-        if self.registry_file:
-            return Path(self.registry_file).read_text(encoding="utf-8")
-        raise ConfigError("no registry: set LLMQ_REGISTRY or LLMQ_REGISTRY_FILE")
+        """The registry JSON from `LLMQ_REGISTRY` or the file `LLMQ_REGISTRY_FILE`.
+
+        `ConfigError` when neither is set, the file cannot be read, the text is not JSON or an
+        object repeats a key.
+        """
+        return _read_document(self.registry, self.registry_file)

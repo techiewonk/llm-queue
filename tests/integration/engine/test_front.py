@@ -55,6 +55,7 @@ async def llmq(store: redis.asyncio.Redis, prefix: str) -> AsyncIterator[LLMQueu
     port = store.connection_pool.connection_kwargs["port"]
     env = {
         "LLMQ_STORE_URL": f"redis://:localdev@127.0.0.1:{port}/0",
+        "LLMQ_ENVIRONMENT": "test",
         "LLMQ_KEY_PREFIX": prefix,
         "LLMQ_REGISTRY": json.dumps(_doc(url)),
         "LLMQ_BEDROCK_ENDPOINT_URL": url,
