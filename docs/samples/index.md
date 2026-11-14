@@ -4,10 +4,10 @@ Nine runnable programs, one per way an app uses llm-queue. Each is plain app cod
 the queue with `LLMQueue.from_env()` and reads nothing else, so you can copy it into a service
 as is. Every page shows the full code and the **real output of a live run** on Amazon Bedrock.
 
-!!! success "Last live run: 2026-11-14, released code `v0.1.0b1`"
+!!! success "Last live run: 2026-11-14, code `v0.1.0b2`"
     All nine samples passed on real Bedrock in `us-east-1`, with an ElastiCache Valkey 8.2 (TLS)
-    as the store: `python scripts/samples.py --live --store env`. The run used its own key
-    prefix and left no keys behind.
+    as the store, in strict mode (`LLMQ_ENVIRONMENT` unset): `python scripts/samples.py --live
+    --store env`. The run used its own key prefix and left no keys behind.
 
 ## What a sample run does
 
@@ -88,7 +88,7 @@ An app sets the same environment the runner sets, from its own secrets:
 | Variable | Runner value | In an app |
 |---|---|---|
 | `LLMQ_ENVIRONMENT` | `test` with the local Valkey; unset with `--store env` | unset or your environment's name (strict) |
-| `LLMQ_ID_HASH_SALT` | | from your secrets (required when strict) |
+| `LLMQ_ID_HASH_SALT` | a random one per run with `--store env` | from your secrets (required when strict) |
 | `LLMQ_STORE_URL` | `redis://:localdev@127.0.0.1:6379/0` | `rediss://...` of the ElastiCache Valkey |
 | `LLMQ_KEY_PREFIX`, `LLMQ_QUEUE_PREFIX` | per run | per environment, e.g. `llmq:prod` |
 | `LLMQ_REGISTRY` | `samples/registry.json`, region set | the app's registry document |

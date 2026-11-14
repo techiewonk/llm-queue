@@ -100,6 +100,8 @@ def environment(live: bool, env_file: Path, prefix: str, store: str) -> dict[str
     )
     if store == LOCAL_STORE_URL:  # no TLS, no salt: only allowed in a test environment
         env["LLMQ_ENVIRONMENT"] = "test"
+    else:  # strict, as in an app: a salt from its secrets; here a fresh one per run
+        env.setdefault("LLMQ_ID_HASH_SALT", uuid.uuid4().hex)
     where = "local Valkey" if store == LOCAL_STORE_URL else "the env file's store (TLS)"
     if store.startswith("redis://") and store != LOCAL_STORE_URL:
         where = "the env file's store (no TLS)"
