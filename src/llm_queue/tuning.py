@@ -43,7 +43,7 @@ class BedrockOptions:
     # botocore only for credentials, SigV4 and stream frames: `clients/bedrock_http.py`).
     # aiohttp is the default: measured vs botocore, converse +78-104 % calls/s, client CPU per
     # call -55-61 %, memory per client 669 -> 87 KiB (2026-11-14, sequential ABAB rounds).
-    transport: Literal["aiohttp", "botocore"] = "aiohttp"
+    transport: str = "aiohttp"  # a str: apps pass it from config; problems() checks it
 
 
 @dataclass(frozen=True, slots=True)
