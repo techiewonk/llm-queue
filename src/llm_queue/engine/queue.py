@@ -233,12 +233,15 @@ return out
 
 # ARGV: id, generation, delay ms, max receives, dead-letter retention ms. The handler failed:
 # count one failure; at `max_receives` the message goes to the dead-letter stream.
-# Reply: 'retry', 'dead' or 'stale'.
+# Reply: 'retry', 'dead' or 'stale'. The receipt ends here (generation + 1, as in RETURN): the
+# store client retries a command whose connection dropped after the server ran it, and the
+# replay counted a second failure (EN-5); now it finds the receipt stale.
 FAIL = (
     _NOW
     + _DLQ
     + """
 if redis.call('HGET', KEYS[3], ARGV[1]) ~= ARGV[2] then return 'stale' end
+redis.call('HINCRBY', KEYS[3], ARGV[1], 1)
 local fails = redis.call('HINCRBY', KEYS[4], ARGV[1], 1)
 local maxr = tonumber(ARGV[4])
 if maxr > 0 and fails >= maxr then

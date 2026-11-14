@@ -218,6 +218,11 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 - The store checks log (debug) why the eviction or cluster check could not run (EN-22).
   `FreshPassword` reads the secret in a worker thread on the asyncio client, so a slow lookup
   no longer blocks the event loop on every reconnect; `secrets` should still cache (EN-31).
+- The store client retries a command whose connection dropped, even when the server already
+  ran it. FAIL now ends its receipt (generation + 1, like RETURN), so a replay is `stale` and
+  one failure is counted, not two. A replayed RECEIVE still takes a second batch (the first is
+  hidden for the visibility time and charged one failure) and a replayed plain SEND appends
+  twice; both are rare and bounded, and are documented in `store_client.py` (EN-5).
 
 ### Security
 

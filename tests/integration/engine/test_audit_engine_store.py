@@ -10,7 +10,7 @@ import redis.asyncio
 
 from llm_queue.engine.health import Health
 from llm_queue.engine.keys import Keys
-from llm_queue.engine.queue import StreamQueues
+from llm_queue.engine.queue import QueueSettings, StreamQueues
 from llm_queue.engine.status import Alert, AlertEvaluator
 
 pytestmark = pytest.mark.integration
@@ -31,6 +31,20 @@ async def test_en12_redrive_skips_a_dead_letter_without_body(
     assert await store.xlen(queues.queue_keys("q")[0]) == 2
     assert await store.llen(queues.bell("q")) == 1  # a waiting worker is woken
     assert await store.pttl(queues.bell("q")) > 0
+
+
+async def test_en5_replayed_fail_counts_one_failure(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """EN-5: FAIL run twice (a client retry after a dropped reply) counted two failures."""
+    settings = QueueSettings(visibility_secs=30, max_receives=5, max_waiting=0)
+    queues = StreamQueues(store, Keys(prefix))
+    await queues.send("q", b"m", settings)
+    [message], _ = await queues.receive("q", 1, settings)
+    assert await queues.fail(message, settings) == "retry"
+    assert await queues.fail(message, settings) == "stale"  # the replay
+    assert await store.hget(queues.queue_keys("q")[3], message.id) == b"1"
+    assert not await queues.extend(message, 30)  # the receipt ended with the failure
 
 
 async def test_en13_ring_again_keeps_a_ttl(store: redis.asyncio.Redis, prefix: str) -> None:
