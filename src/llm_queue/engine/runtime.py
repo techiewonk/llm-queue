@@ -2275,6 +2275,8 @@ class Engine:
         reply = Reply(request_id=env.request_id, ok=True, response=result.response, meta=meta)
         self._bad_accounts.pop((deployment.account, deployment.region), None)  # (plan A4)
         self._record(held, alias, deployment.account, deployment.region, "ok", meta)
+        if self.settings.debug_capture_allowed and view.value(alias, "debug_capture"):
+            await self._debug(env.request_id, params, result.response)  # (never in prod)
         # The caller first: its result, with the final status in the same script. Then the
         # grant and the message are settled together (four round trips one after another
         # before the caller was woken, before).
@@ -2303,8 +2305,6 @@ class Engine:
         )
         held.grants.discard((alias, owner))  # settled: a failure below must not renew it
         await self._count_target_errors(held, succeeded=True)
-        if self.settings.debug_capture_allowed and view.value(alias, "debug_capture"):
-            await self._debug(env.request_id, params, result.response)
         return "ok", None
 
     async def _target_error(
