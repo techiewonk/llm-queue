@@ -16,6 +16,7 @@ from engine_testkit import CHAT, Make
 
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import Message, QueueSettings, StreamQueues
+from llm_queue.engine.runtime import _Slots
 from llm_queue.engine.streaming import ChunkReader
 
 pytestmark = pytest.mark.integration
@@ -122,7 +123,7 @@ async def test_a_worker_with_no_free_slot_gives_the_doorbell_back(make: Make) ->
     """B5 (107): a worker woken with no free slot took the token: other pods slept on."""
     engine, _ = await make({"small": {"worker_slots": 1}})
     await engine.call("small", CHAT)  # the loop is idle on the doorbell now
-    engine._slots["small"] = asyncio.Semaphore(0)  # every slot busy
+    engine._slots["small"] = _Slots(0)  # every slot busy
     view = engine.registry.current
     name = engine._queue_name(view, "small", False)
     await asyncio.sleep(0.2)

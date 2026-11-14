@@ -256,7 +256,8 @@ def _a_held(engine: Engine, rid: str, *, deadline_in_secs: float = 30.0) -> Any:
         request_id=rid, op="converse", model="small", params=CHAT, caller="c", timeout_secs=30
     )
     position_ms = int((engine.clock.now() + deadline_in_secs - 30) * 1000)
-    return _Held(None, env, first_seen=engine.clock.now(), position_ms=position_ms, tag="dtest")
+    now = engine.clock.now()
+    return _Held(None, env, first_seen_secs=now, position_ms=position_ms, tag="dtest")
 
 
 async def test_l4_a_grant_for_a_released_call_goes_back(
@@ -389,10 +390,10 @@ async def test_rt33_heartbeat_steps_fail_on_their_own(
         raise ResponseError("ERR mget refused")
 
     monkeypatch.setattr(engine, "_check_cancels", broken)
-    trouble = engine._store_trouble_at
+    trouble = engine._store_trouble_mono
     await _until(lambda: "step=cancels" in caplog.text or "'cancels'" in caplog.text, secs=4)
     assert "step=renew" not in caplog.text
-    assert engine._store_trouble_at == trouble
+    assert engine._store_trouble_mono == trouble
 
 
 # ---------------------------------------------------------------- S11, RT-8
@@ -755,3 +756,186 @@ async def test_co9_a_corrupt_registry_counter_never_fails_a_call(
     monkeypatch.setattr(engine.registry, "refresh", corrupt)
     reply = await engine.call("small", CHAT, timeout_secs=8)
     assert reply.ok
+
+
+# ---------------------------------------------------------------- RT-22 to RT-32, CO-*, CL-6
+
+
+async def test_rt22_free_slots_are_read_without_private_state(make: Make) -> None:
+    """Audit RT-22: the receive loop read `asyncio.Semaphore._value` (private, unpromised)."""
+    engine, _ = await make({"small": {"worker_slots": 2}})
+    slots = engine._slots["small"]
+    assert (slots.size, slots.free) == (2, 2)
+    async with slots:
+        assert slots.free == 1
+    assert slots.free == 2
+
+
+async def test_rt23_a_live_worker_slots_edit_is_warned_once(
+    make: Make, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Audit RT-23: a live `worker_slots` edit did nothing until restart, and nothing said so."""
+    engine, _ = await make({"small": {"worker_slots": 2}})
+    engine._slots["small"].size = 5  # as if started with 5; the registry says 2
+    engine._slots["small"].warned = 5
+    engine._sync_model_loops()
+    engine._sync_model_loops()
+    assert caplog.text.count("worker_slots_changed_needs_restart") == 1
+
+
+async def test_rt24_a_release_that_cannot_return_is_logged(
+    make: Make, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Audit RT-24: `_release` gave up silently; the message stayed hidden and nobody saw why."""
+    from llm_queue.engine.queue import Message
+
+    engine, _ = await make()
+    engine.settings = dataclasses.replace(engine.settings, lease_secs=0.2)
+
+    async def down(*args: Any, **kwargs: Any) -> Any:
+        raise StoreConnectionError("down")
+
+    monkeypatch.setattr(engine.queues, "return_", down)
+    held = _a_held(engine, "r-release")
+    held.message = Message("q", "1-0", 1, b"{}")
+    await engine._release(held)
+    assert "release_return_failed" in caplog.text
+
+
+async def test_rt27_the_probe_lock_is_held_for_each_probe(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit RT-27: the probe lock lived 5 s while one pass probed for up to 30 s per deployment.
+
+    Another pod took the lock mid-pass and probed the same deployments at the same time.
+    """
+    engine, _ = await make()
+    key = f"{engine.keys.prefix}:lock:probe"
+    await engine.state.set(key, engine.worker_id, ex=5)
+
+    async def disabled(alias: str) -> dict[str, float]:
+        return {"aws-a/r1": 0.0}
+
+    async def probe(*args: Any) -> bool:
+        return True
+
+    async def probed(*args: Any, **kwargs: Any) -> str:
+        return "recovered"
+
+    monkeypatch.setattr(engine.health, "disabled", disabled)
+    monkeypatch.setattr(engine, "_probe", probe)
+    monkeypatch.setattr(engine.health, "probed", probed)
+    await engine.probe_due("small", lock_key=key)
+    assert await engine.state.ttl(key) > 30  # the probe's whole budget
+
+
+async def test_rt31_model_unavailable_reads_breakers_in_one_round_trip(
+    make: Make, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Audit RT-31: the `model_unavailable` diagnosis read each breaker in its own round trip."""
+    engine, _ = await make()
+    await engine.state.hset(engine.keys.breaker("big", "aws-a/r1"), "state", "open")
+
+    async def none(*args: Any, **kwargs: Any) -> Decision:
+        return Decision("none")
+
+    reads: list[str] = []
+    real = engine.state.hgetall
+
+    async def hgetall(*args: Any, **kwargs: Any) -> Any:
+        reads.append(str(args[0]))
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(engine.admission, "pick_take", none)
+    monkeypatch.setattr(engine.state, "hgetall", hgetall)
+    with pytest.raises(CallFailed) as info:
+        await engine.call("big", CHAT, timeout_secs=8)
+    assert info.value.kind == "model_unavailable"
+    assert "breaker open" in caplog.text
+    assert not [r for r in reads if ":cb:" in r]  # 3 HGETALLs before (one per deployment)
+
+
+async def test_rt32_two_waiters_on_one_id_both_wake(make: Make) -> None:
+    """Audit RT-32: the shared wake-up was dropped by whichever waiter left first.
+
+    The bookkeeping is one context now; two coroutines on one id still both get the reply.
+    """
+    engine, _ = await make()
+    first, second = await asyncio.gather(
+        engine.call("small", CHAT, request_id="r-shared"),
+        engine.call("small", CHAT, request_id="r-shared"),
+    )
+    assert first.ok
+    assert second.ok
+    assert "r-shared" not in engine._waiters
+    assert "r-shared" not in engine._local_callers
+
+
+async def test_co1_aclose_closes_every_client_and_raises_the_first_failure(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CO-1: a provider close that raised left both store clients open."""
+    engine, _ = await make()
+    closed: list[str] = []
+
+    async def providers_fail() -> None:
+        raise RuntimeError("provider close failed")
+
+    async def state_close() -> None:
+        closed.append("state")
+
+    monkeypatch.setattr(engine.providers, "aclose", providers_fail)
+    monkeypatch.setattr(engine.state, "aclose", state_close)
+    with pytest.raises(RuntimeError, match="provider close failed"):
+        await engine.aclose()
+    assert closed == ["state"]
+
+
+async def test_co4_registry_reload_errors_are_counted(make: Make) -> None:
+    """CO-4: the registry store had no metrics sink, so reload failures were only logged."""
+    engine, _ = await make()
+    assert engine.registry.metrics is engine.metrics
+    counted: list[str] = []
+
+    class Sink:
+        def count(self, name: str, value: float = 1.0, **labels: str) -> None:
+            counted.append(name)
+
+    engine.registry.metrics = Sink()  # a counting fake
+    engine.registry._count_reload_error(ValueError("corrupt counter"))
+    assert counted == ["llmq_registry_reload_errors_total"]
+
+
+async def test_cl6_openai_routes_are_checked_at_start(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CL-6: only Bedrock routes went to `warm`, so a missing OpenAI key showed on a call."""
+    from engine_testkit import registry as test_registry
+
+    from llm_queue.registry import ResolvedRegistry
+    from llm_queue.registry.validate import check
+
+    engine, _ = await make()
+    doc = test_registry()
+    doc["accounts"]["vllm"] = {
+        "kind": "openai",
+        "base_url": "http://127.0.0.1:9/v1",
+        "api_key_ref": "LLMQ_ACCOUNT_VLLM_KEY",
+    }
+    doc["models"]["local"] = {
+        "type": "chat",
+        "provider": "openai",
+        "model_id": "gpt-oss-120b",
+        "deployments": {"vllm": {"confirmed": ["dc1"]}},
+    }
+    resolved, errors, _ = check(doc, allowed_hosts=("127.0.0.1",))
+    assert resolved is not None, errors
+    monkeypatch.setattr(engine.registry, "_current", ResolvedRegistry(resolved))
+    seen: list[str] = []
+
+    async def warm(routes: Any, slots: Any = None) -> None:
+        seen.extend(r.account.kind for r in routes)
+
+    monkeypatch.setattr(engine.providers.pool, "warm", warm)
+    await engine._warm_clients()
+    assert "openai" in seen

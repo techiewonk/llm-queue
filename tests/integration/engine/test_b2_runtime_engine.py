@@ -20,7 +20,7 @@ from llm_queue.engine import runtime
 from llm_queue.engine.envelope import Envelope
 from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.queue import QueueSettings
-from llm_queue.engine.runtime import Engine, EngineSettings
+from llm_queue.engine.runtime import Engine, EngineSettings, _Backoff
 
 pytestmark = pytest.mark.integration
 SLOW = {"latency_ms": {"p50": 3000, "p95": 3000}}
@@ -194,7 +194,7 @@ async def test_credential_backoff_resets_after_success(make: Make) -> None:
     """PLAN A4: the credential backoff only grew; one success never reset it."""
     engine, _ = await make()
     dep = engine.registry.current.deployments("small")[0]
-    engine._bad_accounts[(dep.account, dep.region)] = (0.0, 40.0)  # lapsed, long backoff
+    engine._bad_accounts[(dep.account, dep.region)] = _Backoff(0.0, 40.0)  # lapsed, long backoff
     assert (await engine.call("small", CHAT)).ok
     assert (dep.account, dep.region) not in engine._bad_accounts
 

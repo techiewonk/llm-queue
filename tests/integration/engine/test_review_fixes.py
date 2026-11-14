@@ -417,17 +417,17 @@ async def test_a_receive_error_marks_store_trouble(make: Make) -> None:
     unseen and callers whose liveness keys lapsed in it were dropped as gone (`cancelled`).
     """
     engine, _ = await make()
-    before = engine._store_trouble_at
+    before = engine._store_trouble_mono
 
     async def broken(_: str) -> bool:
         raise StoreConnectionError("down")
 
     engine._receive_once = broken
     for _ in range(50):
-        if engine._store_trouble_at > before:
+        if engine._store_trouble_mono > before:
             break
         await asyncio.sleep(0.1)
-    assert engine._store_trouble_at > before
+    assert engine._store_trouble_mono > before
 
 
 async def test_a_call_held_past_its_deadline_is_let_go(make: Make) -> None:
@@ -444,7 +444,8 @@ async def test_a_call_held_past_its_deadline_is_let_go(make: Make) -> None:
         request_id="stuck-1", op="converse", model="small", params=CHAT, caller="c", timeout_secs=1
     )
     long_ago_ms = int((engine.clock.now() - 100) * 1000)
-    held = _Held(None, env, first_seen=engine.clock.now(), position_ms=long_ago_ms, tag="dstuck")
+    now = engine.clock.now()
+    held = _Held(None, env, first_seen_secs=now, position_ms=long_ago_ms, tag="dstuck")
     held.grants.add(("small", "stuck-owner"))
     held.run = asyncio.create_task(asyncio.sleep(3600))  # a task that never ends on its own
     engine._held["stuck-1"] = held
