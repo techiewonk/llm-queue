@@ -45,6 +45,7 @@ from gates_fleet import (  # needs the sys.path entry
     Store,
     Worker,
     account_keys,
+    drill_tuning,
     environment,
     log_dir,
     new_prefix,
@@ -153,7 +154,9 @@ async def callers(env: dict[str, str], count: int = 2) -> list[LLMQueue]:
     """Caller-only queues in this process."""
     queues = []
     for _ in range(count):
-        queue = LLMQueue.from_env({**env, "LLMQ_MODE": "caller"}, credentials=account_keys)
+        queue = LLMQueue.from_env(
+            {**env, "LLMQ_MODE": "caller"}, credentials=account_keys, tuning=drill_tuning(env)
+        )
         await queue.start()
         queues.append(queue)
     return queues

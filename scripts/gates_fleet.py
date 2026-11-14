@@ -113,6 +113,21 @@ def account_keys(account: Any) -> dict[str, str]:
     return {"aws_access_key_id": str(account.name), "aws_secret_access_key": "fake"}
 
 
+def drill_tuning(env: dict[str, str] | None = None) -> Any:
+    """`Tuning` for a drill process, or None (the library's defaults).
+
+    `LLMQ_DRILL_STORE_READ_TIMEOUT_SECS` sets the store read timeout: scenario S5's fast
+    profile, so a half-open store is detected within its fault (CO-14).
+    """
+    raw = (os.environ if env is None else env).get("LLMQ_DRILL_STORE_READ_TIMEOUT_SECS")
+    if not raw:
+        return None
+    from llm_queue import Tuning
+    from llm_queue.tuning import StoreOptions
+
+    return Tuning(store=StoreOptions(read_timeout_secs=float(raw)))
+
+
 def process_stats() -> dict[str, float]:
     """This process: RSS, open asyncio tasks and threads (the soak's leak samples)."""
     import psutil
@@ -769,7 +784,7 @@ async def _worker_main() -> None:
 
     setup_logging()
     sink = MetricsToStore(os.environ["LLMQ_KEY_PREFIX"])
-    llmq = LLMQueue.from_env(metrics=sink, credentials=account_keys)
+    llmq = LLMQueue.from_env(metrics=sink, credentials=account_keys, tuning=drill_tuning())
     await llmq.start()
     client = redis.asyncio.Redis.from_url(STORE)
 
@@ -796,7 +811,7 @@ async def _caller_main(calls: int, model: str) -> None:
     """A caller process: run `calls` calls at once, print the outcome counts as JSON."""
     from llm_queue import CallFailed, LLMQueue
 
-    llmq = LLMQueue.from_env(credentials=account_keys)
+    llmq = LLMQueue.from_env(credentials=account_keys, tuning=drill_tuning())
     await llmq.start()
     print("ready", flush=True)
     await asyncio.to_thread(sys.stdin.readline)  # "go"
@@ -854,7 +869,7 @@ async def _client_main(spec: dict[str, Any]) -> None:
     events = _Events()
     logging.getLogger("llm_queue").addHandler(events)
     logging.getLogger("llm_queue").setLevel(logging.INFO)  # the registry events are INFO
-    llmq = LLMQueue.from_env(credentials=account_keys)
+    llmq = LLMQueue.from_env(credentials=account_keys, tuning=drill_tuning())
     await llmq.start()
     view = llmq.registry.current
     model = str(spec["model"])
