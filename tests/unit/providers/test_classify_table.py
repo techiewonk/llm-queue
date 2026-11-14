@@ -503,14 +503,14 @@ def _caused(error: BaseException, cause: BaseException) -> BaseException:
 TRANSPORT_PAIRS: list[Any] = [
     pytest.param(
         aiohttp.ClientSSLError(_conn_key(), ssl.SSLError(1, "CERTIFICATE_VERIFY_FAILED")),
-        SSLError(endpoint_url=URL, error="CERTIFICATE_VERIFY_FAILED"),
+        SSLError(endpoint_url=URL, error=ssl.SSLError(1, "CERTIFICATE_VERIFY_FAILED")),
         F,
         False,
         id="tls",
     ),
     pytest.param(
         aiohttp.ClientProxyConnectionError(_conn_key(), OSError(111, "refused")),
-        ProxyConnectionError(proxy_url="http://proxy:3128", error="refused"),
+        ProxyConnectionError(proxy_url="http://proxy:3128", error=OSError(111, "refused")),
         F,
         False,
         id="proxy",

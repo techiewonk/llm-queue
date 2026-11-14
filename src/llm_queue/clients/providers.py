@@ -13,7 +13,7 @@ import base64
 import contextlib
 import inspect
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -202,7 +202,7 @@ class BedrockProvider:
 
     async def stream(
         self, params: Mapping[str, Any], route: Route, timing: Timing
-    ) -> AsyncIterator[Mapping[str, Any]]:
+    ) -> AsyncGenerator[Mapping[str, Any], None]:
         """ConverseStream events of one attempt, each within the attempt timers."""
         async with self._pool.borrow_bedrock(route) as client:
             request = {**params, "modelId": route.model_id}
@@ -434,7 +434,7 @@ class OpenAIProvider:
 
     async def stream(
         self, params: Mapping[str, Any], route: Route, timing: Timing
-    ) -> AsyncIterator[Any]:
+    ) -> AsyncGenerator[Any, None]:
         """Chat completion chunks of one attempt, each within the attempt timers."""
         with self._pool.borrow_openai(route) as client:
             create = client.chat.completions.create

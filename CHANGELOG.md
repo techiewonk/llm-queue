@@ -66,7 +66,7 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 - **Client hub:** one SDK client per (event loop, credential identity, region, options) per
   process, shared by every queue and the sync path, reference-counted; clients for every
   deployment built concurrently at start; warm connections (unsigned `HEAD` requests, refreshed
-  every 10 s); pool size per client from the registry's concurrency slots (10 to 200);
+  every 10 s); pool size per client from the registry's concurrency slots (at least 10, no cap);
   credentials refreshed 5 minutes before expiry; `Tuning(openai=OpenAIOptions(...),
   warm=WarmOptions(...))`, both importable from `llm_queue` (`warm.connections` or
   `warm.refresh_secs` 0 turns warming or its repeats off).
@@ -123,6 +123,29 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 
 ### Fixed
 
+- Clients audit (CL-*): the aiohttp Bedrock transport followed redirects and re-sent the signed
+  body and session token to the new host (it never follows now; aiobotocore still does); TLS,
+  proxy and bad-URL failures on the aiohttp transport were retried on every attempt and charged
+  breakers (they are fatal, as on botocore); a garbled status line got no quick retry there; a
+  corrupt stream frame or a non-JSON reply was fatal (retryable now).
+- `credentials=` keys other than the AWS keys raised `ConfigError` on every aiohttp call (that
+  account now uses the botocore transport, with one warning); a missing `api_key_ref` secret
+  ended the call as `provider_error` (it is `CredentialsUnavailable` now, so the next deployment
+  is tried, and `warm` lists missing secrets at start); an empty credential chain cached a client
+  that failed until restart (no client is cached; the chain is read again).
+- A slow STS refresh inside the 2-minute mandatory window was cancelled by each caller's attempt
+  timer and never landed (one shared refresh task now; STS has a 10 s read timeout and two
+  attempts); the `credentials=` and `secrets=` callables ran on the event loop.
+- A client retired by `forget()` or an account edit was closed after a fixed 310 s grace, cutting
+  longer healthy answers; it is closed when its calls end now. `aclose()` could release a retired
+  client twice and close it under another queue; a cancelled `release` lost its cancellation.
+- A stream cut after the answer began got the quick retry meant for stale sockets, so the
+  generation ran (and was billed) twice. A sink that raised held the stream's connection until
+  garbage collection.
+- Bedrock pool size is the slots routed to the client (at least 10) without the 200 cap, under
+  which callers queued for a socket inside the first-response timer and charged the breaker.
+- `BedrockHTTP.open` takes `read_timeout_secs` / `connect_timeout_secs`; `ClientPool.bedrock()`
+  returns a `BedrockClient` protocol; the at-fork hook is registered on first use, not at import.
 - A redelivery to the pod already running a call started a second run and leaked its slot.
 - After a store reset only the first pod re-registered its calls; `RENEW` losses went unnoticed.
 - The per-minute retries key had no TTL on a minute without a retry.

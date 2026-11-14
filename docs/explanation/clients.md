@@ -69,7 +69,7 @@ sequenceDiagram
   `keepalive_secs=15.0`); `connections=0` turns it off, `refresh_secs=0` keeps the first
   warm-up but stops the repeats.
 - **Pool size from the registry.** Each client's connection pool is the sum of the concurrency
-  slots routed to its account and region, at least 10 and at most 200, instead of a fixed 100.
+  slots routed to its account and region, at least 10 (no cap: the slots bound the calls), instead of a fixed 100.
 - **Credentials.** Assumed-role sessions and `credentials=` values that carry an expiry are
   refreshed about 5 minutes before they expire, so no call waits on STS.
 

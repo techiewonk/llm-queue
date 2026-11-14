@@ -214,7 +214,7 @@ def _error_response(request: httpx.Request, exc: Exception) -> httpx.Response:
         if exc.retry_after_secs is not None:
             headers["retry-after"] = f"{exc.retry_after_secs:g}"
             headers["retry-after-ms"] = str(int(exc.retry_after_secs * 1000))
-    elif isinstance(exc, ConfigError | KeyError):
+    elif isinstance(exc, ConfigError):  # UnknownModel is one (CL-17: KeyError was never caught)
         status, err_type, code = 404, "invalid_request_error", "model_not_found"
     else:
         status, err_type, code = 500, "server_error", "llmq_error"

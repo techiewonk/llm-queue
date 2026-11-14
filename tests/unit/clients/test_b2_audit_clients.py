@@ -32,6 +32,7 @@ from llm_queue.clients import (
     Route,
     Timing,
     WarmOptions,
+    pool_size_for,
     route_for,
 )
 from llm_queue.clients import pool as pool_module
@@ -218,7 +219,7 @@ async def test_a_missing_api_key_fails_over_and_is_listed_at_warm(
     url, _ = await start_fake()
     view = load_registry(registry_doc(url))
     route = route_for(view, next(iter(view.deployments("local"))))
-    pool = ClientPool(secrets={}.get, warm=NO_WARM)
+    pool = ClientPool(secrets=lambda name: None, warm=NO_WARM)
     try:
         assert pool.problems([route]) == ["account vllm: secret LLMQ_ACCOUNT_VLLM_KEY is not set"]
         await pool.warm([route])
@@ -380,7 +381,7 @@ async def test_aclose_never_releases_a_retired_lease_twice() -> None:
     Lease A (shared with another pool) was released by the task, which then awaited B's slow
     close; aclose released A once more, so A was closed under the other pool.
     """
-    hub, closed = ClientHub(), []
+    hub, closed = ClientHub(), list[str]()
     shared = await _fake_lease(hub, "a", closed)
     await _fake_lease(hub, "a", closed)  # the other pool's hold
     slow = await _fake_lease(hub, "b", closed, close_secs=0.3)
@@ -535,7 +536,7 @@ async def test_a_cancelled_release_stays_cancelled() -> None:
 
     The cancel was lost (broke asyncio.timeout / TaskGroup); the client is still closed.
     """
-    hub, closed = ClientHub(), []
+    hub, closed = ClientHub(), list[str]()
     lease = await _fake_lease(hub, "a", closed)
     stubborn = asyncio.Event()
 
@@ -555,6 +556,47 @@ async def test_a_cancelled_release_stays_cancelled() -> None:
         await outer
     assert outer.cancelled()
     assert closed == ["a"]
+
+
+def test_an_unknown_model_is_a_404_from_the_queued_transport() -> None:
+    """CL-17: the transport's `KeyError -> 404` branch was dead (KeyError was never caught).
+
+    An unknown alias is `UnknownModel` (a ConfigError and a KeyError): 404 `model_not_found`.
+    """
+    import httpx
+
+    from llm_queue.errors import UnknownModel
+    from llm_queue.http_transport import _error_response
+
+    request = httpx.Request("POST", "http://llmq.invalid/v1/chat/completions")
+    reply = _error_response(request, UnknownModel("nope"))
+    assert reply.status_code == 404
+    assert reply.json()["error"]["code"] == "model_not_found"
+
+
+def test_pool_size_follows_the_slots_without_a_cap() -> None:
+    """CL-14: above 200 slots, callers queued for a socket inside the first-response timer.
+
+    A local wait then read as a provider timeout and charged the breaker; the pool is now as
+    large as the slots routed to the client (the slots already bound the calls).
+    """
+    assert pool_size_for(5000) == 5000
+    assert pool_size_for(1) == 10
+
+
+def test_keep_warm_reads_internals_that_still_exist() -> None:
+    """CL-20: `_keep_warm` reads private aiobotocore / aiohttp attributes; fail loudly if gone.
+
+    It only logged at debug level when they vanished, and warm connections silently stopped.
+    """
+    import inspect
+
+    import aiohttp
+    from aiobotocore.httpsession import AIOHTTPSession
+
+    assert hasattr(AIOHTTPSession, "_get_session")
+    assert "self._proxy_config" in inspect.getsource(AIOHTTPSession.__init__)
+    assert "self._acquired" in inspect.getsource(aiohttp.BaseConnector.__init__)
 
 
 def test_importing_the_hub_registers_no_fork_hook() -> None:

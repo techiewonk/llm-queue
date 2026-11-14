@@ -25,15 +25,16 @@ logger = get_logger(__name__)
 _T = TypeVar("_T")
 
 # Pool size per client from the concurrency slots routed to its account and region (E5): a
-# floor so a small model still has spare connections, a cap so one client cannot hold sockets
-# for a whole fleet (aiohttp's limit is per client).
+# floor so a small model still has spare connections. No cap: the slots already bound this
+# process's calls on the client, and a cap below them (200) made callers queue for a socket
+# inside the first-response timer, so a local wait charged the breaker as a provider timeout
+# (CL-14).
 POOL_FLOOR = 10
-POOL_CAP = 200
 
 
 def pool_size_for(slots: int) -> int:
-    """Connections for one client: the slots routed to it, at least 10 and at most 200."""
-    return max(POOL_FLOOR, min(POOL_CAP, int(slots)))
+    """Connections for one client: the slots routed to it, at least 10."""
+    return max(POOL_FLOOR, int(slots))
 
 
 def identity_hash(*parts: Any) -> str:

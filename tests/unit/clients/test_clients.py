@@ -141,6 +141,9 @@ async def test_hung_region_gives_up_at_first_response(setup: Any) -> None:
 async def test_long_healthy_answer_is_not_cut(setup: Any) -> None:
     view, providers = await setup({"defaults": {"output_tokens": 200, "tokens_per_s": 400}})
     route = _route(view, "gpt120b", "aws-a/ap-south-1")
+    # CL-19: warm first, so the 0.3 s first-response budget never covers the cold connect
+    # and TLS setup (it failed under a full parallel-load run and passed alone).
+    await providers.get("bedrock").call("converse", CHAT, route, FAST)
     started = time.monotonic()
     result = await providers.get("bedrock").call("converse", CHAT, route, Timing(0.3, 0.3))
     assert time.monotonic() - started > 0.4  # longer than the first-response limit

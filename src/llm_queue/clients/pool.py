@@ -332,7 +332,8 @@ class ClientPool:
         account = route.account
         if self._session is None:
             self._session = get_session()
-        extra = dict(await asyncio.to_thread(self._credentials, account) or {})
+        given: Mapping[str, Any] | None = await asyncio.to_thread(self._credentials, account)
+        extra = dict(given or {})
         expiry = extra.pop("expiry_time", None)
         who: tuple[Any, ...] = (
             _identity(account),
@@ -472,7 +473,8 @@ class ClientPool:
         from aiobotocore.session import get_session
 
         base = self._session or get_session()
-        base_kwargs = dict(await asyncio.to_thread(self._credentials, account) or {})
+        given: Mapping[str, Any] | None = await asyncio.to_thread(self._credentials, account)
+        base_kwargs = dict(given or {})
         base_kwargs.pop("expiry_time", None)
         external_id = None
         if account.external_id_ref:
@@ -587,7 +589,7 @@ class ClientPool:
     def plan(self, slots: Mapping[tuple[str, str], int]) -> None:
         """Size future Bedrock clients: concurrency slots per (account name, region) (E5).
 
-        Each client gets `pool_size_for(slots)` connections (at least 10, at most 200); a
+        Each client gets `pool_size_for(slots)` connections (at least 10); a
         client already built keeps its size until it is built again.
         """
         self._sizes = {key: pool_size_for(n) for key, n in slots.items()}

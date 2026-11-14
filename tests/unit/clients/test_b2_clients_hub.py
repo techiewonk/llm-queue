@@ -89,8 +89,8 @@ async def test_warm_builds_clients_concurrently_with_per_key_locks(world: Any) -
     assert pool_limit(client) == pool_size_for(3) == 10
 
 
-def test_pool_size_has_a_floor_and_a_cap() -> None:
-    assert (pool_size_for(1), pool_size_for(64), pool_size_for(5000)) == (10, 64, 200)
+def test_pool_size_has_a_floor_and_no_cap() -> None:
+    assert (pool_size_for(1), pool_size_for(64), pool_size_for(5000)) == (10, 64, 5000)
 
 
 async def test_forget_drops_only_that_region(world: Any) -> None:
