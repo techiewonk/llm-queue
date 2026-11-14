@@ -197,7 +197,8 @@ async def test_job_stopped_mid_run_is_returned(store: redis.asyncio.Redis, prefi
     await runner.stop(drain_secs=0.1)
     keys = Keys(prefix)
     assert not await store.hlen(keys.queue(runner.queue("long"), "fails"))
-    assert await store.xlen(keys.queue(runner.queue("long"), "s")) == 1
+    again, _ = await runner.queues.receive(runner.queue("long"), 1, runner.settings)
+    assert len(again) == 1  # visible at once, not after its 30 s hold
 
 
 async def test_job_ack_is_retried_apart(
