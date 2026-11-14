@@ -2921,6 +2921,14 @@ class Engine:
         reply = Reply(request_id=env.request_id, ok=True, response=result.response, meta=meta)
         self._bad_accounts.pop((deployment.account, deployment.region), None)  # (plan A4)
         self._record(held, alias, deployment.account, deployment.region, "ok", meta)
+        if self.settings.debug_capture_allowed and view.value(alias, "debug_capture"):
+            # Before the result (so it is there when the caller reads it), and never failing
+            # the call: a store error here released a call that had succeeded, and it ran
+            # again at the provider (audit RT-12).
+            try:
+                await self._debug(env.request_id, params, result.response)  # (never in prod)
+            except Exception as exc:
+                logger.warning("debug_capture_failed", request_id=env.request_id, error=str(exc))
         # The caller first: its result, with the final status in the same script. Then the
         # grant and the message are settled together (four round trips one after another
         # before the caller was woken, before).
@@ -2968,13 +2976,6 @@ class Engine:
             )
         if isinstance(acked, BaseException):
             raise acked
-        if self.settings.debug_capture_allowed and view.value(alias, "debug_capture"):
-            # After the result, and never failing the call: a store error here released a
-            # call that had succeeded, and it ran again at the provider (audit RT-12).
-            try:
-                await self._debug(env.request_id, params, result.response)  # (never in prod)
-            except Exception as exc:
-                logger.warning("debug_capture_failed", request_id=env.request_id, error=str(exc))
         await self._count_target_errors(held, succeeded=True)
         return _AttemptResult("ok")
 

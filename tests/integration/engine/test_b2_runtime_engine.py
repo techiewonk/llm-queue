@@ -274,9 +274,9 @@ async def test_sweeper_runs_below_one_second(make: Make, monkeypatch: pytest.Mon
     swept: list[str] = []
     real = engine.admission.sweep
 
-    async def counting(alias: str) -> int:
+    async def counting(alias: str, deployments: Any = ()) -> int:
         swept.append(alias)
-        return int(await real(alias))
+        return int(await real(alias, deployments))
 
     monkeypatch.setattr(engine.admission, "sweep", counting)
 
