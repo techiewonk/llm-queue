@@ -132,7 +132,7 @@ mode share the same limits.
 ## Next steps
 
 - Runnable samples of streaming, sync calls, jobs, fallback, status and LangChain:
-  [Samples](../how-to/samples.md).
+  [Samples](../samples/index.md).
 - Every way to call: [Make calls](../how-to/call.md).
 - Settings and live edits: [Configure](../how-to/configure.md).
 - Deploying and running it: [Operate](../how-to/operate.md).

@@ -12,6 +12,18 @@ nav = [
   { "Get started" = [
     { "Getting started" = "tutorials/getting-started.md" },
   ] },
+  { "Samples" = [
+    { "Overview" = "samples/index.md" },
+    { "01 Converse" = "samples/converse.md" },
+    { "02 Stream" = "samples/stream.md" },
+    { "03 Embed" = "samples/embed.md" },
+    { "04 Sync" = "samples/sync.md" },
+    { "05 Errors and fallback" = "samples/errors-and-fallback.md" },
+    { "06 Jobs" = "samples/jobs.md" },
+    { "07 Status and registry" = "samples/status-and-registry.md" },
+    { "08 LangChain" = "samples/langchain.md" },
+    { "09 HTTP router" = "samples/http-router.md" },
+  ] },
   { "How-to guides" = [
     { "Configure" = "how-to/configure.md" },
     { "Tune" = "how-to/tune.md" },
@@ -19,7 +31,6 @@ nav = [
     { "Operate" = "how-to/operate.md" },
     { "Many services, one model" = "how-to/share-models.md" },
     { "Test" = "how-to/test.md" },
-    { "Samples" = "how-to/samples.md" },
   ] },
   { "Explanation" = [
     { "Architecture overview" = "explanation/architecture.md" },
