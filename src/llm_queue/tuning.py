@@ -118,7 +118,7 @@ class RegistryOptions:
     """
 
     history_size: int = 20  # versions kept for `registry rollback`
-    edit_retries: int = 3  # a live edit that raced another one is retried this often
+    edit_retries: int = 3  # a live edit that raced another one is retried this often (max 10)
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +185,13 @@ class Tuning:
         idle = {"engine.idle_poll_secs", "engine.idle_slow_secs"}
         if not idle & bad and engine.idle_poll_secs > engine.idle_slow_secs:
             out.append("engine.idle_poll_secs must not be above engine.idle_slow_secs")
+        retries = self.registry.edit_retries
+        if "registry.edit_retries" not in bad and retries > _EDIT_RETRIES_MAX:
+            # Unbounded, a publish at boot could retry for hours (NB-3).
+            out.append(
+                f"registry.edit_retries must be {_EDIT_RETRIES_MAX} or less "
+                "(each try backs off up to 2 s)"
+            )
         session = self.bedrock.role_session_secs
         if "bedrock.role_session_secs" not in bad and not 900 <= session <= 43200:
             out.append("bedrock.role_session_secs must be 900 to 43200 (STS limits)")
@@ -192,6 +199,8 @@ class Tuning:
 
 
 BEDROCK_TRANSPORTS = ("botocore", "aiohttp")
+# Live-edit tries at most: with the 2 s backoff cap, a publish backs off 12.5 s at most (NB-3).
+_EDIT_RETRIES_MAX = 10
 # Fields where 0 is valid: no store retries; no warm connections, or no refresh (off).
 _ZERO_OK = frozenset({"retries", "connections", "refresh_secs"})
 # Fields that name a choice instead of a number, by `section.field`: keyed by the bare field

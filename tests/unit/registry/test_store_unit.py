@@ -22,6 +22,7 @@ import pytest
 from llm_queue.errors import ConfigError, StoreUnavailable
 from llm_queue.registry.settings import SETTINGS
 from llm_queue.registry.store import (
+    _CONFLICT_BACKOFF_MAX_SECS,
     _PROTECTED_WHY,
     PublishResult,
     RegistryConflict,
@@ -379,3 +380,20 @@ async def test_block_of_an_unknown_name_lists_the_known_ones(full: dict[str, Any
         await store.block(account="aws-mian", on=True, actor="op")
     with pytest.raises(ConfigError, match=r"known: .*ap-south-1"):
         await store.block(region="mars-1", on=True, actor="op")
+
+
+async def test_conflict_backoff_is_capped(full: dict[str, Any], top_of_range: None) -> None:
+    """NB-3: the conflict backoff doubled with no cap.
+
+    With `edit_retries=20` the last publish wait could reach 0.02 * 2**21 s (about 11.6 h).
+    Each wait now stops at `_CONFLICT_BACKOFF_MAX_SECS`.
+    """
+    client = _Client(None, {})
+    sleeps: list[float] = []
+    store = _store(client, sleeps=sleeps, edit_retries=10)
+    store._publish = _Script(lambda: [b"conflict", 1])  # type: ignore[assignment]  # a fake
+    with pytest.raises(RegistryConflict, match="12 tries"):
+        await store.publish(full, actor="op")
+    assert len(sleeps) == 11
+    assert max(sleeps) == _CONFLICT_BACKOFF_MAX_SECS == 2.0
+    assert sleeps[:3] == [0.04, 0.08, 0.16]

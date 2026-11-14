@@ -45,6 +45,9 @@ _SECRET_FIELDS = frozenset({"role_arn", "external_id_ref", "api_key_ref"})
 _ACTOR_MAX = 200
 # First retry of a lost publish / edit waits up to 40 ms, doubling per try (jittered, CO-10).
 _CONFLICT_BACKOFF_SECS = 0.02
+# ... and never more than this: uncapped, try 21 of a publish could wait 0.02 * 2**21 s, about
+# 11.6 h (NB-3). `Tuning.registry.edit_retries` is also bounded (10).
+_CONFLICT_BACKOFF_MAX_SECS = 2.0
 # A reload loop that failed waits up to this long (doubling from its interval) before the next.
 _RELOAD_BACKOFF_MAX_SECS = 30.0
 # Live routing switches a publish carries over from the stored document (an emergency block must
@@ -706,7 +709,8 @@ class RegistryStore:
         Retrying a lost compare-and-set at once made concurrent editors collide again and use
         up their tries together (CO-10).
         """
-        await self._sleep(random.uniform(0, _CONFLICT_BACKOFF_SECS * 2**attempt))
+        cap = min(_CONFLICT_BACKOFF_MAX_SECS, _CONFLICT_BACKOFF_SECS * 2**attempt)
+        await self._sleep(random.uniform(0, cap))
 
     @store_op
     async def set(

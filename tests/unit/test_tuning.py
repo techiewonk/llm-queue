@@ -179,3 +179,11 @@ def test_choice_fields_are_keyed_by_section(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(tuning_module, "EngineTimings", section)  # an engine field `http`
     assert tuning_module._check_part(section(http=-1)) == ["engine.http must be above 0"]
     assert tuning_module._check_part(section(http=5)) == []
+
+
+def test_edit_retries_has_an_upper_bound() -> None:
+    """NB-3: `registry.edit_retries` had no upper bound; 20 meant hours of conflict backoff."""
+    assert Tuning(registry=RegistryOptions(edit_retries=10)).problems() == []
+    assert Tuning(registry=RegistryOptions(edit_retries=11)).problems() == [
+        "registry.edit_retries must be 10 or less (each try backs off up to 2 s)"
+    ]
