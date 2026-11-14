@@ -25,6 +25,19 @@ logger = get_logger(__name__)
 MARKER = b"llmq-offload:"
 
 
+def _is_gone(exc: Exception) -> bool:
+    """True only for S3's own "no such object" error code.
+
+    It matched "404" anywhere in the text (a request id, a host), so a real outage could be
+    reported as an expired result instead of a retryable error (EN-11).
+    """
+    response = getattr(exc, "response", None)  # botocore ClientError
+    if not isinstance(response, dict):
+        return False
+    code = (response.get("Error") or {}).get("Code")
+    return code in {"NoSuchKey", "404"}
+
+
 class ResultOffload(Protocol):
     """Somewhere to keep a large result body."""
 
@@ -111,7 +124,7 @@ class S3Offload:
         try:
             reply = await s3.get_object(Bucket=self.bucket, Key=ref, **self._owner)
         except Exception as exc:
-            if "NoSuchKey" in str(exc) or "404" in str(exc):
+            if _is_gone(exc):
                 return None
             raise
         async with reply["Body"] as body:

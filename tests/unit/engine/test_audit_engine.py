@@ -189,3 +189,123 @@ def test_en28_tokens_does_not_import_the_provider_stack() -> None:
         [sys.executable, "-c", code], capture_output=True, text=True, check=True
     ).stdout.strip()
     assert out == "False"
+
+
+class CountingOffload:
+    """An offload that counts writes; `fail_put` makes every write raise."""
+
+    def __init__(self, *, fail_put: bool = False, delete_on_get: bool = True) -> None:
+        self.puts = 0
+        self.fail_put = fail_put
+        self.delete_on_get = delete_on_get
+        self.data: dict[str, bytes] = {}
+
+    async def put(self, key: str, data: bytes) -> str:
+        self.puts += 1
+        if self.fail_put:
+            raise RuntimeError("botocore said no")
+        ref = f"{key}-{self.puts}"
+        self.data[ref] = data
+        return ref
+
+    async def get(self, ref: str) -> bytes | None:
+        return self.data.pop(ref, None) if self.delete_on_get else self.data.get(ref)
+
+
+# RequestStore registers REGISTER, REGISTER_SEND, CONFIRM, ABANDON, RESULT_PUT, RESULT_TAKE,
+# RESULT_DROP, STATUS_SET in that order.
+def _requests(offload: Any, **runs: Callable[[list[Any], list[Any]], Any]) -> Any:
+    from llm_queue.engine.requests import RequestStore
+
+    order = ("register", "register_send", "confirm", "abandon", "put", "take", "drop", "status")
+    client = ScriptClient(*(runs.get(name, _none) for name in order))
+    store = RequestStore(client, Keys("t"), offload=offload, offload_bytes=10)  # type: ignore[arg-type]  # fake
+    return store, client
+
+
+async def test_en3_result_is_offloaded_once_through_a_store_outage() -> None:
+    """EN-3: each retry of `put_result` during an outage uploaded the result again."""
+    from llm_queue.engine.envelope import Reply
+
+    tries = [0]
+    stored: list[bytes] = []
+
+    def put(_keys: list[Any], args: list[Any]) -> int:
+        tries[0] += 1
+        if tries[0] <= 2:
+            raise StoreConnectionError("reset")
+        stored.append(args[0])
+        return 1
+
+    offload = CountingOffload()
+    requests, _ = _requests(offload, put=put)
+    reply = Reply(request_id="r", ok=True, response={"x": "y" * 50})
+    for _ in range(2):
+        with pytest.raises(StoreConnectionError):
+            await requests.put_result(reply, final_state="done")
+    assert await requests.put_result(reply, final_state="done") is True
+    assert offload.puts == 1
+    assert stored[0].startswith(b"llmq-offload:")
+    assert requests._unsent == {}
+
+
+async def test_en3_offload_failure_keeps_the_result_inline(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """EN-3: a botocore error from the offload escaped `put_result` and the call ran again."""
+    from llm_queue.engine.envelope import Reply
+
+    stored: list[bytes] = []
+    requests, _ = _requests(
+        CountingOffload(fail_put=True), put=lambda _k, a: stored.append(a[0]) or 1
+    )
+    reply = Reply(request_id="r", ok=True, response={"x": "y" * 50})
+    with caplog.at_level(logging.WARNING):
+        assert await requests.put_result(reply, final_state="done") is True
+    assert Reply.model_validate(orjson.loads(stored[0])).response == {"x": "y" * 50}
+    assert len(events(caplog, "offload_put_failed")) == 1
+
+
+async def test_en4_failed_drop_after_offload_read_still_returns_the_reply() -> None:
+    """EN-4: a store blip after the offload read (which deleted the object) lost the answer."""
+    from llm_queue.engine.envelope import Reply
+
+    offload = CountingOffload(delete_on_get=True)
+    body = Reply(request_id="r", ok=True, response={"a": 1}).dumps()
+    offload.data["ref"] = body
+    requests, _ = _requests(offload, take=lambda _k, _a: b"llmq-offload:ref", drop=_down)
+    reply = await requests.take_result("r")
+    assert reply is not None
+    assert reply.response == {"a": 1}
+
+
+async def test_en11_only_no_such_key_reads_as_gone() -> None:
+    """EN-11: any error whose text held "404" was read as an expired result."""
+    from botocore.exceptions import ClientError
+
+    from llm_queue.engine.offload import S3Offload
+
+    def error(code: str) -> ClientError:
+        return ClientError({"Error": {"Code": code, "Message": "req 404abc"}}, "GetObject")
+
+    class FakeS3:
+        def __init__(self, exc: Exception) -> None:
+            self.exc = exc
+
+        async def get_object(self, **_: Any) -> Any:
+            raise self.exc
+
+    offload = S3Offload("bucket")
+    current: list[FakeS3] = []
+
+    async def s3() -> FakeS3:
+        return current[-1]
+
+    offload._s3 = s3  # type: ignore[method-assign]  # fake client
+    for exc, gone in ((error("SlowDown"), False), (error("NoSuchKey"), True)):
+        current.append(FakeS3(exc))
+        if gone:
+            assert await offload.get(f"{offload.prefix}x") is None
+        else:
+            with pytest.raises(ClientError):
+                await offload.get(f"{offload.prefix}x")

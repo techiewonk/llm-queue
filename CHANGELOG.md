@@ -177,6 +177,15 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   None`) gets the defaults filled in. Both used to raise into the worker loop, which returned the
   message at once with no failure counted, so it spun until its deadline (EN-2). A
   `token_estimator` name that is not registered now warns once (EN-15).
+- A large result is offloaded to S3 once even when its store write is retried through an
+  outage (each 0.5 s retry uploaded it again, up to ~120 orphaned objects). An offload write
+  that fails keeps the result inline (up to 64 MB) instead of raising a botocore error, which
+  released the message and ran a call the provider had already answered a second time (EN-3).
+- A store blip after an offloaded result was read no longer loses it: the read-marker cleanup
+  is skipped with a warning, where the caller used to read again, find the object deleted and
+  get `result_expired` (EN-4).
+- `S3Offload.get` reads a result as gone only on S3's `NoSuchKey` / `404` error code; any error
+  whose text held "404" (a request id, a host) was reported as `result_expired` (EN-11).
 
 ### Security
 
