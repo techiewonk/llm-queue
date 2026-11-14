@@ -7,7 +7,9 @@ metric; `PrometheusSink` keeps `prometheus_client` metrics for a `/metrics` endp
 
 from __future__ import annotations
 
+import queue
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping
 from typing import Any, Protocol
@@ -50,6 +52,59 @@ class NullSink:
         """Ignore."""
 
 
+class _StdoutWriter:
+    """Writes lines to stdout from one daemon thread, so a backed-up log pipe never holds the loop.
+
+    `EmfSink`'s default `write` (EN-20). Lines wait in a bounded queue (`MAX_LINES`); when it is
+    full a line is dropped and counted (`dropped`), with one warning. No thread until the first
+    line, so importing or building a sink starts nothing.
+    """
+
+    MAX_LINES = 10_000
+
+    def __init__(self) -> None:
+        """An empty queue; the thread starts on the first line."""
+        self._lines: queue.Queue[str] = queue.Queue(self.MAX_LINES)
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self.dropped = 0
+
+    def __call__(self, line: str) -> None:
+        """Queue one line; drop it (counted, warned once) when the queue is full."""
+        if self._thread is None:
+            with self._lock:
+                if self._thread is None:
+                    self._thread = threading.Thread(
+                        target=self._run, name="llmq-emf-writer", daemon=True
+                    )
+                    self._thread.start()
+        try:
+            self._lines.put_nowait(line)
+        except queue.Full:
+            self.dropped += 1
+            if self.dropped == 1:
+                logger.warning("emf_lines_dropped", reason="stdout is not keeping up")
+
+    def _run(self) -> None:
+        while True:
+            line = self._lines.get()
+            try:
+                sys.stdout.write(line + "\n")
+                if self._lines.empty():
+                    sys.stdout.flush()
+            except Exception:  # a closed or broken stdout must not end the writer
+                pass
+            finally:
+                self._lines.task_done()
+
+    def flush(self, timeout_secs: float = 2.0) -> bool:
+        """Wait until every queued line is written, at most `timeout_secs`; True when done."""
+        deadline = time.monotonic() + timeout_secs
+        while self._lines.unfinished_tasks and time.monotonic() < deadline:
+            time.sleep(0.005)
+        return not self._lines.unfinished_tasks
+
+
 class EmfSink:
     """CloudWatch embedded metric format: one JSON line per point on `write` (stdout)."""
 
@@ -59,12 +114,12 @@ class EmfSink:
         namespace: str = NAMESPACE,
         static: Mapping[str, str] | None = None,
     ) -> None:
-        """`write` receives each line (default: stdout); `static` labels go on every point.
+        """`write` receives each line (default: stdout, via a writer thread); `static` labels too.
 
-        `write` runs on the event loop for every point: pass one that never blocks (a queue
-        handler, a buffered stream) if stdout can back up (EN-20, unmeasured).
+        A `write` passed in runs on the event loop for every point, so it must not block. The
+        default queues each line for a writer thread (EN-20: a backed-up stdout held the loop).
         """
-        self._write = write or (lambda line: sys.stdout.write(line + "\n"))
+        self._write = write or _StdoutWriter()
         self.namespace = namespace
         self.static = dict(static or {})
 

@@ -278,6 +278,10 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 
 ### Performance
 
+- The CloudWatch (EMF) sink writes its lines from a background thread instead of on the event
+  loop: with a stdout that takes 5 ms per line (a backed-up log pipe), a metric point held the
+  loop p50 5,346 us / p99 6,544 us; queued it takes p50 3.8 us / p99 30 us (Python 3.12,
+  Windows, 2026-11-15). Lines past 10,000 waiting are dropped with one warning (EN-20).
 - Log calls below the logger's level are dropped before the message is built: a disabled `info`
   call 9.2 -> 5.3 us (Python 3.12.13, Windows, 2026-11-15).
 - `alias_of(model_id)` is one dict lookup instead of a scan of every model: 2674 -> 241 ns with
