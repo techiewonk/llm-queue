@@ -25,6 +25,7 @@ from llm_queue.clients import (
 )
 from llm_queue.errors import ConfigError, ErrorKind
 from llm_queue.registry import Account, ResolvedRegistry, load_registry
+from llm_queue.tuning import BedrockOptions
 
 MODEL = "openai.gpt-oss-120b-1:0"
 CHAT = {"messages": [{"role": "user", "content": [{"text": "hello"}]}]}
@@ -32,7 +33,7 @@ FAST = Timing(first_response_secs=5, idle_secs=5)
 
 
 @pytest.fixture
-async def setup(start_fake: StartFake) -> AsyncIterator[Any]:
+async def setup(start_fake: StartFake, transport: str) -> AsyncIterator[Any]:
     providers: list[Providers] = []
 
     async def make(scenario: dict[str, Any] | None = None) -> tuple[ResolvedRegistry, Providers]:
@@ -40,6 +41,7 @@ async def setup(start_fake: StartFake) -> AsyncIterator[Any]:
         view = load_registry(registry_doc(url))
         pool = ClientPool(
             bedrock_endpoint_url=url,
+            options=BedrockOptions(transport=transport),
             credentials=lambda account: {
                 "aws_access_key_id": account.name,
                 "aws_secret_access_key": "x",

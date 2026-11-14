@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import pytest
-from clients_testkit import StartFake, registry_doc
+from clients_testkit import StartFake, credentials_of, registry_doc
 from moto.server import ThreadedMotoServer
 
 from llm_queue.clients import (
@@ -22,6 +22,7 @@ from llm_queue.clients import (
     route_for,
 )
 from llm_queue.registry import load_registry
+from llm_queue.tuning import BedrockOptions
 
 ROLE = "arn:aws:iam::123456789012:role/llmq-bedrock"
 CHAT = {"messages": [{"role": "user", "content": [{"text": "hello"}]}]}
@@ -44,7 +45,7 @@ def sts_url() -> Iterator[str]:
 
 
 @pytest.fixture
-async def make(start_fake: StartFake, sts_url: str) -> AsyncIterator[Any]:
+async def make(start_fake: StartFake, sts_url: str, transport: str) -> AsyncIterator[Any]:
     built: list[Providers] = []
 
     async def build(
@@ -64,6 +65,7 @@ async def make(start_fake: StartFake, sts_url: str) -> AsyncIterator[Any]:
         }
         pool = ClientPool(
             bedrock_endpoint_url=url,
+            options=BedrockOptions(transport=transport),
             credentials=lambda account: {
                 "aws_access_key_id": "base",
                 "aws_secret_access_key": "x",
@@ -89,7 +91,7 @@ async def test_assumed_role_credentials_sign_the_calls(make: Any) -> None:
     result = await providers.get("bedrock").call("converse", CHAT, route, FAST)
     assert result.response["stopReason"] == "end_turn"
     client = await providers.pool.bedrock(route)
-    creds = await client._request_signer._credentials.get_frozen_credentials()
+    creds = await credentials_of(client).get_frozen_credentials()
     assert creds.access_key != "base"  # temporary keys from STS, not the base ones
     assert creds.token
     assert await providers.pool.bedrock(route) is client  # one client per (account, region)

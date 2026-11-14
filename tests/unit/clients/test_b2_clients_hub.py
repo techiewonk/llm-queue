@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from clients_testkit import StartFake, registry_doc
+from clients_testkit import StartFake, http_session, pool_limit, registry_doc
 
 from llm_queue.clients import (
     ClientHub,
@@ -28,6 +28,7 @@ from llm_queue.clients import (
 )
 from llm_queue.clients.pool import REFRESH_BEFORE_SECS
 from llm_queue.registry import ResolvedRegistry, load_registry
+from llm_queue.tuning import BedrockOptions
 
 CHAT = {"messages": [{"role": "user", "content": [{"text": "hello"}]}]}
 FAST = Timing(first_response_secs=5, idle_secs=5)
@@ -43,7 +44,7 @@ def _route(view: ResolvedRegistry, model: str, key: str) -> Route:
 
 
 @pytest.fixture
-async def world(start_fake: StartFake) -> AsyncIterator[Any]:
+async def world(start_fake: StartFake, transport: str) -> AsyncIterator[Any]:
     pools: list[ClientPool] = []
     url, fake = await start_fake()
     view = load_registry(registry_doc(url))
@@ -52,6 +53,7 @@ async def world(start_fake: StartFake) -> AsyncIterator[Any]:
     def pool(**kw: Any) -> ClientPool:
         kw.setdefault("warm", NO_WARM)
         kw.setdefault("credentials", _keys)
+        kw.setdefault("options", BedrockOptions(transport=transport))
         built = ClientPool(bedrock_endpoint_url=url, hub=hub, **kw)
         pools.append(built)
         return built
@@ -84,7 +86,7 @@ async def test_warm_builds_clients_concurrently_with_per_key_locks(world: Any) -
     assert len(hub) == 2  # (aws-a, ap-south-1) and (aws-b, ap-south-1): one per account x region
     assert time.perf_counter() - started < 5
     client = await built.bedrock(routes[0])
-    assert client._endpoint.http_session._max_pool_connections == pool_size_for(3) == 10
+    assert pool_limit(client) == pool_size_for(3) == 10
 
 
 def test_pool_size_has_a_floor_and_a_cap() -> None:
@@ -120,7 +122,7 @@ async def test_warm_opens_connections_without_model_calls(world: Any) -> None:
     client = await built.bedrock(route)
     session = None
     for _ in range(100):
-        session = next(iter(client._endpoint.http_session._sessions.values()), None)
+        session = http_session(client)
         if session is not None and sum(len(c) for c in session.connector._conns.values()) >= 3:
             break
         await asyncio.sleep(0.05)

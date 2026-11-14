@@ -20,9 +20,12 @@ from llm_queue.clients import ClientPool, Providers
 from llm_queue.engine.runtime import Engine, EngineSettings
 from llm_queue.engine.store_client import store_client
 from llm_queue.registry.store import RegistryStore
+from llm_queue.tuning import BedrockOptions
 
 PASSWORD = os.environ.get("LLMQ_TEST_REDIS_PASSWORD", "localdev")
 ENGINES = {"valkey": 6379, "redis": 6380}
+# The Bedrock transport the engine tests run on (`BedrockOptions.transport`).
+TRANSPORT = os.environ.get("LLMQ_TEST_BEDROCK_TRANSPORT", "botocore")
 
 
 @pytest.fixture(params=sorted(ENGINES))
@@ -65,6 +68,7 @@ async def make(store: redis.asyncio.Redis, prefix: str) -> AsyncIterator[Make]:
         url = str(server.make_url("")).rstrip("/")
         pool = ClientPool(
             bedrock_endpoint_url=url,
+            options=BedrockOptions(transport=TRANSPORT),
             credentials=lambda account: {
                 "aws_access_key_id": account.name,
                 "aws_secret_access_key": "x",

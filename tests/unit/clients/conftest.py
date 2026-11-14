@@ -7,7 +7,13 @@ from typing import Any
 
 import pytest
 from aiohttp.test_utils import TestServer
-from clients_testkit import Engine, Scenario, StartFake, create_app
+from clients_testkit import TRANSPORTS, Engine, Scenario, StartFake, create_app
+
+
+@pytest.fixture(params=TRANSPORTS)
+def transport(request: pytest.FixtureRequest) -> str:
+    """Bedrock tests run on both transports (`BedrockOptions.transport`)."""
+    return str(request.param)
 
 
 @pytest.fixture

@@ -17,9 +17,41 @@ if str(TOOLS) not in sys.path:
 
 from fakellm import Engine, Scenario, create_app  # noqa: E402  # needs the sys.path entry
 
-__all__ = ["Engine", "Scenario", "StartFake", "create_app", "registry_doc"]
+__all__ = [
+    "TRANSPORTS",
+    "Engine",
+    "Scenario",
+    "StartFake",
+    "create_app",
+    "credentials_of",
+    "http_session",
+    "pool_limit",
+    "registry_doc",
+]
 
 StartFake = Callable[..., Awaitable[tuple[str, Engine]]]
+TRANSPORTS = ("botocore", "aiohttp")
+
+
+def http_session(client: Any) -> Any:
+    """The aiohttp session a Bedrock client sends on (either transport); None before a call."""
+    if hasattr(client, "session"):  # BedrockHTTP
+        return client.session
+    return next(iter(client._endpoint.http_session._sessions.values()), None)
+
+
+def pool_limit(client: Any) -> int:
+    """The connection pool size of a Bedrock client (either transport)."""
+    if hasattr(client, "session"):
+        return int(client.session.connector.limit)
+    return int(client._endpoint.http_session._max_pool_connections)
+
+
+def credentials_of(client: Any) -> Any:
+    """The credentials object a Bedrock client signs with (either transport)."""
+    if hasattr(client, "credentials"):
+        return client.credentials
+    return client._request_signer._credentials
 
 
 def registry_doc(fake_url: str) -> dict[str, Any]:

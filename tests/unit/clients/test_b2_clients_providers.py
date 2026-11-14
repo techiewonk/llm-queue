@@ -30,6 +30,7 @@ from llm_queue.providers import (
     request_error_kind,
 )
 from llm_queue.registry import load_registry
+from llm_queue.tuning import BedrockOptions
 
 CHAT = {"messages": [{"role": "user", "content": [{"text": "hello"}]}]}
 FAST = Timing(first_response_secs=5, idle_secs=5)
@@ -205,12 +206,13 @@ def test_openai_cached_tokens_are_not_counted_twice() -> None:
 
 
 @pytest.fixture
-async def providers(start_fake: StartFake) -> AsyncIterator[tuple[Any, Providers]]:
+async def providers(start_fake: StartFake, transport: str) -> AsyncIterator[tuple[Any, Providers]]:
     url, _ = await start_fake()
     view = load_registry(registry_doc(url))
     built = Providers(
         ClientPool(
             bedrock_endpoint_url=url,
+            options=BedrockOptions(transport=transport),
             credentials=lambda a: {"aws_access_key_id": a.name, "aws_secret_access_key": "x"},
             secrets={"LLMQ_ACCOUNT_VLLM_KEY": "key-v"}.get,
         )
