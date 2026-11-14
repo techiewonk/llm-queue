@@ -19,18 +19,20 @@ local function audit(actor, op, version, diff, retention_ms)
     'op', op, 'version', version, 'diff', diff, 'ts', tostring(now))
   redis.call('XTRIM', KEYS[3], 'MINID', tostring(now_ms - tonumber(retention_ms)))
 end
-local function write_models(first_key, first_arg, changes)
-  for i = first_key, #KEYS do
+local function write_models(first_key, last_key, first_arg, changes)
+  for i = first_key, last_key do
     redis.call('HSET', KEYS[i], 'changes', changes, 'numbers', ARGV[first_arg + i - first_key])
   end
 end
 """
 
-# KEYS: doc, meta (hash), audit (stream), history (hash version -> doc), then one numbers key
-# per model. ARGV: doc, version, config hash, actor, diff JSON, audit retention ms, history size,
-# the change counter the caller read, '1' to replace a stored document of the same version (it
-# was invalid: treated as missing), then one numbers JSON per model key.
-# Reply: {action, stored version, stored doc or ''} with action published | kept | not_bumped |
+# KEYS: doc, meta (hash), audit (stream), history (hash version -> doc), one numbers key per
+# model, then the numbers keys of models the stored document has and this one does not.
+# ARGV: doc, version, config hash, actor, diff JSON, audit retention ms, history size, the change
+# counter the caller read, '1' to replace a stored document of the same version (it was invalid:
+# treated as missing), the count of removed-model keys at the end of KEYS, then one numbers
+# JSON per model key. A publish deletes the removed models' numbers (they stayed forever, CO-20).
+# Reply: {action, stored version, ''} with action published | kept | not_bumped |
 # ignored | conflict. Rule (plan §3.8): higher replaces, equal keeps the stored one (and its live
 # edits), equal with another content hash keeps it and reports not_bumped, lower is ignored.
 # `conflict`: the registry changed after the caller read it (the routing it carried over and its
@@ -43,11 +45,13 @@ local stored_version = tonumber(redis.call('HGET', KEYS[2], 'version') or '0')
 local stored_doc = redis.call('GET', KEYS[1])
 local replace = ARGV[9] == '1' and stored_version == version
 if stored_doc and stored_version >= version and not replace then
-  if stored_version > version then return {'ignored', stored_version, stored_doc} end
+  -- The stored document is not sent back: no caller read it, and every pod boot (`kept`)
+  -- shipped the whole registry back (CO-20).
+  if stored_version > version then return {'ignored', stored_version, ''} end
   if redis.call('HGET', KEYS[2], 'config_hash') == ARGV[3] then
-    return {'kept', stored_version, stored_doc}
+    return {'kept', stored_version, ''}
   end
-  return {'not_bumped', stored_version, stored_doc}
+  return {'not_bumped', stored_version, ''}
 end
 if tonumber(redis.call('HGET', KEYS[2], 'changes') or '0') ~= tonumber(ARGV[8]) then
   return {'conflict', stored_version, ''}
@@ -63,7 +67,9 @@ if #versions > keep then
   for i = 1, #versions - keep do redis.call('HDEL', KEYS[4], versions[i]) end
 end
 audit(ARGV[4], 'publish', version, ARGV[5], ARGV[6])
-write_models(5, 10, changes)
+local last = #KEYS - tonumber(ARGV[10])
+write_models(5, last, 11, changes)
+for i = last + 1, #KEYS do redis.call('DEL', KEYS[i]) end
 return {'published', version, ''}
 """
 )
@@ -82,7 +88,7 @@ changes = redis.call('HINCRBY', KEYS[2], 'changes', 1)
 redis.call('SET', KEYS[1], ARGV[1])
 local version = redis.call('HGET', KEYS[2], 'version') or '0'
 audit(ARGV[3], 'edit', version, ARGV[4], ARGV[5])
-write_models(5, 6, changes)
+write_models(5, #KEYS, 6, changes)
 return {'ok', changes}
 """
 )

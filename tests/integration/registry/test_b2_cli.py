@@ -75,9 +75,11 @@ async def test_gc_removes_queues_of_removed_models(
     for alias in ("embed-titan", "embed-cohere"):
         del v2["models"][alias]
     await RegistryStore(valkey, prefix).publish(v2, actor="deploy")
+    # The publish itself deletes the removed models' numbers keys (CO-20); gc does the rest.
+    assert not [k async for k in valkey.scan_iter(match=f"{prefix}:{{m:embed-*")]
     dry = await amain(["registry", "gc", "--dry-run"], env)
     assert "llm-embed-titan" in dry["queues"]
-    assert dry["would_delete"] >= len(drop) + 2  # plus the two models' numbers keys
+    assert dry["would_delete"] >= len(drop)
     assert all([await valkey.exists(key) for key in drop])
     done = await amain(["registry", "gc", "--yes"], env)
     assert done["deleted_keys"] == dry["would_delete"]

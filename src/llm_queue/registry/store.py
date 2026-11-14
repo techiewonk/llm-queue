@@ -574,8 +574,9 @@ class RegistryStore:
                 raise RegistryError(errors, warnings)
             changes = orjson.dumps(audit_diff(stored or {}, merged)).decode()
             keys, values = self._numbers(ResolvedRegistry(merged_registry))
+            gone = [self.numbers_key(a) for a in _removed_models(stored, merged_registry)]
             reply = await self._publish(
-                [self.doc_key, self.meta_key, self.audit_key, self.history_key, *keys],
+                [self.doc_key, self.meta_key, self.audit_key, self.history_key, *keys, *gone],
                 [
                     orjson.dumps(merged).decode(),
                     registry.version,
@@ -586,6 +587,7 @@ class RegistryStore:
                     self._history_size,
                     int(meta.get("changes", "0")),
                     "1" if replace else "0",
+                    len(gone),
                     *values,
                 ],
             )
@@ -911,6 +913,17 @@ class RegistryStore:
                     "registry_reload_failed", error=repr(exc), failures=failures, exc_info=True
                 )
             await self._sleep(_reload_wait(interval_secs, failures))
+
+
+def _removed_models(stored: Mapping[str, Any] | None, registry: Registry) -> list[str]:
+    """Aliases the stored document has and `registry` does not (their numbers are deleted).
+
+    Read leniently: the stored document may be the invalid one being replaced.
+    """
+    models = stored.get("models") if isinstance(stored, Mapping) else None
+    if not isinstance(models, Mapping):
+        return []
+    return sorted(a for a in models if isinstance(a, str) and a not in registry.models)
 
 
 def _reload_wait(interval_secs: float, failures: int) -> float:
