@@ -89,7 +89,7 @@ async def test_failure_before_any_chunk_raises_the_call_error(make: Make) -> Non
     seen: list[dict[str, Any]] = []
     with pytest.raises(CallFailed) as info:
         await _drain(engine.stream("small", CHAT), seen)
-    assert info.value.kind == "provider_error"
+    assert info.value.kind == "invalid_request"  # a validation error is the request's own
     assert not seen
 
 

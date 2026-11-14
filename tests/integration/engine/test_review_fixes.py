@@ -223,8 +223,9 @@ async def test_first_sync_calls_from_many_threads_build_one_runner(
         assert len({id(r) for r in runners}) == 1
     finally:
         await asyncio.to_thread(queue.close_sync)
+    # The private loop is shared by every queue of the process and stays (plan E2): one thread.
     alive = [t for t in threading.enumerate() if t.name == "llmq-sync"]
-    assert not alive
+    assert len(alive) <= 1
 
 
 async def test_store_error_after_send_waits_instead_of_running_twice(

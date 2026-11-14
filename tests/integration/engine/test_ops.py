@@ -62,6 +62,8 @@ async def test_status_of_model_and_request(make: Make) -> None:
 async def test_readiness_never_depends_on_providers(make: Make) -> None:
     engine, _ = await make(scenario={"defaults": {"force_error": "ServiceUnavailableException"}})
     health = await engine.health_check()
+    policy = health.pop("eviction_policy")  # read at start (plan C4)
+    assert policy != "unknown"
     assert health == {"live": True, "ready": True, "stores": {"state": "ok", "queue": "ok"}}
     await engine.stop(drain_secs=0)
     assert (await engine.health_check())["ready"] is False

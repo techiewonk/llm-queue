@@ -71,7 +71,7 @@ async def test_large_results_go_to_object_storage(make: Make, store: redis.async
         assert isinstance(raw, bytes)
         assert raw.startswith(MARKER)  # the state store keeps only a reference
         objects = await s3.list_objects_v2(Bucket="llmq-results")
-        assert objects["KeyCount"] == 1
+        assert objects["KeyCount"] == 0  # deleted once the result was read (RESCAN X9)
     finally:
         await offload.aclose()
         server.stop()
