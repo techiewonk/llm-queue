@@ -191,6 +191,15 @@ for _, v in ipairs(redis.call('HVALS', KEYS[5])) do if v == 'h' then held = held
 return {redis.call('XLEN', KEYS[1]), held, redis.call('XLEN', KEYS[6])}
 """
 
+# ARGV: retention ms. Dead letters older than the retention go: XADD trimmed them only when a
+# new one came, so a quiet queue kept its prompts for good (RESCAN X10). Reply: how many.
+TRIM_DEAD = (
+    _NOW
+    + """
+return redis.call('XTRIM', KEYS[6], 'MINID', tostring(now - tonumber(ARGV[1])))
+"""
+)
+
 # ARGV: max count. Dead letters back on the queue (new ids: they go to the back).
 REDRIVE = """
 local moved = 0
@@ -270,6 +279,7 @@ class StreamQueues:
         self._fail = client.register_script(FAIL)
         self._depth = client.register_script(DEPTH)
         self._redrive = client.register_script(REDRIVE)
+        self._trim_dead = client.register_script(TRIM_DEAD)
 
     async def _send_and_wait(
         self, queue: str, args: list[bytes | int | str], replicas: int, wait_ms: int
@@ -429,6 +439,18 @@ class StreamQueues:
     async def redrive(self, queue: str, count: int = 1000) -> int:
         """Move up to `count` dead letters back to the queue; returns how many."""
         return int(await self._redrive(self._k(queue), [count]))
+
+    async def trim_dead(self, queue: str, keep_secs: int) -> int:
+        """Drop dead letters older than `keep_secs` (on a timer); returns how many went."""
+        return int(await self._trim_dead(self._k(queue), [int(keep_secs) * 1000]))
+
+    async def mark_consumer(self, queue: str, ttl_secs: int) -> None:
+        """Say a process consumes this queue; the mark lapses `ttl_secs` after the last one."""
+        await self._client.set(self.keys.queue(queue, "consumer"), b"1", ex=ttl_secs)
+
+    async def has_consumer(self, queue: str) -> bool:
+        """True while some process marks itself as this queue's consumer."""
+        return bool(await self._client.exists(self.keys.queue(queue, "consumer")))
 
     async def purge_dead(self, queue: str) -> None:
         """Delete every dead letter of a queue."""
