@@ -128,3 +128,19 @@ def test_new_kinds_are_call_failed_kinds() -> None:
     for kind in ("invalid_request", "context_length_exceeded", "worker_shutdown"):
         assert kind in KINDS
         assert CallFailed(kind).kind == kind
+
+
+async def test_send_job_at_the_limit_is_queue_full(monkeypatch: pytest.MonkeyPatch) -> None:
+    """send_job raised the queue's internal `QueueFull` (not an LLMQueueError) at the limit."""
+    from llm_queue.engine.queue import QueueFull
+
+    engine = SimpleNamespace(queues=None, settings=SimpleNamespace(queue_prefix=""), metrics=None)
+    queue = LLMQueue(engine)  # type: ignore[arg-type]
+
+    async def full(*args: Any, **kwargs: Any) -> str:
+        raise QueueFull("jobs-j", 10_000)
+
+    monkeypatch.setattr(queue.jobs, "send", full)
+    with pytest.raises(CallFailed) as info:
+        await queue.send_job("j", {})
+    assert info.value.kind == "queue_full"

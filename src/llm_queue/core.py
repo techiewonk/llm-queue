@@ -31,6 +31,7 @@ from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.jobs import JobFn, JobRunner
 from llm_queue.engine.metrics import Metrics, sink_for
 from llm_queue.engine.offload import ResultOffload
+from llm_queue.engine.queue import QueueFull
 from llm_queue.engine.runtime import Engine, EngineSettings
 from llm_queue.engine.settings import InfraSettings
 from llm_queue.engine.store_client import Secrets, secret_store_client
@@ -506,9 +507,16 @@ class LLMQueue:
     async def send_job(
         self, name: str, payload: Mapping[str, Any], *, job_id: str | None = None
     ) -> str:
-        """Queue a job; returns its id (jobs run at least once)."""
+        """Queue a job; returns its id (jobs run at least once).
+
+        `CallFailed("queue_full")` when 10,000 jobs of this name already wait (it raised the
+        queue's internal `QueueFull` before).
+        """
         self._check()
-        return await self.jobs.send(name, payload, job_id=job_id)
+        try:
+            return await self.jobs.send(name, payload, job_id=job_id)
+        except QueueFull as exc:
+            raise CallFailed("queue_full", str(exc), retry_after_secs=5) from exc
 
     @store_op
     async def cancel(self, request_id: str) -> None:

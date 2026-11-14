@@ -280,7 +280,8 @@ BEDROCK: list[Any] = [
 
 # Rows (by id) with a refinement set; every other row has none.
 AUTH = {"unrecognized-client", "expired-token", "signature-mismatch", "clock-skew", "bad-key"}
-RESET = {"connection-closed", "connection-reset", "openai-stream-closed"}
+# stream-closed: a Bedrock body cut mid-way is a dropped connection (one quick retry, C7).
+RESET = {"connection-closed", "connection-reset", "openai-stream-closed", "stream-closed"}
 REQUEST_KIND = {
     "input-too-long": "context_length_exceeded",
     "stream-validation": "context_length_exceeded",
