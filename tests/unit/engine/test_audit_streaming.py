@@ -11,7 +11,6 @@ from typing import Any
 
 import pytest
 
-from llm_queue.engine import streaming
 from llm_queue.engine.streaming import ChunkReader, ChunkWriter
 
 
@@ -101,7 +100,7 @@ async def test_en18_reader_backs_off_and_logs_once(
         pauses.append(secs)
         await real_sleep(0)
 
-    monkeypatch.setattr(streaming.asyncio, "sleep", sleep)
+    monkeypatch.setattr(asyncio, "sleep", sleep)  # the module streaming uses
     client = Client(fail_reads=10)
     reader = ChunkReader(client, block_ms=1, wake_key="w")  # type: ignore[arg-type]  # fake
     with caplog.at_level(logging.INFO):

@@ -291,9 +291,12 @@ async def test_en3_offload_failure_keeps_the_result_inline(
     from llm_queue.engine.envelope import Reply
 
     stored: list[bytes] = []
-    requests, _ = _requests(
-        CountingOffload(fail_put=True), put=lambda _k, a: stored.append(a[0]) or 1
-    )
+
+    def put(_keys: list[Any], args: list[Any]) -> int:
+        stored.append(args[0])
+        return 1
+
+    requests, _ = _requests(CountingOffload(fail_put=True), put=put)
     reply = Reply(request_id="r", ok=True, response={"x": "y" * 50})
     with caplog.at_level(logging.WARNING):
         assert await requests.put_result(reply, final_state="done") is True
