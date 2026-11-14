@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from llm_queue.clients.hub import (
     ClientHub,
-    WarmOptions,
     client_hub,
     pool_size_for,
     run,
@@ -17,7 +16,6 @@ from llm_queue.clients.hub import (
 from llm_queue.clients.pool import (
     ClientPool,
     CredentialsUnavailable,
-    OpenAIOptions,
     Route,
     route_for,
 )
@@ -33,6 +31,7 @@ from llm_queue.clients.providers import (
     split_params,
 )
 from llm_queue.clients.timing import AttemptTimeout, Timing
+from llm_queue.tuning import OpenAIOptions, WarmOptions
 
 __all__ = [
     "AttemptTimeout",

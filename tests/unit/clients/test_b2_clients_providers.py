@@ -212,7 +212,7 @@ async def providers(start_fake: StartFake) -> AsyncIterator[tuple[Any, Providers
         ClientPool(
             bedrock_endpoint_url=url,
             credentials=lambda a: {"aws_access_key_id": a.name, "aws_secret_access_key": "x"},
-            secrets={"VLLM_KEY": "key-v"}.get,
+            secrets={"LLMQ_ACCOUNT_VLLM_KEY": "key-v"}.get,
         )
     )
     yield view, built
@@ -237,7 +237,7 @@ async def test_plain_converse_when_an_attempt_timer_is_given(providers: Any) -> 
     timing = Timing(5, 5, attempt_secs=5)
     plain = await built.get("bedrock").call("converse", CHAT, route, timing)
     streamed = await built.get("bedrock").call(
-        "converse", CHAT, route, timing, converse_api="converse_stream"
+        "converse", CHAT, route, timing, converse_api="stream"
     )
     assert plain.response["output"] == streamed.response["output"]
     assert "ResponseMetadata" not in plain.response

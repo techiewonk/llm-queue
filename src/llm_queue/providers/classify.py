@@ -108,7 +108,13 @@ _CONTEXT_MESSAGE = re.compile(
 # Connection dropped by the peer (keep-alive socket closed by the server, NAT reset): one quick
 # retry on a new connection, without charging the breaker (plan C7). Timeouts are not here.
 _RESET_TYPES: dict[str, tuple[str, ...]] = {
-    "aiohttp": ("ServerDisconnectedError", "ClientConnectionResetError", "ClientOSError"),
+    # ClientPayloadError: a Bedrock stream whose body was cut mid-way (the peer closed it).
+    "aiohttp": (
+        "ServerDisconnectedError",
+        "ClientConnectionResetError",
+        "ClientOSError",
+        "ClientPayloadError",
+    ),
     "botocore.exceptions": ("ConnectionClosedError",),
     "httpx": ("RemoteProtocolError", "ReadError"),
     "httpx2": ("RemoteProtocolError", "ReadError"),

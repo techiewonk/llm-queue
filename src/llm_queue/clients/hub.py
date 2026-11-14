@@ -41,22 +41,6 @@ def identity_hash(*parts: Any) -> str:
     return hashlib.sha256(repr(parts).encode()).hexdigest()[:24]
 
 
-@dataclass(frozen=True, slots=True)
-class WarmOptions:
-    """Warm connections per Bedrock client (E4); pass `connections=0` to turn it off.
-
-    After a client is built, `connections` unsigned HEAD requests go to its endpoint at once
-    through the client's own aiohttp session, so DNS, TCP and TLS are done before the first
-    call. They are not billable (no model is invoked; AWS answers an unsigned request with an
-    error status and keeps the connection). Every `refresh_secs` the same requests run again,
-    so the connections outlive AWS's ~20 s idle close and aiohttp's `keepalive_secs`.
-    """
-
-    connections: int = 2
-    refresh_secs: float = 10.0  # below `keepalive_secs` and AWS's 20 s idle timeout; 0 = off
-    keepalive_secs: float = 15.0  # aiohttp keeps an idle pooled connection this long
-
-
 @dataclass(eq=False)
 class Lease:
     """One hub entry: the client, how to close it, and how many pools hold it."""

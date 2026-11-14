@@ -8,8 +8,9 @@ connection and never answers is given up after `first_response_secs`. Raised err
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Awaitable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TypeVar
 
 _T = TypeVar("_T")  # PEP 695 syntax needs 3.12; the package supports 3.11
@@ -38,6 +39,16 @@ async def first(awaitable: Awaitable[_T], secs: float, what: str) -> _T:
         return await asyncio.wait_for(awaitable, secs)
     except TimeoutError as exc:
         raise AttemptTimeout(f"no {what} within {secs:g}s") from exc
+
+
+def opened(timing: Timing, started: float) -> Timing:
+    """`timing` with what is left of the first-response budget since `started` (monotonic).
+
+    One budget covers opening the call and its first event (K7): a slow open no longer gets
+    `first_response_secs` once more for the first event.
+    """
+    left = timing.first_response_secs - (time.monotonic() - started)
+    return replace(timing, first_response_secs=max(0.0, left))
 
 
 async def paced(stream: AsyncIterator[_T], timing: Timing, *, started: bool) -> AsyncIterator[_T]:

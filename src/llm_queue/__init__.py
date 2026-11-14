@@ -35,14 +35,15 @@ from llm_queue.errors import (
 from llm_queue.tuning import (
     BedrockOptions,
     EngineTimings,
+    OpenAIOptions,
     RegistryOptions,
     StoreOptions,
     Tuning,
+    WarmOptions,
 )
 
 if TYPE_CHECKING:
-    from llm_queue.clients.hub import WarmOptions, run
-    from llm_queue.clients.pool import OpenAIOptions
+    from llm_queue.clients.hub import run
     from llm_queue.clients.providers import register_provider
     from llm_queue.core import (
         EmbedResult,
@@ -81,8 +82,6 @@ _LAZY = {
     "LiveEditRefused": "llm_queue.registry.store",
     "register_account_kind": "llm_queue.registry",
     "register_provider": "llm_queue.clients.providers",
-    "OpenAIOptions": "llm_queue.clients.pool",
-    "WarmOptions": "llm_queue.clients.hub",
     "run": "llm_queue.clients.hub",
     "register_token_estimator": "llm_queue.engine.tokens",
 }

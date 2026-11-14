@@ -20,7 +20,7 @@ from typing import Any, Protocol
 import orjson
 
 from llm_queue.clients.pool import ClientPool, Route
-from llm_queue.clients.timing import Timing, first, paced
+from llm_queue.clients.timing import Timing, first, opened, paced
 from llm_queue.errors import ConfigError, ErrorInfo
 from llm_queue.providers.classify import (
     StreamTruncated,
@@ -75,7 +75,7 @@ class Provider(Protocol):
     ) -> Result:
         """Run one attempt; chat operations pass each streamed event to `sink`.
 
-        `converse_api` is the model's setting: `converse` or `converse_stream` (Bedrock only).
+        `converse_api` is the model's setting: `converse` or `stream` (Bedrock only).
         """
         ...
 
@@ -203,12 +203,13 @@ class BedrockProvider:
         """ConverseStream events of one attempt, each within the attempt timers."""
         client = await self._pool.bedrock(route)
         request = {**params, "modelId": route.model_id}
+        started = time.monotonic()
         reply = await first(
             client.converse_stream(**request), timing.first_response_secs, "first response"
         )
         stream = reply["stream"]
         try:
-            async for event in paced(stream, timing, started=False):
+            async for event in paced(stream, opened(timing, started), started=False):
                 yield event
         finally:
             # Always release the HTTP connection: a stream given up on an idle timeout (or a
@@ -234,7 +235,7 @@ class BedrockProvider:
         timer keeps the stream's hung-region detection).
         """
         if op == "converse":
-            plain = converse_api != "converse_stream" and timing.attempt_secs is not None
+            plain = converse_api != "stream" and timing.attempt_secs is not None
             if sink is None and plain:
                 return await _reset_retry(lambda _: self._converse(params, route, timing), None)
             return await _reset_retry(
@@ -438,9 +439,10 @@ class OpenAIProvider:
                 "stream_options": {"include_usage": True},
             },
         )
+        started = time.monotonic()
         reply = await first(create(**request), timing.first_response_secs, "first response")
         try:
-            async for chunk in paced(reply, timing, started=False):
+            async for chunk in paced(reply, opened(timing, started), started=False):
                 yield chunk
         finally:  # release the connection on a timeout or cancel too (as for Bedrock)
             with contextlib.suppress(Exception):

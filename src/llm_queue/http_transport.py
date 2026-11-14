@@ -51,6 +51,7 @@ _STATUS = {
     "queue_unavailable": (503, "service_unavailable"),
     "model_unavailable": (503, "service_unavailable"),
     "credentials_unavailable": (503, "service_unavailable"),
+    "worker_shutdown": (503, "service_unavailable"),
     "deadline_exceeded": (504, "timeout"),
 }
 

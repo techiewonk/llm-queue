@@ -20,13 +20,12 @@ from llm_queue._logging import get_logger
 from llm_queue.clients.hub import (
     ClientHub,
     Lease,
-    WarmOptions,
     client_hub,
     identity_hash,
     pool_size_for,
 )
 from llm_queue.errors import ConfigError, LLMQueueError, MissingExtra
-from llm_queue.tuning import BedrockOptions
+from llm_queue.tuning import BedrockOptions, OpenAIOptions, WarmOptions
 
 if TYPE_CHECKING:
     from aiobotocore.session import AioSession
@@ -52,17 +51,6 @@ SecretSource = Callable[[str], str | None]
 # call); inside the last 2 minutes every caller waits for the renewal.
 REFRESH_BEFORE_SECS = 300
 REFRESH_MANDATORY_SECS = 120
-
-
-@dataclass(frozen=True, slots=True)
-class OpenAIOptions:
-    """The OpenAI-compatible clients' timeouts and connection pool (one client per account)."""
-
-    read_timeout_secs: float = 300.0  # a long generation; each attempt has its own timer too
-    connect_timeout_secs: float = 10.0
-    max_connections: int = 100
-    max_keepalive_connections: int = 20
-    keepalive_secs: float = 15.0
 
 
 @dataclass(frozen=True, slots=True)

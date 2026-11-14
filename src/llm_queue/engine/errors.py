@@ -27,6 +27,9 @@ KINDS = frozenset(
         "cancelled",
         "provider_error",
         "rejected",
+        "invalid_request",
+        "context_length_exceeded",
+        "worker_shutdown",
     }
 )
 

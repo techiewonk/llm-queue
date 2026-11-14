@@ -42,6 +42,33 @@ class BedrockOptions:
 
 
 @dataclass(frozen=True)
+class OpenAIOptions:
+    """The OpenAI-compatible clients' timeouts and connection pool (one client per account)."""
+
+    read_timeout_secs: float = 300.0  # a long generation; each attempt has its own timer too
+    connect_timeout_secs: float = 10.0
+    max_connections: int = 100
+    max_keepalive_connections: int = 20
+    keepalive_secs: float = 15.0
+
+
+@dataclass(frozen=True)
+class WarmOptions:
+    """Warm connections per Bedrock client (E4); pass `connections=0` to turn it off.
+
+    After a client is built, `connections` unsigned HEAD requests go to its endpoint at once
+    through the client's own aiohttp session, so DNS, TCP and TLS are done before the first
+    call. They are not billable (no model is invoked; AWS answers an unsigned request with an
+    error status and keeps the connection). Every `refresh_secs` the same requests run again,
+    so the connections outlive AWS's ~20 s idle close and aiohttp's `keepalive_secs`.
+    """
+
+    connections: int = 2
+    refresh_secs: float = 10.0  # below `keepalive_secs` and AWS's 20 s idle timeout; 0 = off
+    keepalive_secs: float = 15.0  # aiohttp keeps an idle pooled connection this long
+
+
+@dataclass(frozen=True)
 class EngineTimings:
     """Pacing of the engine's loops (`engine/runtime.py`, `engine/streaming.py`)."""
 
@@ -64,6 +91,12 @@ class EngineTimings:
     limiter_cut_ms: int = 1000  # a throttle cuts the adaptive limit at most once per this
     limiter_cut_factor: float = 0.7  # ... to this fraction of itself (0-1)
     budget_key_ms: int = 180_000  # budget and limiter keys live this long (over 2 minutes)
+    # A throttled deployment is skipped for a jittered backoff from 1-2 s doubling to 30 s per
+    # throttle in a row (or Retry-After when longer), for every pod (P2).
+    throttle_base_ms: int = 1000
+    throttle_max_ms: int = 30_000
+    slow_stale_ms: int = 300_000  # a latency average this old no longer marks a deployment slow
+    job_ttl_ms: int = 3_600_000  # a claim record made by a worker lives this long
 
 
 @dataclass(frozen=True)
@@ -85,6 +118,8 @@ class Tuning:
     bedrock: BedrockOptions = field(default_factory=BedrockOptions)
     engine: EngineTimings = field(default_factory=EngineTimings)
     registry: RegistryOptions = field(default_factory=RegistryOptions)
+    openai: OpenAIOptions = field(default_factory=OpenAIOptions)
+    warm: WarmOptions = field(default_factory=WarmOptions)
 
     def problems(self, *, queue_wait_ms: int = 0) -> list[str]:
         """Every bad value and bad combination, one line each (empty when all is well).
@@ -98,6 +133,8 @@ class Tuning:
             "bedrock": BedrockOptions,
             "engine": EngineTimings,
             "registry": RegistryOptions,
+            "openai": OpenAIOptions,
+            "warm": WarmOptions,
         }
         wrong = [
             f"{name} must be {kind.__name__}(...), not {type(getattr(self, name)).__name__}"
@@ -106,7 +143,7 @@ class Tuning:
         ]
         if wrong:  # `Tuning(store=None)`: nothing below can be read
             return wrong
-        for part in (self.store, self.bedrock, self.engine, self.registry):
+        for part in (self.store, self.bedrock, self.engine, self.registry, self.openai, self.warm):
             out += _check_part(part)
         # Each combination is checked once its own fields are valid (a bad field is already
         # listed; comparing it would only repeat the same problem).
@@ -131,6 +168,9 @@ class Tuning:
             out.append(
                 "engine.budget_key_ms must be at least 130000 (a fixed window spans 2 minutes)"
             )
+        throttle = {"engine.throttle_base_ms", "engine.throttle_max_ms"}
+        if not throttle & bad and engine.throttle_base_ms > engine.throttle_max_ms:
+            out.append("engine.throttle_base_ms must not be above engine.throttle_max_ms")
         idle = {"engine.idle_poll_secs", "engine.idle_slow_secs"}
         if not idle & bad and engine.idle_poll_secs > engine.idle_slow_secs:
             out.append("engine.idle_poll_secs must not be above engine.idle_slow_secs")
@@ -140,6 +180,10 @@ class Tuning:
         return out
 
 
+# Fields where 0 is valid: no store retries; no warm connections, or no refresh (off).
+_ZERO_OK = frozenset({"retries", "connections", "refresh_secs"})
+
+
 def _check_part(part: Any) -> list[str]:
     """Type and range of each field: ints are whole numbers, every number finite and above 0."""
     section = {
@@ -147,6 +191,8 @@ def _check_part(part: Any) -> list[str]:
         BedrockOptions: "bedrock",
         EngineTimings: "engine",
         RegistryOptions: "registry",
+        OpenAIOptions: "openai",
+        WarmOptions: "warm",
     }[type(part)]
     out: list[str] = []
     for spec in fields(part):
@@ -159,6 +205,6 @@ def _check_part(part: Any) -> list[str]:
             out.append(f"{name} must be a whole number")
         elif not math.isfinite(value):
             out.append(f"{name} must be finite")
-        elif value < 0 or (value == 0 and spec.name != "retries"):
-            out.append(f"{name} must be {'0 or more' if spec.name == 'retries' else 'above 0'}")
+        elif value < 0 or (value == 0 and spec.name not in _ZERO_OK):
+            out.append(f"{name} must be {'0 or more' if spec.name in _ZERO_OK else 'above 0'}")
     return out
