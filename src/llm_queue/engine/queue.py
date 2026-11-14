@@ -185,10 +185,13 @@ return 1
 """
 
 # ARGV: id, generation, delay ms. Visible again in its place after the delay; no failure.
+# The receipt ends here (generation + 1): a heartbeat extend already in flight hid the given-back
+# message again for its whole visibility timeout (a drained pod's call reached no other pod).
 RETURN = (
     _NOW
     + """
 if redis.call('HGET', KEYS[3], ARGV[1]) ~= ARGV[2] then return 0 end
+redis.call('HINCRBY', KEYS[3], ARGV[1], 1)
 redis.call('HSET', KEYS[5], ARGV[1], 'r')
 redis.call('ZADD', KEYS[2], now + tonumber(ARGV[3]), ARGV[1])
 return 1

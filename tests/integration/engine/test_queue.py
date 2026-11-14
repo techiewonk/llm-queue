@@ -45,13 +45,29 @@ async def test_return_keeps_place_and_no_failure(store: redis.asyncio.Redis, pre
         await queues.return_(message)
     again, _ = await queues.receive("q", 3, FAST)
     assert [m.body for m in again] == [b"m0", b"m1", b"m2"]
-    assert all(m.generation == 2 for m in again)
+    assert all(m.generation == 3 for m in again)  # received, returned (receipt ended), received
     for _ in range(10):  # returned many times: never dead
         for message in again:
             await queues.return_(message)
         again, dead = await queues.receive("q", 3, FAST)
         assert not dead
     assert len(again) == 3
+
+
+async def test_a_returned_receipt_cannot_hide_the_message_again(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """A heartbeat extend in flight while the message was given back hid it for the whole
+    visibility timeout: no pod took it and its caller hit its deadline (drain test, 1 in 12).
+    """
+    queues = await _filled(store, prefix, 1)
+    (held,), _ = await queues.receive("q", 1, FAST)
+    await queues.return_(held)
+    assert not await queues.extend(held, 60)
+    assert await queues.extend_many([(held, 60)]) == [False]
+    assert not await queues.ack(held)
+    again, _ = await queues.receive("q", 1, FAST)
+    assert [m.body for m in again] == [b"m0"]
 
 
 async def test_returned_message_goes_before_newer_ones(
