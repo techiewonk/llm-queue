@@ -165,16 +165,24 @@ class ChunkWriter:
 class ChunkReader:
     """One per caller process: one blocking read over every open chunk stream."""
 
-    def __init__(self, client: redis.asyncio.Redis, *, block_ms: int = 100) -> None:
+    def __init__(
+        self, client: redis.asyncio.Redis, *, block_ms: int = 100, wake_key: str | None = None
+    ) -> None:
         """Keep the client; the read task starts with the first open stream.
 
-        `block_ms`: an opened stream joins the shared read within this time
-        (`Tuning.engine.stream_read_block_ms`).
+        `block_ms`: the longest single blocking read (`Tuning.engine.stream_read_block_ms`).
+        `wake_key`: a stream of this reader's own; a stream opened while the shared read blocks
+        adds an entry there, so the read returns and takes the new stream in at once (without
+        it, the new stream joins when the read ends: up to `block_ms` later).
         """
         self._client = client
         self._block_ms = block_ms
+        self._wake_key = wake_key
         self._open: dict[str, tuple[asyncio.Queue[dict[str, Any]], list[str]]] = {}
         self._task: asyncio.Task[None] | None = None
+        self._reading: set[str] | None = None  # the keys of the blocking read in flight
+        self._woken = False  # a wake-up was sent for the read in flight
+        self._rings: set[asyncio.Task[None]] = set()
 
     def open(self, key: str) -> asyncio.Queue[dict[str, Any]]:
         """Start reading a chunk stream from its beginning; entries arrive on the queue."""
@@ -182,7 +190,28 @@ class ChunkReader:
         self._open[key] = (queue, ["0"])
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._read())
+        elif (
+            self._wake_key is not None
+            and self._reading is not None
+            and key not in self._reading
+            and not self._woken
+        ):
+            self._woken = True
+            ring = asyncio.create_task(self._ring())
+            self._rings.add(ring)
+            ring.add_done_callback(self._rings.discard)
         return queue
+
+    async def _ring(self) -> None:
+        """Wake the blocking read (one entry on the wake stream, which lapses after a minute)."""
+        assert self._wake_key is not None
+        try:
+            async with self._client.pipeline(transaction=False) as pipe:
+                pipe.xadd(self._wake_key, {"w": "1"}, maxlen=1, approximate=False)
+                pipe.pexpire(self._wake_key, 60_000)
+                await pipe.execute()
+        except Exception as exc:  # the new stream still joins when the read ends
+            logger.warning("chunk_reader_wake_failed", error=str(exc))
 
     def close(self, key: str) -> None:
         """Stop reading a chunk stream."""
@@ -199,6 +228,9 @@ class ChunkReader:
     async def _read(self) -> None:
         while self._open:
             streams: dict[Any, Any] = {key: last[0] for key, (_, last) in self._open.items()}
+            if self._wake_key is not None:
+                streams[self._wake_key] = "$"  # only wake-ups sent while this read blocks
+            self._reading, self._woken = set(streams), False
             try:
                 found: Any = await self._client.xread(streams, block=self._block_ms)
             except asyncio.CancelledError:
@@ -207,6 +239,8 @@ class ChunkReader:
                 logger.warning("chunk_reader_error", error=str(exc))
                 await asyncio.sleep(0.5)
                 continue
+            finally:
+                self._reading = None
             for raw_key, entries in found or []:
                 key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
                 if key not in self._open:
