@@ -18,7 +18,14 @@ from botocore.exceptions import ClientError
 from clients_testkit import StartFake, registry_doc
 from openai.types.chat import ChatCompletionChunk
 
-from llm_queue.clients import BedrockProvider, ClientPool, Providers, Timing, route_for
+from llm_queue.clients import (
+    BedrockProvider,
+    ClientPool,
+    OpenAIOptions,
+    Providers,
+    Timing,
+    route_for,
+)
 from llm_queue.clients.providers import _chat_body, _converse_body, _openai_usage
 from llm_queue.errors import ErrorKind
 from llm_queue.providers import (
@@ -206,7 +213,9 @@ def test_openai_cached_tokens_are_not_counted_twice() -> None:
 
 
 @pytest.fixture
-async def providers(start_fake: StartFake, transport: str) -> AsyncIterator[tuple[Any, Providers]]:
+async def providers(
+    start_fake: StartFake, transport: str, request: pytest.FixtureRequest
+) -> AsyncIterator[tuple[Any, Providers]]:
     url, _ = await start_fake()
     view = load_registry(registry_doc(url))
     built = Providers(
@@ -215,12 +224,14 @@ async def providers(start_fake: StartFake, transport: str) -> AsyncIterator[tupl
             options=BedrockOptions(transport=transport),
             credentials=lambda a: {"aws_access_key_id": a.name, "aws_secret_access_key": "x"},
             secrets={"LLMQ_ACCOUNT_VLLM_KEY": "key-v"}.get,
+            openai_options=OpenAIOptions(http=getattr(request, "param", "httpx")),
         )
     )
     yield view, built
     await built.aclose()
 
 
+@pytest.mark.parametrize("providers", ["httpx", "aiohttp"], indirect=True)
 async def test_openai_unknown_params_go_to_extra_body(providers: Any) -> None:
     view, built = providers
     route = route_for(view, view.deployments("local")[0])

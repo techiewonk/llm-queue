@@ -18,7 +18,7 @@ import redis.asyncio
 from aiohttp.test_utils import TestServer
 from engine_testkit import FakeEngine, Scenario, create_app, registry
 
-from llm_queue import CallFailed, LLMQueue, request_context
+from llm_queue import CallFailed, LLMQueue, OpenAIOptions, Tuning, request_context
 from llm_queue.http_transport import _error_response
 
 pytestmark = pytest.mark.integration
@@ -47,7 +47,9 @@ def _doc(url: str) -> dict[str, Any]:
 
 
 @pytest.fixture
-async def llmq(store: redis.asyncio.Redis, prefix: str) -> AsyncIterator[LLMQueue]:
+async def llmq(
+    store: redis.asyncio.Redis, prefix: str, request: pytest.FixtureRequest
+) -> AsyncIterator[LLMQueue]:
     fake = FakeEngine(Scenario.from_mapping({}))
     server = TestServer(create_app(engine=fake), host="127.0.0.1")
     await server.start_server()
@@ -68,6 +70,7 @@ async def llmq(store: redis.asyncio.Redis, prefix: str) -> AsyncIterator[LLMQueu
             "aws_access_key_id": account.name,
             "aws_secret_access_key": "x",
         },
+        tuning=Tuning(openai=OpenAIOptions(http=getattr(request, "param", "httpx"))),
     )
     seen: list[dict[str, Any]] = []
 
@@ -185,6 +188,7 @@ async def test_langchain_bedrock_embeddings(llmq: LLMQueue) -> None:
     assert len(query) == 1024
 
 
+@pytest.mark.parametrize("llmq", ["httpx", "aiohttp"], indirect=True)
 async def test_langchain_openai_chat_and_embeddings(llmq: LLMQueue) -> None:
     from llm_queue.langchain import QueuedChatOpenAI, QueuedOpenAIEmbeddings
 

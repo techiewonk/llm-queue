@@ -34,9 +34,14 @@ class Timing:
 
 
 async def first(awaitable: Awaitable[_T], secs: float, what: str) -> _T:
-    """Await within `secs`, else raise `AttemptTimeout` naming `what`."""
+    """Await within `secs`, else raise `AttemptTimeout` naming `what`.
+
+    `asyncio.timeout`, not `wait_for`: on Python 3.11 `wait_for` lost a cancel that came in the
+    same loop turn as the awaited read finishing, and the call ran on to its idle timer.
+    """
     try:
-        return await asyncio.wait_for(awaitable, secs)
+        async with asyncio.timeout(secs):
+            return await awaitable
     except TimeoutError as exc:
         raise AttemptTimeout(f"no {what} within {secs:g}s") from exc
 

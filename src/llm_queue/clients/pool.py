@@ -9,6 +9,7 @@ other pool of the process on the same event loop, and are closed when the last p
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -441,12 +442,23 @@ class ClientPool:
                 keepalive_expiry=opts.keepalive_secs,
             )
             timeout = Timeout(opts.read_timeout_secs, connect=opts.connect_timeout_secs)
+            http: Any = None
+            if opts.http == "aiohttp":
+                # openai >= 1.9x; 1.x / 2.x need `httpx-aiohttp`, 3.x vendors it. A missing
+                # piece raises RuntimeError on construction: fall back to httpx.
+                aio = getattr(openai, "DefaultAioHttpClient", None)
+                with contextlib.suppress(RuntimeError):
+                    http = aio(limits=limits, timeout=timeout) if aio is not None else None
+                if http is None:
+                    logger.warning("openai_aiohttp_unavailable", account=account.name)
+            if http is None:
+                http = openai.DefaultAsyncHttpxClient(limits=limits, timeout=timeout)
             client = AsyncOpenAI(
                 api_key=key or "unused",
                 base_url=account.base_url,
                 max_retries=0,
                 timeout=timeout,
-                http_client=openai.DefaultAsyncHttpxClient(limits=limits, timeout=timeout),
+                http_client=http,
             )
             return client, client.close
 

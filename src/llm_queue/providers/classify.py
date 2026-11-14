@@ -119,6 +119,8 @@ _RESET_TYPES: dict[str, tuple[str, ...]] = {
     "httpx": ("RemoteProtocolError", "ReadError"),
     "httpx2": ("RemoteProtocolError", "ReadError"),
 }
+# No connection was made (refused, DNS): not a reset, though aiohttp's is a `ClientOSError`.
+_CONNECT_FAILED: dict[str, tuple[str, ...]] = {"aiohttp": ("ClientConnectorError",)}
 
 
 class StreamTruncated(LLMQueueError):
@@ -235,15 +237,26 @@ def _is_any(exc: BaseException, table: Mapping[str, tuple[str, ...]]) -> bool:
 def is_connection_reset(exc: BaseException) -> bool:
     """True when the peer dropped the connection (not a timeout): worth one immediate retry.
 
-    Looks at the error and its cause / context, since SDKs wrap the socket error (openai's
-    `APIConnectionError` around httpx's `RemoteProtocolError`).
+    Looks down the cause / context chain, since SDKs wrap the socket error (openai's
+    `APIConnectionError` around httpx's `RemoteProtocolError`; with the aiohttp transport,
+    `APITimeoutError` around `ConnectTimeout` around `ServerDisconnectedError`).
     """
-    for err in (exc, exc.__cause__, exc.__context__):
-        if err is None or isinstance(err, TimeoutError):
+    for err in _chain(exc):
+        if isinstance(err, TimeoutError) or _is_any(err, _CONNECT_FAILED):
             continue
         if isinstance(err, ConnectionResetError | BrokenPipeError) or _is_any(err, _RESET_TYPES):
             return True
     return False
+
+
+def _chain(exc: BaseException) -> list[BaseException]:
+    """The error and its causes (`__cause__`, else `__context__`), at most 8 deep."""
+    out: list[BaseException] = []
+    err: BaseException | None = exc
+    while err is not None and len(out) < 8 and err not in out:
+        out.append(err)
+        err = err.__cause__ or err.__context__
+    return out
 
 
 def is_auth_error(exc: BaseException, info: ErrorInfo) -> bool:
@@ -339,7 +352,14 @@ def classify_openai(exc: BaseException) -> ErrorInfo:
     no wait fixes. 408/409/5xx, timeouts and connection errors are retryable; other 4xx fatal.
     """
     if is_transport_error(exc):
-        return ErrorInfo(kind=ErrorKind.RETRYABLE, code=type(exc).__name__)
+        code = type(exc).__name__
+        # The aiohttp transport maps a dropped or refused connection to `ConnectTimeout`
+        # (no timer fired anywhere in the chain): name it as the httpx transport does.
+        chain = _chain(exc)
+        timed_out = any(isinstance(err, TimeoutError) for err in chain)
+        if code == "APITimeoutError" and len(chain) > 1 and not timed_out:
+            code = "APIConnectionError"
+        return ErrorInfo(kind=ErrorKind.RETRYABLE, code=code)
     status = getattr(exc, "status_code", None)
     if not isinstance(status, int):
         openai = sys.modules.get("openai")

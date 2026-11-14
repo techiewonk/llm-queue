@@ -17,6 +17,7 @@ from clients_testkit import StartFake, registry_doc
 from llm_queue.clients import (
     AttemptTimeout,
     ClientPool,
+    OpenAIOptions,
     Providers,
     Route,
     Timing,
@@ -33,8 +34,11 @@ FAST = Timing(first_response_secs=5, idle_secs=5)
 
 
 @pytest.fixture
-async def setup(start_fake: StartFake, transport: str) -> AsyncIterator[Any]:
+async def setup(
+    start_fake: StartFake, transport: str, request: pytest.FixtureRequest
+) -> AsyncIterator[Any]:
     providers: list[Providers] = []
+    http: Any = getattr(request, "param", "httpx")  # OpenAI tests run on both HTTP clients
 
     async def make(scenario: dict[str, Any] | None = None) -> tuple[ResolvedRegistry, Providers]:
         url, _ = await start_fake(scenario)
@@ -47,6 +51,7 @@ async def setup(start_fake: StartFake, transport: str) -> AsyncIterator[Any]:
                 "aws_secret_access_key": "x",
             },
             secrets={"LLMQ_ACCOUNT_VLLM_KEY": "key-v"}.get,
+            openai_options=OpenAIOptions(http=http),
         )
         built = Providers(pool)
         providers.append(built)
@@ -161,6 +166,7 @@ async def test_invoke_usage_from_header(setup: Any) -> None:
     assert result.usage.input_tokens is None
 
 
+@pytest.mark.parametrize("setup", ["httpx", "aiohttp"], indirect=True)
 async def test_openai_chat_tools_and_embeddings(setup: Any) -> None:
     view, providers = await setup({"defaults": {"output_tokens": 30}})
     route = _route(view, "local", "vllm/dc1")
@@ -188,6 +194,7 @@ async def test_openai_chat_tools_and_embeddings(setup: Any) -> None:
     assert result.usage.input_tokens is not None
 
 
+@pytest.mark.parametrize("setup", ["httpx", "aiohttp"], indirect=True)
 async def test_openai_key_and_errors(setup: Any) -> None:
     view, providers = await setup({"models": {"gpt-oss-120b@key-v": {"rpm": 1}}})
     route = _route(view, "local", "vllm/dc1")

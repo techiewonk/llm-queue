@@ -55,7 +55,9 @@ dependencies = [
 llm-queue = "llm_queue.engine.cli:main"
 
 [project.optional-dependencies]
-openai = ["openai>=1.40,<4", "httpx>=0.27,<1"]
+# httpx-aiohttp: the SDK's aiohttp client (`OpenAIOptions(http="aiohttp")`) on openai 1.x / 2.x
+# (3.x vendors it); aiohttp itself comes with aiobotocore. 0.1.8: the floor openai[aiohttp] sets.
+openai = ["openai>=1.40,<4", "httpx>=0.27,<1", "httpx-aiohttp>=0.1.8,<1"]
 # Both LangChain lines are supported: 0.3 and 1.x (the adapters are tested on each).
 langchain-aws = ["langchain-aws>=0.2.24,<2", "langchain-core>=0.3.68,<2"]
 langchain-openai = ["langchain-openai>=0.3.26,<2", "langchain-core>=0.3.68,<2"]
@@ -93,6 +95,7 @@ dev = [
     # The dev env is on the LangChain 1.x line; the 0.3 line is checked in CI (langchain-03 job).
     "openai>=1.40,<4",
     "httpx>=0.27,<1",
+    "httpx-aiohttp>=0.1.8,<1",
     "langchain-aws>=1,<2",
     "langchain-openai>=1,<2",
     "langchain-core>=1,<2",

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, fields
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -46,13 +46,19 @@ class BedrockOptions:
 
 @dataclass(frozen=True)
 class OpenAIOptions:
-    """The OpenAI-compatible clients' timeouts and connection pool (one client per account)."""
+    """The OpenAI-compatible clients' timeouts, connection pool and HTTP client (one per account).
+
+    `http="aiohttp"` sends through the SDK's aiohttp client with the same limits and timeouts;
+    aiohttp has no idle cap, so `max_keepalive_connections` is not used there. Without one
+    (openai older than 1.9x, or no `httpx-aiohttp` / `aiohttp`), httpx is used and a warning logged.
+    """
 
     read_timeout_secs: float = 300.0  # a long generation; each attempt has its own timer too
     connect_timeout_secs: float = 10.0
     max_connections: int = 100
     max_keepalive_connections: int = 20
     keepalive_secs: float = 15.0
+    http: Literal["httpx", "aiohttp"] = "httpx"
 
 
 @dataclass(frozen=True)
@@ -177,8 +183,6 @@ class Tuning:
         idle = {"engine.idle_poll_secs", "engine.idle_slow_secs"}
         if not idle & bad and engine.idle_poll_secs > engine.idle_slow_secs:
             out.append("engine.idle_poll_secs must not be above engine.idle_slow_secs")
-        if self.bedrock.transport not in BEDROCK_TRANSPORTS:
-            out.append(f"bedrock.transport must be one of {', '.join(BEDROCK_TRANSPORTS)}")
         session = self.bedrock.role_session_secs
         if "bedrock.role_session_secs" not in bad and not 900 <= session <= 43200:
             out.append("bedrock.role_session_secs must be 900 to 43200 (STS limits)")
@@ -186,10 +190,10 @@ class Tuning:
 
 
 BEDROCK_TRANSPORTS = ("botocore", "aiohttp")
-# Fields checked by name in `problems()`, not as numbers.
-_CHOICES = frozenset({"transport"})
 # Fields where 0 is valid: no store retries; no warm connections, or no refresh (off).
 _ZERO_OK = frozenset({"retries", "connections", "refresh_secs"})
+# Fields that name a choice instead of a number: `bedrock.transport`, `openai.http`.
+_CHOICES = {"transport": BEDROCK_TRANSPORTS, "http": ("httpx", "aiohttp")}
 
 
 def _check_part(part: Any) -> list[str]:
@@ -204,12 +208,13 @@ def _check_part(part: Any) -> list[str]:
     }[type(part)]
     out: list[str] = []
     for spec in fields(part):
-        if spec.name in _CHOICES:
-            continue
         value = getattr(part, spec.name)
         name = f"{section}.{spec.name}"
         whole = spec.type in ("int", int)
-        if isinstance(value, bool) or not isinstance(value, int | float):
+        if (choices := _CHOICES.get(spec.name)) is not None:
+            if value not in choices:
+                out.append(f"{name} must be one of {', '.join(choices)}")
+        elif isinstance(value, bool) or not isinstance(value, int | float):
             out.append(f"{name} must be a number, not {type(value).__name__}")
         elif whole and not isinstance(value, int):
             out.append(f"{name} must be a whole number")
