@@ -650,19 +650,26 @@ class FaultProxy:
     def stop(self) -> None:
         """End the process (killed if it does not stop at once); safe to call twice."""
         proc = self._proc
-        if proc is None or proc.poll() is not None:
+        if proc is None:
             return
-        with contextlib.suppress(OSError, RuntimeError, ValueError):
-            self._lag_secs = float(self._send("lag") or 0.0)
-        with contextlib.suppress(OSError):
-            assert proc.stdin is not None
-            proc.stdin.write(b"stop\n")
-            proc.stdin.close()
         try:
-            proc.wait(5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(10)
+            if proc.poll() is None:
+                with contextlib.suppress(OSError, RuntimeError, ValueError):
+                    self._lag_secs = float(self._send("lag") or 0.0)
+                with contextlib.suppress(OSError):
+                    assert proc.stdin is not None
+                    proc.stdin.write(b"stop\n")
+                    proc.stdin.flush()
+                try:
+                    proc.wait(5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(10)
+        finally:
+            for pipe in (proc.stdin, proc.stdout):
+                if pipe is not None:
+                    with contextlib.suppress(OSError):
+                        pipe.close()
 
     def _send(self, command: str) -> str:
         """One command; its answer's value (`ok <value>`)."""
