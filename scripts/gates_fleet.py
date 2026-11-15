@@ -832,8 +832,12 @@ class MetricsToStore:
     def gauge(self, name: str, value: float, **labels: str) -> None:
         """Not needed by the gates."""
 
-    async def flush(self, client: Any) -> None:
-        """Add and clear what was counted."""
+    async def send(self, client: Any) -> None:
+        """Add and clear what was counted.
+
+        Not named `flush`: the engine calls a sink's `flush()` (no arguments) when it stops,
+        which logged `stop_metrics_flush_failed` on every drill worker.
+        """
         counts, self.counts = self.counts, collections.Counter()
         if counts:
             async with client.pipeline(transaction=False) as pipe:
@@ -857,7 +861,7 @@ async def _worker_main() -> None:
     async def flusher() -> None:
         while True:
             await asyncio.sleep(1)
-            await sink.flush(client)
+            await sink.send(client)
 
     task = asyncio.create_task(flusher())
     print(f"ready {llmq._engine.worker_id}", flush=True)
@@ -869,7 +873,7 @@ async def _worker_main() -> None:
     llmq.pause_receiving()
     await llmq.stop(drain_secs=30)
     task.cancel()
-    await sink.flush(client)
+    await sink.send(client)
     await client.aclose()
 
 
