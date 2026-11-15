@@ -15,7 +15,7 @@ import pytest
 from llm_queue.engine import embed
 from llm_queue.engine.envelope import Meta, Reply
 from llm_queue.engine.errors import CallFailed
-from llm_queue.providers.embeddings import OPENAI
+from llm_queue.providers.embeddings import COHERE, OPENAI
 from llm_queue.registry.settings import EMBED_INFERENCE
 
 
@@ -43,10 +43,12 @@ class FakeEngine:
         self.dims = dims or {}
         self.requests: list[dict[str, Any]] = []
         self.ids: list[str | None] = []
+        self.packed: list[bool] = []  # each call's `vectors` flag
 
     async def call(self, _alias: str, request: dict[str, Any], **kw: Any) -> Reply:
         self.requests.append(request)
         self.ids.append(kw.get("request_id"))
+        self.packed.append(kw.get("vectors") is True)
         texts = (
             request.get("input")
             or request["body"].get("texts")
@@ -185,3 +187,91 @@ def test_q22_family_field_is_checked() -> None:
     assert registry.models["e"].family == "cohere"
     assert any("family" in e for e in build(_registry("nova"))[1])
     assert any("family" in e for e in build(_registry("cohere", kind="chat"))[1])
+
+
+def test_b97_packed_vectors_round_trip_exactly() -> None:
+    """B97: a Cohere batch was stored as base64 of its JSON body, 3.1 MB a result.
+
+    300 such calls peaked at +105 MB of store memory. Packed, float32-exact values travel as
+    float32 and any other as float64: the caller gets exactly the floats the body held.
+    """
+    exact = [[0.5, -1.0, 2.0], [0.25, 0.0, -3.5]]
+    packed = embed.pack_reply("bedrock", COHERE, {"body": {"embeddings": exact}})
+    assert packed is not None
+    assert packed[embed.PACKED]["type"] == "f"
+    assert embed.vectors_of("bedrock", COHERE, packed) == exact
+    inexact = [[0.1, 1 / 3, -2.718281828459045]]
+    packed = embed.pack_reply("bedrock", COHERE, {"body": {"embeddings": inexact}})
+    assert packed is not None
+    assert packed[embed.PACKED]["type"] == "d"
+    assert embed.vectors_of("bedrock", COHERE, packed) == inexact
+    big = [[1e300, 1.0]]  # above float32's range
+    packed = embed.pack_reply("bedrock", COHERE, {"body": {"embeddings": big}})
+    assert packed is not None
+    assert embed.vectors_of("bedrock", COHERE, packed) == big
+
+
+def test_b97_packed_reply_is_smaller_than_the_body() -> None:
+    """B97: 96 x 1024 float64 vectors packed are about 3x smaller than base64 of their JSON."""
+    import random
+
+    import orjson
+
+    rng = random.Random(1)
+    rows = [[rng.gauss(0.0, 1.0) for _ in range(1024)] for _ in range(96)]
+    vectors = [[v / sum(x * x for x in row) ** 0.5 for v in row] for row in rows]  # unit length
+    body_b64 = base64.b64encode(orjson.dumps({"embeddings": vectors}))
+    packed = embed.pack_reply("bedrock", COHERE, {"body": {"embeddings": vectors}})
+    assert packed is not None
+    assert len(orjson.dumps(packed)) * 2.5 < len(body_b64)
+
+
+def test_b97_unreadable_body_is_not_packed() -> None:
+    """A body with no vectors, or vectors of different lengths, is stored as it came."""
+    assert embed.pack_reply("bedrock", COHERE, {"body": {"nothing": 1}}) is None
+    assert (
+        embed.pack_reply("bedrock", COHERE, {"body": {"embeddings": [[1.0], [1.0, 2.0]]}}) is None
+    )
+
+
+@pytest.mark.parametrize(
+    "packed",
+    [
+        {"type": "q", "count": 1, "dims": 1, "data": ""},
+        {
+            "type": "f",
+            "count": 2,
+            "dims": 2,
+            "data": base64.b64encode(struct.pack("<f", 1)).decode(),
+        },
+        "not a mapping",
+    ],
+)
+def test_b97_malformed_packed_vectors_raise(packed: Any) -> None:
+    """A malformed packed field raises, so `embed()` fails the batch as unreadable."""
+    with pytest.raises((ValueError, TypeError)):
+        embed.vectors_of("bedrock", COHERE, {embed.PACKED: packed})
+
+
+async def test_b97_embed_asks_for_packed_vectors() -> None:
+    """Every batch `embed()` sends sets the envelope's `vectors` flag; raw calls do not."""
+    engine: Any = FakeEngine(batch=2)
+    await embed.embed_detailed(engine, "e", ["a", "b", "c"])
+    assert engine.packed == [True, True]
+
+
+def test_b97_worker_packs_only_embedding_replies() -> None:
+    """The worker packs an embedding model's reply; any other reply is stored as it came."""
+    from llm_queue.engine import runtime
+
+    entry = SimpleNamespace(
+        type="embedding", provider="bedrock", model_id="cohere.embed-v3", family=None
+    )
+    chat = SimpleNamespace(type="chat", provider="bedrock", model_id="cohere.embed-v3", family=None)
+    view: Any = SimpleNamespace(registry=SimpleNamespace(models={"e": entry, "c": chat}))
+    response = {"body": {"embeddings": [[0.5, 1.0]]}}
+    assert embed.PACKED in runtime._packed(view, "e", response)
+    assert runtime._packed(view, "c", response) is response
+    assert runtime._packed(view, "gone", response) is response
+    unreadable = {"body": {"nothing": 1}}
+    assert runtime._packed(view, "e", unreadable) is unreadable

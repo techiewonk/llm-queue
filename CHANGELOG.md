@@ -840,6 +840,11 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
   A 96 x 1024 reply, Python 3.12.13, Windows, 2026-11-15, micro-benchmark of `Reply.dumps` and
   of `orjson.loads` + validate + `vectors_of`: stored value 1.95 MB -> 0.53 MB, worker write
   8.6 ms -> 0.6 ms, caller read and decode 22.5 ms -> 10.5 ms.
+- A Bedrock embedding batch sent by `embed()` is stored as its vectors in binary (float32 when
+  every value is exactly one, else float64: lossless) instead of base64 of the JSON body; a raw
+  InvokeModel call keeps its body. Gate B97 (300 Cohere calls of 96 texts, local Valkey 8.1,
+  Windows, 2026-11-15): a stored result 3.1 MB -> 1.05 MB, store memory peak +102 / +107 MB ->
+  +38 / +41 MB (budget +64 MB).
 - Lua audit, measured on the local Valkey 8.1, Python 3.12.13, 2026-11-15, pipelines of 50 script
   calls, 20 rounds A/B against af2fec1 (per call, median): a receive of one message behind 1000
   returned ones 32,957 us -> 1,705 us (the oldest few due ids are picked in one pass instead of

@@ -40,6 +40,7 @@ from llm_queue._version import __version__
 from llm_queue.clients.pool import CredentialsRefreshSlow, CredentialsUnavailable, route_for
 from llm_queue.clients.providers import Providers
 from llm_queue.clients.timing import AttemptTimeout, Timing
+from llm_queue.engine import embed as embed_codec
 from llm_queue.engine import hooks, inference, shapes, tokens
 from llm_queue.engine._codec import text
 from llm_queue.engine.admission import (
@@ -84,7 +85,7 @@ from llm_queue.engine.streaming import (
     replay_events,
     text_of,
 )
-from llm_queue.errors import ErrorKind, UnsupportedEnvelopeError
+from llm_queue.errors import ConfigError, ErrorKind, UnsupportedEnvelopeError
 from llm_queue.ids import new_id
 from llm_queue.providers.classify import (
     error_family,
@@ -163,6 +164,22 @@ def _served_op(view: ResolvedRegistry, alias: str, env: Envelope) -> str:
     """
     op = _op_of(view, alias)
     return op if shapes.converts(env.op, op) else env.op
+
+
+def _packed(view: ResolvedRegistry, alias: str, response: Any) -> Any:
+    """An `embed()` reply as its packed vectors (`pack_reply`, gate B97), else unchanged.
+
+    Read with the codec of the caller's model `alias`: the reply is in its shape. Anything
+    that is not a readable embedding reply is stored as it came.
+    """
+    entry = view.registry.models.get(alias)
+    if entry is None or entry.type != "embedding" or not isinstance(response, dict):
+        return response
+    try:
+        codec = codec_for(entry.provider, entry.model_id, entry.family)
+    except ConfigError:
+        return response
+    return embed_codec.pack_reply(entry.provider, codec, response) or response
 
 
 def _by_deployment(view: ResolvedRegistry, alias: str, name: str) -> float:
@@ -955,11 +972,13 @@ class Engine:
         force_direct: bool = False,
         stream: bool = False,
         stream_id: str | None = None,
+        vectors: bool = False,
     ) -> Reply:
         """Run one call through the queue and return its reply; `CallFailed` on failure.
 
         `force_direct` runs it in this process (sync calls), with the same admission.
         `stream` has the worker write events to the chunk stream of `stream_id` (`stream`).
+        `vectors` (from `embed()`) lets an embedding reply come back as its packed vectors.
         """
         view = self.registry.current
         alias = view.registry.alias_of(model)
@@ -1020,6 +1039,7 @@ class Engine:
             tenant_id=tenant_id,
             app_request_id=request_id is not None,
             stream=stream,
+            vectors=vectors,
         )
         envelope.keep_params_json(encoded)
         hook_name = view.value(alias, "admission")
@@ -3765,6 +3785,8 @@ class Engine:
         )
         # In the caller's shape: a fallback model of the other provider answered (Q40).
         response = shapes.reply(result.response, env.op, served_op, model=alias)
+        if env.vectors:
+            response = _packed(view, env.model, response)
         reply = Reply(request_id=env.request_id, ok=True, response=response, meta=meta)
         self._bad_accounts.pop((deployment.account, deployment.region), None)  # (plan A4)
         self._record(held, alias, deployment.account, deployment.region, "ok", meta)

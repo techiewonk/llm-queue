@@ -11,6 +11,10 @@ again until only the bad text fails; texts over the model's length limit fail be
 from __future__ import annotations
 
 import asyncio
+import base64
+import itertools
+import sys
+from array import array
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -46,9 +50,68 @@ def request_for(
 
 
 def vectors_of(provider: str, codec: EmbeddingCodec, response: dict[str, Any]) -> list[list[float]]:
-    """The vectors of one reply in the order of its texts (an InvokeModel body decoded first)."""
+    """The vectors of one reply in the order of its texts (an InvokeModel body decoded first).
+
+    A reply the worker packed (`pack_reply`) is unpacked instead; an older worker's raw body
+    is read as before.
+    """
+    packed = response.get(PACKED)
+    if packed is not None:
+        return _unpack(packed)
     body = response if provider == "openai" else decode_invoke_body(response)
     return codec.parse_reply(body)
+
+
+# The reply field of vectors a worker packed for `embed()` (the envelope's `vectors` flag).
+PACKED = "llmq_vectors"
+_PARSE_ERRORS = (KeyError, ValueError, TypeError, IndexError, AttributeError, OverflowError)
+
+
+def pack_reply(
+    provider: str, codec: EmbeddingCodec, response: dict[str, Any]
+) -> dict[str, Any] | None:
+    """`response` as its vectors in binary (base64), or None when its body cannot be read.
+
+    A Cohere batch of 96 x 1024 floats was stored as base64 of its JSON body, 3.1 MB a
+    result; with the reply copies and client buffers around it, 300 such calls peaked at
+    +105 MB of store memory (gate B97, +64 MB allowed). Packed it is 1.05 MB (float64), or
+    0.52 MB when every value is exactly a float32: lossless either way. The worker packs only
+    for `embed()`, which reads nothing else of the body; a raw InvokeModel call keeps its body.
+    """
+    try:
+        vectors = vectors_of(provider, codec, response)
+        dims = len(vectors[0]) if vectors else 0
+        if any(len(v) != dims for v in vectors):
+            return None  # the caller's own check reports it, from the raw body
+        flat = list(itertools.chain.from_iterable(vectors))
+        try:
+            data = array("f", flat)
+            exact = data.tolist() == flat
+        except OverflowError:  # above float32's range
+            exact = False
+        if not exact:
+            data = array("d", flat)
+    except _PARSE_ERRORS:
+        return None  # stored raw: the caller fails it as an unreadable body, as before
+    if sys.byteorder == "big":
+        data.byteswap()  # stored little-endian, like `vector()` reads base64 float32
+    blob = base64.b64encode(data.tobytes()).decode("ascii")
+    return {PACKED: {"type": data.typecode, "count": len(vectors), "dims": dims, "data": blob}}
+
+
+def _unpack(packed: Any) -> list[list[float]]:
+    """The vectors of a `pack_reply` field; `ValueError` / `TypeError` when it is malformed."""
+    if not isinstance(packed, Mapping) or packed.get("type") not in ("f", "d"):
+        raise TypeError("packed vectors of an unknown type")
+    count, dims = int(packed["count"]), int(packed["dims"])
+    data = array("d" if packed["type"] == "d" else "f")
+    data.frombytes(base64.b64decode(packed["data"], validate=True))
+    if len(data) != count * dims:
+        raise ValueError("packed vectors of the wrong length")
+    if sys.byteorder == "big":
+        data.byteswap()
+    flat = data.tolist()
+    return [flat[i * dims : (i + 1) * dims] for i in range(count)]
 
 
 def check_texts(texts: object, request_id: str | None = None) -> None:
@@ -209,6 +272,7 @@ async def embed_detailed(
             priority=priority,
             timeout_secs=timeout_secs,
             request_id=f"{request_id}:{label}" if request_id else None,
+            vectors=True,  # the worker stores the vectors packed (B97: 3x smaller)
             **call,
         )
         if reply.response is None:

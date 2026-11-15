@@ -116,6 +116,9 @@ class Envelope(BaseModel):
     tenant_id: str | None = None
     app_request_id: bool = False
     stream: bool = False
+    # Sent by `embed()`: an embedding reply may be stored as its packed vectors (B97). An older
+    # worker ignores it (`extra="ignore"`) and stores the raw body, which the caller still reads.
+    vectors: bool = False
     # `encode_params(params)` when the caller already ran it (the size cap): reused by `dumps`.
     _params_json: tuple[bytes, bool] | None = PrivateAttr(default=None)
 
