@@ -31,7 +31,7 @@ Q1_MESSAGE = (
     "there instead: `await llmq.converse(...)` (or chat / embed), and in LangChain "
     "`await chat.ainvoke(...)`"
 )
-BEDROCK_ID = "openai.gpt-oss-120b-1:0"
+BEDROCK_ID = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # streams on langchain-aws 0.2 too
 META = {"served_model": "big", "deployment": "aws-a/r1", "fallback": None, "attempts": 1}
 USAGE = {"inputTokens": 7, "outputTokens": 5, "cacheReadInputTokens": 0}
 
@@ -192,6 +192,12 @@ async def _collect(model: Any, text: str = "hi") -> list[AIMessageChunk]:
     return [chunk async for chunk in model.astream(text)]
 
 
+def _text(chunk: AIMessageChunk) -> str:
+    """The chunk's text: a method on langchain-core 0.3, a property on 1.x."""
+    text: Any = chunk.text
+    return str(text if isinstance(text, str) else text())
+
+
 def _usage_positions(chunks: list[AIMessageChunk]) -> list[int]:
     return [n for n, chunk in enumerate(chunks) if chunk.usage_metadata]
 
@@ -202,11 +208,11 @@ def _usage_positions(chunks: list[AIMessageChunk]) -> list[int]:
 async def test_streaming_off_by_default_yields_one_whole_message() -> None:
     queue = FakeQueue(_bedrock_events())
     chunks = await _collect(_bedrock(queue))
-    assert "".join(c.text for c in chunks) == "whole"
+    assert "".join(_text(c) for c in chunks) == "whole"
     assert [c[0] for c in queue.calls] == ["converse"]
     openai_queue = FakeQueue(_openai_events())
     chunks = await _collect(_openai(openai_queue))
-    assert "".join(c.text for c in chunks) == "whole"
+    assert "".join(_text(c) for c in chunks) == "whole"
     assert [c[0] for c in openai_queue.calls] == ["chat"]
 
 
@@ -222,7 +228,7 @@ async def test_bedrock_streams_text_tools_usage_and_stop_reason() -> None:
     assert request["messages"][0]["content"][0]["text"] == "hi"
     assert request["inferenceConfig"]["maxTokens"] == 50
     assert kw["meta_event"] is True
-    assert [c.text for c in chunks if c.text] == ["Hel", "lo"]
+    assert [_text(c) for c in chunks if _text(c)] == ["Hel", "lo"]
     tool_chunks = [tc for c in chunks for tc in c.tool_call_chunks]
     assert tool_chunks[0]["id"] == "t1"
     assert tool_chunks[0]["name"] == "lookup"
@@ -258,7 +264,7 @@ async def test_bedrock_astream_events_streams() -> None:
     queue = FakeQueue(_bedrock_events())
     model = _bedrock(queue, queue_streaming=True)
     tokens = [
-        event["data"]["chunk"].text
+        _text(event["data"]["chunk"])
         async for event in model.astream_events("hi", version="v2")
         if event["event"] == "on_chat_model_stream"
     ]
@@ -285,7 +291,7 @@ async def test_openai_streams_text_tools_usage_and_finish_reason() -> None:
     assert not {"model", "stream", "stream_options"} & set(request)
     assert request["messages"] == [{"role": "user", "content": "hi"}]
     assert kw["meta_event"] is True
-    assert [c.text for c in chunks if c.text] == ["Hel", "lo"]
+    assert [_text(c) for c in chunks if _text(c)] == ["Hel", "lo"]
     tool_chunks = [tc for c in chunks for tc in c.tool_call_chunks]
     assert tool_chunks[0]["id"] == "call_1"
     assert tool_chunks[0]["name"] == "lookup"
@@ -319,7 +325,7 @@ async def test_call_failed_mid_stream_keeps_the_partial_text(which: str) -> None
 
     async def consume() -> None:
         async for chunk in model.astream("hi"):
-            seen.append(chunk.text)
+            seen.append(_text(chunk))
 
     with pytest.raises(CallFailed) as caught:
         await consume()
@@ -388,7 +394,7 @@ def test_sync_calls_surface_the_queue_refusal_unchanged(which: str, streaming: b
 def test_sync_stream_yields_one_whole_message() -> None:
     queue = FakeQueue(_bedrock_events())
     chunks = list(_bedrock(queue, queue_streaming=True).stream("hi"))
-    assert "".join(c.text for c in chunks) == "whole"
+    assert "".join(_text(c) for c in chunks) == "whole"
 
 
 def test_result_chunk_keeps_tool_calls() -> None:
