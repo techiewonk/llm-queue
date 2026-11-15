@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import random
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
@@ -18,7 +19,8 @@ import orjson
 
 from llm_queue._logging import get_logger
 from llm_queue.engine.metrics import Metrics, NullSink
-from llm_queue.engine.queue import Message, QueueSettings, StreamQueues
+from llm_queue.engine.queue import Message, NotReplicated, QueueSettings, StreamQueues
+from llm_queue.engine.store_guard import ReplicaWait
 from llm_queue.errors import ConfigError
 from llm_queue.ids import new_id
 
@@ -46,8 +48,9 @@ class JobRunner:
         settings: QueueSettings | None = None,
         concurrency: int = 4,
         metrics: Metrics | None = None,
+        replica_wait: ReplicaWait | None = None,
     ) -> None:
-        """Nothing runs until `start`."""
+        """Nothing runs until `start`. `replica_wait`: the process's (scope `jobs`, owner Q8)."""
         self.queues = queues
         self.queue_prefix = queue_prefix
         self.settings = settings or QueueSettings(
@@ -55,6 +58,7 @@ class JobRunner:
         )
         self.concurrency = concurrency
         self.metrics: Metrics = metrics or NullSink()
+        self.replica_wait = replica_wait or ReplicaWait()
         self._jobs: dict[str, JobFn] = {}
         self._timeouts: dict[str, float | None] = {}
         self._warned: dict[str, float] = {}
@@ -85,7 +89,18 @@ class JobRunner:
         """Queue a job; returns its id (jobs run at least once: make them idempotent)."""
         ident = job_id or new_id()
         body = orjson.dumps({"id": ident, "name": name, "payload": payload})
-        await self.queues.send(self.queue(name), body, self.settings)
+        # Waits for replicas like a call send (R3FM-5): a primary lost right after the send
+        # lost the job for good, unnoticed. Too few replicas: sent anyway, warned (owner Q9).
+        try:
+            await self.queues.send(
+                self.queue(name),
+                body,
+                self.settings,
+                wait_replicas=self.replica_wait.replicas_for("jobs"),
+                wait_ms=self.replica_wait.wait_ms,
+            )
+        except NotReplicated as exc:
+            self.replica_wait.short("jobs", self.metrics, str(exc))
         await self._check_consumer(name)
         return ident
 
@@ -214,14 +229,21 @@ class JobRunner:
         """Acknowledge a finished job, retried apart from the job (RESCAN S8).
 
         A failed ack counted as a failed job and the job ran again. A stale receipt means the
-        hold lapsed and another worker took the job: it ran twice, logged as such.
+        hold lapsed and another worker took the job: it ran twice, logged as such. Retried
+        for up to a visibility time with jittered back-off (R3FM-5): three tries within about
+        1 s re-ran every job that finished during a failover.
         """
-        for tries in range(1, ACK_TRIES + 1):
+        give_up = time.monotonic() + self.settings.visibility_secs
+        tries = 0
+        while True:
+            tries += 1
             try:
                 acked = await self.queues.ack(message)
             except Exception as exc:
                 logger.warning("job_ack_failed", job=name, id=ident, tries=tries, error=str(exc))
-                await asyncio.sleep(0.2 * tries)
+                if time.monotonic() >= give_up:
+                    break
+                await asyncio.sleep(random.uniform(0.05, min(2.0, 0.2 * 2**tries)))
                 continue
             if acked:
                 logger.info("job_done", job=name, id=ident)
@@ -229,7 +251,7 @@ class JobRunner:
                 logger.warning("job_duplicate_run", job=name, id=ident)
             return
         # Every try failed: the job runs again once its hold lapses. Say so once (EN-32).
-        logger.error("job_ack_gave_up", job=name, id=ident, tries=ACK_TRIES)
+        logger.error("job_ack_gave_up", job=name, id=ident, tries=tries)
         self.metrics.count("llmq_job_ack_failed_total", job=name)
 
     async def _keep_visible(self, message: Message) -> None:

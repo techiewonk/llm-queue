@@ -518,7 +518,8 @@ async def test_retries_after_every_region_failed_still_spend_the_budget(make: Ma
 async def test_a_store_out_of_memory_is_a_call_failure(make: Make) -> None:
     """Scenario S9 bug: a store over maxmemory refused the call's registration, and redis-py's
     `OutOfMemoryError` (its "OOM" prefix stripped, so the old string check missed it) reached
-    the app instead of `CallFailed`. It is now `queue_unavailable`, out of memory.
+    the app instead of `CallFailed`. It is now `queue_unavailable`, out of memory (after the
+    model's `store_down` rule: a refusal counts as the store down, owner Q12).
     """
     from redis.exceptions import OutOfMemoryError
 

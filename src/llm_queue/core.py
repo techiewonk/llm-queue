@@ -182,7 +182,10 @@ class LLMQueue:
         self._engine = engine
         self.settings = settings
         self._jobs = JobRunner(
-            engine.queues, queue_prefix=engine.settings.queue_prefix, metrics=engine.metrics
+            engine.queues,
+            queue_prefix=engine.settings.queue_prefix,
+            metrics=engine.metrics,
+            replica_wait=engine.replica_wait,  # one replica wait per process (R3FM-5, Q8)
         )
         self._builder = builder
         self._offload = offload
@@ -302,6 +305,8 @@ class LLMQueue:
                 queue_failover_secs=settings.queue_failover_secs,
                 queue_wait_replicas=settings.queue_wait_replicas,
                 queue_wait_ms=settings.queue_wait_ms,
+                queue_wait_scopes=settings.queue_wait_scopes,
+                strict=settings.strict,
                 debug_capture_allowed=settings.debug_capture_from_config,
                 timings=tuning.engine,
             )
@@ -619,7 +624,8 @@ class LLMQueue:
                 if asyncio.get_running_loop() is loop:
                     raise LLMQueueError(
                         "a sync call on the thread that runs this queue's event loop would "
-                        "deadlock; await converse / chat / embed there instead"
+                        "deadlock; await it there instead: `await llmq.converse(...)` (or chat / "
+                        "embed), and in LangChain `await chat.ainvoke(...)`"
                     )
             return _wait_on_loop(asyncio.run_coroutine_threadsafe(make(self._engine), loop), loop)
         return self._sync_runner().run(make)

@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
+import inspect
 import math
 import random
 import time
@@ -70,7 +71,8 @@ from llm_queue.engine.queue import (
 from llm_queue.engine.requests import RequestStore
 from llm_queue.engine.status import AlertEvaluator, StatusReader
 from llm_queue.engine.store_checks import UNKNOWN as UNKNOWN_POLICY
-from llm_queue.engine.store_checks import check_store
+from llm_queue.engine.store_checks import check_store, eviction_policy, eviction_warning
+from llm_queue.engine.store_guard import WAIT_SCOPES, ReplicaWait
 from llm_queue.engine.streaming import ChunkReader, ChunkWriter, StreamTooLarge
 from llm_queue.errors import ErrorKind, UnsupportedEnvelopeError
 from llm_queue.ids import new_id
@@ -98,7 +100,12 @@ STORE_RETRY_BASE_SECS = 0.1
 STORE_RETRY_CAP_SECS = 1.0
 PROBE_EVERY_SECS = 5.0  # how often one process looks for disabled deployments due a probe
 PROBE_TIMEOUT_SECS = 30.0  # one probe call's budget (first response, idle and whole call)
+POLICY_EVERY_ROUNDS = 12  # the stores' eviction policy is read again each minute (R3FM-8)
 HAND_BACK_FLOOR_SECS = 2.0  # `stop()` returns waiting calls within at least this (FE-6)
+CLOCK_MAX_RTT_SECS = 0.25  # a TIME read slower than this keeps the old offset (R3RC-7)
+CLOCK_JUMP_SECS = 2.0  # the store clock moving this much against ours is a jump (R3FM-10)
+PUBSUB_PING_SECS = 5.0  # a subscriber pings this often; silent for two pings is reset (R3RC-6)
+PUBSUB_SWEEP_MISSES = 3  # sweeps in a row finding unannounced results reset the reader (R3FM-12)
 START_PROBE_SECS = 10.0  # each store step of `start()`: a dead store never holds the pod's start
 # Request fields a fallback model may not understand (another family's knobs): dropped from the
 # caller's params when the call is served by another model (RESCAN P6). The target's own
@@ -174,6 +181,10 @@ class EngineSettings:
     queue_failover_secs: float = 5.0  # queue-store errors this long before calls run direct
     queue_wait_replicas: int = 0  # a send waits for this many replicas (0: off)
     queue_wait_ms: int = 100  # how long it waits for them
+    # What the replica wait covers (owner Q8): calls, jobs, registry; all by default.
+    queue_wait_scopes: frozenset[str] = frozenset(WAIT_SCOPES)
+    # Strict mode (outside dev / test): an evicting store fails readiness (owner Q10).
+    strict: bool = False
     debug_capture_allowed: bool = False  # LLMQ_DEBUG_CAPTURE_FROM_CONFIG (never in prod)
     # A store outage seen by a call is remembered this long (owner Q11, R3FM-3): `fail_fast` and
     # `static_cap` then answer at once instead of re-trying the store (1.5-21.5 s per call).
@@ -227,6 +238,30 @@ async def _close_all(steps: Sequence[tuple[str, Callable[[], Awaitable[object]]]
             first = first or exc
     if first is not None:
         raise first
+
+
+_ACCEPTS_API: dict[type, bool] = {}
+
+
+def _api_kwargs(provider: Any, view: ResolvedRegistry, alias: str) -> dict[str, Any]:
+    """`converse_api` for a provider whose `call` accepts it; nothing for one that does not.
+
+    Owner Q33: a custom provider written for 0.1.0b1 has no such parameter, and passing it
+    raised `TypeError` on every call. Checked once per provider class.
+    """
+    kind = type(provider)
+    accepts = _ACCEPTS_API.get(kind)
+    if accepts is None:
+        try:
+            params = inspect.signature(provider.call).parameters.values()
+        except (TypeError, ValueError):
+            accepts = True
+        else:
+            accepts = any(
+                p.name == "converse_api" or p.kind is inspect.Parameter.VAR_KEYWORD for p in params
+            )
+        _ACCEPTS_API[kind] = accepts
+    return {"converse_api": str(view.value(alias, "converse_api"))} if accepts else {}
 
 
 def _seen(task: asyncio.Future[Any]) -> None:
@@ -367,12 +402,29 @@ class _Slots:
         self._sem.release()
 
 
+@dataclass(slots=True)
+class _Alive:
+    """When a subscriber last delivered anything (a message or a pong) and last pinged."""
+
+    name: str
+    seen_mono: float = field(default_factory=time.monotonic)
+    pinged_mono: float = field(default_factory=time.monotonic)
+
+    def reset(self) -> None:
+        """A fresh subscription: alive now."""
+        self.seen_mono = self.pinged_mono = time.monotonic()
+
+    def seen(self) -> None:
+        """It delivered something."""
+        self.seen_mono = time.monotonic()
+
+
+class _StaleSubscription(Exception):
+    """A subscriber stopped delivering: reset it and subscribe again."""
+
+
 class _QueueDown(Exception):
     """The queue store refused a send while the state store works: run the call direct."""
-
-
-class _SendNotReplicated(Exception):  # internal signal, never raised to callers
-    """The send reached the primary but no replica in time: the caller runs it direct."""
 
 
 class StoreClock:
@@ -381,13 +433,28 @@ class StoreClock:
     def __init__(self) -> None:
         """No offset until `sync`."""
         self._offset = 0.0
+        self._synced = False
 
-    async def sync(self, client: redis.asyncio.Redis) -> None:
-        """Measure the offset between the store's clock and this process."""
+    async def sync(self, client: redis.asyncio.Redis) -> str | None:
+        """Measure the offset between the store's clock and this process.
+
+        Returns None, `slow` (the read took too long: the old offset is kept) or `jump` (the
+        store's clock moved against the local one). The midpoint of a read that took 6-15 s
+        (a failover's retries, a loop stall) put the clock seconds ahead for a whole beat:
+        calls were settled `rate_limited` before their deadline (R3RC-7, R3FM-10).
+        """
         before = time.monotonic()
         secs, micros = await client.time()
         after = time.monotonic()
-        self._offset = (secs + micros / 1e6) - (before + after) / 2
+        offset = (secs + micros / 1e6) - (before + after) / 2
+        if not self._synced:
+            self._offset, self._synced = offset, True
+            return None
+        if after - before > CLOCK_MAX_RTT_SECS:
+            return "slow"
+        moved = abs(offset - self._offset) > CLOCK_JUMP_SECS
+        self._offset = offset
+        return "jump" if moved else None
 
     def now(self) -> float:
         """Seconds on the store's clock."""
@@ -425,6 +492,12 @@ class Engine:
         self.metrics: Metrics = metrics or NullSink()
         registry.metrics = self.metrics  # reload failures are counted too (CO-4)
         self.queues = StreamQueues(queue_store or state, self.keys)
+        self.replica_wait = ReplicaWait(
+            replicas=self.settings.queue_wait_replicas,
+            wait_ms=self.settings.queue_wait_ms,
+            scopes=self.settings.queue_wait_scopes,
+        )
+        self._replid: str | None = None  # the state store's `master_replid` last seen (R3FM-8)
         self.requests = RequestStore(
             state,
             self.keys,
@@ -458,6 +531,10 @@ class Engine:
         # Waited-on ids whose record the store lost (R3FM-4, R3RC-2): their callers send again.
         self._gone: set[str] = set()
         self._sweep_now = asyncio.Event()  # wakes the result sweep (an epoch change)
+        # Readers to reset: their subscription stopped delivering (R3RC-6, R3FM-12).
+        self._stale_readers: set[str] = set()
+        self._sweep_misses = 0  # sweeps in a row that found results pub/sub did not announce
+        self._cancel_misses = 0  # cancel checks in a row that found cancels never announced
         self._pubsub: Any = None
         self._cancels: Any = None
         self._stopping = False
@@ -1145,7 +1222,7 @@ class Engine:
         }
         # Queues in the state store: register, send and confirm are one script (3 round trips
         # before). Not with `queue_wait_replicas`: that send needs its own WAIT.
-        combined = not direct and self.queues_shared and not self.settings.queue_wait_replicas
+        combined = not direct and self.queues_shared and not self.replica_wait.replicas_for("calls")
 
         async def register() -> tuple[str, bool]:
             """The registration's outcome, and whether the call was sent with it.
@@ -1199,11 +1276,7 @@ class Engine:
                     await self.requests.confirm(rid, keep_secs=call_secs)
                     run = self._start_direct(envelope)
                 else:
-                    try:
-                        await self._send(rid, envelope, view, alias, priority, call_secs)
-                    except _SendNotReplicated:
-                        await self.requests.confirm(rid, keep_secs=call_secs)
-                        run = self._start_direct(envelope)
+                    await self._send(rid, envelope, view, alias, priority, call_secs)
             reply = await self._wait_result(
                 rid,
                 waiter,
@@ -1255,8 +1328,9 @@ class Engine:
 
         A separate queue store that keeps failing for `queue_failover_secs` sends the call
         down the direct path; shorter blips are retried. With `queue_wait_replicas`, a send
-        that no replica acknowledged in time is a failed send (plan B23) and the call runs
-        direct.
+        that too few replicas acknowledged in time stays sent (owner Q9): warned at most once
+        a minute and counted. It ran direct in the caller before, its copy bouncing on the
+        queue as a duplicate every 30 s.
         """
         settings = QueueSettings(max_waiting=int(view.value(alias, "max_waiting")))
         loop = asyncio.get_running_loop()
@@ -1270,8 +1344,8 @@ class Engine:
                         self._queue_name(view, alias, priority),
                         body,
                         settings,
-                        wait_replicas=self.settings.queue_wait_replicas,
-                        wait_ms=self.settings.queue_wait_ms,
+                        wait_replicas=self.replica_wait.replicas_for("calls"),
+                        wait_ms=self.replica_wait.wait_ms,
                     )
                     break
                 except STORE_ERRORS:
@@ -1281,11 +1355,9 @@ class Engine:
                         continue
                     raise
             except NotReplicated as exc:
-                # A failed send (plan B23): the call runs direct now, under this same record
-                # (re-registering raced the unreplicated copy's claim into a conflict). Not
-                # re-sent: each try would add a copy; the copy meets a claimed job and stops.
-                logger.warning("send_not_replicated", request_id=rid, error=str(exc))
-                raise _SendNotReplicated from exc
+                # On the primary, not on enough replicas: sent anyway (owner Q9).
+                self.replica_wait.short("calls", self.metrics, str(exc))
+                break
             except BaseException as exc:
                 # One cleanup for every failure, cancels included: four handlers awaited the
                 # abandon bare, so its own store error replaced the original (a cancel turned
@@ -1389,13 +1461,16 @@ class Engine:
     async def _cancel_reader(self) -> None:
         """Stop running attempts whose call was cancelled (by any process)."""
         subscribed = False
+        alive = _Alive("cancel_reader")
         while True:
             try:
                 if not subscribed:
                     await self._cancels.subscribe(self.keys.cancel_channel)
                     subscribed = True
+                    alive.reset()
                     # Cancels published while unsubscribed were missed: read the keys (C9).
                     await self._check_cancels()
+                await self._keep_alive(self._cancels, alive)
                 message = await self._cancels.get_message(
                     ignore_subscribe_messages=True, timeout=1.0
                 )
@@ -1407,6 +1482,9 @@ class Engine:
                 await asyncio.sleep(1)
                 continue
             if not message:
+                continue
+            alive.seen()
+            if message.get("type") == "pong":
                 continue
             data = message["data"]
             rid = data.decode() if isinstance(data, bytes) else str(data)
@@ -1431,10 +1509,16 @@ class Engine:
             return
         keys = [self.keys.request(h.envelope.request_id, "cancel") for h in running]
         flags = await self.state.mget(keys)
+        missed = False
         for held, flag in zip(running, flags, strict=True):
             if flag is not None and held.run is not None and not held.run.done():
+                missed = missed or not held.cancelled  # the channel never announced it
                 held.cancelled = True
                 held.run.cancel()
+        self._cancel_misses = self._cancel_misses + 1 if missed else 0
+        if self._cancel_misses >= PUBSUB_SWEEP_MISSES:
+            self._cancel_misses = 0
+            self._reader_stale("cancel_reader")
 
     async def _store_down(
         self,
@@ -1510,8 +1594,12 @@ class Engine:
                 self._through_outage(lambda: self._cancel_batch([rid], source="fail_fast")),
                 "fail_fast_cancel",
             )
+        # A refusal says what it was (out of memory...): the app's fix differs (S9, Q12).
+        message = _refusal(exc) if exc is not None and _store_refused(exc) else None
         raise CallFailed(
-            "queue_unavailable", "the state store is unreachable", request_id=envelope.request_id
+            "queue_unavailable",
+            message or "the state store is unreachable",
+            request_id=envelope.request_id,
         ) from exc
 
     def _outage_remembered(self) -> bool:
@@ -1568,7 +1656,14 @@ class Engine:
                 if not view.value(alias, "enabled", dep.key) or view.outside_residency(dep):
                     continue
                 route = route_for(view, dep)
-                params = self._params(view, alias, envelope, dep.key)
+                try:
+                    params = self._params(view, alias, envelope, dep.key)
+                except inference.InferenceRejected as exc:
+                    # One error family: `on_exceed: reject` raised its own type to the app on
+                    # this path (RV-EN14).
+                    raise CallFailed(
+                        "invalid_request", str(exc), request_id=envelope.request_id
+                    ) from exc
                 budget = float(view.value(alias, "attempt_timeout_secs", dep.key))
                 timing = Timing(budget, float(view.value(alias, "stream_idle_secs")), budget)
                 try:
@@ -1577,7 +1672,7 @@ class Engine:
                         params,
                         route,
                         timing,
-                        converse_api=str(view.value(alias, "converse_api")),
+                        **_api_kwargs(provider, view, alias),
                     )
                 except Exception as exc:
                     # Classified as `_attempt` does (audit RT-19): every error was retried on
@@ -1830,6 +1925,30 @@ class Engine:
         created = float(job.get("created") or 0)
         return self.clock.now() - created >= self.requests.takeover_grace_secs
 
+    async def _keep_alive(self, pubsub: Any, alive: _Alive) -> None:
+        """Ping a subscriber; raise (reset and resubscribe) when it went silent.
+
+        redis-py's health check writes a PING and never needs the answer, so a half-open
+        socket went unnoticed for about 15 min: results came only by the 5 s sweep, cancels by
+        the 20 s heartbeat (R3RC-6). An old primary cut off by a partition answers the PING but
+        delivers nothing: the sweep and the cancel check mark that reader stale (R3FM-12).
+        """
+        now = time.monotonic()
+        if alive.name in self._stale_readers:
+            self._stale_readers.discard(alive.name)
+            raise _StaleSubscription(f"{alive.name}: results arrive only by the sweep")
+        if now - alive.seen_mono > 2 * PUBSUB_PING_SECS + 1:
+            raise _StaleSubscription(f"{alive.name}: no answer to its pings")
+        if now - alive.pinged_mono >= PUBSUB_PING_SECS:
+            alive.pinged_mono = now
+            await pubsub.ping("llmq-alive")
+
+    def _reader_stale(self, name: str) -> None:
+        """Reset a subscriber that stopped delivering (counted)."""
+        logger.warning("pubsub_stale", reader=name)
+        self.metrics.count("llmq_pubsub_resubscribes_total", reader=name)
+        self._stale_readers.add(name)
+
     async def _warm_clients(self) -> None:
         """Create every Bedrock deployment's client now, not on its first call.
 
@@ -1875,6 +1994,15 @@ class Engine:
                 except Exception as exc:  # the sweep must survive store hiccups
                     logger.warning("result_sweep_failed", error=str(exc))
                     break
+                misses = [
+                    i
+                    for i in found
+                    if (w := self._waiters.get(chunk[int(i)])) is not None and not w.done()
+                ]
+                self._sweep_misses = self._sweep_misses + 1 if misses else 0
+                if self._sweep_misses >= PUBSUB_SWEEP_MISSES:
+                    self._sweep_misses = 0
+                    self._reader_stale("result_reader")
                 if gone:
                     # The store lost these records (restart without persistence, flush, a
                     # failover that lost writes): their callers send them again (R3FM-4).
@@ -1888,15 +2016,18 @@ class Engine:
     async def _result_reader(self) -> None:
         """Wake waiting callers when their result is published (re-subscribes after errors)."""
         subscribed = False
+        alive = _Alive("result_reader")
         while True:
             try:
                 if not subscribed:
                     await self._pubsub.subscribe(self.keys.done_channel(self.worker_id))
                     subscribed = True
+                    alive.reset()
                     # Results published while unsubscribed were missed: every waiter re-reads.
                     for pending in list(self._waiters.values()):
                         if not pending.done():
                             pending.set_result(None)
+                await self._keep_alive(self._pubsub, alive)
                 message = await self._pubsub.get_message(
                     ignore_subscribe_messages=True, timeout=1.0
                 )
@@ -1908,6 +2039,9 @@ class Engine:
                 await asyncio.sleep(1)
                 continue
             if not message:
+                continue
+            alive.seen()
+            if message.get("type") == "pong":
                 continue
             rid = (
                 message["data"].decode()
@@ -2562,7 +2696,13 @@ class Engine:
         if decision.kind == "duplicate":
             self._drop(held)
             if held.message is not None:
-                await self.queues.return_(held.message, delay_secs=self.settings.lease_secs / 2)
+                # When the claim lapses, if the script says (`ms`); else half a lease. The fixed
+                # half lease made a lower `visibility_secs` take over a dead pod's call later
+                # (R3RC-8). The `ms` field of the reply is the Lua owner's part.
+                delay = (
+                    decision.wait_secs if decision.wait_secs > 0 else self.settings.lease_secs / 2
+                )
+                await self.queues.return_(held.message, delay_secs=delay)
             return None
         if decision.kind == "none":
             has_fallback = any(d.group == "fallback" for d in view.deployments(alias))
@@ -3024,7 +3164,7 @@ class Engine:
                     route,
                     timing,
                     sink=writer.add if writer else None,
-                    converse_api=str(view.value(alias, "converse_api")),
+                    **_api_kwargs(provider, view, alias),
                 )
             if writer is not None:
                 await writer.end(
@@ -3357,7 +3497,7 @@ class Engine:
                 params,
                 route_for(view, deployment),
                 Timing(PROBE_TIMEOUT_SECS, PROBE_TIMEOUT_SECS, PROBE_TIMEOUT_SECS),
-                converse_api=str(view.value(alias, "converse_api")),  # the calls' own API (IAM)
+                **_api_kwargs(provider, view, alias),  # the calls' own API (IAM)
             )
         except Exception as exc:
             return provider.classify(exc).kind is ErrorKind.THROTTLE
@@ -3478,6 +3618,12 @@ class Engine:
             stores = cached[1]
         loaded = self.registry._current is not None
         out: dict[str, Any] = {"live": self._live(), "ready": bool(self.ready and loaded)}
+        evicting = self._evicting()
+        if evicting:
+            # Strict mode and a store that may evict queue keys, results and caller keys
+            # (owner Q10): not ready, with the reason. It was a warning at start only.
+            out["ready"] = False
+            out["not_ready_reason"] = evicting
         out["stores"] = stores
         out["eviction_policy"] = self._eviction.get("state", UNKNOWN_POLICY)
         if "queue" in self._eviction:
@@ -3510,14 +3656,45 @@ class Engine:
             self._outage_until_mono = -1e9  # the store is back: calls try it again (Q11)
         return stores
 
+    def _evicting(self) -> str | None:
+        """In strict mode, why a store's eviction policy makes this process not ready."""
+        if not self.settings.strict:
+            return None
+        for name, policy in self._eviction.items():
+            warning = eviction_warning(policy)
+            if warning:
+                return f"{name} store: {warning}"
+        return None
+
     async def _store_prober(self) -> None:
         """Keep the stores' state for `health_check` fresh (one probe per few seconds)."""
+        rounds = 0
         while True:
             try:
                 await self._probe_stores()
             except Exception as exc:  # store trouble reads "down" there: this is a bug (RT-24)
                 logger.warning("store_probe_failed", error=str(exc), error_type=type(exc).__name__)
+            if rounds % POLICY_EVERY_ROUNDS == 0 and rounds:
+                # Re-read: a parameter-group change or a failover to a node of another group
+                # went unseen; it was read once at start (R3FM-8, owner Q10).
+                await self._read_policies()
+            rounds += 1
             await asyncio.sleep(HEALTH_PROBE_EVERY_SECS)
+
+    async def _read_policies(self) -> None:
+        """Read each store's eviction policy again (an unreadable one keeps its old value)."""
+        stores = [("state", self.state)]
+        if self._queue_store is not None:
+            stores.append(("queue", self._queue_store))
+        for name, client in stores:
+            try:
+                async with asyncio.timeout(self.settings.timings.health_probe_secs):
+                    policy = await eviction_policy(client)
+            except Exception as exc:
+                logger.debug("policy_read_failed", store=name, error=str(exc))
+                continue
+            if policy != UNKNOWN_POLICY:
+                self._eviction[name] = policy
 
     def _live(self) -> bool:
         """False when a background loop died, or the heartbeat made no progress for 3 beats."""
@@ -3860,10 +4037,19 @@ class Engine:
             else:
                 self._holds_lost(holds, holders, kept)
             try:
-                await self.clock.sync(self.state)
+                clock = await self.clock.sync(self.state)
+                if clock == "jump":
+                    # A promoted replica with another wall clock, a VM resume: TTLs and holds
+                    # moved with it; callers count as alive for a while (R3FM-10).
+                    logger.error("store_clock_jump")
+                    self._store_trouble("clock")
                 await self._check_epoch()
             except Exception as exc:
                 logger.warning("heartbeat_failed", step="clock", error=str(exc))
+            try:
+                await self._check_replication()
+            except Exception as exc:
+                logger.warning("heartbeat_failed", step="replication", error=str(exc))
             await asyncio.sleep(max(0.2, beat))
 
     def _holds_lost(
@@ -3905,6 +4091,28 @@ class Engine:
             if not missing:
                 logger.error("state_store_reset_detected", by="epoch_changed")
             self._sweep_now.set()  # waiting callers check their records now (R3RC-2)
+            await self._reregister()
+
+    async def _check_replication(self) -> None:
+        """Read the state store's replication: replicas connected, and a promotion.
+
+        A promotion that lost writes leaves the old epoch key in place, so `_check_epoch` saw
+        nothing; a changed `master_replid` now re-registers running grants and has waiting
+        callers check their records (R3FM-8). The replica count lets the replica wait skip a
+        WAIT that cannot succeed (R3FM-11). One INFO per beat.
+        """
+        info = await self.state.info("replication")
+        connected = info.get("connected_slaves")
+        if connected is not None:
+            self.replica_wait.connected = int(connected)
+        replid = info.get("master_replid")
+        if replid is None:
+            return
+        replid, seen = text(replid), self._replid
+        self._replid = replid
+        if seen is not None and seen != replid:
+            logger.error("state_store_promoted", by="master_replid")
+            self._sweep_now.set()
             await self._reregister()
 
     async def _reregister(self, owners: set[str] | None = None) -> None:
