@@ -10,7 +10,9 @@ name (free ports picked per run), its own fakellm (which counts calls it saw twi
 
 Pass mark: `failover` and `restart` lose no call. In `slowdns` only calls already in flight
 when the store stopped taking writes may fail (`deadline_exceeded`), at most 5 %. In every
-scenario no call runs twice at the provider (each request body is unique).
+scenario only a call in flight while the fault began (running at its start, or sent before
+the switch was confirmed) may run twice at the provider (at-least-once, D1; each request
+body is unique).
 
     python scripts/failover.py                  # all three
     python scripts/failover.py slowdns          # one
@@ -161,12 +163,17 @@ async def _drill(scenario: str, stack: contextlib.AsyncExitStack) -> bool:
     failed: collections.Counter[int] = collections.Counter()
     errors: collections.Counter[str] = collections.Counter()
     latencies: list[float] = []
-    running = 0  # calls in flight now
-    in_flight_at_event = 0  # calls in flight when the fault began (may run twice: FT-8)
+    running: set[int] = set()  # calls in flight now
+    # Calls in flight while the fault began (may run twice: FT-8): those running when the event
+    # starts plus those started before the fault is confirmed. One count taken at the event's
+    # start missed the calls sent while `docker exec ... FAILOVER` ran (hundreds of ms).
+    exposed: set[int] = set()
+    exposing = False
 
     async def one(i: int) -> None:
-        nonlocal running
-        running += 1
+        running.add(i)
+        if exposing:
+            exposed.add(i)
         second = int(time.monotonic() - started)
         sent = time.monotonic()
         request = {**REQUEST, "messages": [{"role": "user", "content": [{"text": f"fo {i}"}]}]}
@@ -181,7 +188,7 @@ async def _drill(scenario: str, stack: contextlib.AsyncExitStack) -> bool:
             failed[second] += 1
             errors[type(exc).__name__] += 1
         finally:
-            running -= 1
+            running.discard(i)
 
     async def traffic() -> None:
         calls: list[asyncio.Task[None]] = []
@@ -191,14 +198,16 @@ async def _drill(scenario: str, stack: contextlib.AsyncExitStack) -> bool:
         await asyncio.gather(*calls)
 
     async def event() -> None:
-        nonlocal in_flight_at_event
+        nonlocal exposing
         await asyncio.sleep(EVENT_AT_SECS)
-        in_flight_at_event = running
+        exposed.update(running)
+        exposing = True
         at = f"[{time.monotonic() - started:.1f}s]"
         if scenario == "restart":
             await proxy.set(refuse=True)
             try:
                 await proxy.drop_all()
+                exposing = False
                 print(f"  {at} node down: every connection dropped")
                 await asyncio.sleep(OUTAGE_SECS)
             finally:
@@ -214,6 +223,7 @@ async def _drill(scenario: str, stack: contextlib.AsyncExitStack) -> bool:
             await asyncio.sleep(0.1)
         else:
             raise RuntimeError("FAILOVER did not make node a a replica within 5 s")
+        exposing = False
         print(f"  {at} FAILOVER: a is now a replica")
         if scenario == "slowdns":
             await asyncio.sleep(OUTAGE_SECS)
@@ -226,6 +236,7 @@ async def _drill(scenario: str, stack: contextlib.AsyncExitStack) -> bool:
     provider = await asyncio.to_thread(fake.stats)
     await stack.aclose()  # stopped before the report, as before
     twice = sum(int(m.get("duplicates", 0)) for m in provider.values())
+    in_flight_at_event = len(exposed)
     provider_calls = sum(int(m.get("calls", 0)) for m in provider.values())
     total_ok, total_failed = sum(ok.values()), sum(failed.values())
     latencies.sort()
