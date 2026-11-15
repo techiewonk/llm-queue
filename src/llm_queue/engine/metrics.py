@@ -122,6 +122,25 @@ METRICS: dict[str, MetricSpec] = {
     "llmq_jobs_no_consumer_total": _c("job", "Jobs sent with no consumer group", "caller"),
     "llmq_job_ack_failed_total": _c("job", "Job acknowledgements that failed"),
     "llmq_registry_reload_errors_total": _c("error", "Registry reloads that failed", "every pod"),
+    "llmq_registry_refused_total": _c(
+        "reason", "Stored registry documents this pod refused (owner Q25)", "every pod"
+    ),
+    "llmq_send_not_replicated_total": _c(
+        "scope", "Writes that reached fewer replicas than asked, sent anyway (owner Q9)", "caller"
+    ),
+    "llmq_cancels_total": _c(
+        "source",
+        "Cancels asked, by source: api, caller_task, fail_fast, admin, cli, http, other",
+        "caller",
+    ),
+    "llmq_outage_memo_set_total": _c(
+        "", "Times this pod started remembering a store outage (owner Q11)", "every pod"
+    ),
+    "llmq_store_pool_busy_total": _c("model", "Calls refused because the store pool was full"),
+    "llmq_pubsub_resubscribes_total": _c("reader", "Stale subscribers reset", "every pod"),
+    "llmq_stale_acks_total": _c("model", "Acks refused: another worker took the message over"),
+    "llmq_jobs_total": _c("job outcome", "Jobs finished by outcome (ok, failed, dead, ...)"),
+    "llmq_hook_failed_total": _c("kind hook", "App hooks that raised", "every pod"),
     # ---- cluster state (the alert-lock holder, every 30 s)
     "llmq_queue_waiting": _g("model priority", "Calls in the queue no worker has taken"),
     "llmq_held_waiting": _g(
@@ -148,6 +167,8 @@ METRICS: dict[str, MetricSpec] = {
     ),
     "llmq_kill_switch": _g("", "1 while the routing kill switch is on", "None"),
     "llmq_region_blocked": _g("region", "1 while the region is blocked by routing", "None"),
+    "llmq_job_dead_letters": _g("job", "Dead jobs kept, per job name (owner Q15)"),
+    "llmq_job_waiting": _g("job", "Jobs waiting, per job name"),
     "llmq_alerts_evaluated_timestamp_seconds": _g(
         "", "Unix time of the last alert evaluation (alarm when it stops moving)", "Seconds"
     ),
@@ -159,6 +180,11 @@ METRICS: dict[str, MetricSpec] = {
     "llmq_build_info": _p("version", "Always 1; the library version as a label"),
     "llmq_store_up": _p("store", "1 when the store takes writes, 0 when down or read-only"),
     "llmq_held_calls": _p("", "Calls this pod holds (waiting for budget or running)", "Count"),
+    "llmq_outage_memo_active": _p("", "1 while this pod remembers a store outage (owner Q11)"),
+    "llmq_store_eviction_unsafe": _p(
+        "store", "1 when the store's eviction policy may evict queue keys (owner Q10)"
+    ),
+    "llmq_ready": _p("", "1 when this pod is ready (0: draining, no registry, or evicting store)"),
     "llmq_heartbeat_age_seconds": _p(
         "", "Seconds since this pod's heartbeat last made progress", "Seconds"
     ),
