@@ -89,9 +89,26 @@ result.vectors          # one vector per text, in order
 ```
 
 Texts are batched by the model's `embed_batch_size` (capped by what the provider accepts: Titan
-1, Cohere 96, OpenAI 2048), at most 16 batches in flight at a time.
+1, Cohere 96, OpenAI 2048; the default is 1, so set it, for example 96 for Cohere and 256 to
+2048 for OpenAI), at most `concurrency=16` batches in flight at a time.
 
-- **Empty texts** (or only whitespace) are refused at once with `CallFailed("invalid_request")`.
+- **Checked before any call** (`CallFailed("invalid_request")`, naming the text's index): a
+  `str` instead of a list, a text that is not a string, empty or only whitespace, a text longer
+  than the model's limit (Titan 50,000 characters, Cohere 2,048; the registry's
+  `embed_max_chars` overrides it, 0 turns it off; OpenAI is left to the provider), and a Cohere
+  `input_type` other than `search_document`, `search_query`, `classification`, `clustering`.
+- **A refused batch is split**: when the provider refuses a batch for its content, the batch is
+  split in two and sent again until only the bad text fails; its error names the text's index.
+- **`timeout_secs` is per batch**, not for the whole `embed`: 100,000 Titan texts are 100,000
+  calls. The vectors are Python floats (about 32 bytes each: 100,000 x 1,024 is about 3 GB);
+  embed a large set in slices.
+- **Usage**: `result.meta.tokens_in` (the input tokens the replies reported), `result.batches`
+  (provider calls, splits included) and `result.request_ids`.
+- **Options**: only `input_type` is per call; `dimensions`, `normalize`, `truncate` come from
+  the registry's `inference`. Titan v2 normalises by default, Titan v1 and Cohere do not.
+  `inference.embedding_types` takes only `["float"]`. A Bedrock model behind an ARN (an
+  application inference profile) names its body shape with the model's `family: "cohere"` or
+  `"titan"`; otherwise the model id decides, whatever its case.
 - **`request_id=X`** names batch *n* `X:n`, so each batch is its own call and a repeat of the
   same `embed` returns the same vectors.
 - **Partial results:** by default one failed batch fails the call. With `partial=True` the call
@@ -135,18 +152,8 @@ await llmq.start()
 job_id = await llmq.send_job("index_documents", {"ids": ids, "texts": texts})
 ```
 
-Jobs run at least once, on processes in `both` or `worker` mode. They have no LLM budget of
-their own; the LLM calls inside them do.
-
-- **`timeout_secs`** (`register_job(name, fn, *, timeout_secs=None)`): a run longer than this is cancelled and counts as a failure (retried, then
-  dead-lettered after 5 failures). Without it a hung job holds a worker slot for good.
-- **Queue limit**: a jobs queue holds at most 10,000 waiting jobs; `send_job` beyond that raises
-  `CallFailed("queue_full")` with `retry_after_secs` 5 instead of filling the store.
-- **No consumer**: `send_job` to a name no running process has registered still queues the job,
-  but logs `job_no_consumer` (once a minute per name) and counts `llmq_jobs_no_consumer_total`,
-  so a typo or a missing worker deployment shows up at once.
-- **Shutdown**: a job still running when the drain ends is returned to the queue, not failed.
-  A job whose acknowledgement failed after it finished is logged as a duplicate run.
+Jobs run at least once and are fire and forget. Retries, dead jobs, limits and what a job can
+rely on are in [Run background jobs](jobs.md).
 
 ## Request context
 

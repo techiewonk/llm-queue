@@ -88,25 +88,9 @@ request fields such as `extra_body`, `store`, `metadata` and `user`.
 
 ## Large results in S3
 
-```python
-from llm_queue import S3Offload
+Offloaded results are encrypted at rest (`sse`, default `AES256`, or a KMS key), their object
+names hold no caller text and no request id, and a reference outside the configured prefix is
+refused before any read. `expected_bucket_owner` makes every request fail when the bucket
+changed owner. Every option, the IAM and KMS permissions per process and an example lifecycle
+rule are in [Keep large results in S3](large-results.md).
 
-offload = S3Offload(
-    "my-results-bucket",
-    prefix="llmq-results/",
-    key_prefix="prod",                       # one namespace per environment
-    sse="aws:kms", kms_key_id="arn:aws:kms:ap-south-1:123456789012:key/...",
-    expected_bucket_owner="123456789012",
-)
-llmq = LLMQueue.from_env(offload=offload, offload_bytes=256_000)
-```
-
-| Option | Default | Effect |
-|---|---|---|
-| Object key | | `{prefix}{key_prefix}/{sha256(request id)}-{random}`: no caller text in a key, no two writes on one name |
-| `sse`, `kms_key_id` | `AES256` | Server-side encryption; `aws:kms` with a customer key |
-| `expected_bucket_owner` | | Every request fails when the bucket changed owner |
-| `delete_after_read` | true | The object is deleted after the caller read it (after the read, never before) |
-
-A reference outside the configured prefix is refused before any read. Add a lifecycle rule on
-the bucket (for example one day) for results that are never read.

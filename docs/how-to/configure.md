@@ -176,8 +176,8 @@ llmq = LLMQueue.from_env(offload=S3Offload("my-bucket"), offload_bytes=256_000)
 ```
 
 The store keeps a marker; the caller gets the full result, and the object is deleted once read.
-Key layout, encryption and bucket-owner options are in
-[Secure a deployment](secure.md#large-results-in-s3).
+Every process needs the same offload. Options, IAM and the bucket's lifecycle rule are in
+[Keep large results in S3](large-results.md).
 
 ## Bedrock and other providers
 

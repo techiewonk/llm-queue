@@ -9,6 +9,23 @@ registry settings are listed. How to use them is in [Configure](../how-to/config
 Every `LLMQ_*` variable, its default, and what `LLMQ_ENVIRONMENT` turns on (unset is strict) are
 in [Environment variables](environment.md).
 
+Jobs have their own process settings, `LLMQ_JOB_*` (read by `LLMQueue.from_env`, or passed as
+`LLMQueue(..., job_settings=JobSettings(...))`); a bad value is a `ConfigError` at start:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LLMQ_JOB_DEDUPE_SECS` | 86400 (24 h) | `send_job(job_id=X)` again within this queues nothing and returns `X`; 0 turns it off |
+| `LLMQ_JOB_RETRY_BASE_SECS` | 5 | First retry delay; it doubles after each failure ... |
+| `LLMQ_JOB_RETRY_MAX_SECS` | 300 | ... up to this (at least the base) |
+| `LLMQ_JOB_RETRY_FOR_SECS` | 3600 | Retries go on until the delays add up to this; then the job is dead |
+| `LLMQ_JOB_DEAD_RETENTION_SECS` | 604800 (7 days) | How long dead jobs are kept (60 to 1209600) |
+| `LLMQ_JOB_CONCURRENCY` | 4 | Running jobs per job name per process (`register_job(..., concurrency=N)` wins) |
+| `LLMQ_JOB_PROCESS_CONCURRENCY` | 32 | Running jobs per process, every name together |
+| `LLMQ_JOB_MAX_PAYLOAD_BYTES` | 1048576 (1 MB) | Largest job message; a larger send fails `request_too_large` (at least 1024) |
+| `LLMQ_JOB_MAX_RETURNS` | 5 | Returns at shutdown before a job is dead-lettered; 0 never |
+
+See [Run background jobs](../how-to/jobs.md).
+
 ## `Tuning` (in code)
 
 Passed as `LLMQueue.from_env(tuning=Tuning(...))`. Defaults:
@@ -57,6 +74,9 @@ Settings added or changed in 0.1.0b2:
 | `max_message_bytes` | defaults, model | 4194304 (4 MB) | A call whose message (inline images and documents included) is larger fails `invalid_request` before it is queued; at least 1024 |
 | `inference.extra` | as `inference` | | Provider-specific fields: plain lowercase names only; SDK arguments and request fields (`extra_body`, `store`, `metadata`, `user`, `model`, `messages`, `stream`, `tools`, ...) are refused. Protected in `safe` live-edit mode |
 | `queue.retention_secs`, `queue.dlq_retention_secs` | | | Now at most two weeks (1209600): dead letters hold the prompt |
+| `embed_max_chars` | model (embedding) | the family's: Titan 50000, Cohere 2048, OpenAI none | Longest text an `embed` sends; a longer one fails `invalid_request` with its index before any call. 0 turns the check off |
+| `family` | model field (Bedrock embedding) | guessed from `model_id` | `titan` or `cohere`: the request body of a model whose id does not say (an application inference profile ARN) |
+| `inference.embedding_types` | as `inference` | | Only `["float"]`: the other types were paid for, then unreadable |
 | `alerts` | | | Only `quota_used_pct` (1-100, default 90; `quota_near_limit` now checks TPM too) and `dlq_messages` (1 or more, default 1). `quota_used_mins`, `spill_pct`, `spill_window_secs` and `waiting_age_secs` did nothing and were removed |
 | `live_edit` (top level) | document | unset | The document's live-edit mode (deploy-only) |
 | `min_lib_version` (top level) | document | unset | Now a version such as `0.1.0b2`; checked against the running library |

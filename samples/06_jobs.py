@@ -1,8 +1,10 @@
 """Background jobs (ingestion, nightly re-embedding): queued work that runs at least once.
 
 Register the job function in every worker process before `start()`; any process can send a
-job. A job that raises is retried, so make it safe to run twice (e.g. upsert by id). LLM calls
-made inside a job go through the same queue and budgets as user calls, at normal priority.
+job. A job that raises is retried, so make it safe to run twice (upsert by
+`current_job().job_id`). LLM calls made inside a job go through the same queue and budgets as
+user calls, at normal priority. Jobs return nothing: this sample learns "done" through an
+in-process `asyncio.Queue`, which works only because sender and worker are one process.
 
     python scripts/samples.py 06_jobs [--live]
 """
