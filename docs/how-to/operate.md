@@ -176,7 +176,10 @@ The store is one primary with replicas (cluster mode is not supported).
 - `LLMQ_QUEUE_WAIT_REPLICAS` / `LLMQ_QUEUE_WAIT_MS`: a send waits for this many replicas to
   acknowledge it. Too few acknowledgements make the call run direct under the same record.
 - With a separate queue store (`LLMQ_QUEUE_STORE_URL`), errors for `LLMQ_QUEUE_FAILOVER_SECS`
-  (5) make calls run direct under the same budgets.
+  (5) make calls run direct under the same budgets. Each send try is bounded by that time (a
+  store that never answers fails over then, not after the client's ~21 s budget), and the
+  process remembers the outage for `outage_memo_secs` (3 s, cleared by a good store probe):
+  calls in that time skip the queue store and run direct at once.
 - A state store outage: callers already waiting keep waiting until their deadline; new calls
   follow the model's `store_down` rule (`pause`, the default; `static_cap`; `fail_fast`).
   Measured: a 45 s outage with 500 calls waiting dropped none.

@@ -23,7 +23,7 @@ from llm_queue.engine.admission import Decision
 from llm_queue.engine.envelope import Reply, params_hash
 from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.inference import InferenceRejected
-from llm_queue.engine.queue import Message, NotReplicated
+from llm_queue.engine.queue import Message, NotReplicated, StreamQueues
 from llm_queue.engine.runtime import Engine, _store_refused
 from llm_queue.engine.store_client import StorePoolBusy, store_client
 
@@ -888,8 +888,7 @@ async def test_cg3_a_failing_queue_store_sends_calls_direct(make: Make) -> None:
     """CG-3: `LLMQ_QUEUE_FAILOVER_SECS` (a separate queue store that keeps failing sends the
     call down the direct path) had no test. A queue store on a refused port, failover 0.5 s.
 
-    Only the refused case: a blackholed store still costs the client's full budget per call
-    (R3FM-3's send bound is not done).
+    The refused case; the blackholed one is R3FM-3's test below.
     """
     base, _ = await make(worker=False)
     queue_store = store_client("redis://:x@127.0.0.1:1/0")
@@ -907,6 +906,64 @@ async def test_cg3_a_failing_queue_store_sends_calls_direct(make: Make) -> None:
     finally:
         await engine.stop(drain_secs=0)
         await queue_store.aclose()
+
+
+async def test_r3fm3_a_blackholed_queue_store_is_skipped_after_the_first_detection(
+    make: Make,
+) -> None:
+    """R3FM-3 (send timeout, AMEND CG-3): a blackholed queue store cost every call the
+    client's full retry budget (about 21 s) before the direct path, for the whole outage.
+
+    Each send try is now bounded by `queue_failover_secs`, and the outage is remembered: the
+    first call fails over within the failover time plus 1 s, the next ones skip the queue
+    store at once. The store accepts connections and never answers (not a refused port).
+    """
+    held: list[asyncio.StreamWriter] = []
+
+    async def blackhole(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        held.append(writer)
+        await reader.read()  # never answers
+
+    server = await asyncio.start_server(blackhole, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    base, _ = await make(worker=False)
+    settings = dataclasses.replace(base.settings, queue_failover_secs=0.5)
+    engine = Engine(base.state, base.registry, base.providers, queue_store=base.state)
+    engine.settings = settings
+    await engine.start(worker=False)
+    dead = store_client(f"redis://:x@127.0.0.1:{port}/0")
+    engine._queue_store = dead  # the queue store goes dark after start
+    engine.queues = StreamQueues(dead, engine.keys)
+    sends = 0
+    real_send = engine.queues.send
+
+    async def send(*args: Any, **kwargs: Any) -> Any:
+        nonlocal sends
+        sends += 1
+        return await real_send(*args, **kwargs)
+
+    engine.queues.send = send  # type: ignore[method-assign]  # count the tries
+    loop = asyncio.get_running_loop()
+    try:
+        started = loop.time()
+        reply = await engine.call("small", CHAT, timeout_secs=20)
+        assert reply.ok
+        first_secs = loop.time() - started - reply.meta.provider_ms / 1000
+        assert first_secs < settings.queue_failover_secs + 1.0, first_secs
+        tried = sends
+        for _ in range(3):
+            started = loop.time()
+            reply = await engine.call("small", CHAT, timeout_secs=20)
+            assert reply.ok
+            overhead = loop.time() - started - reply.meta.provider_ms / 1000
+            assert overhead < 0.3, overhead  # the provider's time, nothing spent on the store
+        assert sends == tried  # the dark store was not tried again
+    finally:
+        await engine.stop(drain_secs=0)
+        await dead.aclose()
+        server.close()
+        for writer in held:
+            writer.close()
 
 
 async def test_cg5_a_caller_whose_key_expired_is_gone(make: Make, store: Any) -> None:

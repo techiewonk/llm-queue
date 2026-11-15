@@ -613,6 +613,8 @@ class Engine:
         self._beat_ok_mono = time.monotonic()  # last heartbeat that reached the store
         self._store_trouble_mono = -1e9  # monotonic time this process last saw the store fail
         self._outage_until_mono = -1e9  # a call saw the store down: skip it until then (Q11)
+        # A separate queue store a send found down: calls run direct until then (R3FM-3).
+        self._queue_down_until_mono = -1e9
         self._store_ping: asyncio.Task[bool] | None = None  # pings for paused calls
         self._store_waiting = 0  # calls paused on the store_down path, waiting on the probe
         # Calls whose awaiting task was cancelled, for the one canceller (`_cancel_later`).
@@ -1336,6 +1338,11 @@ class Engine:
         inside an `except _QueueDown` handler, a store error there reached the app as a raw
         redis-py error and skipped the model's `store_down` rule (audit RT-2).
         """
+        if not direct and not self.queues_shared and self._queue_down_remembered():
+            # The separate queue store was found down moments ago (R3FM-3): run direct now.
+            # Each call re-discovered it at the client's full retry budget (about 21 s when
+            # the store is blackholed) before it took the direct path.
+            direct = True
         try:
             return await self._call_once(
                 view, alias, envelope, params, priority, call_secs, request_id, direct
@@ -1483,18 +1490,28 @@ class Engine:
         give_up = loop.time() + self.settings.queue_failover_secs
         body = envelope.dumps()
         tries = 0
+        # Each try against a separate queue store is bounded by what is left of
+        # `queue_failover_secs` (with 0, one store probe's time): one send to a blackholed
+        # store took the client's whole budget, about 21 s, before the failover (R3FM-3). A
+        # shared store keeps the client's own timeouts (the call has no other path).
+        floor_secs = self.settings.timings.health_probe_secs
         while True:
             try:
                 try:
-                    await self.queues.send(
-                        self._queue_name(view, alias, priority),
-                        body,
-                        settings,
-                        wait_replicas=self.replica_wait.replicas_for("calls"),
-                        wait_ms=self.replica_wait.wait_ms,
-                    )
+                    bound = None
+                    if not self.queues_shared:
+                        left = give_up - loop.time()
+                        bound = left if left > 0 else floor_secs
+                    async with asyncio.timeout(bound):
+                        await self.queues.send(
+                            self._queue_name(view, alias, priority),
+                            body,
+                            settings,
+                            wait_replicas=self.replica_wait.replicas_for("calls"),
+                            wait_ms=self.replica_wait.wait_ms,
+                        )
                     break
-                except STORE_ERRORS:
+                except STORE_ERRORS:  # a try past its bound too (TimeoutError is an OSError)
                     if not self.queues_shared and loop.time() < give_up:
                         tries += 1
                         await asyncio.sleep(self._store_retry_secs(tries))
@@ -1518,6 +1535,10 @@ class Engine:
                 ):
                     raise CallFailed("queue_unavailable", _refusal(exc), request_id=rid) from exc
                 if isinstance(exc, STORE_ERRORS) and not self.queues_shared:
+                    self._queue_down_until_mono = time.monotonic() + self.settings.outage_memo_secs
+                    logger.warning(
+                        "queue_store_down", error=str(exc), error_type=type(exc).__name__
+                    )
                     raise _QueueDown from exc
                 raise
         try:
@@ -1757,6 +1778,10 @@ class Engine:
     def _outage_remembered(self) -> bool:
         """True while a store outage a call saw is remembered (owner Q11)."""
         return time.monotonic() < self._outage_until_mono
+
+    def _queue_down_remembered(self) -> bool:
+        """True while a separate queue store a send found down is remembered (R3FM-3)."""
+        return time.monotonic() < self._queue_down_until_mono
 
     def _remember_outage(self) -> None:
         """Remember a store outage for `outage_memo_secs`; a probe that succeeds ends it."""
@@ -4045,6 +4070,8 @@ class Engine:
         self._stores = (time.monotonic(), stores)
         if state == "ok":
             self._outage_until_mono = -1e9  # the store is back: calls try it again (Q11)
+        if queue == "ok":
+            self._queue_down_until_mono = -1e9  # the queue store is back: send again (R3FM-3)
         return stores
 
     def _evicting(self) -> str | None:

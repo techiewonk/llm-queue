@@ -300,7 +300,10 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
 - **An answer in hand is kept until the call's deadline** during a store outage, not one lease
   (Q7).
 - **`fail_fast` / `static_cap` answer at once during a known outage** (Q11, R3FM-3): a store
-  outage a call saw is remembered `outage_memo_secs` (3 s; a good write probe clears it).
+  outage a call saw is remembered `outage_memo_secs` (3 s; a good write probe clears it). A
+  separate queue store found down is remembered the same way: calls then run direct at once,
+  and each send try is bounded by `LLMQ_QUEUE_FAILOVER_SECS`. A blackholed queue store cost
+  every call the client's full retry budget (about 21 s) before the direct path.
 - **`LLMQ_QUEUE_WAIT_REPLICAS` covers call sends, job sends and registry live edits** (Q8, Q51),
   each switchable with `LLMQ_QUEUE_WAIT_SCOPES` (`all`, `none`, or a list of `calls`, `jobs`,
   `registry`; all by default). Too few replicas no longer runs the call direct: it is sent
