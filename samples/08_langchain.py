@@ -1,9 +1,9 @@
 """LangChain: drop-in chat model and embeddings that go through the queue (chains, agents, RAG).
 
 `QueuedChatBedrockConverse` is a `ChatBedrockConverse` whose calls go through the queue (tools
-and structured output work as usual; `astream()` yields the whole answer as one chunk, so use
-`LLMQueue.converse_stream` for token streaming); `QueuedBedrockEmbeddings` is a
-`BedrockEmbeddings`. They find the started `LLMQueue` on their own.
+and structured output work as usual; `astream()` yields the whole answer as one chunk unless
+`queue_streaming=True`, which streams tokens through `LLMQueue.converse_stream`);
+`QueuedBedrockEmbeddings` is a `BedrockEmbeddings`. They find the started `LLMQueue` on their own.
 
     python scripts/samples.py 08_langchain [--live]
 """
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.tools import tool
 
 from llm_queue import LLMQueue
@@ -40,6 +40,22 @@ async def main() -> None:
         print(f"tool calls: {[(c['name'], c['args']) for c in called.tool_calls]}")
         assert called.tool_calls
         assert called.tool_calls[0]["name"] == "stock_price"
+
+        # queue_streaming=True: astream() yields tokens as they arrive (through converse_stream)
+        streaming = QueuedChatBedrockConverse(  # type: ignore[call-arg]
+            model_alias="gpt120b", max_tokens=400, queue_streaming=True
+        )
+        chunks: list[AIMessageChunk] = []
+        async for chunk in streaming.astream("Name three Nifty 50 companies, comma separated."):
+            chunks.append(chunk)
+        streamed = sum(chunks[1:], chunks[0])
+        usage = streamed.usage_metadata  # once, on the last chunk
+        assert usage is not None
+        print(
+            f"streamed: {len(chunks)} chunks, {streamed.text()[:80]!r}, "
+            f"finish_reason={streamed.response_metadata.get('finish_reason')}, "
+            f"output_tokens={usage['output_tokens']}"
+        )
 
         emb = QueuedBedrockEmbeddings(model_alias="titan")
         docs = await emb.aembed_documents(["first", "second"])

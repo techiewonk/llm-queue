@@ -348,6 +348,16 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
 
 ### Added
 
+- **Token streaming in the LangChain chat adapters** (owner Q49): `queue_streaming=True` on
+  `QueuedChatBedrockConverse` and `QueuedChatOpenAI`, **off by default** (one whole message, as
+  before). When on, `astream()`, `astream_events()` and LangGraph's `stream_mode="messages"`
+  go through `LLMQueue.converse_stream` / `chat_stream`: text deltas and `tool_call_chunks` as
+  the parent class parses them, `usage_metadata` once on the last chunk with `finish_reason`
+  (Bedrock's `stopReason` mapped) and how the queue served the call, `CallFailed` with
+  `partial_text` on a mid-stream failure, and the queued call cancelled when the consumer stops
+  (aclosing). Sync `stream()` still yields one whole message; a sync call on the queue's own
+  loop keeps the queue's `LLMQueueError` (Q1), which `QueuedChatOpenAI` now raises as such
+  instead of the SDK's `InternalServerError`. See [LangChain](docs/samples/langchain.md).
 - **Per-tenant fairness** (owner Q28, Q29, Q50): registry setting `fairness` (defaults or per
   model, *merged*), **off by default** (admission is unchanged when off). The tenant is the
   call's `tenant_id`, else its `user_id` (calls with neither share one tenant); the store keys
