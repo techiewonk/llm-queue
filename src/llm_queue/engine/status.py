@@ -17,6 +17,7 @@ from llm_queue._logging import get_logger
 from llm_queue.engine._codec import text as _text
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import StreamQueues
+from llm_queue.registry.settings import ALERT_DEFAULTS
 
 if TYPE_CHECKING:
     import redis.asyncio
@@ -45,6 +46,7 @@ for i = 2, #ARGV do
       + redis.call('ZCOUNT', base .. 'lease:' .. dep .. ':n', now_ms, '+inf'),
     redis.call('HGET', base .. 'cb:' .. dep, 'state') or 'closed',
     redis.call('GET', base .. 'thr:' .. dep .. ':' .. minute) or '0',
+    redis.call('GET', base .. 'thr:' .. dep .. ':' .. (minute - 1)) or '0',
   })
 end
 return out
@@ -80,16 +82,25 @@ class StatusReader:
         name = self.queue_prefix + view.queue_name(alias)
         deps = view.deployments(alias)
         base = self.keys.model(alias, "")
-        depths, raw = await asyncio.gather(
-            asyncio.gather(self.queues.depth(f"{name}-priority"), self.queues.depth(name)),
+        names = (f"{name}-priority", name)
+        depths, raw, firsts = await asyncio.gather(
+            asyncio.gather(*(self.queues.depth(n) for n in names)),
             self._model_status([], [base, *(d.key for d in deps)]),
+            asyncio.gather(*(self._first_id(n) for n in names)),
         )
+        classes = ("priority", "normal")
         waiting = {
-            cls: max(0, total - held)
-            for cls, (total, held, _) in zip(("priority", "normal"), depths, strict=True)
+            cls: max(0, total - held) for cls, (total, held, _) in zip(classes, depths, strict=True)
         }
+        # Taken by a worker but still waiting for a grant: counted nowhere before, so a model
+        # out of budget showed 0 waiting with up to worker_slots x pods calls held (R3OB-2).
+        held_waiting = {cls: held for cls, (_, held, _) in zip(classes, depths, strict=True)}
         dead = sum(letters for _, _, letters in depths)
-        minute = int(raw[0]) // 60
+        now_secs = int(raw[0])
+        minute = now_secs // 60
+        # The oldest call in either queue (an acked message leaves the stream): a queue whose
+        # oldest call keeps ageing is stalled (R3OB-17).
+        oldest_ms = min((ms for ms in firsts if ms is not None), default=None)
         inprog, flat = raw[1], raw[2]
         health = {_text(flat[i]): _text(flat[i + 1]) for i in range(0, len(flat), 2)}
         deployments = [
@@ -100,10 +111,22 @@ class StatusReader:
             "model": alias,
             "enabled": bool(view.effective(alias, "enabled").value),
             "waiting": waiting,
+            "waiting_for_grant": held_waiting,
+            "oldest_waiting_secs": None
+            if oldest_ms is None
+            else round(max(0.0, now_secs - oldest_ms / 1000), 1),
             "in_progress": int(inprog),
             "dead_letters": dead,
             "deployments": deployments,
         }
+
+    async def _first_id(self, queue: str) -> int | None:
+        """The time (ms) in the id of a queue's oldest message, None when it is empty."""
+        client = self.queues.client
+        entries = await client.xrange(self.queues.keys.queue(queue, "s"), count=1)
+        if not entries:
+            return None
+        return int(_text(entries[0][0]).split("-", 1)[0])
 
     def _deployment(
         self,
@@ -114,7 +137,7 @@ class StatusReader:
         health: Mapping[str, str],
         minute: int,
     ) -> dict[str, Any]:
-        flat_rate, raw_limit, in_use, breaker, throttles = replies
+        flat_rate, raw_limit, in_use, breaker, throttles, throttles_before = replies
         dep = deployment.key
         rate = {_text(flat_rate[i]): _text(flat_rate[i + 1]) for i in range(0, len(flat_rate), 2)}
         fresh = rate.get("seen_win") == str(minute)
@@ -152,7 +175,10 @@ class StatusReader:
             if f"{dep}|lat" in health
             else None,
             "samples": int(_num(health.get(f"{dep}|n"))),
-            "throttles_1m": int(_num(throttles)),
+            # The larger of the last full minute and this one: a sample early in the minute read
+            # near 0, so the gauge and `quota_above_observed` flipped at each rollover (R3OB-6).
+            "throttles_1m": int(max(_num(throttles), _num(throttles_before))),
+            "throttles_this_minute": int(_num(throttles)),
         }
 
     async def jobs(self) -> list[dict[str, Any]]:
@@ -227,6 +253,12 @@ def _state(alert: Alert) -> str:
     return "1" if alert.on else "0"
 
 
+# Alerts read from per-minute counters: on at once, off only after this many clear samples in
+# a row, so a saturated deployment does not flip at each minute rollover (R3OB-6).
+_STEADY = frozenset({"quota_near_limit", "quota_above_observed"})
+CLEAR_SAMPLES = 2
+
+
 class AlertEvaluator:
     """State alerts from a report (thresholds from the model's `alerts` setting).
 
@@ -238,15 +270,38 @@ class AlertEvaluator:
         """Keep the client for the change markers."""
         self._client = client
         self.keys = keys
+        self._clear_runs: dict[str, int] = {}  # steady alert marker -> clear samples in a row
+        self._on: dict[str, Alert] = {}  # alerts on at the last `changed()`, by marker
+
+    def _steady(self, alert: Alert) -> Alert:
+        """Hold a per-minute alert on until `CLEAR_SAMPLES` clear samples in a row."""
+        if alert.name not in _STEADY:
+            return alert
+        marker = _marker(self.keys, alert)
+        if alert.on:
+            self._clear_runs[marker] = 0
+            return alert
+        runs = self._clear_runs.get(marker)
+        if runs is None:  # not on here
+            return alert
+        runs += 1
+        if runs >= CLEAR_SAMPLES:
+            del self._clear_runs[marker]
+            return alert
+        self._clear_runs[marker] = runs
+        return Alert(alert.name, True, alert.labels, f"{alert.detail} (clearing)")
 
     def evaluate(self, view: ResolvedRegistry, report: Mapping[str, Any]) -> list[Alert]:
         """Every alert state of a report.
 
         `model_unavailable`: no deployment is enabled (itself and its account), unblocked,
         healthy, inside the residency list and with its breaker not open. `quota_near_limit`:
-        RPM or TPM use this minute at or above `alerts.quota_used_pct`.
+        RPM or TPM use this minute at or above `alerts.quota_used_pct` (off after
+        `CLEAR_SAMPLES` clear samples). `breaker_open`, `kill_switch_on` and `queue_stalled`
+        (the oldest call older than `alerts.queue_age_secs`) were missing (R3OB-17).
         """
         alerts: list[Alert] = []
+        kill_switch = bool(report.get("kill_switch"))
         for model in report["models"]:
             alias = model["model"]
             thresholds = view.value(alias, "alerts")
@@ -262,9 +317,21 @@ class AlertEvaluator:
                 and d["breaker"] != "open"
             ]
             alerts.append(Alert("model_unavailable", not usable, {"model": alias}))
+            alerts.append(Alert("kill_switch_on", kill_switch, {"model": alias}))
+            oldest = model.get("oldest_waiting_secs")
+            age_limit = thresholds.get("queue_age_secs", ALERT_DEFAULTS["queue_age_secs"])
+            alerts.append(
+                Alert(
+                    "queue_stalled",
+                    oldest is not None and oldest >= age_limit,
+                    {"model": alias},
+                    f"oldest call {oldest} s",
+                )
+            )
             for dep in deps:
                 labels = {"model": alias, "deployment": dep["name"]}
                 alerts.append(Alert("deployment_disabled", not dep["healthy"], labels))
+                alerts.append(Alert("breaker_open", dep["breaker"] == "open", labels))
                 used = {
                     budget: 100 * dep[budget]["used"] / dep[budget]["limit"]
                     for budget in ("rpm", "tpm")
@@ -307,10 +374,22 @@ class AlertEvaluator:
                     f"{job['dead_letters']} dead",
                 )
             )
-        return alerts
+        return [self._steady(alert) for alert in alerts]
 
     async def changed(self, alerts: list[Alert]) -> list[Alert]:
-        """Alerts whose state flipped since the last evaluation (logged once, by one process)."""
+        """Alerts whose state flipped since the last evaluation (logged once, by one process).
+
+        An alert that was on here and left the report (its model or deployment was removed) is
+        turned off and logged: its marker used to expire after 24 h with no "off" line.
+        """
+        markers = {_marker(self.keys, alert) for alert in alerts}
+        gone = [
+            Alert(a.name, False, a.labels, "left the registry")
+            for marker, a in self._on.items()
+            if marker not in markers
+        ]
+        alerts = [*alerts, *gone]
+        self._on = {_marker(self.keys, a): a for a in alerts if a.on}
         flipped = []
         # One pipelined `SET ... EX GET` per alert: it was GETSET then EXPIRE, two serial round
         # trips each (~3,700 per sample at 20 models x 30 deployments; GETSET is deprecated
