@@ -105,7 +105,10 @@ class _EmbedEngine:
         entry = SimpleNamespace(provider="openai", model_id="e")
         registry = SimpleNamespace(alias_of=lambda m: m, models={"e": entry})
         self.registry = SimpleNamespace(
-            current=SimpleNamespace(registry=registry, value=lambda alias, name: 2)
+            current=SimpleNamespace(
+                registry=registry,
+                value=lambda alias, name: 2 if name == "embed_batch_size" else None,
+            )
         )
         self.fail = fail or set()
         self.ids: list[str | None] = []
