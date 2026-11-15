@@ -7,7 +7,7 @@ queue on first call through `get_default_queue`. This module never imports langc
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any, Protocol, cast, runtime_checkable
 
 from llm_queue.errors import LLMQueueError
@@ -68,6 +68,33 @@ class QueueClient(Protocol):
         input_type: str | None = None,
         **kw: Any,
     ) -> EmbedResultLike: ...
+
+
+class StreamingQueueClient(Protocol):
+    """The stream methods `queue_streaming=True` adapters call (kept out of `QueueClient`).
+
+    A separate protocol, so a queue object without them still passes the constructor check
+    when streaming is off. Both yield provider events and, with `meta_event=True`, end with
+    the library's `{"llmq": {"usage": ..., "meta": ...}}` event.
+    """
+
+    def converse_stream(
+        self, model: str, request: Mapping[str, Any], *, priority: bool | None = None, **kw: Any
+    ) -> AsyncIterator[dict[str, Any]]: ...
+
+    def chat_stream(
+        self, model: str, request: Mapping[str, Any], *, priority: bool | None = None, **kw: Any
+    ) -> AsyncIterator[dict[str, Any]]: ...
+
+
+def streaming_queue(queue: QueueClient, method: str) -> StreamingQueueClient:
+    """`queue` as a stream client; a clear error when it has no `method`."""
+    if not callable(getattr(queue, method, None)):
+        raise LLMQueueError(
+            f"queue_streaming=True needs a queue with {method}() (an LLMQueue has it), "
+            f"not {type(queue).__name__}"
+        )
+    return cast("StreamingQueueClient", queue)
 
 
 _default_queue: QueueClient | None = None

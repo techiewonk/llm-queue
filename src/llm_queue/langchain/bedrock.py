@@ -10,15 +10,30 @@ from __future__ import annotations
 
 import contextlib
 import os
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from langchain_aws import BedrockEmbeddings, ChatBedrockConverse
+from langchain_aws.chat_models import bedrock_converse as _converse_module
+from langchain_core import __version__ as _core_version
+from langchain_core.messages import AIMessageChunk
+from langchain_core.outputs import ChatGenerationChunk
 from pydantic import Field, model_validator
 
 from llm_queue.errors import LLMQueueError
-from llm_queue.langchain._client import checked_values, get_default_queue, resolve_queue
+from llm_queue.langchain._client import (
+    checked_values,
+    get_default_queue,
+    resolve_queue,
+    streaming_queue,
+)
+from llm_queue.langchain._stream import (
+    finish_reason,
+    queued_chunks,
+    should_stream,
+    usage_metadata,
+)
 
 if TYPE_CHECKING:
     from langchain_core.callbacks import (
@@ -34,6 +49,9 @@ if TYPE_CHECKING:
 # model instance never see each other's handler).
 _Handler = Callable[[dict[str, Any]], dict[str, Any]]
 _HANDLER: ContextVar[_Handler | None] = ContextVar("llmq_converse_handler", default=None)
+# langchain-core 1.x merges a repeated `model_provider` (langchain-aws 1.x sets it on every
+# stream chunk); 0.3 would concatenate it, and langchain-aws 0.2 never sets it.
+_SETS_PROVIDER = not _core_version.startswith("0.")
 
 
 class _Captured(Exception):  # control flow, not an error
@@ -123,7 +141,10 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
 
     `model_alias` is the registry alias (`gpt120b`); `model_id` is the Bedrock id (looked up
     from the registry when omitted) and drives the parent's provider-specific request building.
-    `priority=None` takes the class from `request_context`. Streaming is off (one full message).
+    `priority=None` takes the class from `request_context`. `queue_streaming=True` makes
+    `astream()` (and LangGraph's message streaming) yield tokens as they arrive, through
+    `LLMQueue.converse_stream`; off by default (one full message). Sync `stream()` always
+    yields one full message: the queue has no sync stream.
     """
 
     llmq: Any = Field(default=None, exclude=True)
@@ -133,6 +154,7 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
     # langchain-aws 1.x types it as these values (0.2.x has no such field: ours adds it).
     service_tier: Literal["priority", "default", "flex", "reserved"] | None = None
     queue_timeout_secs: float | None = None
+    queue_streaming: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -141,13 +163,18 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
             _alias_values(checked_values(values)), cls.model_fields, "client", "bedrock_client"
         )
         if isinstance(values, dict):
-            values["disable_streaming"] = True
+            if not values.get("queue_streaming"):
+                values["disable_streaming"] = True
             # Traces (Langfuse, LangSmith) keep the parent's run name, so dashboards still match.
             values.setdefault("name", ChatBedrockConverse.__name__)
         return values
 
     def _queue(self) -> QueueClient:
         return resolve_queue(self.llmq)
+
+    def _should_stream(self, *, async_api: bool, run_manager: Any = None, **kwargs: Any) -> bool:
+        """Stream only with `queue_streaming=True` and only on the async API (see the class)."""
+        return should_stream(self, async_api=async_api, run_manager=run_manager, **kwargs)
 
     @property
     def _alias(self) -> str:
@@ -205,10 +232,15 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
         served = result.meta.served_model
         if served and served != self._alias:
             # Model fallback: report the model that answered (tracers price by `llm_output`).
-            registry = getattr(self._queue(), "registry", None)
-            served_id = registry.current.model(served).model_id if registry else served
-            chat.llm_output = {**(chat.llm_output or {}), "model_name": served_id}
+            chat.llm_output = {**(chat.llm_output or {}), "model_name": self._model_id_of(served)}
         return chat
+
+    def _model_id_of(self, served: str) -> str:
+        """The Bedrock id of the model that answered (this one unless it fell back)."""
+        if not served or served == self._alias:
+            return self.model_id
+        registry = getattr(self._queue(), "registry", None)
+        return registry.current.model(served).model_id if registry else served
 
     def _generate(
         self,
@@ -245,6 +277,62 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
             timeout_secs=self.queue_timeout_secs,
         )
         return self._parse(messages, stop, call_kwargs, result)
+
+    async def _astream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        """Token streaming through `converse_stream` (`queue_streaming=True`).
+
+        The request is built and each ConverseStream event parsed by the installed
+        langchain-aws, as for its own `astream`. The last chunk has the usage, `stopReason`
+        with the OpenAI-style `finish_reason`, and how the queue served the call.
+        """
+        request, _ = self._capture(messages, stop, kwargs)
+        queue = streaming_queue(self._queue(), "converse_stream")
+        stop_reason: list[str] = []
+
+        def convert(event: dict[str, Any]) -> ChatGenerationChunk | None:
+            message = _converse_module._parse_stream_event(event)
+            if message is None:
+                return None
+            if "messageStop" in event:
+                stop_reason.append(event["messageStop"].get("stopReason") or "")
+            if _SETS_PROVIDER:  # langchain-aws 1.x marks every chunk, as its own _stream does
+                message.response_metadata["model_provider"] = "bedrock_converse"
+            return ChatGenerationChunk(message=message)
+
+        def closing(info: Mapping[str, Any], had_usage: bool) -> ChatGenerationChunk:
+            meta = dict(info.get("meta") or {})
+            metadata: dict[str, Any] = {
+                **meta,
+                "model_name": self._model_id_of(str(meta.get("served_model") or "")),
+            }
+            if stop_reason and (reason := finish_reason(stop_reason[-1] or None)):
+                metadata["finish_reason"] = reason
+            usage = None if had_usage else usage_metadata(info.get("usage"))
+            message = AIMessageChunk(content="", response_metadata=metadata, usage_metadata=usage)
+            return ChatGenerationChunk(message=message)
+
+        events = queue.converse_stream(
+            self._alias,
+            request,
+            priority=self.priority,
+            allow_fallback=self.allow_fallback,
+            timeout_secs=self.queue_timeout_secs,
+            meta_event=True,
+        )
+        # aclosing: a consumer that closes this generator closes the queue's stream now.
+        chunks = cast(
+            "AsyncGenerator[ChatGenerationChunk, None]",
+            queued_chunks(events, convert, closing, run_manager),
+        )
+        async with contextlib.aclosing(chunks):
+            async for chunk in chunks:
+                yield chunk
 
 
 class QueuedBedrockEmbeddings(BedrockEmbeddings):
