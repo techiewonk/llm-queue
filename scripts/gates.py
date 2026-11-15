@@ -47,7 +47,9 @@ from gates_fleet import (  # needs the sys.path entry
     account_keys,
     drill_tuning,
     environment,
+    kill_and_reap,
     log_dir,
+    log_file,
     new_prefix,
     registry,
     setup_logging,
@@ -569,37 +571,65 @@ async def b95() -> bool:
 async def b96() -> bool:
     """Kill switch on, 2,000 direct calls waiting in 4 caller processes (plan: 5,000 on 20).
 
-    Pass: admission calls <= 20 per process per second.
+    Pass: every caller started and is still waiting (alive, no outcome yet) through the
+    measurement, the store saw some admission traffic, and scripts <= 20 per process per second.
+    FT-3: a crashed or idle caller used to pass (rate 0); FT-4: callers are always reaped;
+    FT-30: each caller logs to its own file instead of DEVNULL.
     """
     doc = registry({"chat": {"rpm": 600}}, accounts=1, regions=1, routing={"kill_switch": True})
+    procs: list[subprocess.Popen[bytes]] = []
+    ready = alive = 0
+    FLEET = Path(__file__).parent / "gates_fleet.py"  # a path, not a variable
+    rate = 0.0
     async with Gate(doc) as gate:
-        procs = [
-            subprocess.Popen(  # noqa: ASYNC220  # started once, before the measurement
-                [PY, str(Path(__file__).parent / "gates_fleet.py"), "caller", "500", "chat"],
-                env={**gate.env, "LLMQ_MODE": "caller"},
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-            for _ in range(4)
-        ]
-        for proc in procs:
-            assert proc.stdout is not None
-            await asyncio.to_thread(proc.stdout.readline)
-        for proc in procs:
-            assert proc.stdin is not None
-            proc.stdin.write(b"go\n")
-            proc.stdin.flush()
-        await asyncio.sleep(10)
-        s0, t0 = gate.store.script_calls(), time.monotonic()
-        await asyncio.sleep(20)
-        rate = (gate.store.script_calls() - s0) / (time.monotonic() - t0) / len(procs)
-        for proc in procs:
-            proc.kill()
+        try:
+            for _ in range(4):
+                procs.append(
+                    subprocess.Popen(  # noqa: ASYNC220  # started once, before the measurement
+                        [PY, str(FLEET), "caller", "500", "chat"],
+                        env={**gate.env, "LLMQ_MODE": "caller"},
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=log_file("b96-caller"),
+                    )
+                )
+            for proc in procs:
+                assert proc.stdout is not None
+                try:
+                    line = await asyncio.wait_for(asyncio.to_thread(proc.stdout.readline), 60)
+                except TimeoutError:
+                    line = b""
+                ready += line.strip() == b"ready"
+            if ready == len(procs):
+                for proc in procs:
+                    assert proc.stdin is not None
+                    proc.stdin.write(b"go\n")
+                    proc.stdin.flush()
+                await asyncio.sleep(10)
+                s0, t0 = gate.store.script_calls(), time.monotonic()
+                await asyncio.sleep(20)
+                calls = gate.store.script_calls() - s0
+                rate = calls / (time.monotonic() - t0) / len(procs)
+                alive = sum(proc.poll() is None for proc in procs)
+        finally:
+            await asyncio.gather(*(kill_and_reap(p) for p in procs), return_exceptions=True)
+            for proc in procs:
+                for pipe in (proc.stdin, proc.stdout):
+                    if pipe is not None:
+                        with contextlib.suppress(OSError):
+                            pipe.close()
     return verdict(
         "B96",
-        {"store scripts <= 20 per process per second": rate <= 20},
-        [f"store scripts per caller process per second while 2,000 direct calls wait: {rate:.1f}"],
+        {
+            "every caller started": ready == len(procs),
+            "every caller still waiting during the measurement": alive == len(procs),
+            "store scripts > 0 (the callers really ask)": rate > 0,
+            "store scripts <= 20 per process per second": rate <= 20,
+        },
+        [
+            f"ready {ready}/{len(procs)}, alive {alive}/{len(procs)}; store scripts per caller "
+            f"process per second while 2,000 direct calls wait: {rate:.1f}"
+        ],
     )
 
 
