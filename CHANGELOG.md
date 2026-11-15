@@ -32,7 +32,7 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   call -55-61 %, p99 -27-44 %; embeddings +12-25 % calls/s; stream first event -18-23 %; memory
   per client 669 -> 87 KiB. All nine samples pass on real Bedrock with it. Differences: Converse
   fields botocore does not know are sent (Bedrock refuses them) instead of dropped; FIPS
-  endpoints and `AWS_ENDPOINT_URL_*` are not read (`AWS_CA_BUNDLE` and proxy variables are).
+  endpoints and `AWS_ENDPOINT_URL_*` are not read (`AWS_CA_BUNDLE`, `REQUESTS_CA_BUNDLE` and the proxy variables are).
 - **`LLMQ_ENVIRONMENT` unset is strict.** Only `dev`, `local`, `test` and `ci` relax the checks;
   unset (reported as `unset`) or any other name requires TLS stores, `LLMQ_ID_HASH_SALT`,
   `LLMQ_BASE_URL_ALLOWED_HOSTS` when the registry has an `openai` account, and refuses debug
@@ -82,10 +82,44 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   asyncio's `RuntimeError`.
 - `stream()` on a model that is not a chat model raises `CallFailed("invalid_request")`, not
   `ConfigError` (that is for start-up and refused registry edits) (RT-28).
+- **OpenAI-compatible calls refuse params that touch protected fields** (owner decision D2,
+  R3SE-1): `extra_body` keys `model`, `messages`, `stream`, `n`, `max_tokens`,
+  `max_completion_tokens`, `store`, `tools` ...; `extra_headers` `Authorization`, `api-key` and
+  other credential or framing headers; top-level `model`, `stream`, `stream_options`, `store` and
+  SDK client arguments fail as `CallFailed("invalid_request")` before anything is sent. They
+  replaced the route's model, undid the token cap or sent another key. Harmless keys pass.
+- **Strict mode requires `LLMQ_KEY_PREFIX`** (Q26); dev and test keep `llmq`. Two environments
+  that both left the default shared one store's queues and registry.
+- **Strict mode requires `https` for `LLMQ_BEDROCK_ENDPOINT_URL` and `LLMQ_STS_ENDPOINT_URL`**
+  (Q30); an `http` override sent prompts, SigV4 headers and STS role keys in clear.
+- **A pod refuses a stored registry whose protected fields differ from its deploy config**
+  (Q25, R3SE-3): accounts and roles, model ids, residency, region lists, `live_edit`, deploy-only
+  settings. It keeps its registry, logs `registry_invalid` and counts
+  `llmq_registry_refused_total{reason="protected_mismatch"}`. A protected field changed by a live
+  edit under `registry_live_edit=all` is therefore refused by pods that hold a config, and during
+  a rolling deploy pods on the old config keep their registry until they are replaced.
+- **`LLMQueue.engine` and `LLMQueue.jobs` are deprecated** (Q35): they are private now and the
+  old names warn (`DeprecationWarning`) until 0.2.
+- `verify=False` / `use_ssl=False` in `credentials=` stays allowed and logs
+  `bedrock_tls_verify_off` once per account (Q31).
+- Calls borrowing one provider client are capped at its connection pool size; a call beyond it
+  waits before its attempt timers start, not for a socket inside them (R3PF-9). OpenAI pools are
+  sized by the slots routed to the account, at least `OpenAIOptions.max_connections`.
+- A new pool plan (`ClientPool.plan`) retires built Bedrock clients whose size changed; the next
+  call builds them at the new size (Q43).
+- OpenAI stream events keep the wire shape: nulls the server sent (`finish_reason: null`,
+  `content: null`) are kept, so `chunk["choices"][0]["finish_reason"]` no longer raises
+  `KeyError`; `partial_text` counts only choice 0 (R3ST-10).
 - Performance: <!-- filled at release -->
 
 ### Added
 
+- `Provider`, `Route`, `JobFn`, `Secrets` and `PublishResult` are importable from `llm_queue`
+  (Q35). `PublishResult.carried` lists the live routing blocks and kill switch a publish or
+  rollback kept (Q41).
+- `CredentialsRefreshSlow` (a `CredentialsUnavailable`) in `llm_queue.clients`.
+- Warnings `store_pool_small` (the store pool is below the worker slots plus a margin, R3PF-8)
+  and `store_pool_busy`; `StorePoolBusy` names a saturated store pool (R3PF-6).
 - **Client hub:** one SDK client per (event loop, credential identity, region, options) per
   process, shared by every queue and the sync path, reference-counted; clients for every
   deployment built concurrently at start; warm connections (unsigned `HEAD` requests, refreshed
@@ -166,7 +200,39 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 - `RequestStore.cancel` marks and announces a batch of calls in one script, skipping calls
   already final: cancel wins for a shared id (Q3, R3RC-1; the runtime's read-then-write of the
   callers set never cancelled a shared id).
-
+- The aiohttp Bedrock transport ignored `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` and
+  `REQUESTS_CA_BUNDLE`: a pod behind an egress proxy timed out on every call, and one behind a
+  TLS-inspecting gateway failed every certificate check, while STS worked (FC-1, R3SE-12).
+- A slow credentials refresh cut by the attempt timer dropped the client and its shared refresh,
+  and every call it cut doubled the account back-off (5 s to 60 s at once). The client is kept,
+  one refresh takes one back-off step, and a cut while the keys are still valid is a retryable
+  timeout, not `CredentialsUnavailable` (FC-2).
+- With `LLMQ_STORE_PASSWORD` set, a store URL with a user (an ACL user) failed every connection
+  (redis-py refuses a URL user or password with a credential provider); the URL's user is kept
+  and the rotating password used (R3SE-2).
+- A store pool wait that ran out read as the store being down; it waits again up to one read
+  timeout, then raises `StorePoolBusy` (R3PF-6).
+- An assumed role's external id was read once, so a rotated one failed every later refresh; it
+  is read on every AssumeRole (R3SE-11).
+- `openai._constants` failing to import was reported as `MissingExtra("openai")` (R3SE-13).
+- Streamed answers: partial tool JSON cut by `max_tokens`, a text and a tool delta on one index,
+  chunks without `delta` (Azure content filters), tool calls without `index`, and stream frames
+  whose JSON is not an object each failed a call (FATAL) whose whole stream had already reached
+  the caller (R3ST-4, R3ST-5, R3ST-11, R3ST-14).
+- `stop()` during a slow `start()` left a queue stopped and started at once (FC-3); a sync call
+  during the drain built a second private engine (FC-4); a private sync engine whose start
+  failed leaked its clients (FC-6); `converse_stream` closed early left its inner generator to
+  the finalizer (FC-12); a `KeyboardInterrupt` in a waiting sync thread left the call running,
+  and a loop between two `run_until_complete` calls was taken for stopped (FC-13).
+- Two concurrent `ClientPool.aclose()` released every client twice, and a cancel skipped the
+  rest (FC-7); `credentials=` / `secrets=` callables had no time limit (FC-8); an OpenAI
+  account edit left the old client open (FC-10); `credentials=` returning an expired key failed
+  `fatal` instead of trying the next account (FC-11); a dead loop's build lock was kept (FC-14);
+  a failing client close was not logged (FC-15).
+- The EMF writer thread was not restarted in a forked child, whose metric lines piled up and
+  were dropped (FC-9).
+- `RegistryStore.rollback` documents its real retry bound: `edit_retries x (edit_retries + 2)`
+  publishes (FC-16).
 - Clients audit (CL-*): the aiohttp Bedrock transport followed redirects and re-sent the signed
   body and session token to the new host (it never follows now; aiobotocore still does); TLS,
   proxy and bad-URL failures on the aiohttp transport were retried on every attempt and charged
@@ -380,7 +446,13 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   157-199 us -> 175-212 us a receive of one, no gain at batch 1 (fewer commands replicated).
   RENEW can set the caller key and return the epoch (FL-21); the heartbeat does not use it yet.
 - PUBLISH and EDIT test the registry document with EXISTS instead of reading it into Lua (FL-19).
-
+- Streamed answers are folded into the reply as they arrive, joined once: `_converse_body`
+  4,000 deltas 5.6 -> 1.9 ms, 16,000 74 -> 10 ms, 64,000 2,808 -> 49 ms (it was quadratic,
+  R3PF-1), and no list of every event is kept (2.7 MB for a 60 KB Bedrock answer, 2.4 KB per
+  OpenAI chunk, R3PF-4) (Python 3.12.13, Windows, 2026-11-15).
+- Bedrock text blocks skip the blob walk: request scan at 40 messages 629 -> 60 us, per streamed
+  delta 6.9 -> 0.5 us (FC-5; Python 3.12.13, Windows, 2026-11-15).
+- The default credentials and secrets lookups run inline instead of in a thread (FC-18).
 - The CloudWatch (EMF) sink writes its lines from a background thread instead of on the event
   loop: with a stdout that takes 5 ms per line (a backed-up log pipe), a metric point held the
   loop p50 5,346 us / p99 6,544 us; queued it takes p50 3.8 us / p99 30 us (Python 3.12,
