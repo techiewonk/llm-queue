@@ -111,7 +111,7 @@ A setting may be allowed at several levels. The most specific one wins:
 
 Some settings exist at only some levels (for example `shared_rpm` / `shared_tpm` only on an
 account, `model_fallback` only on a model). Every setting, its levels, type, range and default
-are in the [design plan](https://github.com/techiewonk/llm-queue/blob/main/docs/ACCOUNT_ROUTING_PLAN.md),
+are in the design plan (maintainers' notes in docs/internal, not published),
 sections 3.9 and 3.19.
 
 To see the effective value of each setting for a model and the level it came from:

@@ -142,9 +142,16 @@ jobs:
           ls got/*.whl
           built=$(sha256sum dist/*.whl | cut -d' ' -f1)
           uploaded=$(sha256sum got/*.whl | cut -d' ' -f1)
-          [ "$built" = "$uploaded" ] || { echo "::error::TestPyPI wheel differs from the build"; exit 1; }
+          wheel=got/*.whl
+          if [ "$built" != "$uploaded" ]; then
+            # TestPyPI never replaces a version (skip-existing kept an earlier upload, e.g. a dry
+            # run before the last commit). That copy is stale, not a fault of this build: smoke
+            # the wheel that PyPI will get instead of freezing this version for ever (R3RL-1).
+            echo "::warning::TestPyPI holds an older upload of $VERSION; smoke-testing the built wheel"
+            wheel=dist/*.whl
+          fi
           uv venv --python 3.12 try
-          uv pip install --python try got/*.whl
+          uv pip install --python try $wheel
           try/bin/python -c "import llm_queue, sys; v = llm_queue.__version__; print(v); sys.exit(v != '$VERSION')"
           try/bin/python -c "from llm_queue import LLMQueue, CallFailed, Tuning, StoreUnavailable"
           try/bin/llm-queue --help > /dev/null

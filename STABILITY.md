@@ -6,7 +6,7 @@
 - **Message format:** queue messages carry a format version `v`. A worker returns a message newer
   than it understands to the queue instead of dropping it.
 - **Store schema:** the key layout has a schema number; a change to it ships with a migration note.
-- **Supported versions:** Python 3.11-3.13 (3.14 runs in CI, not yet supported); Valkey 8
+- **Supported versions:** Python 3.11-3.14 (unit and integration tests run on each in CI); Valkey 8
   and Redis 7.2+ as one primary with replicas (tested on Valkey 8.1 and Redis 7.4). Cluster mode
   is not supported (one admission touches keys of several hash tags) and `start()` refuses it;
   `maxmemory-policy noeviction` is recommended (a warning at start otherwise). The client is

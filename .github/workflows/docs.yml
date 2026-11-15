@@ -17,9 +17,10 @@ on:
 permissions:
   contents: read
 
+# One group for every deploy (main and tags), so an older build never lands last (R3RL-10).
 concurrency:
-  group: docs-${{ github.ref }}
-  cancel-in-progress: true
+  group: docs-${{ github.event_name == 'pull_request' && github.ref || 'deploy' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:

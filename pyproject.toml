@@ -40,7 +40,7 @@ dependencies = [
     #   and _proxy_config.proxy_url_for(), and aiohttp's BaseConnector._acquired;
     # - bedrock_http: awaitable get_frozen_credentials() on refreshable credentials, and
     #   botocore.httpsession ProxyConfiguration / create_urllib3_context / get_cert_path.
-    "aiobotocore>=2.23,<4",
+    "aiobotocore>=2.24.3,<4",  # floor = the version the lowest-direct CI job installs
     # Queues, budgets, registry and results on any Redis-protocol store (Valkey, Redis).
     # 6+: TLS connections check the host name by default (off before), and the URL parser
     # the settings check uses matches the client's.
@@ -55,7 +55,11 @@ dependencies = [
     # Structured key-value logs. The library never configures it; the app does (README).
     "structlog>=24.1,<27",
     # UUIDv7 ids (time-ordered), Rust: 0.49 us per id vs 2.4 us for uuid.uuid4().hex (measured).
-    "uuid-utils>=0.19,<1",
+    "uuid-utils>=0.19,<2",
+    # The default Bedrock transport (clients/bedrock_http.py) imports aiohttp and yarl directly;
+    # they also come with aiobotocore, but a direct import needs its own bounds (R3RL-4).
+    "aiohttp>=3.10,<4",
+    "yarl>=1.12,<2",
 ]
 
 [project.scripts]
@@ -64,7 +68,7 @@ llm-queue = "llm_queue.engine.cli:main"
 [project.optional-dependencies]
 # httpx-aiohttp: the SDK's aiohttp client (`OpenAIOptions(http="aiohttp")`) on openai 1.x / 2.x
 # (3.x vendors it); aiohttp itself comes with aiobotocore. 0.1.8: the floor openai[aiohttp] sets.
-openai = ["openai>=1.40,<4", "httpx>=0.27,<1", "httpx-aiohttp>=0.1.8,<1"]
+openai = ["openai>=1.109,<4", "httpx>=0.27,<1", "httpx-aiohttp>=0.1.8,<1"]
 # Both LangChain lines are supported: 0.3 and 1.x (the adapters are tested on each).
 langchain-aws = ["langchain-aws>=0.2.24,<2", "langchain-core>=0.3.68,<2"]
 langchain-openai = ["langchain-openai>=0.3.26,<2", "langchain-core>=0.3.68,<2"]
@@ -73,7 +77,7 @@ metrics = ["prometheus-client>=0.20,<1"]
 # 0.115.3+: Starlette with the multipart DoS fixes (CVE-2024-47874).
 http = ["fastapi>=0.115.3,<1"]
 # A faster event loop on Linux / macOS (`llm_queue.run(main)` picks it up); no Windows build.
-uvloop = ["uvloop>=0.21; sys_platform != 'win32'"]
+uvloop = ["uvloop>=0.21,<1; sys_platform != 'win32'"]
 
 [project.urls]
 Homepage = "https://github.com/techiewonk/llm-queue"
@@ -123,7 +127,7 @@ packages = ["src/llm_queue"]
 [tool.hatch.build.targets.sdist]
 # Allow-list: secrets (.env, .pypirc) and local tooling can never reach the sdist.
 # The design plan, walkthrough and release / test plans are internal: never in the sdist.
-include = ["src/", "README.md", "LICENSE", "NOTICE", "CHANGELOG.md", "STABILITY.md", "SECURITY.md"]
+include = ["/src/", "/README.md", "/LICENSE", "/NOTICE", "/CHANGELOG.md", "/STABILITY.md", "/SECURITY.md"]  # anchored (R3RL-7)
 
 [tool.ruff]
 # target-version comes from project.requires-python.

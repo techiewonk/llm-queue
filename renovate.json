@@ -2,5 +2,17 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "lockFileMaintenance": {
+    "enabled": true
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Tool pins inside workflow run: lines (hatchling, twine, zizmor, zensical, mkdocstrings-python)",
+      "managerFilePatterns": ["/^\\.github/workflows/.+\\.ya?ml$/"],
+      "matchStrings": ["(?<depName>hatchling|twine|zizmor|zensical|mkdocstrings-python)==(?<currentValue>[0-9][^\\s\"']*)"],
+      "datasourceTemplate": "pypi"
+    }
   ]
 }

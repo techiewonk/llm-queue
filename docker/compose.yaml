@@ -8,7 +8,7 @@ name: llmq-test
 
 services:
   valkey:
-    # Prod runs Valkey 8.x on ElastiCache; password required, TLS off locally (the app's VALKEY_SSL=false).
+    # Valkey 8.x as on ElastiCache: password required; TLS off locally.
     image: valkey/valkey:8.1-alpine
     command: ["valkey-server", "--requirepass", "localdev", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
     ports: ["6379:6379"]
@@ -19,7 +19,7 @@ services:
       retries: 15
 
   redis:
-    # Redis 7.4 next to Valkey: every store test runs on both engines (plan E8). Port 6380.
+    # Redis 7.4 next to Valkey: every store test runs on both engines. Port 6380.
     image: redis:7.4-alpine
     command: ["redis-server", "--requirepass", "localdev", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
     ports: ["6380:6379"]

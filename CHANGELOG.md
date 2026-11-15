@@ -397,6 +397,22 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   settings read stays 232 ns (freezing happens once per view), but the request build goes
   13.6 -> 21.1 us (+55 %) with the copy (Python 3.12.13, Windows, 2026-11-15).
 
+### Packaging and CI
+
+- Dependencies: `aiohttp>=3.10,<4` and `yarl>=1.12,<2` are declared (the default Bedrock
+  transport imports them directly); `uuid-utils` now allows 1.x (`<2`, tested on 1.2.0); the
+  floors are raised to the versions CI's lowest-versions job really tests (`aiobotocore>=2.24.3`,
+  `openai>=1.109`); `uvloop` gained an upper bound (`<1`).
+- Python 3.14 is supported (unit and integration tests run on 3.11-3.14 in CI).
+- The sdist include list is anchored (a stray `samples/README.md` no longer ships).
+- CI builds the package on every pull request (build, `twine check --strict`, install the wheel
+  in a clean venv, import, `llm-queue --help`), every job has a timeout, and a new push cancels
+  the old pull-request run. Docs deploys share one group, so an older build never lands last.
+- The publish workflow no longer freezes a version after a TestPyPI dry run: TestPyPI keeps the
+  first upload of a version, so when that copy is older than the tag's build the smoke test
+  installs the built wheel instead (with a warning) and PyPI gets the new build.
+- Renovate also updates the tool pins inside workflow steps and refreshes the lock file.
+
 ### Security
 
 - Strict mode by default (see Changed); debug capture refused in every non-dev environment.

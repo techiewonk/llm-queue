@@ -19,7 +19,7 @@ flowchart LR
 
 Every step above is one store round trip; the measured numbers below say what each costs.
 
-Numbers from the CHANGELOG "Performance" section and [plan §13](https://github.com/techiewonk/llm-queue/blob/main/docs/ACCOUNT_ROUTING_PLAN.md) (2026-11-13, Python 3.12, fakellm, worker
+Numbers from the CHANGELOG "Performance" section and plan §13 (maintainers' notes in docs/internal, not published) (2026-11-13, Python 3.12, fakellm, worker
 processes as pods on one machine).
 
 | What | Measured |

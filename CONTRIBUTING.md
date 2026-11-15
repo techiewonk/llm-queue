@@ -282,8 +282,8 @@ The site (Zensical, GitHub Pages) is built from `zensical.toml` and follows
 `docs/reference/` (facts: configuration, errors, CLI and HTTP, extension points, the API
 generated from the docstrings) and `docs/project/` (changelog, stability, contributing,
 security, included from the root files). Put a new page in the section that matches what the
-reader is doing, and add it to `nav`. Internal docs (`docs/ACCOUNT_ROUTING_*`,
-`RELEASING.md`, `ARCHITECTURE.md`, and the git-ignored `docs/internal/`) are excluded
+reader is doing, and add it to `nav`. Internal docs (`ARCHITECTURE.md` and the git-ignored `docs/internal/`, which holds the
+design plan, walkthrough and release steps) are excluded
 from the site and from the sdist. README links are absolute GitHub URLs (it is shown on PyPI).
 
 ```bash
@@ -300,7 +300,7 @@ published release or a manual run (Actions > Docs > Run workflow).
 |---|---|
 | `README.md` | a public name, setting or behaviour changes |
 | `CHANGELOG.md` | always: under the unreleased version, in `Added`, `Fixed`, `Performance`, `Removed` or `Changed` |
-| `docs/ACCOUNT_ROUTING_PLAN.md` §13 | implementation status of a plan item changes |
+| `docs/internal/ACCOUNT_ROUTING_PLAN.md` §13 (maintainers only) | implementation status of a plan item changes |
 | `samples/README.md` (and the sample) | a usage pattern changes or a sample is added |
 | `docs/explanation/*.md` | the structure, the data flow, the failure model or a measured number changes |
 
@@ -323,4 +323,4 @@ that the tag matches `__version__`, is on `main` and has a CHANGELOG entry, re-r
 once, uploads to TestPyPI, smoke-tests that upload, uploads to PyPI with trusted publishing
 (OIDC, with provenance) and creates the GitHub Release. Never upload with `twine` or by hand,
 and never store a PyPI token. A manual run of the workflow is a dry run that stops after the
-TestPyPI smoke test. The steps are in [docs/RELEASING.md](https://github.com/techiewonk/llm-queue/blob/main/docs/RELEASING.md).
+TestPyPI smoke test. The steps are in docs/RELEASING.md (maintainers' notes in docs/internal, not published).

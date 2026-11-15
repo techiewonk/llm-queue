@@ -1,8 +1,8 @@
 # Architecture overview
 
 How llm-queue works, from the code under `src/llm_queue`. The design and
-its decisions are in the [design plan](https://github.com/techiewonk/llm-queue/blob/main/docs/ACCOUNT_ROUTING_PLAN.md); a worked example with
-sample data is in the [walkthrough](https://github.com/techiewonk/llm-queue/blob/main/docs/ACCOUNT_ROUTING_WALKTHROUGH.md). Anything marked
+its decisions are in the design plan (maintainers' notes in docs/internal, not published); a worked example with
+sample data is in the walkthrough (maintainers' notes in docs/internal, not published). Anything marked
 **unverified** was not confirmed in the code or by a measurement.
 
 ## Purpose and boundaries

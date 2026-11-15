@@ -43,7 +43,7 @@ queue = LLMQueue.from_env(
 The registry document's settings (budgets, balancing, fallback, retries, breaker, timeouts,
 queues, inference defaults, alerts) can each be set at some of the levels deployment > model >
 account > defaults. Every setting with its levels, type, range and default is in the
-[design plan](https://github.com/techiewonk/llm-queue/blob/main/docs/ACCOUNT_ROUTING_PLAN.md),
+design plan (maintainers' notes in docs/internal, not published),
 sections 3.9 and 3.19.
 
 For a running system, `llm-queue settings get --model M [--deployment D]` prints the effective
