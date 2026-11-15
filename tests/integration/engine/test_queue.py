@@ -250,6 +250,22 @@ async def test_rv_t1_a_reclaim_leaves_a_re_received_message_alone(
     assert await queues.ack(other)
 
 
+async def test_fl8_a_small_receive_behind_many_returned_takes_the_oldest(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-8: a receive read and sorted up to 1000 due ids even for one message (30 ms of store
+    time a receive after a mass return, measured). It now reads max(4 x want, 32); a receive
+    still takes the oldest returned messages first, before newer ones.
+    """
+    queues = await _filled(store, prefix, 100)
+    batch, _ = await queues.receive("q", 100, SLOW_VIS)
+    for message in reversed(batch):  # returned newest first: deadlines do not follow ids
+        await queues.return_(message)
+    await queues.send("q", b"new", SLOW_VIS)
+    first, _ = await queues.receive("q", 3, SLOW_VIS)
+    assert [m.body for m in first] == [b"m0", b"m1", b"m2"]
+
+
 async def test_q27_a_send_keeps_messages_one_day_by_default(
     store: redis.asyncio.Redis, prefix: str
 ) -> None:

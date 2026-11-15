@@ -86,10 +86,37 @@ end
 # Up to `want` messages of one queue (keys K), oldest first, whether new or visible again; a
 # lapsed hold counts one failure. Returns taken {id, generation, body, ...}, dead {id, body, ...}
 # and the dead letters' entry ids in the dead-letter stream.
+#
+# Only the oldest few due ids are picked out, in one pass (FL-8): the whole window of up to 1000
+# was sorted with two string.match calls per comparison (about 20,000 for 1000 ids), so after a
+# mass return each receive of each worker held the store for ~30 ms. Reading fewer ids instead
+# would break the order (the window is the lowest by visibility deadline, not by id). When the
+# few picked are used up (gone or dead entries), the receive stops rather than take a newer
+# message ahead of an older due one; the next receive goes on.
 _RECEIVE_FN = """
 local function receive(K, want, vis_ms, maxr, keep)
-local due = redis.call('ZRANGEBYSCORE', K[2], '-inf', now, 'LIMIT', 0, 1000)
-table.sort(due, older)
+local window = redis.call('ZRANGEBYSCORE', K[2], '-inf', now, 'LIMIT', 0, 1000)
+local keep_n = want * 3 + 8
+local due, nums = {}, {}
+for _, id in ipairs(window) do
+  local ms, seq = string.match(id, '(%d+)-(%d+)')
+  ms, seq = tonumber(ms), tonumber(seq)
+  local n = #due
+  if n < keep_n or ms < nums[n][1] or (ms == nums[n][1] and seq < nums[n][2]) then
+    -- Insert in order; the list never grows past keep_n.
+    local at = n + 1
+    while at > 1 and (ms < nums[at - 1][1] or (ms == nums[at - 1][1] and seq < nums[at - 1][2])) do
+      at = at - 1
+    end
+    table.insert(due, at, id)
+    table.insert(nums, at, {ms, seq})
+    if #due > keep_n then
+      table.remove(due)
+      table.remove(nums)
+    end
+  end
+end
+local partial = #window > keep_n
 local cursor = redis.call('HGET', K[7], 'cursor')
 local start = cursor and ('(' .. cursor) or '-'
 local fresh = redis.call('XRANGE', K[1], start, '+', 'COUNT', want)
@@ -97,6 +124,7 @@ local taken, gone, gone_at = {}, {}, {}
 local i, j = 1, 1
 local last_new = nil
 while #taken < want * 3 and (i <= #due or j <= #fresh) do
+  if partial and i > #due then break end
   local pick_due
   if i > #due then pick_due = false
   elseif j > #fresh then pick_due = true
