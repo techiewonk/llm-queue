@@ -54,7 +54,7 @@ from llm_queue.engine.envelope import (
     Envelope,
     Meta,
     Reply,
-    message_size_bytes,
+    encode_params,
     params_hash,
     parse,
 )
@@ -953,8 +953,10 @@ class Engine:
             alias = usable[0]
         op = _op_of(view, alias)
         # Here, not in the front door, so every path meets it: async and sync calls, streams,
-        # embeddings, jobs and the LangChain adapters (plan C1). One orjson pass over the params.
-        size, limit = message_size_bytes(params), int(view.value(alias, "max_message_bytes"))
+        # embeddings, jobs and the LangChain adapters (plan C1). One orjson pass over the params,
+        # kept for the message itself (FO-21: it was encoded a second time by `dumps`).
+        encoded = encode_params(params)
+        size, limit = len(encoded[0]), int(view.value(alias, "max_message_bytes"))
         if size > limit:
             raise CallFailed(  # one kind for every too-big call (owner Q38)
                 "request_too_large",
@@ -981,6 +983,7 @@ class Engine:
             app_request_id=request_id is not None,
             stream=stream,
         )
+        envelope.keep_params_json(encoded)
         hook_name = view.value(alias, "admission")
         hook = hooks.get("admission", hook_name)
         if hook is not None:

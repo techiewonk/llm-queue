@@ -857,6 +857,10 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
   per-caller inbox stream (one key per read) is not done.
 - `stream()` reads each chunk entry with one queue get; a Task and an `asyncio.wait` per entry
   cost 42 us each (R3PF-11, caller side; the worker still flushes one pipeline per stream).
+- A call's params are encoded once: the size cap's orjson bytes are spliced into the message
+  (`orjson.Fragment`) instead of `Envelope.dumps` encoding them again (FO-21). Size cap plus
+  message, median: a 2 MB image request 16.3 -> 9.4 ms, a 200 KB text request 70 -> 47 us, a
+  4 KB chat 10.0 -> 9.3 us (micro-benchmark, Python 3.12.13, Windows, 2026-11-15).
 
 ### Packaging and CI
 

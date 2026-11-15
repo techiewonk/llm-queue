@@ -29,6 +29,7 @@ from llm_queue.engine.envelope import (
     MAX_MESSAGE_BYTES,
     Envelope,
     Reply,
+    encode_params,
     message_size_bytes,
     params_hash,
     parse,
@@ -93,6 +94,22 @@ def test_message_size_counts_encoded_bytes() -> None:
     size = message_size_bytes(CHAT)
     assert len(IMAGE) * 4 // 3 < size < len(IMAGE) * 4 // 3 + 500
     assert MAX_MESSAGE_BYTES == 4 * 1024 * 1024
+
+
+@pytest.mark.parametrize("params", [CHAT, {"messages": [{"role": "user", "content": "hi"}]}])
+def test_fo21_kept_params_json_gives_the_same_message(params: dict[str, Any]) -> None:
+    """FO-21: the size cap encoded the params and `dumps` encoded them again (two passes).
+
+    The cap's bytes are now spliced into the message: same bytes out, and they parse back.
+    """
+    common: dict[str, Any] = {"request_id": "r", "op": "converse", "model": "m", "caller": "c"}
+    plain = Envelope(params=params, timeout_secs=5, **common)
+    kept = Envelope(params=params, timeout_secs=5, **common)
+    kept.keep_params_json(encode_params(params))
+    assert kept.dumps() == plain.dumps()
+    assert parse(kept.dumps()).params == params
+    # A copy (the `pause` retry changes only the timeout) keeps the reused bytes valid.
+    assert parse(kept.model_copy(update={"timeout_secs": 2}).dumps()).timeout_secs == 2
 
 
 # ------------------------------------------------------------------------- embed
