@@ -47,6 +47,9 @@ class EmbeddingCodec:
     `patterns` are case-insensitive substrings of a model id that name this family.
     `input_types`, when set, is the closed set of `input_type` values the family takes (others
     fail before any call). `probe_options` go into the health probe's one-text request.
+    `inference_names` are the registry `inference` names (`dimensions`, `normalize`,
+    `input_type`, `truncate`, `embedding_types`) an InvokeModel body of this family takes: the
+    worker fills those from the registry and drops the others; None leaves the body as built.
     """
 
     name: str
@@ -57,6 +60,7 @@ class EmbeddingCodec:
     patterns: tuple[str, ...] = ()
     input_types: frozenset[str] | None = None
     probe_options: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    inference_names: frozenset[str] | None = None
 
     def matches(self, model_id: str) -> bool:
         """True when one of `patterns` is in the model id, whatever its case (R3JE-21)."""
@@ -150,7 +154,15 @@ def _openai_reply(body: Any) -> list[list[float]]:
 # 50,000 (8,192 tokens), Cohere v3 2,048. OpenAI counts tokens, so the server decides. A
 # model's `embed_max_chars` wins over these.
 TITAN = EmbeddingCodec(
-    "titan", _titan_request, _bedrock_vectors, TITAN_MAX_BATCH, 50_000, ("titan-embed",)
+    "titan",
+    _titan_request,
+    _bedrock_vectors,
+    TITAN_MAX_BATCH,
+    50_000,
+    ("titan-embed",),
+    # `embedding_types` is kept as the worker kept it before the codecs (unverified that
+    # Titan accepts it; its own field is `embeddingTypes`).
+    inference_names=frozenset({"dimensions", "normalize", "embedding_types"}),
 )
 COHERE = EmbeddingCodec(
     "cohere",
@@ -162,6 +174,7 @@ COHERE = EmbeddingCodec(
     input_types=COHERE_INPUT_TYPES,
     # Cohere refuses a body without `input_type`; the probe skips the registry defaults.
     probe_options=MappingProxyType({"input_type": "search_query"}),
+    inference_names=frozenset({"input_type", "truncate", "embedding_types"}),
 )
 OPENAI = EmbeddingCodec("openai", _openai_request, _openai_reply, OPENAI_DEFAULT_CHUNK_SIZE)
 

@@ -10,9 +10,15 @@ from __future__ import annotations
 import copy
 import math
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from llm_queue.errors import LLMQueueError
+
+if TYPE_CHECKING:
+    from llm_queue.providers.embeddings import EmbeddingCodec
+
+# Registry `inference` names that go into an embedding body; each family takes some of them.
+_EMBED_NAMES = ("dimensions", "normalize", "input_type", "truncate", "embedding_types")
 
 # Registry name -> (Converse path, OpenAI field).
 _CHAT_BEDROCK = {
@@ -110,8 +116,13 @@ def apply(
     params: Mapping[str, Any],
     defaults: Mapping[str, Any],
     limits: Mapping[str, Any],
+    *,
+    codec: EmbeddingCodec | None = None,
 ) -> dict[str, Any]:
-    """The request with defaults filled, locked values enforced and `max_tokens` capped."""
+    """The request with defaults filled, locked values enforced and `max_tokens` capped.
+
+    `codec` is an embedding model's family: an InvokeModel body gets the defaults it takes.
+    """
     # Only the top level and the sub-dicts written below are copied (the messages are never
     # changed): a deepcopy of the whole request was 1.86 ms per call at 217 KB (measured).
     out = dict(params)
@@ -160,16 +171,17 @@ def apply(
         return out
     if op == "embeddings" and "dimensions" in defaults:
         out.setdefault("dimensions", defaults["dimensions"])
-    if op == "invoke_model" and isinstance(out.get("body"), Mapping):
+    names = codec.inference_names if codec is not None else None
+    if op == "invoke_model" and names is not None and isinstance(out.get("body"), Mapping):
+        # The family's codec says which registry names its body takes; the other embedding
+        # names are dropped (the model refuses them). This sniffed `inputText` to tell Titan
+        # from Cohere, a second copy of the family rules.
         body = dict(out["body"])
-        names = ("dimensions", "normalize", "input_type", "truncate", "embedding_types")
-        for name in names:
-            if name in defaults and (name in locked or name not in body):
+        for name in _EMBED_NAMES:
+            if name not in names:
+                body.pop(name, None)
+            elif name in defaults and (name in locked or name not in body):
                 body[name] = defaults[name]
-        if "inputText" in body:  # Titan takes dimensions / normalize only
-            body = {k: v for k, v in body.items() if k not in ("input_type", "truncate")}
-        else:  # Cohere takes input_type / truncate / embedding_types only
-            body = {k: v for k, v in body.items() if k not in ("dimensions", "normalize")}
         out["body"] = body
     return out
 

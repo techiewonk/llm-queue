@@ -195,6 +195,22 @@ def test_openai_build_and_parse() -> None:
     assert (OPENAI.max_batch, OPENAI.max_chars) == (2048, None)
 
 
+def test_registry_defaults_follow_the_codec() -> None:
+    """The worker sniffed `inputText` to tell Titan from Cohere; now the codec names the fields."""
+    from llm_queue.engine import inference
+
+    defaults = {"dimensions": 256, "input_type": "search_document"}
+    nova = inference.apply("bedrock", "invoke_model", {"body": {"items": []}}, defaults, {},
+                           codec=NOVA)  # fmt: skip
+    assert nova["body"] == {"items": []}  # no `inference_names`: left as built
+    picky = EmbeddingCodec(
+        "p", _nova_request, _nova_reply, 1, inference_names=frozenset({"dimensions"})
+    )
+    body = {"items": [], "truncate": "END"}
+    out = inference.apply("bedrock", "invoke_model", {"body": body}, defaults, {}, codec=picky)
+    assert out["body"] == {"items": [], "dimensions": 256}
+
+
 def test_probe_uses_the_family_codec() -> None:
     """The probe guessed from the id alone: a Cohere model behind an ARN got Titan's body."""
     assert _probe_params("bedrock", "embedding", ARN, "cohere") == {

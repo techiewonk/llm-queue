@@ -2611,12 +2611,14 @@ class Engine:
                 dropped = (*dropped, *_TOOL_FIELDS)
             params = {k: v for k, v in params.items() if k not in dropped}
             limits = {**limits, "on_exceed": "clamp"}
+        embedding = entry.type == "embedding"
         request = inference.apply(
             entry.provider,
             env.op,
             params,
             view.value(alias, "inference", dep) or {},
             limits,
+            codec=codec_for(entry.provider, entry.model_id, entry.family) if embedding else None,
         )
         extra = view.value(alias, "params", dep) if dep else None
         return inference.merge_params(request, extra or {})
