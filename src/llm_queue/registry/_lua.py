@@ -42,7 +42,8 @@ PUBLISH = (
     + """
 local version = tonumber(ARGV[2])
 local stored_version = tonumber(redis.call('HGET', KEYS[2], 'version') or '0')
-local stored_doc = redis.call('GET', KEYS[1])
+-- EXISTS, not GET (FL-19): every pod boot read the whole document into Lua to test it.
+local stored_doc = redis.call('EXISTS', KEYS[1]) == 1
 local replace = ARGV[9] == '1' and stored_version == version
 if stored_doc and stored_version >= version and not replace then
   -- The stored document is not sent back: no caller read it, and every pod boot (`kept`)
@@ -69,7 +70,13 @@ end
 audit(ARGV[4], 'publish', version, ARGV[5], ARGV[6])
 local last = #KEYS - tonumber(ARGV[10])
 write_models(5, last, 11, changes)
-for i = last + 1, #KEYS do redis.call('DEL', KEYS[i]) end
+for i = last + 1, #KEYS do
+  -- With the numbers key (`...:cfg`), the model's own state keys go too (FL-7): health,
+  -- rotation, in-progress set and waiters stayed for good once nothing swept the model.
+  local base = string.sub(KEYS[i], 1, -4)
+  redis.call('DEL', KEYS[i], base .. 'health', base .. 'rot', base .. 'inprog', base .. 'wait:p',
+    base .. 'wait:n', base .. 'waitinfo', base .. 'waitexp')
+end
 return {'published', version, ''}
 """
 )
@@ -81,7 +88,7 @@ EDIT = (
     _COMMON
     + """
 local changes = tonumber(redis.call('HGET', KEYS[2], 'changes') or '0')
-if changes ~= tonumber(ARGV[2]) or not redis.call('GET', KEYS[1]) then
+if changes ~= tonumber(ARGV[2]) or redis.call('EXISTS', KEYS[1]) == 0 then
   return {'conflict', changes}
 end
 changes = redis.call('HINCRBY', KEYS[2], 'changes', 1)
