@@ -108,6 +108,11 @@ METRICS: dict[str, MetricSpec] = {
         "model account region", "Streams: from the attempt's start to its first chunk", CALL_BUCKETS
     ),
     "llmq_admission_refusals_total": _c("model reason", "Calls refused by admission, once each"),
+    "llmq_tenant_refusals_total": _c(
+        "model mode",
+        "Calls held back by tenant fairness, once each: quota (failed rate_limited) or share "
+        "(waited while tenants within their share wait); never labelled by tenant",
+    ),
     "llmq_retries_total": _c("model reason", "Retries after a failed attempt, by error kind"),
     "llmq_grants_lost_total": _c("model step", "Grants found gone at renew or finish"),
     "llmq_store_errors_total": _c("where", "Store errors by step", "every pod"),

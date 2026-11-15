@@ -190,8 +190,170 @@ local function cfg_of(alias)
 end
 """
 
+# Per-tenant fairness (owner Q28, Q29, Q50): helpers PICK_TAKE calls only when an ask carries
+# `tf` (see engine/fairness.py); with fairness off none of them runs. A chunk of its own, so the
+# admission script itself changes by three guarded calls.
+_TENANT = r"""
+-- Keys, all under the model's tag and all with an expiry (h: the tenant's keyed hash):
+--   tf:t:<h>  hash: the tenant's clocks (r_ / t_ fields, as the deployment budgets) and `fq`,
+--             its last fair round
+--   tf:s:<h>  zset: the tenant's slots in use, scored by lease end (share)
+--   tf:act    zset: active tenants by their last ask; tf:w hash: their weights and `~sum`
+--   tf:need   zset: asks refused while within their share, by waiter expiry (share)
+--   tf:fq     hash: `v`, the round of the last grant (fair_queue)
+-- Every step is O(log n) in the tenants: nothing scans them (stale ones leave 16 per ask).
+local function tf_keys(alias, h)
+  return mk(alias, 'tf:t:' .. h), mk(alias, 'tf:s:' .. h)
+end
+
+-- Mark the tenant active; returns the sum of the active tenants' weights, its own included.
+local function tf_active(alias, tf)
+  local act, wts = mk(alias, 'tf:act'), mk(alias, 'tf:w')
+  local act_ms = num(tf.act, 60000)
+  local sum = hnum(wts, '~sum', 0)
+  for _, h in ipairs(redis.call('ZRANGEBYSCORE', act, '-inf', '(' .. (now - act_ms), 'LIMIT', 0, 16)) do
+    sum = sum - hnum(wts, h, 0)
+    redis.call('HDEL', wts, h)
+    redis.call('ZREM', act, h)
+  end
+  local w = num(tf.w, 1)
+  sum = sum - hnum(wts, tf.h, 0) + w
+  if sum < w then sum = w end  -- rounding, or a weight hash lost before the set
+  redis.call('HSET', wts, tf.h, tostring(w), '~sum', tostring(sum))
+  redis.call('ZADD', act, now, tf.h)
+  local ttl = math.max(KEY_MS, 2 * act_ms)
+  slide(act, ttl)
+  slide(wts, ttl)
+  return sum
+end
+
+-- The model's budget the shares split: confirmed, usable deployments' rpm, tpm and slots.
+local function tf_capacity(rows)
+  local cr, ct, cs = 0, 0, 0
+  for _, row in pairs(rows) do
+    if row.group ~= 'fallback' and row.enabled ~= false and row.account_enabled ~= false
+      and not row.blocked and not row.outside_residency then
+      local lim = row.rate_limits
+      if (lim == 'both' or lim == 'rpm') and present(row.rpm) then cr = cr + tonumber(row.rpm) end
+      if (lim == 'both' or lim == 'tpm') and present(row.tpm) then ct = ct + tonumber(row.tpm) end
+      cs = cs + num(row.max_concurrency, 200)
+    end
+  end
+  return cr, ct, cs
+end
+
+-- A share clock (GCRA at the tenant's share): wait ms (0 = within its share) and the state
+-- after charging c even when it borrows. The debt stops one minute past the bucket, so a
+-- tenant that borrowed on an idle model is not held back for long once others come.
+local function tf_clock(key, f, L, c, bf)
+  local per = 60000 / L
+  local burst = math.max(1, math.floor(L * bf))
+  local tat = math.max(rnum(key, f .. '_tat', now), now)
+  local over = tat + c * per - now - burst * per
+  if c > burst and tat <= now then over = 0 end
+  return math.max(0, over), math.min(tat + c * per, now + 60000 + burst * per)
+end
+
+-- The tenant step, before any deployment is tried. Returns a reply to send at once (a quota
+-- refusal, or a share wait) or nil, and the state a grant writes.
+local function tf_check(alias, rows, rid, tf, cost_r, cost_t)
+  local tkey, skey = tf_keys(alias, tf.h)
+  local st = {skey = skey, bud = {}, writes = {}, mode = 'smooth'}
+  local sum = tf_active(alias, tf)
+  if tf.m == 'quota' then
+    -- Hard caps, no borrowing: the model's window (fixed or smooth) and burst.
+    st.mode = tf.win or 'smooth'
+    for _, b in ipairs({{'r', tf.rpm, cost_r}, {'t', tf.tpm, cost_t}}) do
+      if present(b[2]) and tonumber(b[2]) > 0 then
+        local wait, value = room(tkey, b[1], tonumber(b[2]), b[3], 0, num(tf.bf, 0.1), st.mode)
+        if wait > 0 then
+          return {r = 'tenant_limited', ms = math.max(1, math.floor(wait)), reason = 'quota'}, st
+        end
+        table.insert(st.writes, {tkey, b[1], st.mode, value})
+        table.insert(st.bud, {tkey, b[1], tonumber(b[2]), b[1]})
+      end
+    end
+    return nil, st
+  end
+  if tf.m == 'fair_queue' then
+    -- The call's round: max(the round served last, the tenant's last round) + 1, kept for
+    -- the call's later asks. A tenant's lead is capped, so calls it gave up cannot bury it.
+    local r = num(tf.fr, nil)
+    if r == nil then
+      local v = hnum(mk(alias, 'tf:fq'), 'v', 0)
+      r = math.max(v, math.min(hnum(tkey, 'fq', 0), v + 1000)) + 1
+      redis.call('HSET', tkey, 'fq', tostring(r))
+      slide(tkey, math.max(KEY_MS, 2 * num(tf.act, 60000)))
+    end
+    st.round = r
+    return nil, st
+  end
+  -- share: weight / the active tenants' weights, of the model's rpm, tpm and slots.
+  local share = num(tf.w, 1) / sum
+  local cr, ct, cs = tf_capacity(rows)
+  local wait = 0
+  for _, b in ipairs({{'r', cr, cost_r}, {'t', ct, cost_t}}) do
+    if b[2] > 0 then
+      local L = b[2] * share
+      local w, value = tf_clock(tkey, b[1], L, b[3], num(tf.bf, 0.1))
+      if w > wait then wait = w end
+      table.insert(st.writes, {tkey, b[1], 'smooth', value})
+      table.insert(st.bud, {tkey, b[1], L, b[1]})
+    end
+  end
+  redis.call('ZREMRANGEBYSCORE', skey, '-inf', now)
+  if cs > 0 and redis.call('ZCARD', skey) >= math.max(1, math.floor(cs * share)) then
+    wait = math.max(wait, num(T.slot_wait_ms, 50))
+  end
+  if wait <= 0 then
+    st.within = true
+    return nil, st
+  end
+  -- Over its share: it borrows only what no tenant within its share is waiting for.
+  local need = mk(alias, 'tf:need')
+  redis.call('ZREMRANGEBYSCORE', need, '-inf', '(' .. now)
+  local n = redis.call('ZCARD', need)
+  if n > 0 and redis.call('ZSCORE', need, rid) then n = n - 1 end
+  if n > 0 then
+    return {r = 'wait', ms = math.max(1, math.floor(wait)), reason = 'tenant'}, st
+  end
+  return nil, st
+end
+
+-- Refused for budget: a call within its share is one others may not borrow ahead of; a
+-- fair_queue call takes its round back with the reply.
+local function tf_refused(alias, st, rid, exp, reply)
+  if st.within then
+    local need = mk(alias, 'tf:need')
+    redis.call('ZADD', need, exp, rid)
+    slide(need, held_ms())
+  end
+  if st.round then reply.fr = st.round end
+end
+
+-- Granted: the tenant's clocks, its slot, the round served; the entry keeps what to give back.
+local function tf_grant(alias, tf, st, entry_key, owner, rid, lease_ms)
+  for _, s in ipairs(st.writes) do write(s[1], s[2], s[3], s[4]) end
+  if tf.m == 'share' then
+    redis.call('ZADD', st.skey, now + lease_ms, owner)
+    slide(st.skey, held_ms())
+    redis.call('ZREM', mk(alias, 'tf:need'), rid)
+    redis.call('HSET', entry_key, 'tf_slot', st.skey)
+  end
+  if #st.bud > 0 then
+    redis.call('HSET', entry_key, 'tf_bud', cjson.encode(st.bud), 'tf_mode', st.mode)
+  end
+  if st.round then
+    local fq = mk(alias, 'tf:fq')
+    if st.round > hnum(fq, 'v', 0) then redis.call('HSET', fq, 'v', tostring(st.round)) end
+    slide(fq, DAY_MS)
+  end
+end
+"""
+
 PICK_TAKE = (
     _COMMON
+    + _TENANT
     + r"""
 local alias = req.alias
 local model, rows, changes = cfg_of(alias)
@@ -322,6 +484,15 @@ local function reserve_from(list, into)
   end
 end
 local pos = num(req.pos, now * 1000)
+-- Tenant fairness, only with `tf` (_TENANT): a quota refusal or a share wait returns here, and
+-- fair_queue orders the call among the waiters by its round instead of its queue position.
+local tf_st = nil
+if present(req.tf) then
+  local stop
+  stop, tf_st = tf_check(alias, rows, rid, req.tf, whole(num(req.cost_r, 1)), whole(num(req.cost_t, 0)))
+  if stop then return cjson.encode(stop) end
+  if tf_st.round then pos = tf_st.round end
+end
 if not foreign then
   -- %.17g: plain `..` formats with %.14g and misorders waiters within ~0.1 ms of each other.
   local before = '(' .. string.format('%.17g', pos)
@@ -571,8 +742,10 @@ if not chosen then
   slide(info_key, held_ms())
   redis.call('ZADD', exp_key, exp, cls .. '|' .. rid)
   redis.call('PEXPIRE', exp_key, KEY_MS)
-  return cjson.encode({r = 'wait', ms = math.max(1, math.floor(best_wait or num(T.wait_ms, 100))),
-    reason = best_reason or 'slot'})
+  local reply = {r = 'wait', ms = math.max(1, math.floor(best_wait or num(T.wait_ms, 100))),
+    reason = best_reason or 'slot'}
+  if tf_st then tf_refused(alias, tf_st, rid, exp, reply) end
+  return cjson.encode(reply)
 end
 
 -- Take everything at once.
@@ -634,6 +807,7 @@ if req.strategy == 'round_robin' then
 end
 for field, value in pairs(rot_writes) do redis.call('HSET', mk(alias, 'rot'), field, value) end
 if req.strategy == 'round_robin' or next(rot_writes) then slide(mk(alias, 'rot'), DAY_MS) end
+if tf_st then tf_grant(alias, req.tf, tf_st, entry_key, req.owner, rid, lease_ms) end
 local granted = {r = 'granted', dep = chosen.key, minute = minute, limit = res.limit,
   tier = chosen.tier}
 -- A stream's call: how far its chunk stream got (another worker may have begun it, R19); an
@@ -679,6 +853,14 @@ local function settle(alias, owner, rid, refund_r, refund_t, learn, outcome, lat
       if cls == 'n' then redis.call('HINCRBY', rkey, 'seen_n', -refund_r) end
     end
   end
+  -- Tenant fairness (fields written only when it was on): its clocks and slot go back too.
+  local tf = redis.call('HMGET', entry_key, 'tf_bud', 'tf_mode', 'tf_slot')
+  if tf[1] then
+    for _, b in ipairs(cjson.decode(tf[1])) do
+      give(b[1], b[2], b[3], (b[4] == 'r') and refund_r or refund_t, tf[2] or 'smooth', granted_minute)
+    end
+  end
+  if tf[3] then redis.call('ZREM', tf[3], owner) end
   redis.call('ZREM', mk(alias, 'lease:' .. dep .. ':' .. cls), owner)
   redis.call('ZREM', mk(alias, 'inprog'), owner)
   -- A breaker probe that ended without a verdict (cut, given back, throttled) frees the probe
@@ -841,6 +1023,12 @@ for _, item in ipairs(req.items) do
     slide(mk(item.alias, 'lease:' .. dep .. ':' .. cls), held_ms())
     slide(mk(item.alias, 'inprog'), held_ms())
     redis.call('PEXPIRE', entry_key, num(req.lease_ms, 60000) * 2)
+    -- A tenant's slot (fairness share) lives as long as the grant's lease.
+    local tf_slot = redis.call('HGET', entry_key, 'tf_slot')
+    if tf_slot then
+      redis.call('ZADD', tf_slot, until_, item.owner)
+      slide(tf_slot, held_ms())
+    end
     beat(item.request_id, redis.call('HGET', entry_key, 'job_owner')
       or string.match(item.owner, '^.*|([^|]*)|[^|]*$'))
     renewed = renewed + 1

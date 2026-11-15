@@ -336,6 +336,24 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
 
 ### Added
 
+- **Per-tenant fairness** (owner Q28, Q29, Q50): registry setting `fairness` (defaults or per
+  model, *merged*), **off by default** (admission is unchanged when off). The tenant is the
+  call's `tenant_id`, else its `user_id` (calls with neither share one tenant); the store keys
+  hold only its keyed id hash, and no metric carries it. Modes: `share` (each active tenant
+  gets `weight / active weights` of the model's rpm, tpm and slots; an over-share tenant
+  borrows unless a tenant within its share is waiting), `quota` (hard per-tenant `rpm` / `tpm`
+  caps, `quotas` per tenant; a refusal is `CallFailed("rate_limited")` with
+  `retry_after_secs`), `fair_queue` (waiting calls served round robin between tenants). Each
+  admission is O(log n) in tenants, every new key (`{m:ALIAS}:tf:*`) has an expiry, and the
+  scripts stay not cluster-safe like the rest of admission. New metric
+  `llmq_tenant_refusals_total{model, mode}`, refusal reason `tenant`, `status()` field
+  `fairness` (counts only), registry checks. See
+  [Tenant fairness](docs/explanation/fairness.md).
+  Measured 2026-11-15 on the local Valkey 8.1 (6,000 PICK_TAKE + FINISH cycles per variant,
+  interleaved, 100 tenants; server time per script call from `INFO commandstats`): before the
+  feature 287.0 us, **off 288.0 us (+0.3 %, within noise)**, `fair_queue` 312.2 us (+9 %),
+  `quota` 325.3 us (+13 %), `share` 353.4 us (+23 %). Client round trips on this loaded
+  Windows box (median about 4 ms per cycle) did not separate the variants.
 - **`register_embedding_family(name, codec)` and `EmbeddingCodec`**: an app adds an embedding
   family (Cohere v4, Nova, ...) without a library release; the registry's `family` accepts its
   name, and its id patterns are tried before the built-in ones. Register it in every process

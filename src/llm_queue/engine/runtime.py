@@ -59,6 +59,7 @@ from llm_queue.engine.envelope import (
     parse,
 )
 from llm_queue.engine.errors import CallFailed
+from llm_queue.engine.fairness import Fairness, fairness_for
 from llm_queue.engine.health import Health
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.metrics import GaugeSet, Metrics, NullSink
@@ -392,6 +393,9 @@ class _Held:
     last_dep: str = ""
     attempts: int = 0
     granted_secs: float = 0.0
+    # Tenant fairness (fair_queue): the call's round per model, so a re-ask keeps its place.
+    fair_rounds: dict[str, float] = field(default_factory=dict)
+    tenant_waited: bool = False  # a share wait was counted for this call
 
     @property
     def position(self) -> float:
@@ -2618,9 +2622,29 @@ class Engine:
             callers_ttl=self.caller_ttl_secs if held.check_callers else None,
             count_first=int(self.clock.now() // 60) if attempt == 1 else None,
             chunks=env.stream and env.op in ("converse", "chat"),
+            fairness=self._fairness(view, alias, held),
         )
         held.estimates[(alias, ask.owner)] = estimate
         return ask
+
+    def _fairness(self, view: ResolvedRegistry, alias: str, held: _Held) -> Fairness | None:
+        """The call's tenant fairness on model `alias` (None when its `fairness` is off).
+
+        The tenant is the call's tenant id, else its user id; only its keyed hash leaves here.
+        """
+        setting = view.value(alias, "fairness")
+        if setting.get("mode", "off") == "off":
+            return None
+        env = held.envelope
+        return fairness_for(
+            setting,
+            env.tenant_id,
+            env.user_id,
+            self.hash_id,
+            burst=float(view.value(alias, "rate_burst")),
+            window=str(view.value(alias, "rate_window")),
+            round_=held.fair_rounds.get(alias),
+        )
 
     def _custom_order(
         self,
@@ -2859,6 +2883,8 @@ class Engine:
         ):
             decision = await self.admission.pick_take(ask, self.registry.changes)
         held.check_callers = False  # checked once, on its first admission
+        if ask.fairness is not None and await self._tenant_step(alias, held, ask, decision):
+            return None
         if decision.kind == "gone":
             # A warning: a dropped call is worth seeing (the soak and scenario S5 found calls
             # dropped wrongly, and INFO logs alone did not show it).
@@ -2897,6 +2923,31 @@ class Engine:
         if decision.kind == "none":
             return await self._none_usable(view, alias, held, attempt, failed)
         return decision
+
+    async def _tenant_step(self, alias: str, held: _Held, ask: Ask, decision: Decision) -> bool:
+        """Tenant fairness after an admission: keep the fair round, count, settle a quota refusal.
+
+        True when the call was settled: its tenant's quota is used up, so it fails at once as
+        `rate_limited` with `retry_after_secs` (a hard cap, no wait). Labels are the model and
+        the mode only, never a tenant.
+        """
+        fairness = ask.fairness
+        assert fairness is not None
+        if (fair_round := decision.extra.get("fr")) is not None:
+            held.fair_rounds[alias] = float(fair_round)
+        if decision.kind == "tenant_limited":
+            self.metrics.count("llmq_tenant_refusals_total", model=alias, mode=fairness.mode)
+            await self._finish_call(
+                held,
+                "rate_limited",
+                "the tenant's quota is used up",
+                retry_after=max(decision.wait_secs, 0.001),
+            )
+            return True
+        if decision.kind == "wait" and decision.reason == "tenant" and not held.tenant_waited:
+            held.tenant_waited = True  # once per call, like the refusals counter
+            self.metrics.count("llmq_tenant_refusals_total", model=alias, mode=fairness.mode)
+        return False
 
     async def _none_usable(
         self,

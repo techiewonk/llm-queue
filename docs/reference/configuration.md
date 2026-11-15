@@ -117,6 +117,7 @@ refused with its path when the registry is loaded or edited.
 | `alerts` | defaults, model | `{"quota_used_pct": 90, "dlq_messages": 1, "queue_age_secs": 600}` | *merged*; `queue_age_secs` (1 or more) turns `queue_stalled` on when the oldest queued call is older; the four names removed in 0.1.0b2 are ignored with a warning until 0.2 |
 | `admission`, `fallback_policy`, `token_estimator`, `probe` | defaults, model | none | Names of registered hooks (1-64 letters, digits, `_`, `.`, `-`) |
 | `debug_capture` | model | false | Store prompt and answer for an hour (dev only; protected) |
+| `fairness` | defaults, model | `{"mode": "off", "default_weight": 1, "active_secs": 60}` | *merged*; per-tenant fairness, see [Tenant fairness](../explanation/fairness.md). `mode`: `off`, `share`, `quota` or `fair_queue`; `weights` (share: tenant id -> weight above 0, at most 1000000) and `default_weight`; `rpm`, `tpm` (quota: each tenant's cap, whole numbers of at least 1) and `quotas` (tenant id -> `{rpm, tpm}`); `active_secs` (1 to 86400). Tenant ids 1-256 characters. A `quota` with no cap is refused; a cap above the model's budget, a `tpm` cap below one call's reservation and settings the mode never reads warn |
 
 Names (aliases, accounts, regions) are 1-64 lowercase letters, digits, `_`, `.` or `-`,
 starting with a letter or digit; a trailing newline or padding is refused. A stored document is
