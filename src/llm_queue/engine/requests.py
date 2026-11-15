@@ -48,7 +48,9 @@ local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 
 # KEYS: job, callers, status, result. ARGV: user hash, params hash, caller, unconfirmed ttl,
 # status ttl, model, priority, takeover grace secs, app id ('1': kept after its first read).
-# Returns new | attached | takeover | done | expired | conflict.
+# Returns new | attached | takeover | done | expired | conflict. Only a success is replayed
+# (owner decision Q2): an id whose last run ended failed, expired or cancelled runs again (`new`),
+# its old result, status and cancel mark dropped in the same script.
 _REGISTER_FN = """
 local function register()
 local job = redis.call('HGETALL', KEYS[1])
@@ -59,7 +61,7 @@ local function keep_callers()
   local ttl = redis.call('TTL', KEYS[1])
   if ttl > 0 then redis.call('EXPIRE', KEYS[2], ttl) end
 end
-if #job == 0 then
+local function create()
   redis.call('HSET', KEYS[1], 'state', 'queued', 'user', ARGV[1], 'params', ARGV[2],
     'caller', ARGV[3], 'confirmed', '0', 'created', now)
   if ARGV[9] == '1' then redis.call('HSET', KEYS[1], 'app', '1') end
@@ -74,6 +76,7 @@ if #job == 0 then
   end
   return 'new'
 end
+if #job == 0 then return create() end
 local fields = {}
 for i = 1, #job, 2 do fields[job[i]] = job[i + 1] end
 if fields['params'] == nil then
@@ -87,9 +90,16 @@ if fields['params'] == nil then
 end
 if fields['user'] ~= ARGV[1] or fields['params'] ~= ARGV[2] then return 'conflict' end
 local state = fields['state']
-if state == 'done' or state == 'failed' or state == 'expired' or state == 'cancelled' then
+if state == 'done' then
   if redis.call('EXISTS', KEYS[4]) == 1 then return 'done' end
   return 'expired'
+end
+if state == 'failed' or state == 'expired' or state == 'cancelled' then
+  -- Q2: run again, from a clean slate (a stream's old chunks too: a new run would resume
+  -- after them). The key names of one request share the job key's base.
+  local base = string.sub(KEYS[1], 1, -4)
+  redis.call('DEL', KEYS[1], KEYS[2], KEYS[3], KEYS[4], base .. 'cancel', base .. 'chunks')
+  return create()
 end
 -- An unconfirmed record older than the grace: its send failed or its sender died; take over.
 if fields['confirmed'] == '0' and now - tonumber(fields['created'] or '0') >= tonumber(ARGV[8]) then
@@ -234,6 +244,25 @@ return value
 """
 RESULT_DROP = _DROP_READ + "return 1\n"
 
+# KEYS: job, cancel of each call. ARGV: cancel ttl secs, cancel channel, then the request ids.
+# Cancel wins (owner decision Q3): any caller's cancel stops the call for every caller on its id,
+# with no read of the callers set in a round trip of its own (R3RC-1: that read-then-write never
+# cancelled a shared id, or cancelled a caller that attached in between). A call already final
+# is left alone, so a later run of its id (Q2) is not cancelled by a stale mark. An attach after
+# the mark waits on the same call and gets its `cancelled` reply. Reply: how many were marked.
+CANCEL = """
+local n = 0
+for i = 1, #KEYS / 2 do
+  local state = redis.call('HGET', KEYS[2 * i - 1], 'state')
+  if state ~= 'done' and state ~= 'failed' and state ~= 'expired' and state ~= 'cancelled' then
+    redis.call('SET', KEYS[2 * i], '1', 'EX', tonumber(ARGV[1]))
+    redis.call('PUBLISH', ARGV[2], ARGV[2 + i])
+    n = n + 1
+  end
+end
+return n
+"""
+
 # KEYS: status. ARGV: state, ttl, then field / value pairs (see `_STATUS_FN`).
 STATUS_SET = _STATUS_FN + "return set_status(KEYS[1], ARGV[1], tonumber(ARGV[2]), 3)\n"
 
@@ -289,6 +318,7 @@ class RequestStore:
         self._take = client.register_script(RESULT_TAKE)
         self._drop_read = client.register_script(RESULT_DROP)
         self._status = client.register_script(STATUS_SET)
+        self._cancel = client.register_script(CANCEL)
 
     def _req(self, request_id: str) -> tuple[str, str, str, str]:
         k = self.keys
@@ -486,6 +516,21 @@ class RequestStore:
                 )
             raw = body
         return Reply.model_validate(orjson.loads(raw))
+
+    async def cancel(self, request_ids: Sequence[str], *, ttl_secs: int, channel: str) -> int:
+        """Mark calls cancelled and announce each on `channel`, in one script; how many.
+
+        Cancel wins for a shared id (Q3, R3RC-1): every caller of it gets `cancelled`. A call
+        already final is skipped.
+        """
+        if not request_ids:
+            return 0
+        keys = [
+            k
+            for rid in request_ids
+            for k in (self.keys.request(rid, "job"), self.keys.request(rid, "cancel"))
+        ]
+        return int(await self._cancel(keys, [ttl_secs, channel, *request_ids]))
 
     async def set_status(self, request_id: str, state: str, **fields: Any) -> bool:
         """Write a status (False when a final state was already there)."""
