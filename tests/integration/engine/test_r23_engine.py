@@ -908,6 +908,43 @@ async def test_cg3_a_failing_queue_store_sends_calls_direct(make: Make) -> None:
         await queue_store.aclose()
 
 
+async def test_fe5_amend_callers_take_over_a_dead_direct_run(make: Make) -> None:
+    """AMEND FE-5: a direct run whose process died left the record confirmed with no result;
+    attached callers and every retry of the id waited to their deadline (`deadline_exceeded`).
+
+    The dead runner is a record made as a direct run's caller makes it, its liveness key gone:
+    a retry takes it over at once, and a caller attached while the runner lived re-registers
+    at its first recheck (after the takeover grace) and takes it over too.
+    """
+    engine, _ = await make()
+    alias = "small"
+    record: dict[str, Any] = {
+        "user_hash": engine.hash_id(""),
+        "params_hash": params_hash({"m": alias, "p": CHAT}),
+        "model": alias,
+        "priority": False,
+        "app_id": True,
+    }
+
+    async def dead_direct_run(rid: str) -> None:
+        await engine.requests.register(rid, caller="dead-pod", **record)
+        await engine.requests.confirm(rid, keep_secs=30, direct=True)
+
+    await dead_direct_run("fe5-retry")
+    await engine.state.delete(engine.keys.caller("dead-pod"))
+    reply = await engine.call(alias, CHAT, request_id="fe5-retry", timeout_secs=8)
+    assert reply.ok  # `deadline_exceeded` after 8 s before
+
+    await dead_direct_run("fe5-attached")
+    attached = asyncio.create_task(
+        engine.call(alias, CHAT, request_id="fe5-attached", timeout_secs=15)
+    )
+    await _until(lambda: "fe5-attached" in engine._local_callers, what="the caller attached")
+    await asyncio.sleep(0.2)  # registered while the runner was alive
+    await engine.state.delete(engine.keys.caller("dead-pod"))  # the runner's process dies
+    assert (await attached).ok
+
+
 async def test_r3fm3_a_blackholed_queue_store_is_skipped_after_the_first_detection(
     make: Make,
 ) -> None:

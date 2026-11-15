@@ -59,12 +59,13 @@ local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 
 # KEYS: job, callers, status, result. ARGV: user hash, params hash, caller, unconfirmed ttl,
 # status ttl, model, priority, takeover grace secs, app id ('1': kept after its first read);
-# `register(caller_ttl)` takes the caller key's TTL (its ARGV place differs per script).
+# `register(caller_ttl, lease_ms)` takes the caller key's TTL and the worker lease (their ARGV
+# places differ per script).
 # Returns new | attached | takeover | done | expired | conflict | cancelled. Only a success is
 # replayed (owner decision Q2): an id whose last run ended failed, expired or cancelled runs
 # again (`new`), its old result, status and cancel mark dropped in the same script.
 _REGISTER_FN = """
-local function register(caller_ttl)
+local function register(caller_ttl, lease_ms)
 local job = redis.call('HGETALL', KEYS[1])
 local clock = redis.call('TIME')
 local now = tonumber(clock[1])
@@ -132,24 +133,43 @@ if fields['confirmed'] == '0' and now - tonumber(fields['created'] or '0') >= to
   keep_callers()
   return 'takeover'
 end
+-- A direct run whose process died (AMEND FE-5: killed, OOM, node lost): its record stayed
+-- confirmed with no result, and every caller of the id waited to its deadline for up to the
+-- claim's TTL (1 h). Taken over when the runner's liveness key is gone and its claim had no
+-- heartbeat for a lease (or it never started running). A live runner renews both.
+if fields['direct'] == '1' and fields['caller'] ~= ARGV[3] and tonumber(lease_ms or '') then
+  local prefix = string.match(KEYS[1], '^(.*):{r:')
+  if redis.call('EXISTS', prefix .. ':caller:' .. fields['caller']) == 0 then
+    local now_ms = now * 1000 + math.floor(tonumber(clock[2]) / 1000)
+    if state ~= 'running' or now_ms - tonumber(fields['hb'] or '0') >= tonumber(lease_ms) then
+      redis.call('HSET', KEYS[1], 'caller', ARGV[3], 'created', now, 'confirmed', '0',
+        'state', 'queued')
+      redis.call('HDEL', KEYS[1], 'direct', 'owner', 'hb')
+      redis.call('SADD', KEYS[2], ARGV[3])
+      keep_callers()
+      return 'takeover'
+    end
+  end
+end
 redis.call('SADD', KEYS[2], ARGV[3])
 keep_callers()
 return 'attached'
 end
 """
 
-REGISTER = _REGISTER_FN + "return register(ARGV[10])\n"
+REGISTER = _REGISTER_FN + "return register(ARGV[10], ARGV[11])\n"
 
 # KEYS: REGISTER's, then the queue's keys (stream first, `_PARTS` order). ARGV: REGISTER's, then
-# body, max waiting, retention ms, doorbell key, keep secs. Register, send a new call and
-# confirm it in one round trip when the queues share the state store (three before). A full
-# queue drops the record it just made. Reply: {outcome}, {outcome, message id} or {'full', depth}.
+# body, max waiting, retention ms, doorbell key, keep secs, caller ttl, lease ms. Register, send
+# a new call and confirm it in one round trip when the queues share the state store (three
+# before). A full queue drops the record it just made. Reply: {outcome}, {outcome, message id}
+# or {'full', depth}.
 REGISTER_SEND = (
     _NOW_MS
     + SEND_FN
     + _REGISTER_FN
     + """
-local outcome = register(ARGV[15])
+local outcome = register(ARGV[15], ARGV[16])
 if outcome ~= 'new' and outcome ~= 'takeover' then return {outcome} end
 local sent = send(KEYS[5], ARGV[10], tonumber(ARGV[11]), tonumber(ARGV[12]), ARGV[13])
 if sent[1] == 'full' then
@@ -168,10 +188,12 @@ return {outcome, sent[2]}
 """
 )
 
-# KEYS: job, callers. ARGV: keep secs. The send succeeded: the record lives until the deadline
-# plus the status TTL.
+# KEYS: job, callers. ARGV: keep secs, '1' for a direct run. The send succeeded: the record
+# lives until the deadline plus the status TTL. A direct run is marked: if its process dies,
+# REGISTER takes the record over (AMEND FE-5).
 CONFIRM = """
 redis.call('HSET', KEYS[1], 'confirmed', '1')
+if ARGV[2] == '1' then redis.call('HSET', KEYS[1], 'direct', '1') end
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
 redis.call('EXPIRE', KEYS[2], tonumber(ARGV[1]))
 return 1
@@ -314,6 +336,7 @@ class RequestStore:
         unconfirmed_secs: int = 30,
         takeover_grace_secs: int = 5,
         caller_ttl_secs: int = 0,
+        lease_secs: float = 60.0,
         offload: ResultOffload | None = None,
         offload_bytes: int | None = None,
     ) -> None:
@@ -344,6 +367,7 @@ class RequestStore:
         self.unconfirmed_secs = unconfirmed_secs
         self.takeover_grace_secs = takeover_grace_secs
         self.caller_ttl_secs = caller_ttl_secs  # 0: registration leaves the caller key alone
+        self.lease_ms = int(lease_secs * 1000)  # a dead direct run's claim lapses after it
         self.offload = offload
         self.offload_bytes = offload_bytes
         self._unsent: dict[str, tuple[Reply, bytes]] = {}
@@ -391,6 +415,7 @@ class RequestStore:
                 self.takeover_grace_secs,
                 "1" if app_id else "0",
                 self.caller_ttl_secs,
+                self.lease_ms,
             ],
         )
         return Registration(_text(outcome))
@@ -436,6 +461,7 @@ class RequestStore:
                 bell,
                 int(keep_secs) + self.status_ttl_secs,
                 self.caller_ttl_secs,
+                self.lease_ms,
             ],
         )
         outcome = _text(reply[0])
@@ -443,10 +469,16 @@ class RequestStore:
             raise QueueFull(queue, int(reply[1]))
         return Registration(outcome)
 
-    async def confirm(self, request_id: str, *, keep_secs: float) -> None:
-        """The send succeeded: keep the record until the deadline plus the status TTL."""
+    async def confirm(self, request_id: str, *, keep_secs: float, direct: bool = False) -> None:
+        """The send succeeded: keep the record until the deadline plus the status TTL.
+
+        `direct`: the call runs in this process, not from a queue; marked so that a caller of
+        the id takes the record over if this process dies (AMEND FE-5).
+        """
         job, callers, _, _ = self._req(request_id)
-        await self._confirm([job, callers], [int(keep_secs) + self.status_ttl_secs])
+        await self._confirm(
+            [job, callers], [int(keep_secs) + self.status_ttl_secs, "1" if direct else "0"]
+        )
 
     async def abandon(self, request_id: str, *, caller: str) -> None:
         """The send failed: remove this caller's unconfirmed record."""

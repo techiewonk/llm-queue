@@ -258,3 +258,36 @@ def test_envelope_version_rule() -> None:
     with pytest.raises(ValueError, match="params"):
         Envelope(request_id="r", op="converse", model="m", caller="c", timeout_secs=1)  # type: ignore[call-arg]  # params is required
     assert params_hash({"b": 1, "a": 2}) == params_hash({"a": 2, "b": 1})
+
+
+async def test_fe5_a_dead_direct_runner_is_taken_over(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """AMEND FE-5: a direct run whose process died left its record confirmed with no result;
+    REGISTER only took over unconfirmed records, so every caller of the id (and every retry of
+    it) attached and waited to its deadline for up to the claim's TTL (1 h).
+
+    Now taken over once the runner's liveness key is gone and its claim had no heartbeat for
+    a lease; a live runner (key present, or a fresh heartbeat) keeps it.
+    """
+    keys = Keys(prefix)
+    requests = RequestStore(store, keys, takeover_grace_secs=0, caller_ttl_secs=30, lease_secs=1)
+    assert await _register(requests, "pod-a") == "new"
+    await requests.confirm("req-1", keep_secs=120, direct=True)
+    assert await _register(requests, "pod-b") == "attached"  # pod-a's key is alive
+    await store.delete(keys.caller("pod-a"))
+    job = keys.request("req-1", "job")
+    secs, micros = await store.time()
+    now_ms = secs * 1000 + micros // 1000
+    await store.hset(job, mapping={"state": "running", "owner": "pod-a@t", "hb": now_ms})
+    assert await _register(requests, "pod-c") == "attached"  # its claim beat just now
+    await store.hset(job, "hb", now_ms - 1500)  # no beat for more than a lease
+    assert await _register(requests, "pod-c") == "takeover"
+    record = await requests.job("req-1")
+    assert (record["caller"], record["confirmed"], record["state"]) == ("pod-c", "0", "queued")
+    assert "direct" not in record
+    assert "owner" not in record
+    # A queued (not direct) record is never taken over this way: its message is on a queue.
+    await requests.confirm("req-1", keep_secs=120)
+    await store.delete(keys.caller("pod-c"))
+    assert await _register(requests, "pod-d") == "attached"

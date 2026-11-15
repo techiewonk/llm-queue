@@ -573,6 +573,7 @@ class Engine:
             result_dedupe_secs=self.settings.result_dedupe_secs,
             status_ttl_secs=self.settings.status_ttl_secs,
             caller_ttl_secs=self.caller_ttl_secs,
+            lease_secs=self.settings.lease_secs,
             offload=offload,
             offload_bytes=offload_bytes,
         )
@@ -1426,7 +1427,7 @@ class Engine:
             run: asyncio.Task[None] | None = None  # the direct run, watched while waiting
             if outcome in ("new", "takeover") and not sent:
                 if direct:
-                    await self.requests.confirm(rid, keep_secs=call_secs)
+                    await self.requests.confirm(rid, keep_secs=call_secs, direct=True)
                     run = self._start_direct(envelope)
                 else:
                     await self._send(rid, envelope, view, alias, priority, call_secs)
@@ -2108,9 +2109,25 @@ class Engine:
         if not job:
             return True
         if job.get("confirmed") != "0":
-            return False
+            return await self._direct_runner_dead(job)
         created = float(job.get("created") or 0)
         return self.clock.now() - created >= self.requests.takeover_grace_secs
+
+    async def _direct_runner_dead(self, job: Mapping[str, str]) -> bool:
+        """True when a confirmed record's direct run lives in a process that died (AMEND FE-5).
+
+        REGISTER's rule, read here so an attached caller registers again (and takes the record
+        over) instead of waiting to its deadline: the runner's liveness key is gone and its
+        claim had no heartbeat for a lease, or it never started running.
+        """
+        runner = job.get("caller")
+        if job.get("direct") != "1" or not runner or runner == self.worker_id:
+            return False
+        if await self.state.exists(self.keys.caller(runner)):
+            return False
+        if job.get("state") != "running":
+            return True
+        return self.clock.now() * 1000 - float(job.get("hb") or 0) >= self.requests.lease_ms
 
     async def _keep_alive(self, pubsub: Any, alive: _Alive) -> None:
         """Ping a subscriber; raise (reset and resubscribe) when it went silent.

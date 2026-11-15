@@ -500,7 +500,9 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
   inside its admission, and an admission that failed without an answer undoes its possible
   grant (FE-4, RV-N1); a hold cancelled before its first step frees its class (RV-N2); paused
   calls resume only when the store takes writes (FE-7); a direct run that raised stores its
-  failure (FE-5); a caller-only process stops its direct run on cancel (FE-17); an unreadable
+  failure (FE-5), and one whose process died (killed, out of memory) is taken over by the next
+  caller of its id once its liveness key and heartbeat lapse, where callers waited to their
+  deadline for up to an hour (AMEND FE-5); a caller-only process stops its direct run on cancel (FE-17); an unreadable
   message whose return or fail errs is returned (FE-9); a retry admits against the current
   view (FE-13); a stale ack is logged and counted, `llmq_stale_acks_total` (FE-14); one model's
   failing sweep skips only itself (FE-15); `_free_stuck` cannot end the heartbeat (FE-18);
