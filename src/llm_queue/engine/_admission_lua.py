@@ -25,6 +25,8 @@ local function mk(alias, name) return P .. ':{m:' .. alias .. '}:' .. name end
 local function num(v, d) if v == nil or v == false or v == cjson.null then return d end return tonumber(v) end
 local function hnum(key, field, d) return num(redis.call('HGET', key, field), d) end
 local function present(v) return v ~= nil and v ~= false and v ~= cjson.null end
+-- Costs and refunds go to HINCRBY, which raises on a fraction after earlier writes stayed (FL-9).
+local function whole(v) return math.floor(v + 0.5) end
 KEY_MS = num(T.budget_key_ms, 180000)  -- budget and limiter keys live this long (> 2 minutes)
 
 -- One budget: field prefix f, limit L per minute, burst fraction bf, window mode.
@@ -296,8 +298,8 @@ if cls == 'n' and not foreign then
   reserve_from(redis.call('ZRANGE', wait_keys.p, 0, 199), priority_reserved)
 end
 
-local cost_r = num(req.cost_r, 1)
-local cost_t = num(req.cost_t, 0)
+local cost_r = whole(num(req.cost_r, 1))
+local cost_t = whole(num(req.cost_t, 0))
 local best_wait, best_reason = nil, nil
 -- A breaker's one probe call is in flight: its answer comes within an attempt, so a call
 -- waits for it instead of failing as `model_unavailable` (scenario P7 at 300 %: ten calls
@@ -598,6 +600,7 @@ _SETTLE = r"""
 local function settle(alias, owner, rid, refund_r, refund_t, learn, outcome, latency, retry_after_ms)
   local entry_key = mk(alias, 'inprog:' .. rid)
   if redis.call('HGET', entry_key, 'owner') ~= owner then return 0 end
+  refund_r, refund_t = whole(refund_r), whole(refund_t)
   local dep = redis.call('HGET', entry_key, 'dep')
   local cls = redis.call('HGET', entry_key, 'cls')
   local granted_minute = hnum(entry_key, 'minute', minute)

@@ -473,6 +473,26 @@ async def test_fl6_a_live_grant_is_not_taken_over_when_the_job_record_is_gone(
     assert (await r.ask("c1", worker="pod-b", tag="m2")).kind == "duplicate"  # granted before
 
 
+async def test_fl9_a_fractional_cost_or_refund_is_rounded_not_half_applied(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-9: HINCRBY got the cost and refund straight from JSON; a fraction raised after the
+    budget writes (charged for nothing), and in FINISH after the refund (refunded per replay).
+    """
+    r = await rig(store, prefix, model={"tpm": 1000})
+    granted = await r.ask("c1", cost_t=12.5)  # raised before the fix
+    assert granted.kind == "granted"
+    assert await r.admission.finish(
+        "m",
+        owner_token("c1", "w1", 1),
+        "c1",
+        refund_r=0,
+        refund_t=2.5,  # type: ignore[arg-type]  # a float on purpose
+        outcome="ok",
+    )
+    assert not await store.exists(f"{prefix}:{{m:m}}:inprog:c1")
+
+
 async def test_fl1_release_claims_of_calls_held_without_a_grant(
     store: redis.asyncio.Redis, prefix: str
 ) -> None:
