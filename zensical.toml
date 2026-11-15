@@ -42,6 +42,7 @@ nav = [
     { "Architecture overview" = "explanation/architecture.md" },
     { "The life of a call" = "explanation/call-lifecycle.md" },
     { "Admission" = "explanation/admission.md" },
+{ "Tenant fairness" = "explanation/fairness.md" },
     { "Attempts and retries" = "explanation/attempts.md" },
     { "Failures and recovery" = "explanation/resilience.md" },
     { "Streaming" = "explanation/streaming.md" },
