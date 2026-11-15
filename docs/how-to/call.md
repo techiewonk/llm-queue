@@ -118,9 +118,8 @@ Texts are batched by the model's `embed_batch_size` (capped by what the provider
   (provider calls, splits included) and `result.request_ids`.
 - **Options**: only `input_type` is per call; `dimensions`, `normalize`, `truncate` come from
   the registry's `inference`. Titan v2 normalises by default, Titan v1 and Cohere do not.
-  `inference.embedding_types` takes only `["float"]`. A Bedrock model behind an ARN (an
-  application inference profile) names its body shape with the model's `family: "cohere"` or
-  `"titan"`; otherwise the model id decides, whatever its case.
+  `inference.embedding_types` takes only `["float"]`. The body shape is the model's family
+  (see below).
 - **`request_id=X`** names batch *n* `X:n`, so each batch is its own call and a repeat of the
   same `embed` returns the same vectors.
 - **Partial results:** by default one failed batch fails the call. With `partial=True` the call
@@ -131,6 +130,60 @@ Texts are batched by the model's `embed_batch_size` (capped by what the provider
 result = await llmq.embed("embed-cohere", texts, partial=True)
 retry = [texts[i] for i in result.errors]      # texts to send again
 ```
+
+### Embedding families
+
+A family is one request and reply shape, held in an `EmbeddingCodec`: texts per call
+(`max_batch`), the longest text (`max_chars`), the request body and the reply parser. Three are
+built in:
+
+| Family | Texts per call | Longest text | Request | Reply |
+|---|---|---|---|---|
+| `titan` | 1 | 50,000 | `inputText` (`dimensions`, `normalize`) | `embedding` |
+| `cohere` | 96 | 2,048 | `texts`, `input_type` | `embeddings` (or `embeddings.float`) |
+| `openai` | 2,048 | (server's) | `input`, base64 vectors | `data[i].embedding` |
+
+A model's family is its registry `family` if set, else `openai` for the `openai` provider,
+else the first family whose pattern is in the model id, whatever its case (`titan-embed`,
+`cohere.embed`). A model id no family matches (an application inference profile ARN, a new
+model) fails the registry load: `cannot tell the embedding family of <id>; set family (one
+of ...)`. Set `"family": "cohere"` (or another name) on that model.
+
+Add a family for a model the library does not know, without waiting for a release:
+
+```python
+from llm_queue import EmbeddingCodec, register_embedding_family
+
+
+def nova_request(texts, options):
+    return {"taskType": "SINGLE_EMBEDDING",
+            "singleEmbeddingParams": {"text": {"value": texts[0]}}}
+
+
+def nova_reply(body):
+    return [item["embedding"] for item in body["embeddings"]]
+
+
+register_embedding_family("nova", EmbeddingCodec(
+    name="nova",
+    build_request=nova_request,      # (texts, options) -> the model's JSON body
+    parse_reply=nova_reply,          # decoded reply body -> one vector per text, in order
+    max_batch=1,
+    max_chars=50_000,
+    patterns=("amazon.nova-2-multimodal-embeddings",),  # optional: ids that name it
+))
+```
+
+Register it in every process (callers and workers) **before** the registry loads; a registry
+that names a family this process has not registered is refused. Patterns of the newest
+registration are tried first, so a narrower one (`cohere.embed-v4`) wins over a built-in one.
+`options` carries the per-call `input_type`; `input_types=` closes the set of values it may
+take, `probe_options=` go into the health probe's request, and `inference_names=` names the
+registry `inference` fields the body takes (left out: the worker leaves the body as built).
+`parse_reply` raising `ValueError`, `TypeError` or `KeyError` fails the batch as
+`provider_error`; `llm_queue.providers.vector` turns a list of numbers or base64 float32 into
+floats with the built-in checks. The request shapes above are an example: check the model's
+own documentation.
 
 ## Sync code: `converse_sync`, `embed_sync`
 
