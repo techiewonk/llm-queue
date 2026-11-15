@@ -352,3 +352,59 @@ def test_repeated_keys_are_refused(small: dict[str, Any]) -> None:
     with pytest.raises(RegistryError, match="not valid JSON"):
         parse_document("{nope")
     assert parse_document(json.dumps(small)) == small
+
+
+def test_r3cf10_timeouts_are_checked_against_each_other(small: dict[str, Any]) -> None:
+    """R3CF-10: `after_secs` beyond the deadline, retention below the timeout: all silent."""
+    doc = copy.deepcopy(small)
+    doc["models"]["gpt20b"]["fallback"] = {"on": ["exhausted"], "after_secs": 9999}
+    assert _has(_errors(doc), "fallback.after_secs", "timeout_secs", "never fire")
+    doc = copy.deepcopy(small)
+    model = doc["models"]["gpt20b"]
+    model.update(timeout_secs=600, timeout_max_secs=900, queue={"retention_secs": 60})
+    model.update(retry_base_secs=100, retry_max_secs=1)
+    model["health"] = {"probe_after_secs": 9000, "probe_max_secs": 10}
+    warnings = _warnings(doc)
+    assert _has(warnings, "queue.retention_secs", "below")
+    assert _has(warnings, "retry_base_secs", "retry_max_secs")
+    assert _has(warnings, "probe_after_secs", "probe_max_secs")
+
+
+def test_r3cf11_no_usable_deployment_warns(small: dict[str, Any]) -> None:
+    """R3CF-11: a model whose only account is disabled validated with no word."""
+    doc = copy.deepcopy(small)
+    doc["accounts"]["aws-main"]["enabled"] = False
+    assert _has(_warnings(doc), "models.gpt20b", "no usable confirmed deployment")
+
+
+def test_r3cf12_weighted_priority_needs_a_weight(small: dict[str, Any]) -> None:
+    """R3CF-12: all weights 0 was refused for `balance` only, not `balance_priority`."""
+    doc = copy.deepcopy(small)
+    model = doc["models"]["gpt20b"]
+    model["balance_priority"] = "weighted"
+    model["deployments"]["aws-main"]["overrides"] = {"ap-south-1": {"weight": 0}}
+    assert _has(_errors(doc), "balance_priority", "weight 0")
+
+
+def test_r3cf16_misleading_values_warn(small: dict[str, Any]) -> None:
+    """R3CF-16: duplicates, a rule with no target and settings the model never reads."""
+    doc = copy.deepcopy(small)
+    model = doc["models"]["gpt20b"]
+    model["fallback"] = {"on": ["exhausted", "exhausted"]}
+    model["inference_limits"] = {"locked": ["dimensions"]}
+    warnings = _warnings(doc)
+    assert _has(warnings, "fallback.on", "twice")
+    assert _has(warnings, "fallback", "no fallback regions")
+    assert _has(warnings, "locked", "dimensions")
+
+
+def test_r3cf17_messages_name_values_levels_and_paths(small: dict[str, Any]) -> None:
+    """R3CF-17: messages gave no values or levels and a path `settings set` cannot take."""
+    doc = copy.deepcopy(small)
+    doc["defaults"] = {"timeout_secs": 1000}
+    assert _has(_errors(doc), "`timeout_secs` 1000 (defaults)", "`timeout_max_secs` 900")
+    doc = copy.deepcopy(small)
+    doc["models"]["gpt20b"]["attempt_timeout_secs"] = 500
+    assert _has(_errors(doc), "models.gpt20b.deployments.aws-main.overrides.ap-south-1")
+    text = '{"registry_version": 1, "defaults": {"rpm": 1, "tpm": 5, "rpm": 2}}'
+    assert _has(_errors(text), "`rpm` (in the object with tpm)")
