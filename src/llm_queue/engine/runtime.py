@@ -896,7 +896,9 @@ class Engine:
         hook = hooks.get("admission", hook_name)
         if hook is not None:
             ctx = hooks.CallContext(alias, rid, priority, session_id, user_id, tenant_id)
-            verdict = hooks.call_safely("admission", hook_name, hook, ctx, default=None)
+            verdict = hooks.call_safely(
+                "admission", hook_name, hook, ctx, default=None, metrics=self.metrics
+            )
             if isinstance(verdict, hooks.Reject):
                 raise CallFailed("rejected", verdict.reason, request_id=rid)
         direct = force_direct or self._direct_route(view, alias, rid, user_id)

@@ -157,6 +157,44 @@ def test_hook_failure_falls_back_once() -> None:
         hooks.register_balancer("", lambda c, x: [])
 
 
+class _Counts:
+    """A metrics sink that keeps every counter call."""
+
+    def __init__(self) -> None:
+        self.seen: list[tuple[str, dict[str, str]]] = []
+
+    def count(self, name: str, value: float = 1.0, **labels: str) -> None:
+        self.seen.append((name, labels))
+
+    def observe(self, name: str, value: float, **labels: str) -> None:
+        """Unused."""
+
+    def gauge(self, name: str, value: float, **labels: str) -> None:
+        """Unused."""
+
+
+def test_admission_hook_fails_closed_and_counts() -> None:
+    """FO-4: a raising or unregistered admission hook admitted the call, logged once only."""
+    from llm_queue.engine import hooks
+
+    def broken(_: object) -> None:
+        raise RuntimeError("entitlement service down")
+
+    sink = _Counts()
+    ctx = hooks.CallContext("m", "r", False, None, None, "t")
+    for _ in range(2):
+        verdict = hooks.call_safely("admission", "gate", broken, ctx, default=None, metrics=sink)
+        assert isinstance(verdict, hooks.Reject)
+    assert sink.seen == [("llmq_hook_failed_total", {"kind": "admission", "hook": "gate"})] * 2
+    missing = hooks.get("admission", "fo4-not-registered")
+    assert missing is not None
+    verdict = hooks.call_safely("admission", "fo4-not-registered", missing, ctx, default=None)
+    assert isinstance(verdict, hooks.Reject)
+    assert "fo4-not-registered" in verdict.reason
+    # Other kinds still fall back to the built-in behaviour.
+    assert hooks.call_safely("sticky_key", "s", broken, ctx, default=None, metrics=sink) is None
+
+
 def test_max_completion_tokens_is_capped_and_locked() -> None:
     """FO-2: the OpenAI cap read only `max_tokens`, so `max_completion_tokens` went uncapped."""
     out = inference.apply(

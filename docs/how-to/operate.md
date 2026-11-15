@@ -197,8 +197,10 @@ Metrics go to `LLMQ_METRICS_SINK`: `emf` (CloudWatch embedded metrics, default),
 (needs the `metrics` extra) or `none`; one sink per process. Names include `llmq_calls_total`,
 `llmq_wait_seconds`, `llmq_tokens_input_total`, `llmq_tokens_output_total`,
 `llmq_fallback_total`, `llmq_admission_refusals_total` (counted once per call),
-`llmq_retries_total`, `llmq_grants_lost_total`, `llmq_store_errors_total` and
-`llmq_jobs_no_consumer_total`. Every 30 s the alert loop also sets gauges per model and
+`llmq_retries_total`, `llmq_grants_lost_total`, `llmq_store_errors_total`,
+`llmq_jobs_no_consumer_total` and `llmq_hook_failed_total` (a failing or unregistered
+admission hook, which refuses the call; labels `kind`, `hook`). Every 30 s the alert loop also
+sets gauges per model and
 deployment: `llmq_queue_waiting`, `llmq_in_progress`, `llmq_dead_letters`, `llmq_breaker_open`,
 `llmq_rpm_used`, `llmq_tpm_used`, `llmq_concurrency_in_use`, `llmq_throttles_1m`,
 `llmq_provider_latency_ms` and `llmq_alert_<name>`.
