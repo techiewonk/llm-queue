@@ -7,6 +7,11 @@ public API (see STABILITY.md).
 
 ## [Unreleased]
 
+### Added
+
+- Docs: a reference page listing every log event the library writes, with its level and
+  module (`docs/reference/log-events.md`, R3OB-9).
+
 ## [0.1.0b2] - 2026-11-15
 
 Fixes from three code reviews and a six-part rescan of 0.1.0b1, a process-level client hub, and
