@@ -117,8 +117,8 @@ def test_register_job_takes_a_timeout() -> None:
         return None
 
     queue.register_job("j", job, timeout_secs=2.5)
-    assert queue.jobs._timeouts["j"] == 2.5
-    assert queue.jobs.metrics is engine.metrics  # the engine's sink, not a NullSink
+    assert queue._jobs._timeouts["j"] == 2.5
+    assert queue._jobs.metrics is engine.metrics  # the engine's sink, not a NullSink
 
 
 def test_new_kinds_are_call_failed_kinds() -> None:
@@ -140,7 +140,7 @@ async def test_send_job_at_the_limit_is_queue_full(monkeypatch: pytest.MonkeyPat
     async def full(*args: Any, **kwargs: Any) -> str:
         raise QueueFull("jobs-j", 10_000)
 
-    monkeypatch.setattr(queue.jobs, "send", full)
+    monkeypatch.setattr(queue._jobs, "send", full)
     with pytest.raises(CallFailed) as info:
         await queue.send_job("j", {})
     assert info.value.kind == "queue_full"

@@ -144,7 +144,7 @@ async def test_failed_start_stops_what_it_started() -> None:
     async def jobs_fail() -> None:
         raise RuntimeError("jobs failed")
 
-    queue.jobs.start = jobs_fail  # type: ignore[method-assign]
+    queue._jobs.start = jobs_fail  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="jobs failed"):
         await queue.start()
     assert engine.tasks == []
@@ -419,7 +419,7 @@ async def test_calls_during_the_drain_are_served() -> None:
         await call("engine")
         await engine_stop(**kw)
 
-    queue.jobs.stop = jobs_stop  # type: ignore[method-assign]
+    queue._jobs.stop = jobs_stop  # type: ignore[method-assign]
     engine.stop = stop_engine  # type: ignore[method-assign]
     await queue.stop()
     assert outcome == ["jobs: served", "engine: served"]

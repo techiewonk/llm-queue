@@ -303,7 +303,7 @@ async def test_sync_calls_run_on_the_started_queue_loop(no_default: None) -> Non
         main = asyncio.get_running_loop()
         reply = await asyncio.to_thread(queue.converse_sync, "m", {"messages": []})
         assert reply.ok
-        assert queue.engine.loops[-1] is main  # type: ignore[attr-defined]
+        assert queue._engine.loops[-1] is main  # type: ignore[attr-defined]
         assert queue._sync is None  # no private engine was built
         with pytest.raises(LLMQueueError, match="deadlock"):
             queue.converse_sync("m", {"messages": []})  # on the loop's own thread

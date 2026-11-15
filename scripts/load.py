@@ -91,11 +91,11 @@ async def stop_all(queues: list[LLMQueue]) -> None:
 async def still_held(queues: list[LLMQueue], secs: float = 3.0) -> int:
     """Held calls left once the last replies are acknowledged (a reply is published first)."""
     for _ in range(int(secs / 0.1)):
-        held = sum(len(q.engine._held) for q in queues)
+        held = sum(len(q._engine._held) for q in queues)
         if not held:
             return 0
         await asyncio.sleep(0.1)
-    return sum(len(q.engine._held) for q in queues)
+    return sum(len(q._engine._held) for q in queues)
 
 
 async def cleanup(prefix: str) -> None:

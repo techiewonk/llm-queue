@@ -16,6 +16,7 @@ import contextlib
 import os
 import socket
 import threading
+import warnings
 import weakref
 from collections.abc import (
     AsyncGenerator,
@@ -178,9 +179,9 @@ class LLMQueue:
 
         That engine is used only while this queue is not started (sync-only processes).
         """
-        self.engine = engine
+        self._engine = engine
         self.settings = settings
-        self.jobs = JobRunner(
+        self._jobs = JobRunner(
             engine.queues, queue_prefix=engine.settings.queue_prefix, metrics=engine.metrics
         )
         self._builder = builder
@@ -198,6 +199,31 @@ class LLMQueue:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._inherited = False
         _QUEUES.add(self)
+
+    @property
+    def engine(self) -> Engine:
+        """Deprecated: the engine is private (owner decision Q35); use the queue's methods.
+
+        Kept as an alias that warns until 0.2.
+        """
+        warnings.warn(
+            "LLMQueue.engine is private since 0.1.0b2 and will be removed in 0.2; use the "
+            "LLMQueue methods (call, status, registry, ...)",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._engine
+
+    @property
+    def jobs(self) -> JobRunner:
+        """Deprecated: the job runner is private (Q35); use `register_job` and `send_job`."""
+        warnings.warn(
+            "LLMQueue.jobs is private since 0.1.0b2 and will be removed in 0.2; use "
+            "register_job / send_job",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._jobs
 
     # ---------------------------------------------------------------- construction
 
@@ -388,12 +414,12 @@ class LLMQueue:
                 hint="one LLMQueue per process shares clients and stores; this one gets its own",
             )
         mode = self.settings.mode if self.settings else "both"
-        await self.engine.start(
+        await self._engine.start(
             worker=mode in ("both", "worker"), caller=mode in ("both", "caller")
         )
         if mode in ("both", "worker"):
             self._check_store_pool()
-            await self.jobs.start()
+            await self._jobs.start()
         from llm_queue.langchain import get_default_queue, set_default_queue
 
         try:
@@ -427,7 +453,7 @@ class LLMQueue:
         model while the pool stays 200, and the overflow waited on the pool inside the call.
         """
         cap = getattr(self.settings, "store_max_connections", None)
-        view = getattr(self.engine.registry, "current", None)
+        view = getattr(self._engine.registry, "current", None)
         if not isinstance(cap, int) or view is None:
             return
         slots = sum(int(view.value(alias, "worker_slots")) for alias in view.registry.models)
@@ -442,8 +468,8 @@ class LLMQueue:
 
     def pause_receiving(self) -> None:
         """Fail readiness and take no new calls or jobs; running work goes on (preStop hook)."""
-        self.engine.pause_receiving()
-        self.jobs.pause()
+        self._engine.pause_receiving()
+        self._jobs.pause()
 
     async def stop(self, drain_secs: float | None = None) -> None:
         """Shut down in order (plan §3.18) and close every client; a second call does nothing.
@@ -466,21 +492,21 @@ class LLMQueue:
                 set_default_queue(None)
         self.started = False
         loop = asyncio.get_running_loop()
-        drain = self.engine.settings.drain_secs if drain_secs is None else drain_secs
+        drain = self._engine.settings.drain_secs if drain_secs is None else drain_secs
         until = loop.time() + drain
         # One step that raised skipped every later one, and `_stopped` made a second stop()
         # return at once, so store pools, provider sessions and the S3 client leaked (CO-1).
         cancelled = False
         steps: list[tuple[str, Callable[[], Awaitable[Any]]]] = [
-            ("jobs", lambda: self.jobs.stop(drain_secs=0 if cancelled else drain)),
+            ("jobs", lambda: self._jobs.stop(drain_secs=0 if cancelled else drain)),
             (
                 "engine",
-                lambda: self.engine.stop(
+                lambda: self._engine.stop(
                     drain_secs=0 if cancelled else max(0.0, until - loop.time())
                 ),
             ),
             ("sync", lambda: asyncio.to_thread(self.close_sync)),  # blocking: off the loop
-            ("engine_close", self.engine.aclose),
+            ("engine_close", self._engine.aclose),
             ("offload", lambda: _close_offload(self._offload)),
         ]
         failures: list[Exception] = []
@@ -517,7 +543,7 @@ class LLMQueue:
     ) -> Reply:
         """Any operation of a model (`converse`, `chat`, `invoke_model`, `embeddings`)."""
         self._check(work=True)
-        return await self.engine.call(model, params, **self._call_kwargs(priority, **kw))
+        return await self._engine.call(model, params, **self._call_kwargs(priority, **kw))
 
     async def converse(
         self, model: str, request: Mapping[str, Any], *, priority: bool | None = None, **kw: Any
@@ -544,7 +570,7 @@ class LLMQueue:
         # aclosing: a consumer that stopped early left the inner generator to the asyncgen
         # finalizer, an untracked task (FC-12, as CL-10 in the providers).
         inner = cast(
-            "AsyncGenerator[dict[str, Any], None]", self.engine.stream(model, request, **kwargs)
+            "AsyncGenerator[dict[str, Any], None]", self._engine.stream(model, request, **kwargs)
         )
         async with contextlib.aclosing(inner) as events:
             async for event in events:
@@ -569,7 +595,13 @@ class LLMQueue:
         """
         self._check(work=True)
         return await _embed(
-            self.engine, model, texts, input_type, partial, False, self._call_kwargs(priority, **kw)
+            self._engine,
+            model,
+            texts,
+            input_type,
+            partial,
+            False,
+            self._call_kwargs(priority, **kw),
         )
 
     # ---------------------------------------------------------------- sync (direct path)
@@ -589,7 +621,7 @@ class LLMQueue:
                         "a sync call on the thread that runs this queue's event loop would "
                         "deadlock; await converse / chat / embed there instead"
                     )
-            return _wait_on_loop(asyncio.run_coroutine_threadsafe(make(self.engine), loop), loop)
+            return _wait_on_loop(asyncio.run_coroutine_threadsafe(make(self._engine), loop), loop)
         return self._sync_runner().run(make)
 
     def _sync_runner(self) -> _SyncRunner:
@@ -656,7 +688,7 @@ class LLMQueue:
         A run longer than `timeout_secs` is cancelled and counts as a failure (retried, then
         dead-lettered); None (the default) lets it run as long as it takes.
         """
-        self.jobs.register(name, fn, timeout_secs=timeout_secs)
+        self._jobs.register(name, fn, timeout_secs=timeout_secs)
 
     @store_op
     async def send_job(
@@ -669,7 +701,7 @@ class LLMQueue:
         """
         self._check(work=True)
         try:
-            return await self.jobs.send(name, payload, job_id=job_id)
+            return await self._jobs.send(name, payload, job_id=job_id)
         except QueueFull as exc:
             raise CallFailed("queue_full", str(exc), retry_after_secs=5) from exc
 
@@ -677,7 +709,7 @@ class LLMQueue:
     async def cancel(self, request_id: str) -> None:
         """Cancel a call (waiting or running)."""
         self._check()
-        await self.engine.cancel(request_id)
+        await self._engine.cancel(request_id)
 
     @overload
     async def status(self, model: None = None) -> StatusReport: ...
@@ -689,23 +721,23 @@ class LLMQueue:
     async def status(self, model: str | None = None) -> StatusReport | ModelStatus:
         """Status of a model (`ModelStatus`) or of everything (`StatusReport`)."""
         self._check()
-        return cast("StatusReport | ModelStatus", await self.engine.status(model))
+        return cast("StatusReport | ModelStatus", await self._engine.status(model))
 
     @store_op
     async def request_status(self, request_id: str) -> RequestStatus:
         """Status of one call (empty when unknown)."""
         self._check()
-        return cast("RequestStatus", await self.engine.request_status(request_id))
+        return cast("RequestStatus", await self._engine.request_status(request_id))
 
     async def health(self) -> Health:
         """Liveness, readiness and the stores' state."""
         self._check()
-        return cast("Health", await self.engine.health_check())
+        return cast("Health", await self._engine.health_check())
 
     @property
     def registry(self) -> RegistryStore:
         """The registry store (live edits, audit, rollback)."""
-        return self.engine.registry
+        return self._engine.registry
 
     def http_router(
         self,
@@ -721,7 +753,7 @@ class LLMQueue:
         from llm_queue.engine.http import status_router
 
         return status_router(
-            self.engine, dependencies=dependencies, allow_writes=allow_writes, actor=actor
+            self._engine, dependencies=dependencies, allow_writes=allow_writes, actor=actor
         )
 
 

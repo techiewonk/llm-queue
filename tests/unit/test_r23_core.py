@@ -10,7 +10,7 @@ import concurrent.futures
 import threading
 from collections.abc import AsyncIterator, Iterator
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -78,7 +78,7 @@ def _queue(engine: _Engine, mode: str = "both", **settings: Any) -> LLMQueue:
         engine,  # type: ignore[arg-type]  # a fake
         settings=SimpleNamespace(mode=mode, **settings),  # type: ignore[arg-type]
     )
-    queue.jobs = _Jobs()  # type: ignore[assignment]
+    queue._jobs = _Jobs()  # type: ignore[assignment]
     return queue
 
 
@@ -209,3 +209,21 @@ async def test_a_store_pool_smaller_than_the_slots_is_warned(
     await queue.start()
     await queue.stop(drain_secs=0)
     assert any("store_pool_small" in r.getMessage() for r in caplog.records)
+
+
+def test_public_types_and_deprecated_internals() -> None:
+    """Q35: apps imported Provider, Route, JobFn, Secrets and PublishResult from private modules.
+
+    They are public now; `LLMQueue.engine` and `.jobs` became private, with aliases that warn.
+    """
+    import llm_queue
+
+    for name in ("Provider", "Route", "JobFn", "Secrets", "PublishResult"):
+        assert name in llm_queue.__all__
+        assert getattr(llm_queue, name) is not None
+    engine = _Engine()
+    queue = _queue(engine)
+    with pytest.warns(DeprecationWarning, match=r"LLMQueue\.engine is private"):
+        assert queue.engine is cast("Any", engine)
+    with pytest.warns(DeprecationWarning, match=r"LLMQueue\.jobs is private"):
+        assert queue.jobs is queue._jobs

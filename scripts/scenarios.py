@@ -600,7 +600,7 @@ async def kill_switch(ctx: Ctx) -> None:
         off = ctx.now()
     finally:
         await ctx.edit({"routing.kill_switch": False}, model=None)
-    callers = {q.engine.worker_id for q in ctx.queues}
+    callers = {q._engine.worker_id for q in ctx.queues}
     switched = [r for r in ctx.run.results if on <= r.sent <= off and r.ok]
     queued = [r for r in switched if r.worker not in callers]
     ctx.checks["calls ran direct (in the caller) while the switch was on"] = (
@@ -961,7 +961,8 @@ async def split_pods(ctx: Ctx) -> None:
     await clients(ctx, pods)
     calls = judge_clients(ctx, pods, set())
     worker_ids = {w.worker_id for w in ctx.gate.fleet}
-    caller_ids = {pod.ready["worker_id"] for pod in pods} | {q.engine.worker_id for q in ctx.queues}
+    callers = {q._engine.worker_id for q in ctx.queues}
+    caller_ids = {pod.ready["worker_id"] for pod in pods} | callers
     served = [r["worker"] for r in calls if r["ok"]] + [r.worker for r in ctx.run.results if r.ok]
     ctx.checks["every call served by a worker pod"] = all(w in worker_ids for w in served)
     ctx.checks["no caller pod served a call"] = not set(served) & caller_ids
@@ -1001,7 +1002,7 @@ async def queue_store_block(ctx: Ctx) -> None:
     finally:
         await ctx.queue_proxy.set(refuse=False)
     await asyncio.sleep(2)  # the calls sent while blocked come back
-    caller_ids = {q.engine.worker_id for q in ctx.queues}
+    caller_ids = {q._engine.worker_id for q in ctx.queues}
     direct = [r for r in ctx.run.results[sent:] if r.ok and r.worker in caller_ids]
     ctx.checks["calls ran direct while the queue store was down (more than one)"] = len(direct) > 1
     ctx.notes.append(f"{len(direct)} calls ran direct (in the caller) during the block")

@@ -183,9 +183,9 @@ async def test_start_twice_and_restart(make: Make, store: Any, prefix: str) -> N
     }
     queue = LLMQueue.from_env(env)
     await queue.start()
-    tasks = len(queue.engine._tasks)
+    tasks = len(queue._engine._tasks)
     await queue.start()
-    assert len(queue.engine._tasks) == tasks
+    assert len(queue._engine._tasks) == tasks
     await queue.stop(drain_secs=0)
     await queue.stop(drain_secs=0)  # twice: nothing happens
     with pytest.raises(Exception, match="stopped"):
