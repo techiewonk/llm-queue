@@ -461,6 +461,18 @@ async def test_fl1_a_given_back_call_is_granted_to_another_pod_at_once(
     assert (await r.ask("c1", worker="pod-c", tag="m1")).kind == "duplicate"
 
 
+async def test_fl6_a_live_grant_is_not_taken_over_when_the_job_record_is_gone(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-6: take-over judged "fresh" from the job record's hb only; with the record gone
+    (expired) hb read 0, the live grant was dropped and the call ran twice.
+    """
+    r = await rig(store, prefix)
+    assert (await r.ask("c1", worker="pod-a", tag="m1")).kind == "granted"
+    await store.delete(f"{prefix}:{{r:c1}}:job")
+    assert (await r.ask("c1", worker="pod-b", tag="m2")).kind == "duplicate"  # granted before
+
+
 async def test_fl1_release_claims_of_calls_held_without_a_grant(
     store: redis.asyncio.Redis, prefix: str
 ) -> None:

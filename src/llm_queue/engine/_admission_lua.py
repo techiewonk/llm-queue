@@ -212,7 +212,11 @@ if held then
   end
   local holder = redis.call('HGET', entry_key, 'worker')
   local hb = hnum(job_key, 'hb', 0)
-  local fresh = now - hb < num(req.lease_ms, 60000) and redis.call('HGET', entry_key, 'started') ~= false
+  -- Alive by its own lease too (FL-6): with the job record gone (expired, or a call with no
+  -- claim) hb read 0 and a live grant was dropped, so the call ran twice.
+  local leased = num(redis.call('ZSCORE', mk(alias, 'inprog'), held), 0) > now
+  local fresh = (leased or now - hb < num(req.lease_ms, 60000))
+    and redis.call('HGET', entry_key, 'started') ~= false
   if fresh then return cjson.encode({r = 'duplicate'}) end
   -- A dead owner (no heartbeat for a lease): drop its slot and entry (no refund).
   local old_dep = redis.call('HGET', entry_key, 'dep')
