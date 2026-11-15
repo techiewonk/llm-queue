@@ -20,7 +20,9 @@ from llm_queue import (
     StoreOptions,
     Tuning,
 )
+from llm_queue.engine.cross_checks import start_warnings
 from llm_queue.engine.store_client import store_client
+from llm_queue.registry import load_registry
 
 REGISTRY = {
     "registry_version": 1,
@@ -213,3 +215,32 @@ def test_r3cf15_upper_bounds_and_pairs() -> None:
         "bedrock.read_timeout_secs must be at least 1",
     ):
         assert fragment in text
+
+
+def test_r3cf10_result_ttl_below_the_recheck_is_refused() -> None:
+    """R3CF-10: `LLMQ_RESULT_TTL_SECS=1` was accepted while `result_recheck_secs` is 60: a caller
+    that missed its wake-up found its result gone. Both names are in the one problem line.
+    """
+    assert Tuning().problems(result_ttl_secs=300) == []
+    [line] = Tuning().problems(result_ttl_secs=30)
+    assert "LLMQ_RESULT_TTL_SECS (30)" in line
+    assert "engine.result_recheck_secs (60)" in line
+    with pytest.raises(ConfigError, match="LLMQ_RESULT_TTL_SECS"):
+        LLMQueue.from_env({**ENV, "LLMQ_RESULT_TTL_SECS": "30"})
+
+
+def test_r3cf10_registry_pairs_with_the_process_are_warned() -> None:
+    """R3CF-10: an attempt timeout above the client's read timeout (the client cut the call
+    first) and a call timeout above `LLMQ_STATUS_TTL_SECS` passed with no word at start.
+    """
+    doc = json.loads(json.dumps(REGISTRY))
+    doc["models"]["chat"].update(attempt_timeout_secs=800, timeout_secs=900, breaker_probe_secs=900)
+    timeouts = {"bedrock": 300.0}
+    lines = start_warnings(load_registry(doc), read_timeouts=timeouts, status_ttl_secs=600)
+    assert len(lines) == 2
+    assert "attempt_timeout_secs (800)" in lines[0]
+    assert "bedrock.read_timeout_secs (300)" in lines[0]
+    assert "timeout_secs (900)" in lines[1]
+    assert "LLMQ_STATUS_TTL_SECS (600)" in lines[1]
+    view = load_registry(REGISTRY)
+    assert start_warnings(view, read_timeouts=timeouts, status_ttl_secs=1800) == []

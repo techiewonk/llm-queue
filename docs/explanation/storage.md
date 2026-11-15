@@ -82,7 +82,8 @@ model's `queue.name`) and `...-priority`; jobs use `jobs-<name>`. Hash tags grou
   Liveness is false when a background loop died or the heartbeat stopped for a lease.
 - **`NOSCRIPT`**: a pipelined `SEND` + `WAIT` that meets a node without the script cached is run once
   more (pipelines load scripts only when they start); plain script calls rely on redis-py's reload.
-- **Queue store failover**: `LLMQ_QUEUE_FAILOVER_SECS` (5) of send errors before a call runs direct;
+- **Queue store failover**: `LLMQ_QUEUE_FAILOVER_SECS` (5) of send errors (each try bounded by
+  it) before a call runs direct; the next calls skip the queue store while the outage is remembered;
   `LLMQ_QUEUE_WAIT_REPLICAS` / `LLMQ_QUEUE_WAIT_MS` (0 / 100) make a send wait for replicas.
 - **Store reset**: a missing or changed `P:epoch` (restart without data, failover to an empty node)
   is detected by every pod's heartbeat (each remembers the epoch it saw): each pod puts its own

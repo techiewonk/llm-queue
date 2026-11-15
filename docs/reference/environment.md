@@ -94,7 +94,7 @@ Numbers have a range: whole-number variables refuse `200.0` or `1e3`, TTLs stay 
 |---|---|---|
 | `LLMQ_LEASE_SECS` | 60 | Lease of a running call's grant; renewed by the heartbeat every third of it (at most 3600) |
 | `LLMQ_CALLER_TTL_SECS` | 30 | How long a caller process counts as alive without a heartbeat. Must be at least `LLMQ_LEASE_SECS / 3` plus a margin (`max(5, beat / 2)`), checked at start |
-| `LLMQ_RESULT_TTL_SECS` | 300 | How long a stored result lives |
+| `LLMQ_RESULT_TTL_SECS` | 300 | How long a stored result lives; at least `Tuning.engine.result_recheck_secs` (60), or start-up fails |
 | `LLMQ_RESULT_DEDUPE_SECS` | 0 | Keep a result with a library-made id this long after it was read (0: delete on read) |
 | `LLMQ_STATUS_TTL_SECS` | 1800 | How long a call's status record lives (at least 60) |
 | `LLMQ_DRAIN_SECS` | 25 | Default `drain_secs` of `stop()` (0 to 3600; 0 returns held work at once); fits the Kubernetes default grace period of 30 s (see [Operate](../how-to/operate.md#deploys-and-restarts)) |

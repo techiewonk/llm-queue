@@ -266,9 +266,45 @@ class Admission:
             logger.warning("finish_skipped", model=alias, request_id=request_id, error=str(exc))
             return False
         if not settled:  # swept as dead, taken over, or lost with the store (RESCAN A6)
-            logger.warning("grant_lost", model=alias, request_id=request_id, step="finish")
-            self.metrics.count("llmq_grants_lost_total", model=alias, step="finish")
+            self.grant_lost(alias, request_id)
         return settled
+
+    def finish_args(
+        self,
+        alias: str,
+        owner: str,
+        request_id: str,
+        *,
+        refund_r: int,
+        refund_t: int,
+        outcome: Outcome,
+        latency_ms: float = -1,
+    ) -> list[Any]:
+        """FINISH's arguments (prefix, JSON, clock) for a script that runs it with others.
+
+        `RequestStore.put_result_settled` stores the result, acks and finishes in one round
+        trip (FL-22). The owner counts as settled from here, as in `finish`.
+        """
+        self._settle(owner)
+        body = {
+            "alias": alias,
+            "owner": owner,
+            "request_id": request_id,
+            "refund_r": refund_r,
+            "refund_t": refund_t,
+            "outcome": outcome,
+            "latency_ms": latency_ms,
+            "retry_after_ms": 0,
+            "rand": self._rng.random(),
+            "t": self._t,
+        }
+        clock = "" if self._clock_ms is None else int(self._clock_ms())
+        return [self.keys.prefix, orjson.dumps(body), clock]
+
+    def grant_lost(self, alias: str, request_id: str) -> None:
+        """Log and count a grant found gone when it was settled (swept, taken over, reset)."""
+        logger.warning("grant_lost", model=alias, request_id=request_id, step="finish")
+        self.metrics.count("llmq_grants_lost_total", model=alias, step="finish")
 
     async def undo(
         self, alias: str, owner: str, request_id: str, *, keep_claim: bool = False

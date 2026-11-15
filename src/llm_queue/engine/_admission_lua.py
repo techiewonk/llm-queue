@@ -17,8 +17,9 @@ from __future__ import annotations
 _COMMON = r"""
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
--- ARGV[3], tests only: an injected clock (ms) instead of the store's (production never sends it).
-if ARGV[3] then now = tonumber(ARGV[3]) end
+-- ARGV[3], tests only: an injected clock (ms) instead of the store's (production never sends it,
+-- or sends '' where later ARGV follow: SETTLE_DONE in requests.py).
+if ARGV[3] and ARGV[3] ~= '' then now = tonumber(ARGV[3]) end
 local minute = math.floor(now / 60000)
 local P = ARGV[1]
 local req = cjson.decode(ARGV[2])
@@ -393,9 +394,11 @@ end
 local job_owner = req.job_owner or req.worker
 if req.claim and state == 'running' then
   local runner = redis.call('HGET', job_key, 'owner')
-  if runner and runner ~= job_owner
-    and now - hnum(job_key, 'hb', 0) < num(req.lease_ms, 60000) then
-    return cjson.encode({r = 'duplicate'})
+  local age = now - hnum(job_key, 'hb', 0)
+  if runner and runner ~= job_owner and age < num(req.lease_ms, 60000) then
+    -- `ms`: when the claim lapses, so a redelivery comes back then, not half a lease later
+    -- (R3RC-8: a lower `visibility_secs` made a dead pod's take-over slower).
+    return cjson.encode({r = 'duplicate', ms = math.max(1, num(req.lease_ms, 60000) - age)})
   end
 end
 local held = redis.call('HGET', entry_key, 'owner')
@@ -410,10 +413,15 @@ if held then
   local hb = hnum(job_key, 'hb', 0)
   -- Alive by its own lease too (FL-6): with the job record gone (expired, or a call with no
   -- claim) hb read 0 and a live grant was dropped, so the call ran twice.
-  local leased = num(redis.call('ZSCORE', mk(alias, 'inprog'), held), 0) > now
+  local lease_end = num(redis.call('ZSCORE', mk(alias, 'inprog'), held), 0)
+  local leased = lease_end > now
   local fresh = (leased or now - hb < num(req.lease_ms, 60000))
     and redis.call('HGET', entry_key, 'started') ~= false
-  if fresh then return cjson.encode({r = 'duplicate'}) end
+  if fresh then
+    -- `ms` (R3RC-8): the later of the lease's end and the heartbeat's lapse.
+    local until_ms = math.max(lease_end, hb + num(req.lease_ms, 60000))
+    return cjson.encode({r = 'duplicate', ms = math.max(1, until_ms - now)})
+  end
   -- A dead owner (no heartbeat for a lease): drop its slot and entry (no refund).
   local old_dep = redis.call('HGET', entry_key, 'dep')
   local old_cls = redis.call('HGET', entry_key, 'cls')

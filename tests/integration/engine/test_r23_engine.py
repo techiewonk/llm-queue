@@ -23,7 +23,7 @@ from llm_queue.engine.admission import Decision
 from llm_queue.engine.envelope import Reply, params_hash
 from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.inference import InferenceRejected
-from llm_queue.engine.queue import Message, NotReplicated
+from llm_queue.engine.queue import Message, NotReplicated, StreamQueues
 from llm_queue.engine.runtime import Engine, _store_refused
 from llm_queue.engine.store_client import StorePoolBusy, store_client
 
@@ -54,7 +54,7 @@ async def _until_async(check: Any, secs: float = 3.0, what: str = "condition") -
 
 async def _confirmed(engine: Any, rid: str) -> bool:
     """True once the call's record says its send landed."""
-    return (await engine.requests.job(rid)).get("confirmed") == "1"
+    return bool((await engine.requests.job(rid)).get("confirmed") == "1")
 
 
 async def _cancel(*tasks: asyncio.Task[Any]) -> None:
@@ -104,7 +104,7 @@ async def test_fe2_a_call_received_during_stop_is_returned(
 
     async def return_(message: Any, delay_secs: float = 0.0) -> bool:
         returned.append(message.id)
-        return await real_return(message, delay_secs)
+        return bool(await real_return(message, delay_secs))
 
     async def decide(*args: Any, **kwargs: Any) -> Decision:
         return Decision("wait", wait_secs=0.05)
@@ -139,7 +139,7 @@ async def test_fe6_stop_with_no_drain_still_returns_waiting_calls(
     real_return = engine.queues.return_
 
     async def return_(message: Any, delay_secs: float = 0.0) -> bool:
-        ok = await real_return(message, delay_secs)
+        ok = bool(await real_return(message, delay_secs))
         returned.append(ok)
         return ok
 
@@ -230,7 +230,7 @@ async def test_fe14_a_stale_ack_is_logged(make: Make, caplog: pytest.LogCaptureF
     async def ack(message: Any) -> bool:
         return False
 
-    engine.queues.ack = ack  # type: ignore[method-assign]  # a stale receipt
+    engine.queues.ack = ack  # a stale receipt
     await engine._ack(held)
     assert "ack_stale_receipt" in caplog.text
 
@@ -636,7 +636,7 @@ async def test_fe20_ring_again_error_does_not_end_the_model_loop(
         return None  # no free slot: a doorbell token taken goes back
 
     async def wait_bell(*args: Any, **kwargs: Any) -> str:
-        return name
+        return str(name)
 
     async def ring_again(queue: str) -> None:
         raise ResponseError("UNBLOCKED force unblock from blocking operation")
@@ -888,8 +888,7 @@ async def test_cg3_a_failing_queue_store_sends_calls_direct(make: Make) -> None:
     """CG-3: `LLMQ_QUEUE_FAILOVER_SECS` (a separate queue store that keeps failing sends the
     call down the direct path) had no test. A queue store on a refused port, failover 0.5 s.
 
-    Only the refused case: a blackholed store still costs the client's full budget per call
-    (R3FM-3's send bound is not done).
+    The refused case; the blackholed one is R3FM-3's test below.
     """
     base, _ = await make(worker=False)
     queue_store = store_client("redis://:x@127.0.0.1:1/0")
@@ -907,6 +906,126 @@ async def test_cg3_a_failing_queue_store_sends_calls_direct(make: Make) -> None:
     finally:
         await engine.stop(drain_secs=0)
         await queue_store.aclose()
+
+
+async def test_fl22_a_call_ends_in_one_script_on_a_shared_store(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FL-22: the end of a queued call was RESULT_PUT, then FINISH and ACK (two round trips).
+
+    With the queue in the state store it is one script: the three separate writes are not
+    used, and the grant, the message and the result are all settled.
+    """
+    engine, _ = await make()
+
+    async def unused(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("settled by its own script")
+
+    monkeypatch.setattr(engine.requests, "put_result", unused)
+    monkeypatch.setattr(engine.admission, "finish", unused)
+    monkeypatch.setattr(engine.queues, "ack", unused)
+    reply = await engine.call("small", CHAT, request_id="fl22", timeout_secs=10)
+    assert reply.ok
+    await _until(lambda: not engine._held, what="the call settled")  # woken inside the script
+    name = engine._queue_name(engine.registry.current, "small", False)
+    assert await engine.state.xlen(engine.queues.queue_keys(name)[0]) == 0  # acked
+    entry = f"{engine.keys.prefix}:{{m:small}}:inprog:fl22"
+    assert not await engine.state.exists(entry)  # the grant is finished
+
+
+async def test_fe5_amend_callers_take_over_a_dead_direct_run(make: Make) -> None:
+    """AMEND FE-5: a direct run whose process died left the record confirmed with no result;
+    attached callers and every retry of the id waited to their deadline (`deadline_exceeded`).
+
+    The dead runner is a record made as a direct run's caller makes it, its liveness key gone:
+    a retry takes it over at once, and a caller attached while the runner lived re-registers
+    at its first recheck (after the takeover grace) and takes it over too.
+    """
+    engine, _ = await make()
+    alias = "small"
+    record: dict[str, Any] = {
+        "user_hash": engine.hash_id(""),
+        "params_hash": params_hash({"m": alias, "p": CHAT}),
+        "model": alias,
+        "priority": False,
+        "app_id": True,
+    }
+
+    async def dead_direct_run(rid: str) -> None:
+        await engine.requests.register(rid, caller="dead-pod", **record)
+        await engine.requests.confirm(rid, keep_secs=30, direct=True)
+
+    await dead_direct_run("fe5-retry")
+    await engine.state.delete(engine.keys.caller("dead-pod"))
+    reply = await engine.call(alias, CHAT, request_id="fe5-retry", timeout_secs=8)
+    assert reply.ok  # `deadline_exceeded` after 8 s before
+
+    await dead_direct_run("fe5-attached")
+    attached = asyncio.create_task(
+        engine.call(alias, CHAT, request_id="fe5-attached", timeout_secs=15)
+    )
+    await _until(lambda: "fe5-attached" in engine._local_callers, what="the caller attached")
+    await asyncio.sleep(0.2)  # registered while the runner was alive
+    await engine.state.delete(engine.keys.caller("dead-pod"))  # the runner's process dies
+    assert (await attached).ok
+
+
+async def test_r3fm3_a_blackholed_queue_store_is_skipped_after_the_first_detection(
+    make: Make,
+) -> None:
+    """R3FM-3 (send timeout, AMEND CG-3): a blackholed queue store cost every call the
+    client's full retry budget (about 21 s) before the direct path, for the whole outage.
+
+    Each send try is now bounded by `queue_failover_secs`, and the outage is remembered: the
+    first call fails over within the failover time plus 1 s, the next ones skip the queue
+    store at once. The store accepts connections and never answers (not a refused port).
+    """
+    held: list[asyncio.StreamWriter] = []
+
+    async def blackhole(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        held.append(writer)
+        await reader.read()  # never answers
+
+    server = await asyncio.start_server(blackhole, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    base, _ = await make(worker=False)
+    settings = dataclasses.replace(base.settings, queue_failover_secs=0.5)
+    engine = Engine(base.state, base.registry, base.providers, queue_store=base.state)
+    engine.settings = settings
+    await engine.start(worker=False)
+    dead = store_client(f"redis://:x@127.0.0.1:{port}/0")
+    engine._queue_store = dead  # the queue store goes dark after start
+    engine.queues = StreamQueues(dead, engine.keys)
+    sends = 0
+    real_send = engine.queues.send
+
+    async def send(*args: Any, **kwargs: Any) -> Any:
+        nonlocal sends
+        sends += 1
+        return await real_send(*args, **kwargs)
+
+    engine.queues.send = send  # type: ignore[method-assign]  # count the tries
+    loop = asyncio.get_running_loop()
+    try:
+        started = loop.time()
+        reply = await engine.call("small", CHAT, timeout_secs=20)
+        assert reply.ok
+        first_secs = loop.time() - started - reply.meta.provider_ms / 1000
+        assert first_secs < settings.queue_failover_secs + 1.0, first_secs
+        tried = sends
+        for _ in range(3):
+            started = loop.time()
+            reply = await engine.call("small", CHAT, timeout_secs=20)
+            assert reply.ok
+            overhead = loop.time() - started - reply.meta.provider_ms / 1000
+            assert overhead < 0.3, overhead  # the provider's time, nothing spent on the store
+        assert sends == tried  # the dark store was not tried again
+    finally:
+        await engine.stop(drain_secs=0)
+        await dead.aclose()
+        server.close()
+        for writer in held:
+            writer.close()
 
 
 async def test_cg5_a_caller_whose_key_expired_is_gone(make: Make, store: Any) -> None:

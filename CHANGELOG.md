@@ -123,11 +123,20 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
   `LLMQ_BASE_URL_ALLOWED_HOSTS` with a scheme, port or path are refused by name (R3CF-13).
 - **Registry checks added** (R3CF-10, R3CF-12): a fallback `after_secs` that could never fire
   inside `timeout_secs` is an error; the weight-0 check covers `balance_priority` and counts
-  usable deployments only. Cross-field messages show values and levels and use the dotted
+  usable deployments only. `LLMQ_RESULT_TTL_SECS` below `Tuning.engine.result_recheck_secs`
+  is a `ConfigError` (a caller that missed its wake-up never read its result), and `start()`
+  warns (`config_cross_check`) when a model's `attempt_timeout_secs` is above its client's
+  read timeout in `Tuning` or its call timeout above `LLMQ_STATUS_TTL_SECS`. Cross-field messages show values and levels and use the dotted
   override path `settings set` takes (R3CF-17).
-- **A fallback model of another provider is allowed** (owner Q40, R3CF-6): the changelog and
-  docs said it was refused; it never was. The request is not converted between shapes yet, so
-  the validator warns. A disabled fallback target and unknown `blocked_regions` stay warnings.
+- **A fallback model of another provider is allowed and converted** (owner Q40, R3CF-6): the
+  changelog and docs said it was refused; it never was, and the caller's request reached the
+  other provider unchanged (a Converse body at an OpenAI server) with the reply in the other
+  shape. Requests and replies are now converted between Converse and OpenAI chat (messages
+  with text, images, tool use and results; system prompt; tools and tool choice; output and
+  sampling settings; stop reason and usage), by `llm_queue.engine.shapes`. A request with a
+  part the other shape cannot carry skips that target; streams do not fall back across shapes.
+  The validator still warns where such a target is configured. A disabled fallback target and
+  unknown `blocked_regions` stay warnings.
 - **Admin HTTP status codes** (FO-6, FO-7, FO-17): a write that lost the compare-and-set race
   answers 409 with `Retry-After` (was 400); a route hit before the registry loaded answers 503
   (was a 500); only an unknown model is a 404 (any internal `KeyError` was).
@@ -300,7 +309,10 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
 - **An answer in hand is kept until the call's deadline** during a store outage, not one lease
   (Q7).
 - **`fail_fast` / `static_cap` answer at once during a known outage** (Q11, R3FM-3): a store
-  outage a call saw is remembered `outage_memo_secs` (3 s; a good write probe clears it).
+  outage a call saw is remembered `outage_memo_secs` (3 s; a good write probe clears it). A
+  separate queue store found down is remembered the same way: calls then run direct at once,
+  and each send try is bounded by `LLMQ_QUEUE_FAILOVER_SECS`. A blackholed queue store cost
+  every call the client's full retry budget (about 21 s) before the direct path.
 - **`LLMQ_QUEUE_WAIT_REPLICAS` covers call sends, job sends and registry live edits** (Q8, Q51),
   each switchable with `LLMQ_QUEUE_WAIT_SCOPES` (`all`, `none`, or a list of `calls`, `jobs`,
   `registry`; all by default). Too few replicas no longer runs the call direct: it is sent
@@ -497,7 +509,9 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
   inside its admission, and an admission that failed without an answer undoes its possible
   grant (FE-4, RV-N1); a hold cancelled before its first step frees its class (RV-N2); paused
   calls resume only when the store takes writes (FE-7); a direct run that raised stores its
-  failure (FE-5); a caller-only process stops its direct run on cancel (FE-17); an unreadable
+  failure (FE-5), and one whose process died (killed, out of memory) is taken over by the next
+  caller of its id once its liveness key and heartbeat lapse, where callers waited to their
+  deadline for up to an hour (AMEND FE-5); a caller-only process stops its direct run on cancel (FE-17); an unreadable
   message whose return or fail errs is returned (FE-9); a retry admits against the current
   view (FE-13); a stale ack is logged and counted, `llmq_stale_acks_total` (FE-14); one model's
   failing sweep skips only itself (FE-15); `_free_stuck` cannot end the heartbeat (FE-18);
@@ -514,7 +528,8 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
 - A slow `TIME` read keeps the old store-clock offset and a clock jump is logged,
   `store_clock_jump` (R3RC-7, R3FM-10); a subscriber is pinged and reset when silent, or when
   the sweep keeps finding results it never announced, `llmq_pubsub_resubscribes_total`
-  (R3RC-6, R3FM-12); a duplicate goes back when the claim lapses, if the script says (R3RC-8).
+  (R3RC-6, R3FM-12); a duplicate goes back when the claim lapses: PICK_TAKE's `duplicate`
+  reply carries the claim's time left (`ms`), where it went back after a fixed half lease (R3RC-8).
 - A job delivered again while it still ran in the same process ran twice (R3JE-9); a failed job
   was logged without its traceback or id (R3JE-11) and any `TimeoutError` as the job's own
   limit (now `job_timeout` only when `timeout_secs` ran out: R3JE-13).
@@ -856,6 +871,16 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
   per-caller inbox stream (one key per read) is not done.
 - `stream()` reads each chunk entry with one queue get; a Task and an `asyncio.wait` per entry
   cost 42 us each (R3PF-11, caller side; the worker still flushes one pipeline per stream).
+- A queued call that succeeded ends in one script when the queues share the state store
+  (`SETTLE_DONE`: result, status, ack, then FINISH): one round trip instead of two (RESULT_PUT,
+  then FINISH and ACK together), and no window where the result is stored while the slot
+  waits (FL-22). A separate queue store keeps the old path. Local Valkey 8.1, 1,000 calls per
+  side, interleaved, 2 KB answer: 4.4-4.6 ms -> 2.2-2.3 ms median, p90 11.0-11.4 -> 5.0-5.5 ms
+  (Python 3.12.13, Windows, 2026-11-15).
+- A call's params are encoded once: the size cap's orjson bytes are spliced into the message
+  (`orjson.Fragment`) instead of `Envelope.dumps` encoding them again (FO-21). Size cap plus
+  message, median: a 2 MB image request 16.3 -> 9.4 ms, a 200 KB text request 70 -> 47 us, a
+  4 KB chat 10.0 -> 9.3 us (micro-benchmark, Python 3.12.13, Windows, 2026-11-15).
 
 ### Packaging and CI
 

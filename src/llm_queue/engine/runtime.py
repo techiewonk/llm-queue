@@ -40,7 +40,7 @@ from llm_queue._version import __version__
 from llm_queue.clients.pool import CredentialsRefreshSlow, CredentialsUnavailable, route_for
 from llm_queue.clients.providers import Providers
 from llm_queue.clients.timing import AttemptTimeout, Timing
-from llm_queue.engine import hooks, inference, tokens
+from llm_queue.engine import hooks, inference, shapes, tokens
 from llm_queue.engine._codec import text
 from llm_queue.engine.admission import (
     Admission,
@@ -54,7 +54,7 @@ from llm_queue.engine.envelope import (
     Envelope,
     Meta,
     Reply,
-    message_size_bytes,
+    encode_params,
     params_hash,
     parse,
 )
@@ -153,6 +153,16 @@ def _op_of(view: ResolvedRegistry, alias: str) -> str:
     """The provider operation of a model's calls (Converse, InvokeModel, chat, embeddings)."""
     entry = view.registry.models[alias]
     return OPS.get((entry.provider, entry.type), "chat" if entry.type == "chat" else "embeddings")
+
+
+def _served_op(view: ResolvedRegistry, alias: str, env: Envelope) -> str:
+    """The provider operation for `alias` serving `env`: its own shape when it differs (Q40).
+
+    `env.op` is the caller's model's shape (Converse or OpenAI chat); a fallback model of the
+    other provider is sent its own, converted (`shapes`).
+    """
+    op = _op_of(view, alias)
+    return op if shapes.converts(env.op, op) else env.op
 
 
 def _by_deployment(view: ResolvedRegistry, alias: str, name: str) -> float:
@@ -573,6 +583,7 @@ class Engine:
             result_dedupe_secs=self.settings.result_dedupe_secs,
             status_ttl_secs=self.settings.status_ttl_secs,
             caller_ttl_secs=self.caller_ttl_secs,
+            lease_secs=self.settings.lease_secs,
             offload=offload,
             offload_bytes=offload_bytes,
         )
@@ -613,6 +624,8 @@ class Engine:
         self._beat_ok_mono = time.monotonic()  # last heartbeat that reached the store
         self._store_trouble_mono = -1e9  # monotonic time this process last saw the store fail
         self._outage_until_mono = -1e9  # a call saw the store down: skip it until then (Q11)
+        # A separate queue store a send found down: calls run direct until then (R3FM-3).
+        self._queue_down_until_mono = -1e9
         self._store_ping: asyncio.Task[bool] | None = None  # pings for paused calls
         self._store_waiting = 0  # calls paused on the store_down path, waiting on the probe
         # Calls whose awaiting task was cancelled, for the one canceller (`_cancel_later`).
@@ -936,25 +949,37 @@ class Engine:
         view = self.registry.current
         alias = view.registry.alias_of(model)
         rid = request_id or stream_id or new_id()
+        # The caller's shape (its model's provider), kept when a fallback model of the other
+        # provider serves it: the request and reply are converted on the worker (Q40).
+        op = _op_of(view, alias)
         if view.effective(alias, "enabled").level == "model" and not view.value(alias, "enabled"):
             rule = view.value(alias, "model_fallback")
             if not rule or allow_fallback != "all" or not rule["models"]:
                 raise CallFailed("model_disabled", f"{alias} is disabled", request_id=rid)
             # The first target that can take calls: one disabled itself (model, every
-            # deployment or every account) got them all and failed each (RESCAN R8).
+            # deployment or every account) got them all and failed each (RESCAN R8). A target
+            # of another shape needs a request that converts, and never takes a stream.
             targets = [item["model"] for item in rule["models"]]
-            usable = [t for t in targets if t in view.registry.models and _takes_calls(view, t)]
+            usable = [
+                t
+                for t in targets
+                if t in view.registry.models
+                and _takes_calls(view, t)
+                and self._shape_ok(view, t, op, params, stream=stream)
+            ]
             if not usable:
                 raise CallFailed(
                     "model_unavailable",
-                    f"{alias} is disabled and no fallback model is enabled",
+                    f"{alias} is disabled and no fallback model is enabled (or none takes this "
+                    "request's shape)",
                     request_id=rid,
                 )
             alias = usable[0]
-        op = _op_of(view, alias)
         # Here, not in the front door, so every path meets it: async and sync calls, streams,
-        # embeddings, jobs and the LangChain adapters (plan C1). One orjson pass over the params.
-        size, limit = message_size_bytes(params), int(view.value(alias, "max_message_bytes"))
+        # embeddings, jobs and the LangChain adapters (plan C1). One orjson pass over the params,
+        # kept for the message itself (FO-21: it was encoded a second time by `dumps`).
+        encoded = encode_params(params)
+        size, limit = len(encoded[0]), int(view.value(alias, "max_message_bytes"))
         if size > limit:
             raise CallFailed(  # one kind for every too-big call (owner Q38)
                 "request_too_large",
@@ -981,6 +1006,7 @@ class Engine:
             app_request_id=request_id is not None,
             stream=stream,
         )
+        envelope.keep_params_json(encoded)
         hook_name = view.value(alias, "admission")
         hook = hooks.get("admission", hook_name)
         if hook is not None:
@@ -1003,6 +1029,32 @@ class Engine:
             # fell during an outage and read as "traffic fell" (R3OB-5).
             self.metrics.count("llmq_caller_failures_total", model=alias, outcome=str(exc.kind))
             raise
+
+    def _shape_ok(
+        self,
+        view: ResolvedRegistry,
+        target: str,
+        op: str,
+        params: Mapping[str, Any],
+        *,
+        stream: bool,
+    ) -> bool:
+        """Whether a fallback model can serve a call of shape `op` (Q40).
+
+        Same shape: always. The other shape: not for a stream (its events are not converted),
+        and only when the request converts (`shapes.unconvertible`); either is logged.
+        """
+        target_op = _op_of(view, target)
+        if not shapes.converts(op, target_op):
+            return True
+        if stream:
+            logger.info("fallback_shape_skipped", model=target, reason="stream")
+            return False
+        reason = shapes.unconvertible(params, op, target_op)
+        if reason is not None:
+            logger.info("fallback_shape_skipped", model=target, reason=reason)
+            return False
+        return True
 
     @contextlib.contextmanager
     def _caller_ref(self, rid: str) -> Iterator[None]:
@@ -1333,6 +1385,11 @@ class Engine:
         inside an `except _QueueDown` handler, a store error there reached the app as a raw
         redis-py error and skipped the model's `store_down` rule (audit RT-2).
         """
+        if not direct and not self.queues_shared and self._queue_down_remembered():
+            # The separate queue store was found down moments ago (R3FM-3): run direct now.
+            # Each call re-discovered it at the client's full retry budget (about 21 s when
+            # the store is blackholed) before it took the direct path.
+            direct = True
         try:
             return await self._call_once(
                 view, alias, envelope, params, priority, call_secs, request_id, direct
@@ -1416,7 +1473,7 @@ class Engine:
             run: asyncio.Task[None] | None = None  # the direct run, watched while waiting
             if outcome in ("new", "takeover") and not sent:
                 if direct:
-                    await self.requests.confirm(rid, keep_secs=call_secs)
+                    await self.requests.confirm(rid, keep_secs=call_secs, direct=True)
                     run = self._start_direct(envelope)
                 else:
                     await self._send(rid, envelope, view, alias, priority, call_secs)
@@ -1480,18 +1537,28 @@ class Engine:
         give_up = loop.time() + self.settings.queue_failover_secs
         body = envelope.dumps()
         tries = 0
+        # Each try against a separate queue store is bounded by what is left of
+        # `queue_failover_secs` (with 0, one store probe's time): one send to a blackholed
+        # store took the client's whole budget, about 21 s, before the failover (R3FM-3). A
+        # shared store keeps the client's own timeouts (the call has no other path).
+        floor_secs = self.settings.timings.health_probe_secs
         while True:
             try:
                 try:
-                    await self.queues.send(
-                        self._queue_name(view, alias, priority),
-                        body,
-                        settings,
-                        wait_replicas=self.replica_wait.replicas_for("calls"),
-                        wait_ms=self.replica_wait.wait_ms,
-                    )
+                    bound = None
+                    if not self.queues_shared:
+                        left = give_up - loop.time()
+                        bound = left if left > 0 else floor_secs
+                    async with asyncio.timeout(bound):
+                        await self.queues.send(
+                            self._queue_name(view, alias, priority),
+                            body,
+                            settings,
+                            wait_replicas=self.replica_wait.replicas_for("calls"),
+                            wait_ms=self.replica_wait.wait_ms,
+                        )
                     break
-                except STORE_ERRORS:
+                except STORE_ERRORS:  # a try past its bound too (TimeoutError is an OSError)
                     if not self.queues_shared and loop.time() < give_up:
                         tries += 1
                         await asyncio.sleep(self._store_retry_secs(tries))
@@ -1515,6 +1582,10 @@ class Engine:
                 ):
                     raise CallFailed("queue_unavailable", _refusal(exc), request_id=rid) from exc
                 if isinstance(exc, STORE_ERRORS) and not self.queues_shared:
+                    self._queue_down_until_mono = time.monotonic() + self.settings.outage_memo_secs
+                    logger.warning(
+                        "queue_store_down", error=str(exc), error_type=type(exc).__name__
+                    )
                     raise _QueueDown from exc
                 raise
         try:
@@ -1755,6 +1826,10 @@ class Engine:
         """True while a store outage a call saw is remembered (owner Q11)."""
         return time.monotonic() < self._outage_until_mono
 
+    def _queue_down_remembered(self) -> bool:
+        """True while a separate queue store a send found down is remembered (R3FM-3)."""
+        return time.monotonic() < self._queue_down_until_mono
+
     def _remember_outage(self) -> None:
         """Remember a store outage for `outage_memo_secs`; a probe that succeeds ends it."""
         if not self._outage_remembered():
@@ -1817,9 +1892,10 @@ class Engine:
                     ) from exc
                 budget = float(view.value(alias, "attempt_timeout_secs", dep.key))
                 timing = Timing(budget, float(view.value(alias, "stream_idle_secs")), budget)
+                served_op = _served_op(view, alias, envelope)
                 try:
                     result = await provider.call(
-                        envelope.op,
+                        served_op,
                         params,
                         route,
                         timing,
@@ -1854,9 +1930,8 @@ class Engine:
                 )
                 # Tokens spent with no record before: the store is down, so only here (R3OB-5).
                 self._outcome(envelope, alias, dep.account, dep.region, "ok", meta, "static_cap")
-                return Reply(
-                    request_id=envelope.request_id, ok=True, response=result.response, meta=meta
-                )
+                response = shapes.reply(result.response, envelope.op, served_op, model=alias)
+                return Reply(request_id=envelope.request_id, ok=True, response=response, meta=meta)
         raise CallFailed(
             kind, str(error or "no usable deployment"), request_id=envelope.request_id
         ) from error
@@ -2080,9 +2155,25 @@ class Engine:
         if not job:
             return True
         if job.get("confirmed") != "0":
-            return False
+            return await self._direct_runner_dead(job)
         created = float(job.get("created") or 0)
         return self.clock.now() - created >= self.requests.takeover_grace_secs
+
+    async def _direct_runner_dead(self, job: Mapping[str, str]) -> bool:
+        """True when a confirmed record's direct run lives in a process that died (AMEND FE-5).
+
+        REGISTER's rule, read here so an attached caller registers again (and takes the record
+        over) instead of waiting to its deadline: the runner's liveness key is gone and its
+        claim had no heartbeat for a lease, or it never started running.
+        """
+        runner = job.get("caller")
+        if job.get("direct") != "1" or not runner or runner == self.worker_id:
+            return False
+        if await self.state.exists(self.keys.caller(runner)):
+            return False
+        if job.get("state") != "running":
+            return True
+        return self.clock.now() * 1000 - float(job.get("hb") or 0) >= self.requests.lease_ms
 
     async def _keep_alive(self, pubsub: Any, alive: _Alive) -> None:
         """Ping a subscriber; raise (reset and resubscribe) when it went silent.
@@ -2705,10 +2796,18 @@ class Engine:
                 dropped = (*dropped, *_TOOL_FIELDS)
             params = {k: v for k, v in params.items() if k not in dropped}
             limits = {**limits, "on_exceed": "clamp"}
+        op = _served_op(view, alias, env)
+        if op != env.op:
+            # A fallback model of the other provider (Q40): its own request shape, its own
+            # defaults and limits applied after.
+            try:
+                params = shapes.request(params, env.op, op)
+            except shapes.ShapeError as exc:
+                raise inference.InferenceRejected(f"{alias}: {exc}") from exc
         embedding = entry.type == "embedding"
         request = inference.apply(
             entry.provider,
-            env.op,
+            op,
             params,
             view.value(alias, "inference", dep) or {},
             limits,
@@ -2914,7 +3013,7 @@ class Engine:
             if held.message is not None:
                 # When the claim lapses, if the script says (`ms`); else half a lease. The fixed
                 # half lease made a lower `visibility_secs` take over a dead pod's call later
-                # (R3RC-8). The `ms` field of the reply is the Lua owner's part.
+                # (R3RC-8). PICK_TAKE's `duplicate` carries `ms`; the half lease is a fallback.
                 delay = (
                     decision.wait_secs if decision.wait_secs > 0 else self.settings.lease_secs / 2
                 )
@@ -3095,6 +3194,8 @@ class Engine:
         for item in rule["models"]:
             other = item["model"]
             if other not in view.registry.models or not _takes_calls(view, other):
+                continue
+            if not self._shape_ok(view, other, env.op, env.params, stream=env.stream):
                 continue
             pct = int(view.value(other, "require_headroom_pct")) if item["require_headroom"] else 0
             ask = self._ask(
@@ -3414,6 +3515,7 @@ class Engine:
             "cost_r": 1,
             "cost_t": estimate.total,
         }
+        served_op = _served_op(view, alias, env)
         writer = held.writer = None
         if env.stream and env.op in ("converse", "chat"):
             writer = held.writer = ChunkWriter(
@@ -3459,7 +3561,7 @@ class Engine:
         try:
             async with outer:
                 result = await provider.call(
-                    env.op,
+                    served_op,
                     params,
                     route,
                     timing,
@@ -3646,7 +3748,9 @@ class Engine:
             tokens_out=result.usage.output_tokens,
             worker=self.worker_id,
         )
-        reply = Reply(request_id=env.request_id, ok=True, response=result.response, meta=meta)
+        # In the caller's shape: a fallback model of the other provider answered (Q40).
+        response = shapes.reply(result.response, env.op, served_op, model=alias)
+        reply = Reply(request_id=env.request_id, ok=True, response=response, meta=meta)
         self._bad_accounts.pop((deployment.account, deployment.region), None)  # (plan A4)
         self._record(held, alias, deployment.account, deployment.region, "ok", meta)
         if self.settings.debug_capture_allowed and view.value(alias, "debug_capture"):
@@ -3657,6 +3761,17 @@ class Engine:
                 await self._debug(env.request_id, params, result.response)  # (never in prod)
             except Exception as exc:
                 logger.warning("debug_capture_failed", request_id=env.request_id, error=str(exc))
+        status = {
+            "deployment": dep_key,
+            "served_model": alias,
+            "attempts": attempt,
+            "tokens_in": result.usage.input_tokens,
+            "tokens_out": result.usage.output_tokens,
+        }
+        if self.queues_shared and held.message is not None:
+            await self._settle_done(held, alias, owner, reply, status, refund, latency)
+            await self._count_target_errors(held, succeeded=True)
+            return _AttemptResult("ok")
         # The caller first: its result, with the final status in the same script. Then the
         # grant and the message are settled together (four round trips one after another
         # before the caller was woken, before).
@@ -3664,17 +3779,7 @@ class Engine:
         # released the message, which ran a second time once it showed again (failover drills:
         # 1 call run twice, 61 s). Held meanwhile, so the heartbeat keeps its grant and message.
         await self._through_outage(
-            lambda: self.requests.put_result(
-                reply,
-                final_state="done",
-                status={
-                    "deployment": dep_key,
-                    "served_model": alias,
-                    "attempts": attempt,
-                    "tokens_in": result.usage.input_tokens,
-                    "tokens_out": result.usage.output_tokens,
-                },
-            )
+            lambda: self.requests.put_result(reply, final_state="done", status=status)
         )
         # Settled from here: a failure below must neither renew the grant nor refund the whole
         # estimate of a call that succeeded (`_release`). `return_exceptions`: a FINISH refused
@@ -3706,6 +3811,59 @@ class Engine:
             raise acked
         await self._count_target_errors(held, succeeded=True)
         return _AttemptResult("ok")
+
+    async def _settle_done(
+        self,
+        held: _Held,
+        alias: str,
+        owner: str,
+        reply: Reply,
+        status: Mapping[str, Any],
+        refund: tokens.Refund,
+        latency: float,
+    ) -> None:
+        """Result, ack and FINISH of a call that succeeded, in one round trip (FL-22).
+
+        Queues in the state store only. It was RESULT_PUT, then FINISH and ACK together: two
+        round trips, three scripts, and a window where the result was stored while the slot
+        waited. Through a store outage as the result and ack were (the answer is in hand).
+        """
+        message = held.message
+        assert message is not None  # the caller checks: a direct run has no message
+        env = held.envelope
+        finish = self.admission.finish_args(
+            alias,
+            owner,
+            env.request_id,
+            refund_r=refund.requests,
+            refund_t=refund.tokens,
+            outcome="ok",
+            latency_ms=latency,
+        )
+        out: list[tuple[bool, bool, int]] = []
+
+        async def write() -> None:
+            out.append(
+                await self.requests.put_result_settled(
+                    reply,
+                    final_state="done",
+                    status=status,
+                    queue_keys=self.queues.queue_keys(message.queue),
+                    message_id=message.id,
+                    generation=message.generation,
+                    finish=finish,
+                )
+            )
+
+        await self._through_outage(write, held)
+        held.grants.discard((alias, owner))  # settled: never renewed or refunded again
+        _, acked, settled = out[-1]
+        if settled == 0:
+            self.admission.grant_lost(alias, env.request_id)
+        if not acked:
+            logger.warning("ack_stale_receipt", request_id=env.request_id, model=env.model)
+            self.metrics.count("llmq_stale_acks_total", model=env.model)
+        self._drop(held)
 
     async def _target_error(
         self, view: ResolvedRegistry, alias: str, held: _Held, dep_key: str, exc: BaseException
@@ -4042,6 +4200,8 @@ class Engine:
         self._stores = (time.monotonic(), stores)
         if state == "ok":
             self._outage_until_mono = -1e9  # the store is back: calls try it again (Q11)
+        if queue == "ok":
+            self._queue_down_until_mono = -1e9  # the queue store is back: send again (R3FM-3)
         return stores
 
     def _evicting(self) -> str | None:

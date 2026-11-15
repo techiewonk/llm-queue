@@ -313,11 +313,12 @@ def _check_model(
             if target.type != "chat":
                 errors.append(f"{path}.model_fallback: `{other}` is not a chat model")
             if target.provider != entry.provider:
-                # Allowed (owner decision); the request is not converted between shapes yet,
-                # so say so where it is configured (R3CF-6a).
+                # Allowed (owner Q40): non-stream calls are converted between the request
+                # shapes; a stream does not fall back to it. Said where it is configured.
                 warnings.append(
                     f"{path}.model_fallback: `{other}` is an {target.provider} model; this "
-                    f"{entry.provider} model's requests reach it unchanged"
+                    f"{entry.provider} model's calls are converted to its shape, and streams do "
+                    "not fall back to it"
                 )
             allowed = view.residency(alias)
             if allowed is not None:

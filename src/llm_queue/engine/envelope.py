@@ -15,7 +15,7 @@ import hashlib
 from typing import Any, Literal
 
 import orjson
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from llm_queue.errors import UnsupportedEnvelopeError
 
@@ -74,13 +74,24 @@ def _dumps(fields: dict[str, Any]) -> bytes:
     return data[:-1] + b',"' + _HAS_BYTES.encode() + b'":true}' if encoder.used else data
 
 
+def encode_params(params: Any) -> tuple[bytes, bool]:
+    """A call's params as they travel (bytes base64-encoded), and whether they held bytes.
+
+    One orjson pass serves both the size cap and the message: `call()` measures this and
+    hands it to `Envelope.keep_params_json`, so `dumps` does not encode the params again
+    (FO-21: two full passes per call, double the encode cost on large multimodal requests).
+    """
+    encoder = _Encoder()
+    return orjson.dumps(params, default=encoder), encoder.used
+
+
 def message_size_bytes(params: Any) -> int:
     """The JSON size of a call's params as they travel (bytes base64-encoded): the size cap.
 
     Checked against `max_message_bytes` before a call is sent; above it the call fails with
     `CallFailed("request_too_large")` instead of reaching the store or Bedrock.
     """
-    return len(orjson.dumps(params, default=json_default))
+    return len(encode_params(params)[0])
 
 
 class Envelope(BaseModel):
@@ -105,10 +116,29 @@ class Envelope(BaseModel):
     tenant_id: str | None = None
     app_request_id: bool = False
     stream: bool = False
+    # `encode_params(params)` when the caller already ran it (the size cap): reused by `dumps`.
+    _params_json: tuple[bytes, bool] | None = PrivateAttr(default=None)
+
+    def keep_params_json(self, encoded: tuple[bytes, bool]) -> None:
+        """Reuse `encode_params(self.params)` in `dumps` (FO-21); the params must not change.
+
+        The private dict directly: pydantic's attribute hooks cost about 1 us a call, which
+        made a small call slower than encoding its params twice.
+        """
+        private = self.__pydantic_private__
+        assert private is not None  # a model with a private attribute always has the dict
+        private["_params_json"] = encoded
 
     def dumps(self) -> bytes:
         """JSON bytes for the queue (fields directly: `model_dump` re-walked the params)."""
-        return _dumps({k: v for k, v in self.__dict__.items() if v is not None})
+        fields = {k: v for k, v in self.__dict__.items() if v is not None}
+        kept = (self.__pydantic_private__ or {}).get("_params_json")
+        if kept is None:
+            return _dumps(fields)
+        data, has_bytes = kept
+        fields["params"] = orjson.Fragment(data)  # spliced in as is: no second pass
+        out = orjson.dumps(fields)
+        return out[:-1] + b',"' + _HAS_BYTES.encode() + b'":true}' if has_bytes else out
 
 
 def parse(data: bytes | str) -> Envelope:

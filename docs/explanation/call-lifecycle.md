@@ -81,8 +81,10 @@ stateDiagram-v2
 `FINISH` (refund, slot and entry removed, learning) runs first; then `RESULT_PUT` writes
 `P:{r:ID}:res` once (TTL `LLMQ_RESULT_TTL_SECS`, 300), marks the job final and `PUBLISH`es the id to
 every caller's `P:done:<caller>`; then `STATUS_SET` (`done` with deployment, served model, attempts,
-tokens) and `ACK` (deletes the message, only with the current generation). A failure writes an error
-`Reply` the same way. `RESULT_TAKE` returns the result and, for a library-made id, deletes it at once
+tokens) and `ACK` (deletes the message, only with the current generation). When the queues share
+the state store, a success does all of it in one script, `SETTLE_DONE` (result, status, ack, then
+`FINISH` under `pcall`, so a failing settle never undoes the answer): one round trip instead of two.
+A failure writes an error `Reply` the same way. `RESULT_TAKE` returns the result and, for a library-made id, deletes it at once
 (`LLMQ_RESULT_DEDUPE_SECS`, default 0, keeps it that long instead); an app-supplied id keeps its TTL
 so a duplicate id gets the same answer. Results above `offload_bytes` go to S3 (`ResultOffload`) and
 the store keeps a marker. One `llmq_call_finished` log record per call (ids hashed, no text).

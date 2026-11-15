@@ -686,3 +686,23 @@ async def test_fl1_release_claims_of_calls_held_without_a_grant(
     assert await r.admission.release_claims([("c1", "pod-x@m1")]) == 0  # not its owner
     assert await r.admission.release_claims([("c1", "pod-a@m1")]) == 1
     assert (await r.ask("c1", worker="pod-b", tag="m1")).kind == "granted"
+
+
+async def test_r3rc8_duplicate_reply_says_when_the_claim_lapses(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """R3RC-8: `duplicate` carried no `ms`, so the runtime returned the message for a fixed
+    half lease and a lower `visibility_secs` made a dead pod's take-over slower. The reply now
+    says how long the running claim has left.
+    """
+    r = await rig(store, prefix, lease_secs=3)
+    assert (await r.ask("c1", worker="pod-a", tag="m1")).kind == "granted"
+    await asyncio.sleep(1.0)
+    entry = await r.ask("c1", worker="pod-b", tag="m2")  # the grant entry's lease is held
+    assert entry.kind == "duplicate"
+    assert 1.5 <= entry.wait_secs <= 2.1, entry.wait_secs
+    # The job claim only (no grant entry, the owner between retries): its heartbeat's lapse.
+    await store.delete(f"{prefix}:{{m:m}}:inprog:c1")
+    claim = await r.ask("c1", worker="pod-c", tag="m3")
+    assert claim.kind == "duplicate"
+    assert 1.5 <= claim.wait_secs <= 2.1, claim.wait_secs

@@ -106,7 +106,7 @@ refused with its path when the registry is loaded or edited.
 | `sticky_move_after_secs` | defaults, model | 1 | A sticky session keeps its deployment while it would wait at most this long |
 | `require_headroom_pct` | defaults, model | 20 | Free share a fallback target listed with `require_headroom` needs, 0 to 100 |
 | `fallback` | defaults, model | none | Fallback regions: `{"on": [exhausted, broken, error], "after_secs" (2), "regions": account or any}` |
-| `model_fallback` | model | none | Fallback models (protected): `{"on", "after_secs" (5), "models": [alias or {model, require_headroom}]}`. A target may use another provider (see below) |
+| `model_fallback` | model | none | Fallback models (protected): `{"on", "after_secs" (5), "models": [alias or {model, require_headroom}]}`. A target may use another provider: [converted](#fallback-to-a-model-of-another-provider) |
 | `store_down` | defaults, model | `pause` | `pause`, `static_cap` or `fail_fast` |
 | `embed_batch_size` | model | 1 | Texts per embedding request, 1 to 4096 (embedding models only) |
 | `embed_max_chars` | model | the family's (Titan 50000, Cohere 2048) | Longest text an `embed` sends, 0 to 10000000 (0: off; embedding models only) |
@@ -155,10 +155,38 @@ Warnings (the document loads; each is logged with its path): a fallback to a dis
 account; a model with no usable confirmed deployment; queue retention below the timeout; a
 retry base above its cap; `probe_after_secs` above `probe_max_secs`; duplicate fallback causes
 or models; a `fallback` rule with no fallback regions; settings the model's type or provider
-never reads; a `model_fallback` to a model of another provider. Such a fallback is allowed, but
-the request is passed on in the source model's shape (Converse or OpenAI chat): converting it
-between providers is not done yet, so list such a target only when its provider accepts that
-shape.
+never reads; a `model_fallback` to a model of another provider (allowed: see below).
+
+### Fallback to a model of another provider
+
+A `model_fallback` target may be a model of the other provider: a Bedrock (Converse) model may
+fall back to an OpenAI-compatible model and the other way round. The caller still writes its
+request in its own model's shape and reads the reply in that shape; the worker converts both:
+
+| Part | Converse | OpenAI chat |
+|---|---|---|
+| System prompt | `system` text blocks | a `system` (or `developer`) message |
+| Text and images | `text`, `image` (inline bytes: png, jpeg, gif, webp) | string content, `text` and `image_url` parts (base64 data URLs) |
+| Tool use | `toolUse` blocks in an assistant turn | assistant `tool_calls` (arguments as JSON text) |
+| Tool results | `toolResult` blocks in a user turn (`status: error` becomes an `error: ` prefix) | `tool` messages |
+| Tools | `toolConfig.tools[].toolSpec` (`inputSchema.json`) | `tools[].function` (`parameters`) |
+| Tool choice | `toolChoice` `auto` / `any` / `tool` | `tool_choice` `auto` / `required` / a named function (`none` has no Converse counterpart: left out) |
+| Output and sampling | `inferenceConfig.maxTokens`, `temperature`, `topP`, `stopSequences` | `max_tokens` (or `max_completion_tokens`), `temperature`, `top_p`, `stop` |
+| Reply | `output.message` (text, `toolUse`), `stopReason`, `usage` (input, output, total, cache read) | `choices[0].message` (content, `tool_calls`), `finish_reason`, `usage` (prompt, completion, total, cached) |
+
+Stop reasons map `end_turn` / `stop_sequence` to `stop`, `max_tokens` to `length`, `tool_use` to
+`tool_calls` and the guardrail / content filter reasons to `content_filter` (and back). Fields
+with no counterpart are dropped: Converse `additionalModelRequestFields`, guardrails, cache points
+and reasoning blocks of past turns; OpenAI `response_format`, `logprobs`, `n`, penalties and
+`seed`. The target's own `inference` defaults and limits apply after the conversion.
+
+A request the other shape cannot carry (a `document` or `video` block, an image by URL or S3
+location instead of inline bytes, an image inside a tool result, a non-text OpenAI part such as
+audio, tool arguments that are not JSON) skips that target (logged `fallback_shape_skipped`);
+the call then waits, tries the next target or fails as it would without it. **Streams do not
+fall back across shapes**: their events are not converted, so a stream skips such a target
+(a disabled model whose only targets are of the other shape fails a stream with
+`model_unavailable`). The validator warns where such a target is configured.
 
 `LLMQ_CALLER_TTL_SECS` must be at least `LLMQ_LEASE_SECS / 3 + max(5, LLMQ_LEASE_SECS / 6)`. The
 registry audit is capped at about 10,000 entries besides its age limit.
