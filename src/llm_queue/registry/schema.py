@@ -20,11 +20,23 @@ from urllib.parse import parse_qsl, urlparse
 
 from llm_queue._version import __version__
 from llm_queue.errors import ConfigError, UnknownModel
-from llm_queue.registry.settings import SETTINGS, A, D, M, R, settings_at
+from llm_queue.registry.settings import (
+    MAX_NUMBER,
+    SETTINGS,
+    A,
+    D,
+    M,
+    ObjCheck,
+    R,
+    settings_at,
+)
 
-NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
-# Queue (stream) names: short and plain, so key names and metric labels stay readable.
-QUEUE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,71}$")  # leaves room for "-priority"
+# `\Z`, not `$`: `$` also matches before one trailing newline, and `"chat-x\n"` went into
+# store keys, metric labels and log lines (R3CF-4). At most 64 characters, so the default queue
+# name `llm-<alias>` stays a valid queue name (R3CF-5).
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}\Z")
+NAME_RULE = "1-64 lowercase letters, digits, `_`, `.` or `-`, starting with a letter or digit"
+_ROLE_ARN_RE = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role/[\w+=,.@/-]{1,512}\Z")
 # Account kind -> the provider it serves. `register_account_kind` adds more.
 ACCOUNT_KINDS: dict[str, str] = {"aws": "bedrock", "openai": "openai"}
 MODEL_TYPES = ("chat", "embedding")
@@ -34,7 +46,7 @@ LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "host.docker.internal"
 # An account's secrets are environment variables (or secrets) under this prefix only, so a
 # registry edit can never name the store password or the pod's own AWS keys.
 SECRET_REF_PREFIX = "LLMQ_ACCOUNT_"
-_SECRET_REF_RE = re.compile(rf"^{SECRET_REF_PREFIX}[A-Z0-9_]+$")
+_SECRET_REF_RE = re.compile(rf"^{SECRET_REF_PREFIX}[A-Z0-9_]+\Z")
 # Query names that carry a credential: a key in a URL ends up in logs and proxies.
 _URL_SECRET_PARAMS = frozenset(
     {"api_key", "apikey", "key", "token", "access_token", "password", "secret", "sig", "signature"}
@@ -59,7 +71,7 @@ _PROFILE_FIELDS = frozenset({"name", "region", "profile_id", "routes_to"})
 
 def register_account_kind(kind: str, provider: str) -> None:
     """Allow accounts of `kind` to serve models of `provider` (for a custom provider)."""
-    if not NAME_RE.match(kind) or not NAME_RE.match(provider):
+    if not NAME_RE.match(kind) or not NAME_RE.match(provider):  # `\Z`: no trailing newline
         raise ConfigError("kind and provider must be lowercase names")
     ACCOUNT_KINDS[kind] = provider
 
@@ -296,7 +308,10 @@ def _settings(
         if name not in allowed:
             out.unknown(f"{path}.{name}", name, allowed | skip, where[level])
             continue
-        problem = SETTINGS[name].check(value)
+        check = SETTINGS[name].check
+        if isinstance(check, ObjCheck) and isinstance(value, dict):
+            value = _sub_fields(out, f"{path}.{name}", value, check)
+        problem = check(value)
         if problem:
             out.error(f"{path}.{name}", problem)
             continue
@@ -304,6 +319,28 @@ def _settings(
             out.error(f"{path}.queue.name", "a queue name can only be set on a model")
             continue
         kept[name] = value
+    return kept
+
+
+def _sub_fields(
+    out: _Collector, path: str, value: dict[str, Any], check: ObjCheck
+) -> dict[str, Any]:
+    """`value` without deprecated or (in lenient mode) unknown sub-fields, each warned.
+
+    A stored document is read leniently: a sub-field a newer pod added (`health.new_field`)
+    made every older pod refuse the whole document, and its refresh then republished its own
+    config over it (R3CF-8). Removed alert names are accepted with a warning until 0.2 (Q34).
+    """
+    kept: dict[str, Any] = {}
+    for key, item in value.items():
+        if key in check.fields:
+            kept[key] = item
+        elif key in check.deprecated:
+            out.warn(f"{path}.{key}", check.deprecated[key])
+        elif not out.strict:
+            out.warn(f"{path}.{key}", f"unknown field `{key}` (ignored)")
+        else:
+            kept[key] = item  # strict: the check reports it as an error
     return kept
 
 
@@ -343,7 +380,7 @@ def _account(
 ) -> Account | None:
     path = f"accounts.{name}"
     if not NAME_RE.match(name):
-        out.error(path, "account names are lowercase letters, digits, `_`, `.`, `-`")
+        out.error(path, f"an account name is {NAME_RULE}")
     body = out.mapping(path, raw)
     if body is None:
         return None
@@ -365,6 +402,12 @@ def _account(
         for key in ("role_arn", "external_id_ref"):
             if texts[key]:
                 out.error(f"{path}.{key}", f"only an `aws` account takes `{key}`")
+    role_arn = texts["role_arn"]
+    if role_arn and not _ROLE_ARN_RE.match(role_arn):
+        # It failed only at the first call (R3CF-16).
+        out.error(
+            f"{path}.role_arn", "must be an IAM role ARN: arn:aws:iam::<12 digits>:role/<name>"
+        )
     if texts["external_id_ref"] and not texts["role_arn"]:
         out.error(f"{path}.external_id_ref", "needs `role_arn`")
     for key in ("external_id_ref", "api_key_ref"):
@@ -408,7 +451,7 @@ def _account(
 def _region_entry(out: _Collector, path: str, raw: Any, group: str) -> RegionEntry | None:
     if isinstance(raw, str):
         if not NAME_RE.match(raw):
-            out.error(path, f"`{raw}` is not a valid region name")
+            out.error(path, f"{raw!r} is not a valid region name ({NAME_RULE})")
             return None
         return RegionEntry(name=raw, region=raw, group=group)
     body = out.mapping(path, raw)
@@ -417,10 +460,12 @@ def _region_entry(out: _Collector, path: str, raw: Any, group: str) -> RegionEnt
     name, region = body.get("name"), body.get("region")
     for key, value in (("name", name), ("region", region)):
         if not (isinstance(value, str) and NAME_RE.match(value)):
-            out.error(f"{path}.{key}", "needs a valid name")
+            out.error(f"{path}.{key}", f"needs a valid name ({NAME_RULE})")
     profile = body.get("profile_id")
-    if not (isinstance(profile, str) and profile):
+    if not (isinstance(profile, str) and profile.strip()):
         out.error(f"{path}.profile_id", "an inference profile needs `profile_id`")
+    elif profile != profile.strip():
+        out.error(f"{path}.profile_id", "must not start or end with spaces")
     routes = out.names(f"{path}.routes_to", body.get("routes_to", []))
     extra = {k: v for k, v in body.items() if k not in _PROFILE_FIELDS}
     settings = _settings(out, path, extra, R)
@@ -519,7 +564,7 @@ def _model(
 ) -> ModelEntry | None:
     path = f"models.{alias}"
     if not NAME_RE.match(alias):
-        out.error(path, "an alias is lowercase letters, digits, `_`, `.`, `-`")
+        out.error(path, f"an alias is {NAME_RULE}")
     body = out.mapping(path, raw)
     if body is None:
         return None
@@ -531,8 +576,11 @@ def _model(
         known = ", ".join(sorted(set(ACCOUNT_KINDS.values())))
         out.error(f"{path}.provider", f"must be one of {known}")
     model_id = body.get("model_id")
-    if not (isinstance(model_id, str) and model_id):
+    if not (isinstance(model_id, str) and model_id.strip()):
         out.error(f"{path}.model_id", "is required")
+    elif model_id != model_id.strip():
+        # A padded id failed only at the first call (R3CF-16).
+        out.error(f"{path}.model_id", "must not start or end with spaces or newlines")
     settings = _settings(out, path, body, M, skip=_MODEL_FIELDS)
     deployments = _deployments(out, f"{path}.deployments", body.get("deployments"), accounts)
     if not any(e.group == "confirmed" for entries in deployments.values() for e in entries):
@@ -589,8 +637,12 @@ def build(
         if key not in _TOP_KEYS:
             out.unknown(key, key, _TOP_KEYS, "at the top level")
     version = raw.get("registry_version")
-    if not (isinstance(version, int) and not isinstance(version, bool) and version >= 1):
-        out.error("registry_version", "is required: an integer of at least 1")
+    # Bounded like every number: Lua stored 2**70 back as 1.18e+21 and every reload then
+    # failed to read the version (R3CF-2).
+    if not (
+        isinstance(version, int) and not isinstance(version, bool) and 1 <= version <= MAX_NUMBER
+    ):
+        out.error("registry_version", f"is required: a whole number from 1 to {MAX_NUMBER}")
         version = 0
     min_lib = raw.get("min_lib_version")
     if min_lib is not None and not (isinstance(min_lib, str) and version_key(min_lib)):

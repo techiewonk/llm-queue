@@ -6,6 +6,7 @@ a new setting is one row here. Used by `registry.schema` (checks) and `registry.
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -18,12 +19,23 @@ LEVEL_NAMES = {D: "defaults", A: "account", M: "model", R: "deployment"}
 Check = Callable[[Any], "str | None"]
 
 STRATEGIES = ("ordered", "round_robin", "weighted", "headroom")
-_CUSTOM_RE = re.compile(r"^custom:[A-Za-z0-9_.-]+$")
-_HOOK_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+# `\Z`, not `$`: `$` also matches before one trailing newline, so `"a\n"` passed (R3CF-4).
+_CUSTOM_RE = re.compile(r"^custom:[A-Za-z0-9_.-]{1,64}\Z")
+_HOOK_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}\Z")
+# Every number in the registry stays exact as a double: Lua reads numbers as doubles, and
+# orjson refuses integers above 64 bits, so `rpm: 2**64` failed boot with a raw TypeError and
+# `2**53 + 1` lost precision (R3CF-2, owner Q42). Settings with a real limit are tighter.
+MAX_NUMBER = 2**53 - 1
+DAY_SECS = 86_400  # the longest any timeout or wait may be (Q42)
 
 
 def _is_number(value: Any) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _shown(value: float) -> str:
+    """A bound as people read it: `86400`, `0.5`, `9007199254740991` (not `9.0072e+15`)."""
+    return str(int(value)) if float(value).is_integer() else f"{value:g}"
 
 
 def number(
@@ -33,17 +45,26 @@ def number(
     integer: bool = False,
     lo_open: bool = False,
 ) -> Check:
-    """A number (an integer when `integer`) inside [lo, hi]; `lo_open` makes the low end strict."""
+    """A finite number (a whole number when `integer`) inside [lo, hi].
+
+    `lo_open` makes the low end strict. With no `hi` the bound is `MAX_NUMBER` (2**53 - 1),
+    and with no `lo` it is `-MAX_NUMBER` (R3CF-2). `NaN` and infinities are refused first:
+    they passed every range check, since every comparison with `NaN` is false (R3CF-1).
+    """
+    top = MAX_NUMBER if hi is None else hi
+    bottom = -MAX_NUMBER if lo is None else lo
 
     def check(value: Any) -> str | None:
-        if integer and not (isinstance(value, int) and not isinstance(value, bool)):
-            return "must be an integer"
         if not _is_number(value):
-            return "must be a number"
-        if lo is not None and (value <= lo if lo_open else value < lo):
-            return f"must be {'above' if lo_open else 'at least'} {lo:g}"
-        if hi is not None and value > hi:
-            return f"must be at most {hi:g}"
+            return "must be a whole number (an integer)" if integer else "must be a number"
+        if not math.isfinite(value):
+            return "must be a finite number"
+        if integer and not isinstance(value, int):
+            return "must be a whole number (an integer, no decimal point)"
+        if value <= bottom if lo_open else value < bottom:
+            return f"must be {'above' if lo_open else 'at least'} {_shown(bottom)}"
+        if value > top:
+            return f"must be at most {_shown(top)}"
         return None
 
     return check
@@ -77,7 +98,9 @@ def strategy(value: Any) -> str | None:
 
 def hook_name(value: Any) -> str | None:
     """The name of a registered hook."""
-    return None if isinstance(value, str) and _HOOK_RE.match(value) else "must be a hook name"
+    if isinstance(value, str) and _HOOK_RE.match(value):
+        return None
+    return "must be a hook name: 1-64 letters, digits, `_`, `.` or `-`"
 
 
 def text_list(value: Any) -> str | None:
@@ -101,24 +124,52 @@ def any_object(value: Any) -> str | None:
     return None if isinstance(value, dict) else "must be an object"
 
 
-def obj(fields: Mapping[str, Check], *, required: tuple[str, ...] = ()) -> Check:
-    """An object whose keys are among `fields`, each checked; `required` keys must be present."""
+class ObjCheck:
+    """An object whose keys are among `fields`, each checked; `required` keys must be present.
 
-    def check(value: Any) -> str | None:
+    `deprecated` names are accepted and dropped with a warning (`registry.schema` reads
+    `fields` and `deprecated` to do it, and drops unknown fields with a warning in lenient
+    mode: a newer pod's sub-field made every older pod refuse the stored document, R3CF-8).
+    """
+
+    def __init__(
+        self,
+        fields: Mapping[str, Check],
+        required: tuple[str, ...] = (),
+        deprecated: Mapping[str, str] | None = None,
+    ) -> None:
+        """`deprecated` maps a removed name to the reason shown in its warning."""
+        self.fields = fields
+        self.required = required
+        self.deprecated: Mapping[str, str] = deprecated or {}
+
+    def __call__(self, value: Any) -> str | None:
+        """Every problem of `value`, joined; None when it is valid."""
         if not isinstance(value, dict):
             return "must be an object"
-        problems = [f"needs `{key}`" for key in required if key not in value]
+        problems = [f"needs `{key}`" for key in self.required if key not in value]
         for key, item in value.items():
-            sub = fields.get(key)
+            sub = self.fields.get(key)
             if sub is None:
-                problems.append(f"unknown field `{key}` (known: {', '.join(sorted(fields))})")
+                if key in self.deprecated:
+                    continue
+                known = ", ".join(sorted(self.fields))
+                problems.append(f"unknown field `{key}` (known: {known})")
                 continue
             problem = sub(item)
             if problem:
                 problems.append(f"`{key}` {problem}")
         return "; ".join(problems) or None
 
-    return check
+
+def obj(
+    fields: Mapping[str, Check],
+    *,
+    required: tuple[str, ...] = (),
+    deprecated: Mapping[str, str] | None = None,
+) -> ObjCheck:
+    """An object check (see `ObjCheck`)."""
+    return ObjCheck(fields, required, deprecated)
 
 
 def _tags(value: Any) -> str | None:
@@ -156,7 +207,7 @@ def _stop(value: Any) -> str | None:
     return None if isinstance(value, str) or text_list(value) is None else "must be text or a list"
 
 
-_EXTRA_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_EXTRA_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}\Z")
 # Names the OpenAI SDK reads as its own arguments (headers, body, query, timeout), names that
 # change what the provider keeps (`store` saves prompt and answer), and the request's own
 # fields: an `inference.extra` entry must never reach any of them.
@@ -195,19 +246,20 @@ def _extra(value: Any) -> str | None:
 
 
 # Inference parameters and the model type they belong to (rules of §3.9).
+MAX_OUTPUT_TOKENS = 10_000_000  # far above any model's output limit (Q42)
 CHAT_INFERENCE: Mapping[str, Check] = {
-    "max_tokens": number(1, integer=True),
+    "max_tokens": number(1, MAX_OUTPUT_TOKENS, integer=True),
     "temperature": number(0, 2),
     "top_p": number(0, 1),
     "stop": _stop,
-    "top_k": number(1, integer=True),
+    "top_k": number(1, 1_000_000, integer=True),
     "seed": number(integer=True),
     "frequency_penalty": number(-2, 2),
     "presence_penalty": number(-2, 2),
     "extra": _extra,
 }
 EMBED_INFERENCE: Mapping[str, Check] = {
-    "dimensions": number(1, integer=True),
+    "dimensions": number(1, 65_536, integer=True),
     "normalize": boolean,
     "input_type": text,
     "truncate": text,
@@ -232,17 +284,38 @@ HEALTH_DEFAULTS = {
     "slow_min_samples": 20,
 }
 ALERT_DEFAULTS = {"quota_used_pct": 90, "dlq_messages": 1}
+# Alert settings removed in 0.1.0b2 (they did nothing): accepted with a warning until 0.2, so a
+# 0.1.0b1 document still loads (owner Q34, R3AP-5).
+REMOVED_ALERTS = dict.fromkeys(
+    ("quota_used_mins", "spill_pct", "spill_window_secs", "waiting_age_secs"),
+    "removed in 0.1.0b2 (it did nothing); ignored, and refused from 0.2",
+)
 # A queue's messages and dead letters (which hold the prompt) live at most two weeks.
 MAX_RETENTION_SECS = 1_209_600
 QUEUE_DEFAULTS = {
     "visibility_secs": 60,
     "max_receives": 10,
-    "retention_secs": 345_600,
+    # A message holds the prompt: kept one day unless the model says otherwise (owner Q27).
+    "retention_secs": 86_400,
     "dlq_retention_secs": 86_400,
 }
+# Explicit queue names. Dots are allowed so the default `llm-<alias>` always fits (R3CF-5).
+QUEUE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,71}\Z")  # leaves room for "-priority"
+JOB_QUEUE_PREFIX = "jobs-"  # the job queues' names: a model queue may not take one
+
+
+def queue_name(value: Any) -> str | None:
+    """An explicit queue (stream) name: short and plain, and not a job queue's name."""
+    if not (isinstance(value, str) and QUEUE_NAME_RE.match(value)):
+        return "must be 1-71 letters, digits, `_`, `.` or `-` (it becomes a store key)"
+    if value.startswith(JOB_QUEUE_PREFIX):
+        return f"must not start with `{JOB_QUEUE_PREFIX}` (the job queues use it)"
+    return None
+
 
 _PCT = number(0, 100, integer=True)
 _POS = number(0, lo_open=True)
+_SECS = number(0, DAY_SECS, lo_open=True)  # timeouts and waits: at most one day (Q42)
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,73 +350,75 @@ SETTINGS: Mapping[str, Spec] = {
         one_of("both", "rpm", "tpm", "off"),
         by_type=lambda kind: "both" if kind == "chat" else "rpm",
     ),
-    "tpm_output_weight": _spec("D,A,M,R", number(1), 1),
+    "tpm_output_weight": _spec("D,A,M,R", number(1, 1000), 1),
     "tpm_count_cached": _spec("D,A,M,R", boolean, False),
-    "default_output_tokens": _spec("D,A,M,R", number(1, integer=True), 1000),
+    "default_output_tokens": _spec("D,A,M,R", number(1, MAX_OUTPUT_TOKENS, integer=True), 1000),
     "shared_rpm": _spec("A", number(1, integer=True)),
     "shared_tpm": _spec("A", number(1, integer=True)),
     "rate_window": _spec("D,A,M,R", one_of("smooth", "fixed"), "smooth"),
     "rate_burst": _spec("D,A,M,R", number(0, 1), 0.1),
     "stream_flush_ms": _spec("M,R", number(0, 1000, integer=True), 30),
-    "max_concurrency": _spec("D,A,M,R", number(1, integer=True)),
+    "max_concurrency": _spec("D,A,M,R", number(1, 100_000, integer=True)),
     "priority_reserve": _spec(
         "D,A,M", number(0, 1), by_type=lambda kind: 0.2 if kind == "chat" else 0.0
     ),
     "normal_min_share": _spec("D,M", number(0, 1), 0.1),
-    "timeout_secs": _spec("D,A,M", _POS, 120),
-    "timeout_max_secs": _spec("D,M", _POS, 900),
-    "max_wait_secs": _spec("D,M", _POS),
-    "attempt_timeout_secs": _spec("D,A,M,R", _POS, 60),
+    "timeout_secs": _spec("D,A,M", _SECS, 120),
+    "timeout_max_secs": _spec("D,M", _SECS, 900),
+    "max_wait_secs": _spec("D,M", _SECS),
+    "attempt_timeout_secs": _spec("D,A,M,R", _SECS, 60),
     "throttle_retry_attempts": _spec("D,A,M,R", number(1, 20, integer=True), 6),
-    "retry_base_secs": _spec("D,A,M,R", number(0), 1.0),
-    "retry_multiplier": _spec("D,A,M,R", number(1), 4.0),
-    "retry_spread": _spec("D,A,M,R", number(1), 2.5),
-    "retry_max_secs": _spec("D,A,M,R", _POS, 30.0),
-    "breaker_threshold": _spec("D,A,M,R", number(1, integer=True), 5),
-    "breaker_cooldown_secs": _spec("D,A,M,R", _POS, 15.0),
+    "retry_base_secs": _spec("D,A,M,R", number(0, DAY_SECS), 1.0),
+    # `factor ** tries` overflowed a float at 1e300 on the second retry (R3CF-3).
+    "retry_multiplier": _spec("D,A,M,R", number(1, 100), 4.0),
+    "retry_spread": _spec("D,A,M,R", number(1, 100), 2.5),
+    "retry_max_secs": _spec("D,A,M,R", _SECS, 30.0),
+    "breaker_threshold": _spec("D,A,M,R", number(1, 10_000, integer=True), 5),
+    "breaker_cooldown_secs": _spec("D,A,M,R", _SECS, 15.0),
     # Failures count toward the threshold only within this window (one after it restarts it).
-    "breaker_window_secs": _spec("D,A,M,R", _POS, 60.0),
+    "breaker_window_secs": _spec("D,A,M,R", _SECS, 60.0),
     # A probe call that never reported back stops blocking others after this.
-    "breaker_probe_secs": _spec("D,A,M,R", _POS, 60.0),
+    "breaker_probe_secs": _spec("D,A,M,R", _SECS, 60.0),
     "balance": _spec("D,M", strategy, "ordered"),
     "balance_opts": _spec(
         "D,M", obj({"pick": one_of("percent", "max", "spread")}), {"pick": "percent"}, merge=True
     ),
     "balance_priority": _spec("M", strategy),
-    "max_attempts": _spec("D,M", number(1, integer=True), 4),
+    "max_attempts": _spec("D,M", number(1, 100, integer=True), 4),
     "retry_budget_pct": _spec("D,M", _PCT, 20),
-    "retry_budget_min": _spec("D,M", number(0, integer=True), 10),
-    "stream_idle_secs": _spec("D,M", _POS, 30),
-    "stream_max_bytes": _spec("M", number(1024, integer=True), 8_388_608),
+    "retry_budget_min": _spec("D,M", number(0, 1_000_000, integer=True), 10),
+    "stream_idle_secs": _spec("D,M", _SECS, 30),
+    "stream_max_bytes": _spec("M", number(1024, 1_073_741_824, integer=True), 8_388_608),
     # A call whose messages (inline images and documents included) are larger fails as
     # `invalid_request` before it is queued.
-    "max_message_bytes": _spec("D,M", number(1024, integer=True), 4_194_304),
+    "max_message_bytes": _spec("D,M", number(1024, 268_435_456, integer=True), 4_194_304),
     # Non-stream chat calls: plain Converse (IAM `bedrock:InvokeModel`), or ConverseStream
     # (`bedrock:InvokeModelWithResponseStream`) for its first-response timer.
     "converse_api": _spec("D,M", one_of("converse", "stream"), "converse"),
     # False for a model without tool use: a call served by it as a fallback model loses the
     # caller's tool fields (`toolConfig`, `tools`, `tool_choice`) instead of being refused.
     "supports_tools": _spec("M", boolean, True),
-    "max_waiting": _spec("D,M", number(0, integer=True), 50_000),
-    "sticky_move_after_secs": _spec("D,M", _POS, 1),
+    # 0 means no limit, not "never queue" (R3CF-16).
+    "max_waiting": _spec("D,M", number(0, 100_000_000, integer=True), 50_000),
+    "sticky_move_after_secs": _spec("D,M", _SECS, 1),
     "require_headroom_pct": _spec("D,M", _PCT, 20),
     "tags": _spec("R", _tags),
     "weight": _spec("R", number(0), 1),
     "sticky": _spec(
         "D,M",
-        obj({"key": _sticky_key, "idle_ttl_secs": _POS}, required=("key",)),
+        obj({"key": _sticky_key, "idle_ttl_secs": _SECS}, required=("key",)),
     ),
     "fallback": _spec(
         "D,M",
         obj(
-            {"on": _causes, "after_secs": number(0), "regions": one_of("account", "any")},
+            {"on": _causes, "after_secs": number(0, DAY_SECS), "regions": one_of("account", "any")},
             required=("on",),
         ),
     ),
     "model_fallback": _spec(
         "M",
         obj(
-            {"on": _causes, "after_secs": number(0), "models": _fallback_models},
+            {"on": _causes, "after_secs": number(0, DAY_SECS), "models": _fallback_models},
             required=("on", "models"),
         ),
         protected=True,
@@ -355,9 +430,9 @@ SETTINGS: Mapping[str, Spec] = {
         "D,M",
         obj(
             {
-                "name": text,
+                "name": queue_name,
                 "visibility_secs": number(1, 43_200, integer=True),
-                "max_receives": number(1, integer=True),
+                "max_receives": number(1, 1000, integer=True),
                 "retention_secs": number(60, MAX_RETENTION_SECS, integer=True),
                 "dlq_retention_secs": number(60, MAX_RETENTION_SECS, integer=True),
             }
@@ -365,16 +440,16 @@ SETTINGS: Mapping[str, Spec] = {
         QUEUE_DEFAULTS,
         merge=True,
     ),
-    "embed_batch_size": _spec("M", number(1, integer=True), 1),
+    "embed_batch_size": _spec("M", number(1, 4096, integer=True), 1),
     # Longest text, in characters, an embed call sends; 0 turns the check off. None: the
     # family's own limit (Titan 50,000, Cohere 2,048; OpenAI counts tokens, not checked).
-    "embed_max_chars": _spec("M", number(0, integer=True)),
+    "embed_max_chars": _spec("M", number(0, 10_000_000, integer=True)),
     "inference": _spec("D,A,M,R", obj({**CHAT_INFERENCE, **EMBED_INFERENCE}), merge=True),
     "inference_limits": _spec(
         "D,A,M,R",
         obj(
             {
-                "max_tokens": number(1, integer=True),
+                "max_tokens": number(1, MAX_OUTPUT_TOKENS, integer=True),
                 "locked": _locked,
                 "on_exceed": one_of("clamp", "reject"),
             }
@@ -386,13 +461,13 @@ SETTINGS: Mapping[str, Spec] = {
         "D,A,M,R",
         obj(
             {
-                "disable_errors": number(1, integer=True),
-                "disable_window_secs": _POS,
-                "probe_after_secs": _POS,
-                "probe_max_secs": _POS,
-                "slow_ratio": number(1, lo_open=True),
-                "slow_min_secs": number(0),
-                "slow_min_samples": number(1, integer=True),
+                "disable_errors": number(1, 10_000, integer=True),
+                "disable_window_secs": _SECS,
+                "probe_after_secs": _SECS,
+                "probe_max_secs": _SECS,
+                "slow_ratio": number(1, 1000, lo_open=True),
+                "slow_min_secs": number(0, DAY_SECS),
+                "slow_min_samples": number(1, 1_000_000, integer=True),
             }
         ),
         HEALTH_DEFAULTS,
@@ -400,7 +475,10 @@ SETTINGS: Mapping[str, Spec] = {
     ),
     "alerts": _spec(
         "D,M",
-        obj({"quota_used_pct": number(1, 100), "dlq_messages": number(1, integer=True)}),
+        obj(
+            {"quota_used_pct": number(1, 100), "dlq_messages": number(1, integer=True)},
+            deprecated=REMOVED_ALERTS,
+        ),
         ALERT_DEFAULTS,
         merge=True,
     ),

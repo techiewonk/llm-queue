@@ -318,9 +318,14 @@ def parse_document(text: str | bytes) -> Any:
             out[key] = value
         return out
 
+    def constant(name: str) -> Any:
+        # `json` reads NaN / Infinity, which pass every range check and are written back as
+        # `null` (orjson), so the stored document then failed on every reader (R3CF-1).
+        raise ValueError(f"{name} is not a JSON number")
+
     try:
-        doc = json.loads(text, object_pairs_hook=pairs)
-    except ValueError as exc:  # JSONDecodeError and bad UTF-8
+        doc = json.loads(text, object_pairs_hook=pairs, parse_constant=constant)
+    except ValueError as exc:  # JSONDecodeError, NaN / Infinity and bad UTF-8
         raise RegistryError([f"registry is not valid JSON: {exc}"]) from exc
     if repeated:
         names = ", ".join(f"`{k}`" for k in sorted(set(repeated)))

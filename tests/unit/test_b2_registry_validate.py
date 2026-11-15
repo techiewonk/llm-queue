@@ -83,9 +83,106 @@ def test_inference_extra_refuses_sdk_arguments(small: dict[str, Any], name: str)
 def test_alert_thresholds_are_bounded_and_dead_names_gone(small: dict[str, Any]) -> None:
     """O3: thresholds took any number (a 500 % quota alert never fired), four did nothing."""
     doc = copy.deepcopy(small)
-    for alerts in ({"quota_used_pct": 150}, {"dlq_messages": 0}, {"spill_pct": 20}):
+    for alerts in ({"quota_used_pct": 150}, {"dlq_messages": 0}):
         doc["defaults"] = {"alerts": alerts}
         assert _has(_errors(doc), "alerts")
+
+
+@pytest.mark.parametrize(
+    "name", ["quota_used_mins", "spill_pct", "spill_window_secs", "waiting_age_secs"]
+)
+def test_removed_alert_names_warn_until_0_2(small: dict[str, Any], name: str) -> None:
+    """Q34 / R3AP-5: a 0.1.0b1 document naming a removed alert stopped the pod from starting."""
+    doc = copy.deepcopy(small)
+    doc["models"]["gpt20b"]["alerts"] = {name: 5, "dlq_messages": 2}
+    warnings = _warnings(doc)
+    assert _has(warnings, f"alerts.{name}", "removed in 0.1.0b2")
+    view = load_registry(doc)
+    assert name not in view.value("gpt20b", "alerts")
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_non_finite_numbers_are_refused(small: dict[str, Any], value: float) -> None:
+    """R3CF-1: NaN and Infinity passed every range check (every NaN comparison is false)."""
+    for name in ("rate_burst", "priority_reserve", "timeout_max_secs", "tpm_output_weight"):
+        doc = copy.deepcopy(small)
+        doc["models"]["gpt20b"][name] = value
+        assert _has(_errors(doc), f"models.gpt20b.{name}", "finite")
+
+
+def test_nan_in_json_text_is_refused(small: dict[str, Any]) -> None:
+    """R3CF-1: `json.loads` accepts NaN; orjson later refused it with a raw JSONDecodeError."""
+    text = json.dumps(small)[:-1] + ', "defaults": {"rate_burst": NaN}}'
+    assert _has(_errors(text), "NaN")
+
+
+def test_integers_have_an_upper_bound(small: dict[str, Any]) -> None:
+    """R3CF-2 / Q42: `rpm: 2**64` validated, then orjson raised a raw TypeError at boot."""
+    for name, value in (("rpm", 2**64), ("max_concurrency", 10**12), ("max_attempts", 10**9)):
+        doc = copy.deepcopy(small)
+        doc["models"]["gpt20b"][name] = value
+        assert _has(_errors(doc), f"models.gpt20b.{name}", "at most")
+    doc = copy.deepcopy(small)
+    doc["registry_version"] = 2**70
+    assert _has(_errors(doc), "registry_version")
+    doc = copy.deepcopy(small)
+    doc["models"]["gpt20b"]["timeout_secs"] = 10**8  # Q42: a timeout is at most one day
+    assert _has(_errors(doc), "timeout_secs", "at most 86400")
+
+
+def test_retry_multiplier_is_capped(small: dict[str, Any]) -> None:
+    """R3CF-3: `retry_multiplier: 1e300` overflowed the backoff on the second retry."""
+    doc = copy.deepcopy(small)
+    doc["defaults"] = {"retry_multiplier": 1e300}
+    assert _has(_errors(doc), "retry_multiplier", "at most 100")
+
+
+def test_names_refuse_a_trailing_newline(small: dict[str, Any]) -> None:
+    """R3CF-4: `$` matched before a trailing newline, so `"acc\\n"` became a store key."""
+    doc = copy.deepcopy(small)
+    doc["models"]["a\n"] = doc["models"].pop("gpt20b")
+    assert _has(_errors(doc), "alias")
+    doc = copy.deepcopy(small)
+    doc["models"]["gpt20b"]["admission"] = "gate\n"
+    assert _has(_errors(doc), "admission", "hook name")
+
+
+def test_queue_names_are_checked(small: dict[str, Any]) -> None:
+    """R3CF-5: `queue.name` took spaces, `{}`, newlines and a job queue's `jobs-` name."""
+    for name in ("my queue {x}:é\n", "jobs-x", "q" * 72):
+        doc = copy.deepcopy(small)
+        doc["models"]["gpt20b"]["queue"] = {"name": name}
+        assert _has(_errors(doc), "models.gpt20b.queue")
+    doc = copy.deepcopy(small)
+    doc["models"]["a" * 65] = doc["models"].pop("gpt20b")
+    assert _has(_errors(doc), "alias")
+
+
+def test_unknown_sub_fields_are_lenient_in_a_stored_document(small: dict[str, Any]) -> None:
+    """R3CF-8: a newer pod's sub-field made every older pod refuse the stored document."""
+    doc = copy.deepcopy(small)
+    doc["models"]["gpt20b"]["health"] = {"new_field": 1, "disable_errors": 4}
+    assert _has(_errors(doc), "new_field")  # the process's own config stays strict
+    registry, errors, warnings = check(doc, strict=False)
+    assert registry is not None, errors
+    assert _has(warnings, "health.new_field", "ignored")
+
+
+def test_padded_ids_and_bad_role_arns_are_refused(small: dict[str, Any]) -> None:
+    """R3CF-16: a padded model id or a malformed role ARN failed only at the first call."""
+    doc = copy.deepcopy(small)
+    doc["models"]["gpt20b"]["model_id"] = " anthropic.a \n"
+    assert _has(_errors(doc), "model_id", "spaces")
+    doc = copy.deepcopy(small)
+    doc["accounts"]["aws-main"]["role_arn"] = "not an arn"
+    assert _has(_errors(doc), "role_arn", "IAM role ARN")
+    doc["accounts"]["aws-main"]["role_arn"] = "arn:aws:iam::123456789012:role/llm-queue"
+    assert check(doc)[0] is not None
+
+
+def test_retention_defaults_to_one_day(small: dict[str, Any]) -> None:
+    """Q27: a queue kept prompts four days by default; the default is now one day."""
+    assert load_registry(small).value("gpt20b", "queue")["retention_secs"] == 86_400
 
 
 def test_queue_retention_is_capped(small: dict[str, Any]) -> None:
