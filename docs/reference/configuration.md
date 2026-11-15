@@ -109,6 +109,7 @@ refused with its path when the registry is loaded or edited.
 | `model_fallback` | model | none | Fallback models (protected): `{"on", "after_secs" (5), "models": [alias or {model, require_headroom}]}`. A target may use another provider (see below) |
 | `store_down` | defaults, model | `pause` | `pause`, `static_cap` or `fail_fast` |
 | `embed_batch_size` | model | 1 | Texts per embedding request, 1 to 4096 (embedding models only) |
+| `embed_max_chars` | model | the family's (Titan 50000, Cohere 2048) | Longest text an `embed` sends, 0 to 10000000 (0: off; embedding models only) |
 | `inference` | all four | none | *merged* defaults of the request: `max_tokens`, `temperature`, `top_p`, `stop`, `top_k`, `seed`, penalties, `extra`; embedding `dimensions`, `normalize`, `input_type`, `truncate`, `embedding_types` |
 | `inference_limits` | all four | none | *merged*: `max_tokens` cap (also `max_completion_tokens`; a call without one gets the cap), `locked` names, `on_exceed` (`clamp` or `reject`) |
 | `params` | deployment | none | Extra request fields of one deployment (guardrails); protected |
