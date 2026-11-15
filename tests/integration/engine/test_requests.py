@@ -132,7 +132,7 @@ async def test_fl2_a_replayed_take_still_returns_the_result(
     assert first is not None
     assert replay is not None
     assert replay.response == {"x": 1}
-    assert 0 < await store.pttl(f"{prefix}:{{r:r}}:res") <= 10_000  # gone within seconds
+    assert 0 < await store.pttl(f"{prefix}:{{r:r}}:res") <= 2_000  # TAKE_GRACE_MS
 
 
 @pytest.mark.parametrize("final", ["failed", "expired", "cancelled"])

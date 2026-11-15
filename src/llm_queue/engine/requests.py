@@ -317,8 +317,10 @@ end
 # Replay-safe (FL-2): redis-py runs a script again when the connection drops after the server
 # ran it. A take that deleted the body made that replay return nil, and the caller waited out
 # its deadline for a call that had succeeded. With no dedupe window the body now lives `grace
-# ms` more (longer than the client's retry span), so a replay reads it again.
-TAKE_GRACE_MS = 10_000
+# ms` more (longer than the client's retry span, about 1.5 s), so a replay reads it again.
+# 2 s, not 10: every read body stayed 10 s and a burst of large embedding results held
+# 215 MB of store memory (gate B97's budget is +64 MB).
+TAKE_GRACE_MS = 2_000
 RESULT_TAKE = """
 local value = redis.call('GET', KEYS[1])
 if not value then return false end
