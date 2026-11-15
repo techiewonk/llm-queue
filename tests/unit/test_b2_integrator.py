@@ -87,11 +87,13 @@ def test_dedupe_refuses_an_offload_that_deletes_on_read() -> None:
     """16: with result_dedupe_secs, the second reader of an offloaded result found it deleted."""
     client = MagicMock()
     with pytest.raises(ConfigError, match="delete_after_read=False"):
-        RequestStore(client, Keys("p"), result_dedupe_secs=60, offload=S3Offload("b"))
-    RequestStore(
-        client, Keys("p"), result_dedupe_secs=60, offload=S3Offload("b", delete_after_read=False)
-    )
-    RequestStore(client, Keys("p"), offload=S3Offload("b"))  # no dedupe: deleting is right
+        RequestStore(
+            client, Keys("p"), result_dedupe_secs=60, offload=S3Offload("b"), offload_bytes=1
+        )
+    keep = S3Offload("b", delete_after_read=False)
+    RequestStore(client, Keys("p"), result_dedupe_secs=60, offload=keep, offload_bytes=1)
+    # No dedupe: deleting on read is right.
+    RequestStore(client, Keys("p"), offload=S3Offload("b"), offload_bytes=1)
 
 
 async def test_liveness_route_reports_dead_loops() -> None:

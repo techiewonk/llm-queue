@@ -11,6 +11,8 @@ never replaced. Used by the runtime on both the caller and the worker side.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -38,6 +40,15 @@ _STORE_ERRORS = (StoreConnectionError, StoreTimeoutError, ReadOnlyError, OSError
 # A result whose offload write failed is kept inline up to this size (the store takes 512 MB;
 # a result lives `result_ttl_secs`). Above it the caller gets `result_expired`.
 _INLINE_MAX_BYTES = 64 * 1024 * 1024
+# An offload write slower than this falls back inline: a slow S3 held a finished call past
+# its caller's deadline (R3JE-30).
+OFFLOAD_PUT_SECS = 15.0
+# A failed offload read is tried this many times, these seconds apart, before the caller gets
+# a retryable failure (R3JE-28).
+_GET_RETRY_SECS = (0.2, 0.5)
+# How long the store remembers that this fleet offloads results (refreshed on every start
+# and offloaded write): a pod without the offload then refuses to start (Q24).
+OFFLOAD_FLAG_SECS = 7 * 86_400
 # Prepared bodies of results whose store write failed, kept for the retry (oldest dropped).
 _UNSENT_MAX = 64
 
@@ -309,8 +320,17 @@ class RequestStore:
         """Register the scripts; no I/O until the first call.
 
         With `result_dedupe_secs`, a result is read again by later callers of the same id, so
-        an offload that deletes its object on the first read is refused (`ConfigError`).
+        an offload that deletes its object on the first read is refused (`ConfigError`). An
+        offload needs `offload_bytes` (1 or more) and the other way round: one without the
+        other turned nothing on, with no log (R3JE-27).
         """
+        if (offload is None) != (offload_bytes is None):
+            raise ConfigError(
+                "offload and offload_bytes go together: give both (offload_bytes is the result "
+                "size above which a result goes to the offload) or neither"
+            )
+        if offload_bytes is not None and offload_bytes < 1:
+            raise ConfigError("offload_bytes must be 1 or more")
         if result_dedupe_secs > 0 and getattr(offload, "delete_after_read", False):
             raise ConfigError(
                 "result_dedupe_secs > 0 reads a result more than once: build the offload with "
@@ -464,7 +484,56 @@ class RequestStore:
                 self._unsent.pop(next(iter(self._unsent)))
             raise
         self._unsent.pop(reply.request_id, None)
+        if not written and data.startswith(MARKER):
+            # A result was already stored (a duplicate run): the object just uploaded would
+            # stay until the bucket rule removed it (R3JE-29).
+            await self._delete_object(data[len(MARKER) :].decode())
         return bool(written)
+
+    async def _delete_object(self, ref: str) -> None:
+        """Delete an offloaded object no marker points to; a failure is only logged."""
+        delete = getattr(self.offload, "delete", None)
+        if delete is None:
+            return
+        try:
+            await delete(ref)
+        except Exception as exc:
+            logger.warning("offload_delete_failed", error_type=type(exc).__name__)
+
+    def _flag_key(self) -> str:
+        return f"{self.keys.prefix}:offload"
+
+    async def check_offload(self) -> None:
+        """At start: record that this fleet offloads, or refuse to start without the offload.
+
+        A process without the offload read an offloaded result as JSON, failed with a raw
+        error and deleted the result (R3JE-26): owner decision Q24 makes it refuse to start
+        while the store says the fleet offloads (the flag lapses `OFFLOAD_FLAG_SECS` after the
+        last offloading process wrote).
+        """
+        if self.offload is not None:
+            await self._client.set(self._flag_key(), b"1", ex=OFFLOAD_FLAG_SECS)
+            return
+        if await self._client.exists(self._flag_key()):
+            raise ConfigError(
+                "this fleet stores large results in a result offload (the store's "
+                f"`{self._flag_key()}` key says so), but this process has none: build it with "
+                "the same LLMQueue.from_env(offload=..., offload_bytes=...) as the others"
+            )
+
+    async def check_lifecycle(self) -> None:
+        """At start: warn when the bucket has no expiry rule for the offload's prefix (Q23).
+
+        Objects of callers that never read them (timed out, cancelled, gone) are removed only
+        by that rule. Never raises: a check that cannot run is logged and skipped.
+        """
+        check = getattr(self.offload, "check_lifecycle", None)
+        if check is None:
+            return
+        try:
+            await check()
+        except Exception as exc:
+            logger.info("offload_lifecycle_not_checked", error_type=type(exc).__name__)
 
     async def _prepared(self, reply: Reply) -> bytes:
         """The stored form of a reply: its JSON, or an offload marker when it is large.
@@ -480,14 +549,19 @@ class RequestStore:
         if self.offload is None or not self.offload_bytes or len(data) <= self.offload_bytes:
             return data
         try:
-            return MARKER + (await self.offload.put(reply.request_id, data)).encode()
-        except Exception as exc:
+            async with asyncio.timeout(OFFLOAD_PUT_SECS):
+                ref = await self.offload.put(reply.request_id, data)
+        except Exception as exc:  # TimeoutError included: kept inline below
             logger.warning(
                 "offload_put_failed",
                 request_id=reply.request_id,
                 size_bytes=len(data),
                 error_type=type(exc).__name__,
             )
+        else:
+            with contextlib.suppress(Exception):  # only keeps the fleet flag fresh (Q24)
+                await self._client.set(self._flag_key(), b"1", ex=OFFLOAD_FLAG_SECS)
+            return MARKER + ref.encode()
         if len(data) <= _INLINE_MAX_BYTES:
             return data
         failed = Reply(
@@ -503,13 +577,16 @@ class RequestStore:
         """A stored result; a library id's then expires in seconds (or `result_dedupe_secs`).
 
         An offloaded result is deleted only after its offload read worked (RESCAN S4): it was
-        deleted first, and a blip in that read lost it. A failed or empty read raises
-        `CallFailed("result_expired")`, not the offload's raw error.
+        deleted first, and a blip in that read lost it. A gone object raises
+        `CallFailed("result_expired")`; a read that keeps failing (access denied, throttling,
+        a timeout) raises `queue_unavailable` and leaves the result to read again (R3JE-28).
+        A process without the offload never deletes an offloaded result (R3JE-26).
         """
         job, _, _, result = self._req(request_id)
-        marker = MARKER if self.offload is not None else b""
+        # The marker always: without it the script took the marker for a result and dropped
+        # it, and the JSON parse of the marker raised a raw error (R3JE-26).
         try:
-            raw = await self._take([result, job], [self.result_dedupe_secs, marker, TAKE_GRACE_MS])
+            raw = await self._take([result, job], [self.result_dedupe_secs, MARKER, TAKE_GRACE_MS])
         except ResponseError as exc:
             # RESULT_TAKE writes (it drops a read result): a store refusing writes (NOREPLICAS,
             # OOM, MISCONF) made a stored answer unreadable (R3FM-7). Read it plainly; the drop
@@ -519,15 +596,15 @@ class RequestStore:
             raw = await self._client.get(result)
         if raw is None:
             return None
-        if self.offload is not None and raw.startswith(MARKER):
-            try:
-                body = await self.offload.get(raw[len(MARKER) :].decode())
-            except Exception as exc:
+        if raw.startswith(MARKER):
+            if self.offload is None:
+                logger.error("offload_missing", request_id=request_id)
                 raise CallFailed(
                     "result_expired",
-                    "the offloaded result could not be read",
+                    "the result is in a result offload and this process has none configured",
                     request_id=request_id,
-                ) from exc
+                )
+            body = await self._read_offloaded(self.offload, request_id, raw[len(MARKER) :].decode())
             if body is None:
                 raise CallFailed(
                     "result_expired", "the offloaded result is gone", request_id=request_id
@@ -543,6 +620,31 @@ class RequestStore:
                 )
             raw = body
         return Reply.model_validate(orjson.loads(raw))
+
+    @staticmethod
+    async def _read_offloaded(offload: ResultOffload, request_id: str, ref: str) -> bytes | None:
+        """The offloaded body (None when gone), tried again on other errors, then refused."""
+        for pause in (*_GET_RETRY_SECS, None):
+            try:
+                return await offload.get(ref)
+            except Exception as exc:
+                code = (getattr(exc, "response", None) or {}).get("Error", {}).get("Code")
+                logger.warning(
+                    "offload_get_failed",
+                    request_id=request_id,
+                    error_type=type(exc).__name__,
+                    code=code,
+                    last=pause is None,
+                )
+                if pause is None:
+                    raise CallFailed(
+                        "queue_unavailable",
+                        "the offloaded result could not be read now; it is kept, try again",
+                        retry_after_secs=1,
+                        request_id=request_id,
+                    ) from exc
+                await asyncio.sleep(pause)
+        return None  # not reached: the last pass returns or raises
 
     async def cancel(self, request_ids: Sequence[str], *, ttl_secs: int, channel: str) -> int:
         """Mark calls cancelled and announce each on `channel`, in one script; how many.

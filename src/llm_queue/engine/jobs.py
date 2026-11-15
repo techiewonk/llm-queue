@@ -283,8 +283,8 @@ class JobRunner:
         ident = job_id or new_id()
         body = self._body(name, ident, payload)
         queue = self.queue(name)
-        claim = self.queues.keys.queue(queue, f"id:{ident}")
         dedupe = job_id is not None and self.limits.dedupe_secs > 0
+        claim = self.queues.keys.queue(queue, f"id:{ident}") if dedupe else ""
         # Claimed first for a short time, kept for the window only once the send worked: a
         # sender that dies between the two leaves a claim that lapses, not a lost job.
         if dedupe and not await self.queues.client.set(claim, b"1", nx=True, ex=_CLAIM_SECS):
