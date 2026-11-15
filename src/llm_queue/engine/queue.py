@@ -423,12 +423,16 @@ return 'retry'
 """
 )
 
-# Reply: {messages in the stream, held, dead letters}.
-DEPTH = """
-local held = 0
-for _, v in ipairs(redis.call('HVALS', KEYS[5])) do if v == 'h' then held = held + 1 end end
+# Reply: {messages in the stream, held (or returned with a delay still to run), dead letters}.
+# Held is counted by visibility deadline in the future (FL-15): HVALS copied every hold and
+# return into Lua, on every status report and alert pass.
+DEPTH = (
+    _NOW
+    + """
+local held = redis.call('ZCOUNT', KEYS[2], '(' .. now, '+inf')
 return {redis.call('XLEN', KEYS[1]), held, redis.call('XLEN', KEYS[6])}
 """
+)
 
 # ARGV: retention ms. Dead letters older than the retention go: XADD trimmed them only when a
 # new one came, so a quiet queue kept its prompts for good (RESCAN X10). Reply: how many.
@@ -439,15 +443,33 @@ return redis.call('XTRIM', KEYS[6], 'MINID', tostring(now - tonumber(ARGV[1])))
 """
 )
 
+# KEYS: the dead-letter streams of several queues. ARGV: retention ms. TRIM_DEAD for each in one
+# call (FL-20: the sweeper made one round trip per queue). Reply: how many went in all.
+TRIM_DEAD_MANY = (
+    _NOW
+    + """
+local n = 0
+for i = 1, #KEYS do
+  n = n + redis.call('XTRIM', KEYS[i], 'MINID', tostring(now - tonumber(ARGV[1])))
+end
+return n
+"""
+)
+
 # ARGV: max count, retention ms, doorbell key. Dead letters back on the queue (new ids: they go
 # to the back), with SEND's trim and doorbell. An entry without a body is dropped and counted:
 # XADD with a nil body raised part-way, after earlier moves that Lua does not roll back, and
-# the redriven calls rang no doorbell (EN-12). Reply: {moved, dropped}.
+# the redriven calls rang no doorbell (EN-12). ARGV[4] (optional): max waiting, 0 = no limit;
+# the redrive stops there and the rest stay dead letters (FL-23: it filled the queue past the
+# model's max_waiting). Reply: {moved, dropped, left: dead letters still there}.
 REDRIVE = (
     _NOW
     + """
 local moved, dropped = 0, 0
+local limit = tonumber(ARGV[4] or '0') or 0
+local depth = redis.call('XLEN', KEYS[1])
 for _, entry in ipairs(redis.call('XRANGE', KEYS[6], '-', '+', 'COUNT', tonumber(ARGV[1]))) do
+  if limit > 0 and depth >= limit then break end
   local fields = entry[2]
   local body
   for k = 1, #fields, 2 do if fields[k] == 'body' then body = fields[k + 1] end end
@@ -455,6 +477,7 @@ for _, entry in ipairs(redis.call('XRANGE', KEYS[6], '-', '+', 'COUNT', tonumber
     redis.call('XADD', KEYS[1], 'MINID', '~', tostring(now - tonumber(ARGV[2])), '*',
       'body', body)
     moved = moved + 1
+    depth = depth + 1
   else
     dropped = dropped + 1
   end
@@ -465,7 +488,7 @@ if moved > 0 then
   redis.call('LTRIM', ARGV[3], -64, -1)
   redis.call('PEXPIRE', ARGV[3], 60000)
 end
-return {moved, dropped}
+return {moved, dropped, redis.call('XLEN', KEYS[6])}
 """
 )
 
@@ -551,6 +574,7 @@ class StreamQueues:
         self._depth = client.register_script(DEPTH)
         self._redrive = client.register_script(REDRIVE)
         self._trim_dead = client.register_script(TRIM_DEAD)
+        self._trim_dead_many = client.register_script(TRIM_DEAD_MANY)
         self._ring = client.register_script(RING)
         self._reclaim = client.register_script(RECLAIM)
 
@@ -749,7 +773,7 @@ class StreamQueues:
         )
 
     async def depth(self, queue: str) -> tuple[int, int, int]:
-        """(messages in the queue, held by workers, dead letters)."""
+        """(messages in the queue, held by workers or returned with a delay, dead letters)."""
         reply = await self._depth(self.queue_keys(queue), [])
         return int(reply[0]), int(reply[1]), int(reply[2])
 
@@ -770,22 +794,38 @@ class StreamQueues:
         return out
 
     async def redrive(
-        self, queue: str, count: int = 1000, retention_secs: int = RETENTION_SECS
+        self,
+        queue: str,
+        count: int = 1000,
+        retention_secs: int = RETENTION_SECS,
+        *,
+        max_waiting: int = 0,
     ) -> int:
         """Move up to `count` dead letters back to the queue; returns how many.
 
-        A dead letter without a body cannot run again: it is dropped, with a warning.
+        A dead letter without a body cannot run again: it is dropped, with a warning. With
+        `max_waiting` the redrive stops once that many wait (FL-23); the rest are logged.
         """
-        moved, dropped = await self._redrive(
-            self.queue_keys(queue), [count, retention_secs * 1000, self.bell(queue)]
+        moved, dropped, left = await self._redrive(
+            self.queue_keys(queue),
+            [count, retention_secs * 1000, self.bell(queue), max_waiting],
         )
         if int(dropped):
             logger.warning("redrive_dropped_bodyless", queue=queue, count=int(dropped))
+        if max_waiting and int(left):
+            logger.warning("redrive_stopped_full", queue=queue, left=int(left))
         return int(moved)
 
     async def trim_dead(self, queue: str, keep_secs: int) -> int:
         """Drop dead letters older than `keep_secs` (on a timer); returns how many went."""
         return int(await self._trim_dead(self.queue_keys(queue), [int(keep_secs) * 1000]))
+
+    async def trim_dead_many(self, queues: Sequence[str], keep_secs: int) -> int:
+        """`trim_dead` for several queues in one call (a model's two, by the sweeper)."""
+        if not queues:
+            return 0
+        keys = [self.keys.queue(queue, "dlq") for queue in queues]
+        return int(await self._trim_dead_many(keys, [int(keep_secs) * 1000]))
 
     async def mark_consumer(self, queue: str, ttl_secs: int) -> None:
         """Say a process consumes this queue; the mark lapses `ttl_secs` after the last one."""

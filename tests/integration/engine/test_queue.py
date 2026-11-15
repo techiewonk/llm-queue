@@ -266,6 +266,37 @@ async def test_fl8_a_small_receive_behind_many_returned_takes_the_oldest(
     assert [m.body for m in first] == [b"m0", b"m1", b"m2"]
 
 
+async def test_fl15_depth_counts_holds_by_deadline(store: redis.asyncio.Redis, prefix: str) -> None:
+    """FL-15: DEPTH copied every hold and return into Lua (HVALS) to count holds; it now counts
+    visibility deadlines still ahead: holds, and returns whose delay has not run out.
+    """
+    queues = await _filled(store, prefix, 3)
+    batch, _ = await queues.receive("q", 2, SLOW_VIS)
+    await queues.return_(batch[0], delay_secs=30)
+    await queues.return_(batch[1])
+    assert await queues.depth("q") == (3, 1, 0)  # (3, 0, 0) before: a delayed return
+
+
+async def test_fl20_trim_dead_many_trims_every_queue_in_one_call(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-20: the sweeper trimmed a model's two dead-letter streams one round trip each."""
+    queues = StreamQueues(store, Keys(prefix))
+    for name in ("p", "n"):
+        await store.xadd(queues.keys.queue(name, "dlq"), {"body": "x"}, id="1-1")
+    assert await queues.trim_dead_many(["p", "n"], 60) == 2
+    assert await queues.trim_dead_many([], 60) == 0
+
+
+async def test_fl23_redrive_stops_at_max_waiting(store: redis.asyncio.Redis, prefix: str) -> None:
+    """FL-23: REDRIVE ignored max_waiting and filled the queue past it."""
+    queues = await _filled(store, prefix, 1)
+    for i in range(3):
+        await store.xadd(queues.keys.queue("q", "dlq"), {"body": f"d{i}"})
+    assert await queues.redrive("q", max_waiting=2) == 1  # 3 before the fix
+    assert await queues.depth("q") == (2, 0, 2)
+
+
 async def test_q27_a_send_keeps_messages_one_day_by_default(
     store: redis.asyncio.Redis, prefix: str
 ) -> None:
