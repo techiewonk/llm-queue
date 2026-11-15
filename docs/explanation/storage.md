@@ -99,10 +99,16 @@ model's `queue.name`) and `...-priority`; jobs use `jobs-<name>`. Hash tags grou
 
 | Requirement | Why | What the library does |
 |---|---|---|
-| `maxmemory-policy noeviction` (recommended) | Any evicting policy lets a full store drop queue messages, budgets and results: lost calls and overspent budgets | Reads the policy at `start()` (`CONFIG GET`, else `INFO memory` where `CONFIG` is disabled, as on ElastiCache); logs `store_eviction_policy` with a warning when it is not `noeviction`, and reports it in `health()`: `eviction_policy` for the state store (`unknown` when unreadable), `queue_eviction_policy` only when the queue store is a separate one |
+| `maxmemory-policy noeviction` (recommended) | Any evicting policy lets a full store drop queue messages, budgets and results: lost calls and overspent budgets | Reads the policy at `start()` and every minute after (`CONFIG GET`, else `INFO memory` where `CONFIG` is disabled, as on ElastiCache); logs `store_eviction_policy` with a warning when it is not `noeviction` and, in strict mode, fails readiness with `not_ready_reason`; reports it in `health()`: `eviction_policy` for the state store (`unknown` when unreadable), `queue_eviction_policy` only when the queue store is a separate one |
 | One primary (with replicas), **not cluster mode** | One admission script touches keys of several hash tags | `start()` refuses a cluster-mode store with a `ConfigError` (`INFO cluster`) instead of failing at the first call |
 | Lua scripts, pub/sub, blocking list reads (`BLPOP`) | Admission, result wake-ups and the queue doorbell | ElastiCache for Valkey / Redis OSS allows all three |
 | A store that is out of memory | `noeviction` refuses writes when full | Calls fail `queue_unavailable` ("out of memory"), admin operations `StoreUnavailable`; nothing is lost silently |
+| `min-replicas-to-write 1` (recommended with replicas) | Without it a primary that lost its replicas keeps accepting writes, and a failover then drops what only it held | A write the store refuses for it (`NOREPLICAS`), like `OOM`, `MISCONF` (a failed save), `BUSY` (a long script) and `READONLY`, is treated as the store being down: `store_down` decides (pause, static cap, fail fast); a result already written stays readable |
+
+Set `min-replicas-to-write` with `min-replicas-max-lag` (for example 1 and 10 s) on a replicated
+self-managed Valkey or Redis; on a managed service, check whether its parameter group exposes
+them (unverified for ElastiCache). `LLMQ_QUEUE_WAIT_REPLICAS` adds a `WAIT` after each
+send for the same guarantee per message.
 
 Tested versions: Valkey 8.1 and Redis 7.4 (the `docker/compose.yaml` stack every integration
 test, scenario and gate runs on); Valkey 8 and Redis 7.2+ are supported. The client is redis-py
