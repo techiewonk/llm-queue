@@ -166,6 +166,49 @@ async def test_r3st13_end_is_not_capped() -> None:
         await _writer(store, max_bytes=10).add(_delta("y" * 50))
 
 
+async def test_r3pf2_xread_is_packed_once_per_key_as_redis_py_would() -> None:
+    """R3PF-2: redis-py's `xread` rebuilt and packed every key and id on each read turn."""
+    from redis.asyncio.connection import Connection
+
+    reader = ChunkReader(Store(), block_ms=100, wake_key="w")  # type: ignore[arg-type]  # fake
+    reader._task = asyncio.get_running_loop().create_future()  # type: ignore[assignment]
+    reader.open("a:{r:1}:chunks")
+    reader.open("a:{r:2}:chunks")
+    reader._open["a:{r:2}:chunks"][1][0] = b"1700000000000-3"
+    expected = Connection().pack_command(
+        "XREAD", "BLOCK", 100, "STREAMS", "a:{r:1}:chunks", "a:{r:2}:chunks", "w",
+        "0", "1700000000000-3", "$",
+    )  # fmt: skip
+    assert reader._command() == b"".join(expected)
+
+
+async def test_r3pf2_raw_replies_of_both_protocols_are_read() -> None:
+    """R3PF-2: the raw reply is a map under RESP3 and a list of pairs under RESP2."""
+    fields = [b"seq", b"1", b"att", b"a", b"t", b"end", b"d", b"{}"]
+    for reply in (
+        {b"k": [[b"1-0", fields]]},
+        [[b"k", [[b"1-0", fields]]]],
+    ):
+
+        class Client:
+            connection_pool = None
+
+            def __init__(self, reply: Any) -> None:
+                self.reply = reply
+
+            async def xread(self, streams: Any, block: int) -> Any:
+                reply, self.reply = self.reply, None
+                await asyncio.sleep(0.001)
+                return reply
+
+        reader = ChunkReader(Client(reply), block_ms=1)  # type: ignore[arg-type]  # fake
+        queue = reader.open("k")
+        entry = await asyncio.wait_for(queue.get(), 2)
+        assert entry == {"seq": 1, "att": "a", "t": "end", "d": {}}
+        assert reader._open["k"][1][0] == b"1-0"
+        await reader.aclose()
+
+
 async def test_r3st8_a_second_open_of_one_stream_is_refused() -> None:
     """R3ST-8: a second open replaced the first's queue, and its close removed the second's."""
     store = Store()

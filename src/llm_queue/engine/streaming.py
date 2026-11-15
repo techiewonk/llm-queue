@@ -337,7 +337,9 @@ class ChunkReader:
         self._client = client
         self._block_ms = block_ms
         self._wake_key = wake_key
-        self._open: dict[str, tuple[asyncio.Queue[dict[str, Any]], list[str]]] = {}
+        # Per open stream: its queue, the last entry id read (bytes, in a list to update in
+        # place) and its key as a packed RESP argument, built once (R3PF-2).
+        self._open: dict[str, tuple[asyncio.Queue[dict[str, Any]], list[bytes], bytes]] = {}
         self._task: asyncio.Task[None] | None = None
         self._reading: set[str] | None = None  # the keys of the blocking read in flight
         self._woken = False  # a wake-up was sent for the read in flight
@@ -352,7 +354,7 @@ class ChunkReader:
         if key in self._open:
             raise ValueError(f"the chunk stream {key} is already open in this process")
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        self._open[key] = (queue, ["0"])
+        self._open[key] = (queue, [b"0"], _arg(key.encode()))
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._read())
         elif (
@@ -393,12 +395,9 @@ class ChunkReader:
     async def _read(self) -> None:
         failures = 0
         while self._open:
-            streams: dict[Any, Any] = {key: last[0] for key, (_, last) in self._open.items()}
-            if self._wake_key is not None:
-                streams[self._wake_key] = "$"  # only wake-ups sent while this read blocks
-            self._reading, self._woken = set(streams), False
+            self._reading, self._woken = set(self._open), False
             try:
-                found: Any = await self._client.xread(streams, block=self._block_ms)
+                found: Any = await self._xread()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -414,17 +413,23 @@ class ChunkReader:
             if failures:
                 logger.info("chunk_reader_recovered", failures=failures)
                 failures = 0
-            for raw_key, entries in found or []:
+            # A raw reply: a map under RESP3, a list of [key, entries] pairs under RESP2.
+            for raw_key, entries in found.items() if isinstance(found, Mapping) else found or []:
                 key = _text(raw_key)
                 if key not in self._open:
                     continue
-                queue, last = self._open[key]
+                queue, last, _ = self._open[key]
                 for entry_id, fields in entries:
-                    last[0] = _text(entry_id)
+                    last[0] = entry_id if isinstance(entry_id, bytes) else str(entry_id).encode()
                     # One bad entry is skipped: it ended the reader shared by every stream of
                     # this process (RESCAN S11); the stream's caller then sees a gap.
                     try:
-                        entry = {_text(k): v for k, v in fields.items()}
+                        pairs = (
+                            fields.items()
+                            if isinstance(fields, Mapping)
+                            else zip(fields[::2], fields[1::2], strict=True)
+                        )
+                        entry = {_text(k): v for k, v in pairs}
                         item = {
                             "seq": int(entry["seq"]),
                             "att": _text(entry.get("att", b"")),
@@ -435,6 +440,53 @@ class ChunkReader:
                         logger.warning("chunk_entry_bad", error_type=type(exc).__name__)
                         continue
                     queue.put_nowait(item)
+
+    async def _xread(self) -> Any:
+        """One blocking XREAD over every open stream (and the wake stream).
+
+        Packed here from each stream's cached key argument and sent on a pooled connection:
+        redis-py's `xread` built a dict and packed every key and id in Python again on each
+        turn, 3.6 ms per read at 1,000 open streams (R3PF-2). The reply is raw (a map under
+        RESP3, a list of pairs under RESP2; fields as a flat list). A client without a pool (a
+        test fake) gets the plain command.
+        """
+        pool = getattr(self._client, "connection_pool", None)
+        if pool is None:
+            streams: dict[Any, Any] = {key: last[0] for key, (_, last, _) in self._open.items()}
+            if self._wake_key is not None:
+                streams[self._wake_key] = "$"  # only wake-ups sent while this read blocks
+            return await self._client.xread(streams, block=self._block_ms)
+        command = self._command()
+        conn = await pool.get_connection()
+        try:
+            await conn.send_packed_command(command)
+            return await conn.read_response()
+        except BaseException:
+            # Cancelled or failed mid-read: the reply may still come on this connection, and
+            # the next command would read it as its own.
+            await asyncio.shield(conn.disconnect())
+            raise
+        finally:
+            await pool.release(conn)
+
+    def _command(self) -> bytes:
+        """The packed `XREAD BLOCK ms STREAMS keys... ids...` of the open streams."""
+        opened = list(self._open.values())
+        keys = [packed for _, _, packed in opened]
+        ids = [_arg(last[0]) for _, last, _ in opened]
+        if self._wake_key is not None:
+            keys.append(_arg(self._wake_key.encode()))
+            ids.append(b"$1\r\n$\r\n")  # only wake-ups sent while this read blocks
+        head = b"*%d\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n%s$7\r\nSTREAMS\r\n" % (
+            4 + 2 * len(keys),
+            _arg(b"%d" % self._block_ms),
+        )
+        return b"".join([head, *keys, *ids])
+
+
+def _arg(value: bytes) -> bytes:
+    """One RESP bulk-string argument."""
+    return b"$%d\r\n%s\r\n" % (len(value), value)
 
 
 async def _cancel_and_wait(tasks: list[asyncio.Task[None]]) -> None:
