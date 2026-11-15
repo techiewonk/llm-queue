@@ -364,7 +364,7 @@ async def b19() -> bool:
     )
 
 
-async def _shares(processes: int) -> tuple[dict[str, float], float, float]:
+async def _shares(processes: int) -> tuple[dict[str, float], float]:
     """Deployment shares and store commands per call for one load on `processes` workers."""
     doc = registry({"chat": {"rpm": 1_000_000, "balance": "round_robin"}})
     async with Gate(doc) as gate:
@@ -378,12 +378,11 @@ async def _shares(processes: int) -> tuple[dict[str, float], float, float]:
         t0, c0 = time.monotonic(), gate.store.commands()
         await paced(100, 15, lambda i: run.call(queues[i % 2], "chat", chat()))
         secs, cmds = time.monotonic() - t0, gate.store.commands() - c0
-        probes = gate.store.client.keys(f"{gate.prefix}:lock:*")
     served = collections.Counter(r.deployment for r in run.results if r.ok)
     total = sum(served.values())
     shares = {d: n / total for d, n in served.items()}
     per_call = (cmds - idle_rate * secs) / max(1, len(run.results))
-    return shares, per_call, len(probes) + 0.0
+    return shares, per_call
 
 
 async def b22() -> bool:
@@ -392,8 +391,8 @@ async def b22() -> bool:
     Pass: deployment shares and
     store commands per call (idle polling subtracted) equal within 5 %.
     """
-    two, two_cmds, _ = await _shares(2)
-    eight, eight_cmds, _ = await _shares(8)
+    two, two_cmds = await _shares(2)
+    eight, eight_cmds = await _shares(8)
     worst = max(abs(two.get(d, 0) - eight.get(d, 0)) / max(two.get(d, 1e-9), 1e-9) for d in two)
     cmd_diff = abs(two_cmds - eight_cmds) / two_cmds
     lines = [
@@ -965,22 +964,30 @@ SLOW_GATES = frozenset({"B17", "B91", "B92"})  # left out by --quick
 def main() -> int:
     """Run the chosen gates; exit 1 if any fails."""
     setup_logging()
-    print(f"  logs of worker processes: {log_dir()}", flush=True)
-    args = [a for a in sys.argv[1:] if a != "--record-baseline"]
-    seed = random.randrange(2**31)
-    if "--seed" in args:
-        at = args.index("--seed")
-        seed = int(args[at + 1])
-        del args[at : at + 2]
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
+    parser.add_argument("gates", nargs="*", help=f"gate names (default: all): {', '.join(GATES)}")
+    parser.add_argument("--quick", action="store_true", help="leave out the slow gates")
+    parser.add_argument("--list", action="store_true", help="list the gates and exit")
+    parser.add_argument("--seed", type=int, help="replay the random choices of a run")
+    parser.add_argument("--record-baseline", action="store_true", help="kept for check.py")
+    # FT-27: argparse, so `--quick B19` works and a typo is an error, not a KeyError.
+    opts = parser.parse_args()
+    seed = opts.seed if opts.seed is not None else random.randrange(2**31)
     random.seed(seed)
     print(f"  seed {seed} (replay with --seed {seed})", flush=True)
-    if args == ["--list"]:
+    if opts.list:  # before any output folder is needed
         for name, fn in GATES.items():
             print(f"{name:4} {(fn.__doc__ or '').splitlines()[0]}")
         return 0
-    if args == ["--quick"]:
-        args = [name for name in GATES if name not in SLOW_GATES]
-    chosen = args or list(GATES)
+    unknown = [g for g in opts.gates if g not in GATES]
+    if unknown:
+        parser.error(f"unknown gate(s) {unknown}; have {', '.join(GATES)}")
+    chosen = opts.gates or list(GATES)
+    if opts.quick:
+        chosen = [name for name in chosen if name not in SLOW_GATES]
+    print(f"  logs of worker processes: {log_dir()}", flush=True)
     results: dict[str, bool] = {}
     for name in chosen:
         print(f"[{name}]", flush=True)
