@@ -194,6 +194,62 @@ async def test_s11_a_retried_receive_hands_back_the_same_messages(
         assert await queues.ack(message)
 
 
+async def test_fl4_a_replayed_receive_hands_back_its_dead_letters(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-4: dead letters were not in the claim; a receive replayed after a lost reply (or one
+    that took nothing but dead-lettered) returned no dead letter, so the caller was never told.
+    """
+    once = QueueSettings(visibility_secs=0.05, max_receives=1, max_waiting=0)
+    queues = await _filled(store, prefix, 1)
+    await queues.receive("q", 1, once)  # held; its hold lapses: the next receive counts a failure
+    await asyncio.sleep(0.1)  # time is what is under test: past the visibility
+    key = queues.claim_key("w1:model")
+    taken, dead = await queues.receive_first(["q"], 1, once, claim=(key, "n1"))
+    assert (taken, [d.body for d in dead]) == ([], [b"m0"])
+    taken, dead = await queues.receive_first(["q"], 1, once, claim=(key, "n1"))  # the replay
+    assert (taken, [d.body for d in dead]) == ([], [b"m0"])  # ([], []) before the fix
+    assert await store.type(key) == b"string"  # FL-16: one SET, not a list of RPUSHes
+
+
+async def test_fl5_a_returned_or_reclaimed_message_rings_the_doorbell(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-5: RETURN and RECLAIM made a message visible without a doorbell token, so idle
+    workers of other pods slept in BLPOP for their poll pause before they took it.
+    """
+    queues = await _filled(store, prefix, 2)
+    await store.delete(queues.bell("q"))  # the sends' tokens are taken
+    (held,), _ = await queues.receive("q", 1, SLOW_VIS)
+    await queues.return_(held, delay_secs=5)
+    assert await store.llen(queues.bell("q")) == 0  # visible later: no token yet
+    (held,), _ = await queues.receive("q", 1, SLOW_VIS)
+    await queues.return_(held)
+    assert await queues.wait_bell(["q"], 0.5) == "q"
+    key = queues.claim_key("w1:model")
+    await queues.receive_first(["q"], 1, SLOW_VIS, claim=(key, "n1"))
+    assert await queues.reclaim(key, "n1") == 1
+    assert await queues.wait_bell(["q"], 0.5) == "q"
+
+
+async def test_rv_t1_a_reclaim_leaves_a_re_received_message_alone(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """RV-T1 (S11): a message another receiver took after the lost receive's hold lapsed is
+    left alone by the reclaim: its receipt stays good and it is not made visible again.
+    """
+    short = QueueSettings(visibility_secs=0.05, max_receives=0, max_waiting=0)
+    queues = await _filled(store, prefix, 1)
+    key = queues.claim_key("w1:model")
+    (lost,), _ = await queues.receive_first(["q"], 1, short, claim=(key, "n1"))
+    await asyncio.sleep(0.1)  # time is what is under test: the lost hold lapses
+    (other,), _ = await queues.receive_first(["q"], 1, SLOW_VIS, claim=(key + "2", "m1"))
+    assert other.id == lost.id
+    assert await queues.reclaim(key, "n1") == 0
+    assert await queues.receive("q", 1, SLOW_VIS) == ([], [])  # still hidden under `other`
+    assert await queues.ack(other)
+
+
 async def test_q27_a_send_keeps_messages_one_day_by_default(
     store: redis.asyncio.Redis, prefix: str
 ) -> None:

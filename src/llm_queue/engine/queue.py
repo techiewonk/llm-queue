@@ -66,13 +66,14 @@ return send(KEYS[1], ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3]), ARGV[4])
 # K: the keys of one queue, in `_PARTS` order.
 _DLQ = """
 local function to_dlq(K, id, body, fails, keep_ms)
-  redis.call('XADD', K[6], 'MINID', '~', tostring(now - keep_ms), '*',
+  local dlq_id = redis.call('XADD', K[6], 'MINID', '~', tostring(now - keep_ms), '*',
     'body', body, 'src', id, 'fails', fails)
   redis.call('XDEL', K[1], id)
   redis.call('ZREM', K[2], id)
   redis.call('HDEL', K[3], id)
   redis.call('HDEL', K[4], id)
   redis.call('HDEL', K[5], id)
+  return dlq_id
 end
 local function older(a, b)
   local am, as = string.match(a, '(%d+)-(%d+)')
@@ -83,7 +84,8 @@ end
 """
 
 # Up to `want` messages of one queue (keys K), oldest first, whether new or visible again; a
-# lapsed hold counts one failure. Returns taken {id, generation, body, ...}, dead {id, body, ...}.
+# lapsed hold counts one failure. Returns taken {id, generation, body, ...}, dead {id, body, ...}
+# and the dead letters' entry ids in the dead-letter stream.
 _RECEIVE_FN = """
 local function receive(K, want, vis_ms, maxr, keep)
 local due = redis.call('ZRANGEBYSCORE', K[2], '-inf', now, 'LIMIT', 0, 1000)
@@ -91,7 +93,7 @@ table.sort(due, older)
 local cursor = redis.call('HGET', K[7], 'cursor')
 local start = cursor and ('(' .. cursor) or '-'
 local fresh = redis.call('XRANGE', K[1], start, '+', 'COUNT', want)
-local taken, gone = {}, {}
+local taken, gone, gone_at = {}, {}, {}
 local i, j = 1, 1
 local last_new = nil
 while #taken < want * 3 and (i <= #due or j <= #fresh) do
@@ -114,7 +116,7 @@ while #taken < want * 3 and (i <= #due or j <= #fresh) do
       if redis.call('HGET', K[5], id) == 'h' then
         local fails = redis.call('HINCRBY', K[4], id, 1)
         if maxr > 0 and fails >= maxr then
-          to_dlq(K, id, body, fails, keep)
+          table.insert(gone_at, to_dlq(K, id, body, fails, keep))
           table.insert(gone, id)
           table.insert(gone, body)
           body = nil
@@ -138,7 +140,7 @@ while #taken < want * 3 and (i <= #due or j <= #fresh) do
   end
 end
 if last_new then redis.call('HSET', K[7], 'cursor', last_new) end
-return taken, gone
+return taken, gone, gone_at
 end
 """
 
@@ -155,34 +157,81 @@ return {taken, gone, now}
 """
 )
 
+# One doorbell token (SEND's cap and TTL): wakes one idle worker blocked on the bell.
+_RING_FN = """
+local function ring(bell)
+  if not bell or bell == '' then return end
+  redis.call('RPUSH', bell, '1')
+  redis.call('LTRIM', bell, -64, -1)
+  redis.call('PEXPIRE', bell, 60000)
+end
+"""
+
+# Read a receive's claim (see RECEIVE_FIRST): nil when there is none, or an older library's list
+# (WRONGTYPE), or anything that is not the JSON this library writes.
+_CLAIM_FN = """
+local function read_claim(key)
+  local raw = redis.pcall('GET', key)
+  if type(raw) ~= 'string' then return nil end
+  local ok, prior = pcall(cjson.decode, raw)
+  if ok and type(prior) == 'table' then return prior end
+  return nil
+end
+"""
+
 # KEYS: the keys of several queues (7 each), in order of preference. ARGV as RECEIVE, then the
-# claim key ('' for none) and this receive's nonce. Receives from the first queue that has
-# messages (a model's priority queue, then its normal one: one round trip, not two). Reply:
-# {queue index from 1 (0: none), taken, dead {index, id, body, ...} of every queue read, the
-# store's time in ms}.
+# claim key ('' for none), this receive's nonce, then each queue's doorbell key (optional, rung
+# by RECLAIM). Receives from the first queue that has messages (a model's priority queue, then
+# its normal one: one round trip, not two). Reply: {queue index from 1 (0: none), taken, dead
+# {index, id, body, ...} of every queue read, the store's time in ms}.
 #
-# The claim (a list: nonce, the queue's key base, id, generation, ...; it lives one visibility
-# time) records what this receive took for its receiver. A receive whose reply was lost (a cut
-# connection) left its messages hidden for the whole visibility timeout: run again with the
-# same nonce (redis-py's retry) it hands back the same messages, and `RECLAIM` returns them to
-# the queue at once (scenario S11). Key names come from data here, as in the admission scripts
-# (the single-primary store the library supports).
+# The claim (JSON: nonce `n`, the queue's key base `b` and `bell`, ids and generations taken `t`,
+# dead letters `d` as queue index, id, dead-letter entry id; it lives one visibility time)
+# records what this receive did for its receiver. A receive whose reply was lost (a cut
+# connection) left its messages hidden for the whole visibility timeout: run again with the same
+# nonce (redis-py's retry) it hands back the same messages and dead letters, and `RECLAIM`
+# returns the messages to the queue at once (scenario S11). Dead letters were not in the claim,
+# so a replay dropped them and their callers waited to their deadline (FL-4). One SET and one
+# GET (FL-16): the list took LRANGE + DEL + RPUSH + an RPUSH per message + PEXPIRE. Key names
+# come from data here, as in the admission scripts (the single-primary store the library
+# supports).
 RECEIVE_FIRST = (
     _NOW
     + _DLQ
     + _RECEIVE_FN
+    + _CLAIM_FN
     + """
 local claim, nonce, vis_ms = ARGV[5] or '', ARGV[6] or '', tonumber(ARGV[2])
+local nq = #KEYS / 7
+local function keys_of(q)
+  local K = {}
+  for i = 1, 7 do K[i] = KEYS[(q - 1) * 7 + i] end
+  return K
+end
 if claim ~= '' then
-  local prior = redis.call('LRANGE', claim, 0, -1)
-  if prior[1] == nonce then
-    for q = 1, #KEYS / 7 do
-      local K = {}
-      for i = 1, 7 do K[i] = KEYS[(q - 1) * 7 + i] end
-      if K[1] == prior[2] .. 's' then
-        local taken = {}
-        for i = 3, #prior, 2 do
-          local id, gen = prior[i], prior[i + 1]
+  local prior = read_claim(claim)
+  if prior and prior.n == nonce then
+    -- A replay: the same batch and dead letters, never a second batch.
+    local dead, d = {}, prior.d or {}
+    for i = 1, #d, 3 do
+      local q = tonumber(d[i])
+      if q and q <= nq then
+        local entry = redis.call('XRANGE', keys_of(q)[6], d[i + 2], d[i + 2])
+        if #entry > 0 then
+          local fields, body = entry[1][2], ''
+          for k = 1, #fields, 2 do if fields[k] == 'body' then body = fields[k + 1] end end
+          table.insert(dead, q)
+          table.insert(dead, d[i + 1])
+          table.insert(dead, body)
+        end
+      end
+    end
+    for q = 1, nq do
+      local K = keys_of(q)
+      if prior.b and prior.b ~= '' and K[1] == prior.b .. 's' then
+        local taken, t = {}, prior.t or {}
+        for i = 1, #t, 2 do
+          local id, gen = t[i], t[i + 1]
           if redis.call('HGET', K[3], id) == gen and redis.call('HGET', K[5], id) == 'h' then
             local entry = redis.call('XRANGE', K[1], id, id)
             if #entry > 0 then
@@ -193,55 +242,73 @@ if claim ~= '' then
             end
           end
         end
-        if #taken > 0 then return {q, taken, {}, now} end
-        return {0, {}, {}, now}
+        if #taken > 0 then return {q, taken, dead, now} end
       end
     end
+    return {0, {}, dead, now}
   end
 end
-local dead = {}
-for q = 1, #KEYS / 7 do
-  local K = {}
-  for i = 1, 7 do K[i] = KEYS[(q - 1) * 7 + i] end
-  local taken, gone = receive(K, tonumber(ARGV[1]), vis_ms, tonumber(ARGV[3]),
+local dead, dead_at = {}, {}
+local function record(q, taken)
+  if claim == '' or (#taken == 0 and #dead_at == 0) then return end
+  local t, base, bell = {}, '', ''
+  for i = 1, #taken, 3 do
+    table.insert(t, taken[i])
+    table.insert(t, taken[i + 1])
+  end
+  if #taken > 0 then
+    base = string.sub(KEYS[(q - 1) * 7 + 1], 1, -2)
+    bell = ARGV[6 + q] or ''
+  end
+  redis.call('SET', claim, cjson.encode({n = nonce, b = base, bell = bell, t = t, d = dead_at}),
+    'PX', vis_ms)
+end
+for q = 1, nq do
+  local K = keys_of(q)
+  local taken, gone, gone_at = receive(K, tonumber(ARGV[1]), vis_ms, tonumber(ARGV[3]),
     tonumber(ARGV[4]))
   for i = 1, #gone, 2 do
     table.insert(dead, q)
     table.insert(dead, gone[i])
     table.insert(dead, gone[i + 1])
+    table.insert(dead_at, q)
+    table.insert(dead_at, gone[i])
+    table.insert(dead_at, gone_at[(i + 1) / 2])
   end
   if #taken > 0 then
-    if claim ~= '' then
-      redis.call('DEL', claim)
-      redis.call('RPUSH', claim, nonce, string.sub(K[1], 1, -2))
-      for i = 1, #taken, 3 do redis.call('RPUSH', claim, taken[i], taken[i + 1]) end
-      redis.call('PEXPIRE', claim, vis_ms)
-    end
+    record(q, taken)
     return {q, taken, dead, now}
   end
 end
+record(0, {})
 return {0, {}, dead, now}
 """
 )
 
 # ARGV: claim key, nonce. The receive with this nonce lost its reply: each message it took that
-# is still under that receipt is visible again now, with no failure (as RETURN). Reply: how many.
+# is still under that receipt is visible again now, with no failure (as RETURN), and its queue's
+# doorbell rings (FL-5: idle workers slept through a poll pause). Reply: how many.
 RECLAIM = (
     _NOW
+    + _RING_FN
+    + _CLAIM_FN
     + """
-local prior = redis.call('LRANGE', ARGV[1], 0, -1)
-if prior[1] ~= ARGV[2] then return 0 end
-local base, n = prior[2], 0
-for i = 3, #prior, 2 do
-  local id, gen = prior[i], prior[i + 1]
-  if redis.call('HGET', base .. 'gen', id) == gen then
-    redis.call('HINCRBY', base .. 'gen', id, 1)
-    redis.call('HSET', base .. 'st', id, 'r')
-    redis.call('ZADD', base .. 'vis', now, id)
-    n = n + 1
+local prior = read_claim(ARGV[1])
+if not prior or prior.n ~= ARGV[2] then return 0 end
+local base, n, t = prior.b or '', 0, prior.t or {}
+if base ~= '' then
+  for i = 1, #t, 2 do
+    local id, gen = t[i], t[i + 1]
+    if redis.call('HGET', base .. 'gen', id) == gen then
+      redis.call('HINCRBY', base .. 'gen', id, 1)
+      redis.call('HSET', base .. 'st', id, 'r')
+      redis.call('ZADD', base .. 'vis', now, id)
+      n = n + 1
+    end
   end
 end
 redis.call('DEL', ARGV[1])
+if n > 0 then ring(prior.bell) end
 return n
 """
 )
@@ -257,16 +324,20 @@ redis.call('HDEL', KEYS[5], ARGV[1])
 return 1
 """
 
-# ARGV: id, generation, delay ms. Visible again in its place after the delay; no failure.
-# The receipt ends here (generation + 1): a heartbeat extend already in flight hid the given-back
-# message again for its whole visibility timeout (a drained pod's call reached no other pod).
+# ARGV: id, generation, delay ms, doorbell key (optional). Visible again in its place after the
+# delay; no failure. The receipt ends here (generation + 1): a heartbeat extend already in flight
+# hid the given-back message again for its whole visibility timeout (a drained pod's call reached
+# no other pod). With no delay the doorbell rings (FL-5): idle workers of other pods slept in
+# BLPOP for their poll pause before they saw it.
 RETURN = (
     _NOW
+    + _RING_FN
     + """
 if redis.call('HGET', KEYS[3], ARGV[1]) ~= ARGV[2] then return 0 end
 redis.call('HINCRBY', KEYS[3], ARGV[1], 1)
 redis.call('HSET', KEYS[5], ARGV[1], 'r')
 redis.call('ZADD', KEYS[2], now + tonumber(ARGV[3]), ARGV[1])
+if tonumber(ARGV[3]) <= 0 then ring(ARGV[4]) end
 return 1
 """
 )
@@ -559,6 +630,8 @@ class StreamQueues:
             return [], []
         keys = [key for queue in queues for key in self.queue_keys(queue)]
         args: list[int | str] = [*_receive_args(count, settings), *(claim or ("", ""))]
+        if claim:
+            args += [self.bell(queue) for queue in queues]  # rung by `reclaim` (FL-5)
         index, taken, dead, now = await self._receive_first(keys, args)
         letters = [
             DeadLetter(queues[int(dead[i]) - 1], _text(dead[i + 1]), _bytes(dead[i + 2]))
@@ -601,11 +674,14 @@ class StreamQueues:
         )
 
     async def return_(self, message: Message, delay_secs: float = 0.0) -> bool:
-        """Make a message visible again in its place (after `delay_secs`), with no failure."""
+        """Make a message visible again in its place (after `delay_secs`), with no failure.
+
+        With no delay its queue's doorbell rings, so an idle worker takes it at once (FL-5).
+        """
         return bool(
             await self._return(
                 self.queue_keys(message.queue),
-                [message.id, message.generation, int(delay_secs * 1000)],
+                [message.id, message.generation, int(delay_secs * 1000), self.bell(message.queue)],
             )
         )
 
