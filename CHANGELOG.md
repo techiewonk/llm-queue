@@ -300,8 +300,10 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
   is an `EmbeddingCodec` holding its batch limit, longest text, request body, reply parser and
   health-probe options; a model's codec is its registry `family`, else its provider (`openai`),
   else the first codec whose id pattern matches (`titan-embed`, `cohere.embed`, any case).
-  Batch size, the text-length check, the request, the reply and the health probe all use it
-  (the probe ignored `family`, so a Cohere model behind an ARN was probed with Titan's body).
+  Batch size, the text-length check, the request, the reply, the health probe and the registry
+  `inference` fields the worker fills all use it (the probe ignored `family`, so a Cohere model
+  behind an ARN was probed with Titan's body; the worker told the families apart by looking
+  for `inputText`).
   An embedding id no codec matches is now a registry load error ("cannot tell the embedding
   family of <id>; set `family` (one of ...)"); it used to be sent Titan's body (one text,
   `inputText`) and every call failed at the provider. `family` is allowed on any embedding
