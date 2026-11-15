@@ -764,10 +764,18 @@ RENEW = (
     + r"""
 local renewed = 0
 local lost = {}
-for _, item in ipairs(req.jobs or {}) do
-  local job = P .. ':{r:' .. item.request_id .. '}:job'
-  if redis.call('HGET', job, 'owner') == item.owner then redis.call('HSET', job, 'hb', now) end
+local lease_ms = num(req.lease_ms, 60000)
+-- The claim of a call this worker runs: hb, and a TTL that outlives the call (FL-12: a call that
+-- ran past the job TTL lost its claim, and a redelivery could run it again). Only the claim's
+-- own owner writes it: a fallback grant of worker A kept worker B's claim fresh.
+local function beat(rid, jo)
+  local job = P .. ':{r:' .. rid .. '}:job'
+  if not jo or redis.call('HGET', job, 'owner') ~= jo then return end
+  redis.call('HSET', job, 'hb', now)
+  local ttl = redis.call('PTTL', job)
+  if ttl >= 0 and ttl < lease_ms * 2 then redis.call('PEXPIRE', job, num(T.job_ttl_ms, 3600000)) end
 end
+for _, item in ipairs(req.jobs or {}) do beat(item.request_id, item.owner) end
 for _, item in ipairs(req.items) do
   local entry_key = mk(item.alias, 'inprog:' .. item.request_id)
   if redis.call('HGET', entry_key, 'owner') == item.owner then
@@ -779,8 +787,8 @@ for _, item in ipairs(req.items) do
     redis.call('ZADD', mk(item.alias, 'lease:' .. dep .. ':' .. cls), until_, item.owner)
     redis.call('ZADD', mk(item.alias, 'inprog'), 'XX', until_, item.owner)
     redis.call('PEXPIRE', entry_key, num(req.lease_ms, 60000) * 2)
-    local job = P .. ':{r:' .. item.request_id .. '}:job'
-    if redis.call('EXISTS', job) == 1 then redis.call('HSET', job, 'hb', now) end
+    beat(item.request_id, redis.call('HGET', entry_key, 'job_owner')
+      or string.match(item.owner, '^.*|([^|]*)|[^|]*$'))
     renewed = renewed + 1
   else
     table.insert(lost, item.owner)

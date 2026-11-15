@@ -493,6 +493,24 @@ async def test_fl9_a_fractional_cost_or_refund_is_rounded_not_half_applied(
     assert not await store.exists(f"{prefix}:{{m:m}}:inprog:c1")
 
 
+async def test_fl12_renew_keeps_the_claim_alive_and_only_its_own(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-12: RENEW wrote hb but never extended the job record's TTL (a long call lost its
+    claim), and wrote hb with no owner check (A's fallback grant kept B's claim fresh).
+    """
+    r = await rig(store, prefix)
+    assert (await r.ask("c1", worker="pod-a", tag="m1")).kind == "granted"
+    job = f"{prefix}:{{r:c1}}:job"
+    await store.pexpire(job, 1000)  # about to run out
+    grant = [("m", owner_token("c1", "pod-a@m1", 1), "c1")]
+    assert await r.admission.renew(grant) == 1
+    assert await store.pttl(job) > 60_000  # 1000 ms before the fix
+    await store.hset(job, mapping={"owner": "pod-b@m2", "hb": 0})  # B claims it now
+    assert await r.admission.renew(grant) == 1
+    assert await store.hget(job, "hb") == b"0"  # A's beat no longer writes B's claim
+
+
 async def test_fl1_release_claims_of_calls_held_without_a_grant(
     store: redis.asyncio.Redis, prefix: str
 ) -> None:
