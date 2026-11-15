@@ -374,7 +374,10 @@ def _pytest(name: str, tests: list[str], *, cov: str = "") -> bool:
     # -rA: a line per test with its outcome, so the log shows what ran, not only failures.
     cmd = [PY, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rA"]
     if cov:
-        cmd += ["--cov", "--cov-report="] + (["--cov-append"] if cov == "append" else [])
+        # Each run only collects: pytest-cov would judge `fail_under` on the unit run alone
+        # (69 % of 89 %); the combined `coverage report` after both runs is the judge.
+        cmd += ["--cov", "--cov-report=", "--cov-fail-under=0"]
+        cmd += ["--cov-append"] if cov == "append" else []
     return _run(name, "pytest", [*cmd, *tests], timeout_secs=TEST_SECS)
 
 
