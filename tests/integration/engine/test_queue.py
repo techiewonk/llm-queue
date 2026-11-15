@@ -297,6 +297,23 @@ async def test_fl23_redrive_stops_at_max_waiting(store: redis.asyncio.Redis, pre
     assert await queues.depth("q") == (2, 0, 2)
 
 
+async def test_cg4_scripts_reload_after_a_script_flush(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """CG-4: no test covered NOSCRIPT after SCRIPT FLUSH (a failover to a node without the
+    scripts): the raw EVALSHA of a send with a replica wait, and redis-py's own reload.
+    """
+    from llm_queue.engine.queue import NotReplicated
+
+    queues = await _filled(store, prefix, 1)
+    await store.script_flush()
+    with pytest.raises(NotReplicated):  # no replicas here: sent, then refused by WAIT
+        await queues.send("q", b"m1", FAST, wait_replicas=1, wait_ms=10)
+    await store.script_flush()
+    taken, _ = await queues.receive("q", 5, FAST)
+    assert [m.body for m in taken] == [b"m0", b"m1"]
+
+
 async def test_q27_a_send_keeps_messages_one_day_by_default(
     store: redis.asyncio.Redis, prefix: str
 ) -> None:

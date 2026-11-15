@@ -653,6 +653,26 @@ async def test_fl21_renew_sets_the_caller_key_and_reads_the_epoch(
     assert r.admission.last_epoch == "1700000000"
 
 
+async def test_cg7_sticky_key_hit_miss_and_expiry(store: redis.asyncio.Redis, prefix: str) -> None:
+    """CG-7: the sticky-session Lua path had one test (hit). A miss writes the key with its
+    TTL, a hit follows the key (even to a deployment the strategy would not pick), a call
+    with every deployment full waits, and the key expires with its TTL.
+    """
+    r = await rig(store, prefix, model={"rpm": 1})
+    key = f"{prefix}:{{m:m}}:sticky:s1"
+    miss = await r.ask("a", sticky_hash="s1", sticky_ttl_secs=0.3)
+    assert miss.deployment == "aws-a/r1"  # ordered: the first one
+    assert await store.get(key) == b"aws-a/r1"
+    assert 0 < await store.pttl(key) <= 300
+    await store.set(key, "aws-a/r2", px=300)
+    hit = await r.ask("b", sticky_hash="s1", sticky_ttl_secs=0.3)
+    assert hit.deployment == "aws-a/r2"
+    moved = await r.ask("c", sticky_hash="s1", sticky_ttl_secs=0.3, sticky_move_secs=0.001)
+    assert moved.kind == "wait"  # both full at rpm 1: no move possible, waits
+    await asyncio.sleep(0.4)  # time is what is under test: the key's TTL
+    assert not await store.exists(key)
+
+
 async def test_fl1_release_claims_of_calls_held_without_a_grant(
     store: redis.asyncio.Redis, prefix: str
 ) -> None:
