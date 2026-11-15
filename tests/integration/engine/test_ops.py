@@ -61,7 +61,12 @@ async def test_readiness_never_depends_on_providers(make: Make) -> None:
     health = await engine.health_check()
     policy = health.pop("eviction_policy")  # read at start (plan C4)
     assert policy != "unknown"
-    assert health == {"live": True, "ready": True, "stores": {"state": "ok", "queue": "ok"}}
+    stable = {key: health[key] for key in ("live", "ready", "stores")}
+    assert stable == {"live": True, "ready": True, "stores": {"state": "ok", "queue": "ok"}}
+    assert "not_ready_reason" not in health
+    assert "live_reason" not in health
+    # Fields for the operator (R3OB-20): present, whatever their values.
+    assert {"worker", "version", "registry_version", "held", "heartbeat_age_secs"} <= set(health)
     await engine.stop(drain_secs=0)
     assert (await engine.health_check())["ready"] is False
 
