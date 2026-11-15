@@ -383,9 +383,10 @@ def split_params(method: Callable[..., Any], params: Mapping[str, Any]) -> dict[
 # account decide. The SDK merges `extra_body` over the JSON body and `extra_headers` over the
 # headers, so `{"extra_body": {"model": "other", "max_tokens": 999999}}` replaced the route's
 # model and undid the `inference_limits` cap, and `extra_headers` replaced `Authorization`.
-_PROTECTED_PARAMS = frozenset(
-    {"model", "stream", "stream_options", "store", "api_key", "base_url", "extra_query"}
-)
+# Top-level `model`, `stream` and `stream_options` are not here: the provider sets them after
+# the caller's params, so a caller's values are always overridden (LangChain's OpenAI adapter
+# sends `model` and `stream` on every call). Only `extra_body` can override them: refused below.
+_PROTECTED_PARAMS = frozenset({"store", "api_key", "base_url", "extra_query"})
 _PROTECTED_BODY = frozenset(
     {
         "model",
@@ -430,7 +431,7 @@ class InvalidRequestParams(ValueError):
 def check_params(params: Mapping[str, Any]) -> None:
     """Refuse caller params that would override the route's model, limits or credentials.
 
-    Top-level `model`, `stream`, `store` and SDK client arguments; in `extra_body` the request
+    Top-level `store` and SDK client arguments; in `extra_body` the request
     fields and the capped ones (`max_tokens`, `n`, ...); in `extra_headers` the credentials and
     framing headers. Harmless keys pass. Raised before anything is sent (R3SE-1).
     """
@@ -673,7 +674,9 @@ class OpenAIProvider:
                 timing.first_response_secs,
                 "response",
             )
-        body = reply.model_dump(mode="json", exclude_unset=True)
+        # The reply carries base64 vectors (R3PF-10) where the SDK's model says list[float], so
+        # pydantic's serializer warns; the codec decodes them, the warning is noise here.
+        body = reply.model_dump(mode="json", exclude_unset=True, warnings=False)
         return Result(body, _openai_usage(body.get("usage")))
 
     def classify(self, exc: BaseException) -> ErrorInfo:

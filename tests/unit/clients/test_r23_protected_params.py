@@ -26,8 +26,8 @@ REFUSED: list[dict[str, Any]] = [
     {"extra_body": {"n": 8}},
     {"extra_headers": {"Authorization": "Bearer other"}},
     {"extra_headers": {"api-key": "k"}},
-    {"model": "other"},
     {"store": True},
+    {"api_key": "k"},
     {"extra_body": "not an object"},
 ]
 
@@ -42,6 +42,12 @@ def test_caller_params_cannot_touch_protected_fields(params: dict[str, Any]) -> 
     with pytest.raises(providers_module.InvalidRequestParams) as info:
         providers_module.check_params(params)
     assert request_error_kind(info.value, classify_openai(info.value)) == "invalid_request"
+
+
+def test_top_level_model_and_stream_pass_because_they_are_overridden() -> None:
+    """LangChain's OpenAI adapter sends `model` and `stream` on every call; the provider sets
+    both after the caller's params, so they are harmless and must not fail the call."""
+    providers_module.check_params({"model": "other", "stream": False, "stream_options": {}})
 
 
 async def test_openai_provider_refuses_protected_params_before_sending() -> None:
