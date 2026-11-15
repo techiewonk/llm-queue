@@ -114,7 +114,7 @@ refused with its path when the registry is loaded or edited.
 | `inference_limits` | all four | none | *merged*: `max_tokens` cap (also `max_completion_tokens`; a call without one gets the cap), `locked` names, `on_exceed` (`clamp` or `reject`) |
 | `params` | deployment | none | Extra request fields of one deployment (guardrails); protected |
 | `health` | all four | see below | *merged*: `disable_errors` (3), `disable_window_secs` (300), `probe_after_secs` (900), `probe_max_secs` (7200), `slow_ratio` (3), `slow_min_secs` (5), `slow_min_samples` (20) |
-| `alerts` | defaults, model | `{"quota_used_pct": 90, "dlq_messages": 1}` | *merged*; the four names removed in 0.1.0b2 are ignored with a warning until 0.2 |
+| `alerts` | defaults, model | `{"quota_used_pct": 90, "dlq_messages": 1, "queue_age_secs": 600}` | *merged*; `queue_age_secs` (1 or more) turns `queue_stalled` on when the oldest queued call is older; the four names removed in 0.1.0b2 are ignored with a warning until 0.2 |
 | `admission`, `fallback_policy`, `token_estimator`, `probe` | defaults, model | none | Names of registered hooks (1-64 letters, digits, `_`, `.`, `-`) |
 | `debug_capture` | model | false | Store prompt and answer for an hour (dev only; protected) |
 
@@ -137,7 +137,7 @@ Settings added or changed in 0.1.0b2:
 | `embed_max_chars` | model (embedding) | the family's: Titan 50000, Cohere 2048, OpenAI none | Longest text an `embed` sends; a longer one fails `invalid_request` with its index before any call. 0 turns the check off |
 | `family` | model field (embedding) | `openai` for the `openai` provider, else from `model_id` | `titan`, `cohere`, `openai` or a name added with `register_embedding_family`: the request and reply shape. Required when the id names no family (an application inference profile ARN); the registry load fails without it |
 | `inference.embedding_types` | as `inference` | | Only `["float"]`: the other types were paid for, then unreadable |
-| `alerts` | | | Only `quota_used_pct` (1-100, default 90; `quota_near_limit` now checks TPM too) and `dlq_messages` (1 or more, default 1). `quota_used_mins`, `spill_pct`, `spill_window_secs` and `waiting_age_secs` did nothing and were removed: a document naming them still loads, with a deprecation warning, until 0.2 |
+| `alerts` | | | `quota_used_pct` (1-100, default 90; `quota_near_limit` now checks TPM too), `dlq_messages` (1 or more, default 1) and the new `queue_age_secs` (default 600, for `queue_stalled`). `quota_used_mins`, `spill_pct`, `spill_window_secs` and `waiting_age_secs` did nothing and were removed: a document naming them still loads, with a deprecation warning, until 0.2 |
 | `live_edit` (top level) | document | unset | The document's live-edit mode (deploy-only) |
 | `min_lib_version` (top level) | document | unset | Now a version such as `0.1.0b2`; checked against the running library |
 

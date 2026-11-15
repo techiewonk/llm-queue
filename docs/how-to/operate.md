@@ -112,17 +112,23 @@ HTTP: `GET /status`, `GET /requests/{id}`.
 
 ## Alerts
 
-Every 30 s one process evaluates alerts from the status report. Each alert is a gauge, and a
-log line `llmq_alert` is written once when it turns on or off. Thresholds come from the model's
-`alerts` setting.
+Every 30 s one process (the holder of the alert lock, which it keeps while it runs) evaluates
+alerts from the status report. Each alert is a gauge `llmq_alert_<name>`, and a log line
+`llmq_alert` is written once when it turns on or off; an alert whose model or deployment left
+the registry is logged off. Thresholds come from the model's `alerts` setting. Alarm and query
+examples: [Monitor](monitor.md).
 
 | Alert | On when |
 |---|---|
 | `model_unavailable` | No usable deployment is left: disabled, unhealthy, outside residency, blocked, on a disabled account, or behind an open breaker |
 | `deployment_disabled` | A deployment was auto-disabled by health checks |
-| `quota_near_limit` | A deployment used `alerts.quota_used_pct` (90) % of its RPM or TPM |
-| `quota_above_observed` | The provider throttled while the deployment had budget left: the real quota is below the registry's number |
-| `dead_letters` | A model's dead-letter queue holds `alerts.dlq_messages` (1) or more messages |
+| `quota_near_limit` | A deployment used `alerts.quota_used_pct` (90) % of its RPM or TPM (off after two clear samples) |
+| `quota_above_observed` | The provider throttled (this or the last minute) while the deployment had budget left: the real quota is below the registry's number (off after two clear samples) |
+| `dead_letters` | A model's dead-letter queues (priority and normal together) hold `alerts.dlq_messages` (1) or more messages: `dlq list --model M` and `dlq list --model M --priority` |
+| `breaker_open` | A deployment's breaker is open |
+| `kill_switch_on` | The routing kill switch is on (one per model) |
+| `queue_stalled` | A model's oldest queued call is older than `alerts.queue_age_secs` (600) |
+| `job_dead_letters` | A job name has dead jobs |
 
 ## Change things at run time
 
@@ -190,7 +196,7 @@ named events, for example:
 
 | Event | Meaning |
 |---|---|
-| `llmq_call_finished` | One per call: ids (hashed), model, deployment, outcome, tokens; no prompt text |
+| `llmq_call_finished` | One per call (every path, failures too): request id, model, outcome, account, region, deployment, attempts, waits, duration, tokens, worker, hashed user and tenant; no prompt text |
 | `llmq_alert` | An alert turned on or off |
 | `llmq_registry_audit` | A registry publish or edit, with actor and diff (secrets redacted) |
 | `registry_older_ignored` | This process's registry is older than the stored one, which is used |
@@ -201,14 +207,12 @@ named events, for example:
 | `store_down` | The state store failed before a call was sent; the `store_down` rule applies |
 | `deployment_disabled`, `deployment_recovered` | Health checks turned a deployment off or back on |
 
-Metrics go to `LLMQ_METRICS_SINK`: `emf` (CloudWatch embedded metrics, default), `prometheus`
-(needs the `metrics` extra) or `none`; one sink per process. Names include `llmq_calls_total`,
-`llmq_wait_seconds`, `llmq_tokens_input_total`, `llmq_tokens_output_total`,
-`llmq_fallback_total`, `llmq_admission_refusals_total` (counted once per call),
-`llmq_retries_total`, `llmq_grants_lost_total`, `llmq_store_errors_total`,
-`llmq_jobs_no_consumer_total` and `llmq_hook_failed_total` (a failing or unregistered
-admission hook, which refuses the call; labels `kind`, `hook`). Every 30 s the alert loop also
-sets gauges per model and
-deployment: `llmq_queue_waiting`, `llmq_in_progress`, `llmq_dead_letters`, `llmq_breaker_open`,
-`llmq_rpm_used`, `llmq_tpm_used`, `llmq_concurrency_in_use`, `llmq_throttles_1m`,
-`llmq_provider_latency_ms` and `llmq_alert_<name>`.
+Metrics go to `LLMQ_METRICS_SINK`: `emf` (CloudWatch embedded metrics, default, with the
+`environment` dimension), `prometheus` (needs the `metrics` extra; `status_router(...,
+metrics_route=True)` serves `GET /metrics`) or `none`; one sink per process. Per call: calls by
+outcome and by caller-seen failure, attempts by result, tokens, and histograms of the queue
+wait, the wait for a grant, the call and each provider attempt. Every 30 s the alert-lock
+holder sets the cluster gauges (queues, held calls, oldest call, budgets and their limits,
+concurrency, breakers, usable deployments, routing switches, dead jobs, alerts), and every pod
+sets its own (ready, stores up, held calls, heartbeat age, outage memo, registry state, build
+info). [Monitor](monitor.md) lists every metric with its labels, unit and emitter.

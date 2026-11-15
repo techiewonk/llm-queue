@@ -35,7 +35,8 @@ from redis.exceptions import ConnectionError as StoreConnectionError
 from redis.exceptions import ReadOnlyError as StoreReadOnlyError
 from redis.exceptions import TimeoutError as StoreTimeoutError
 
-from llm_queue._logging import get_logger
+from llm_queue._logging import LogLimiter, get_logger
+from llm_queue._version import __version__
 from llm_queue.clients.pool import CredentialsRefreshSlow, CredentialsUnavailable, route_for
 from llm_queue.clients.providers import Providers
 from llm_queue.clients.timing import AttemptTimeout, Timing
@@ -60,7 +61,7 @@ from llm_queue.engine.envelope import (
 from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.health import Health
 from llm_queue.engine.keys import Keys
-from llm_queue.engine.metrics import Metrics, NullSink
+from llm_queue.engine.metrics import GaugeSet, Metrics, NullSink
 from llm_queue.engine.offload import ResultOffload
 from llm_queue.engine.queue import (
     Message,
@@ -109,6 +110,8 @@ STORE_RETRY_BASE_SECS = 0.1
 STORE_RETRY_CAP_SECS = 1.0
 PROBE_EVERY_SECS = 5.0  # how often one process looks for disabled deployments due a probe
 PROBE_TIMEOUT_SECS = 30.0  # one probe call's budget (first response, idle and whole call)
+ALERT_EVERY_SECS = 30.0
+ALERT_LOCK_SECS = 45  # longer than a tick: the holder keeps it (R3OB-1)
 POLICY_EVERY_ROUNDS = 12  # the stores' eviction policy is read again each minute (R3FM-8)
 HAND_BACK_FLOOR_SECS = 2.0  # `stop()` returns waiting calls within at least this (FE-6)
 CLOCK_MAX_RTT_SECS = 0.25  # a TIME read slower than this keeps the old offset (R3RC-7)
@@ -384,6 +387,11 @@ class _Held:
     refused: bool = False  # an admission refusal was counted for this call (RESCAN O4)
     model_retried: bool = False  # its one free retry after a model error was used (P9)
     check_callers: bool = False  # its first admission also checks its callers are alive
+    # For the per-call record of a failed call (R3OB-4): its last deployment tried and the
+    # attempt number; and the store time of its first grant (R3OB-2: admission wait).
+    last_dep: str = ""
+    attempts: int = 0
+    granted_secs: float = 0.0
 
     @property
     def position(self) -> float:
@@ -503,6 +511,19 @@ class StoreClock:
         return time.monotonic() + self._offset
 
 
+# `llmq_cancels_total` sources; any other value is counted as `other` (bounded labels).
+CANCEL_SOURCES = frozenset({"api", "caller_task", "fail_fast", "admin", "cli", "http"})
+
+
+def _where(view: ResolvedRegistry, alias: str, dep_key: str) -> tuple[str, str]:
+    """A deployment's (account, region) for metric labels; ("-", "-") when unknown."""
+    if dep_key and alias in view.registry.models:
+        for dep in view.deployments(alias):
+            if dep.key == dep_key:
+                return dep.account, dep.region
+    return "-", "-"
+
+
 class Engine:
     """Caller and worker of one process (plan E72: workers run in the app pods)."""
 
@@ -602,6 +623,11 @@ class Engine:
         self.health = Health(state, self.keys)
         self.status_reader = StatusReader(state, self.keys, self.queues, self.settings.queue_prefix)
         self.alerts = AlertEvaluator(state, self.keys)
+        # Gauges this process sets for the cluster while it holds the alert lock; cleared when
+        # another process holds it, so no pod's /metrics keeps a stale value (R3OB-1).
+        self._cluster = GaugeSet(self.metrics)
+        self._limited = LogLimiter()  # outage log lines: one per event and key a while (R3OB-7)
+        self._loop_died: set[str] = set()  # background loops already logged as died (R3OB-20)
         # Credentials that failed in this process, per account and region: (account, region)
         # -> (until, backoff). Per region: a token can be refused in one region only (an
         # opt-in region such as ap-south-2 refuses v1 STS tokens), and keying by account took
@@ -680,7 +706,21 @@ class Engine:
 
     def _loop(self, work: Coroutine[Any, Any, None], name: str) -> None:
         """Start a background loop, named: `stop_task_failed` logged `Task-123` (FE-19)."""
-        self._tasks.append(asyncio.create_task(work, name=f"llmq:{name}"))
+        task = asyncio.create_task(work, name=f"llmq:{name}")
+        task.add_done_callback(functools.partial(self._loop_ended, name))
+        self._tasks.append(task)
+
+    def _loop_ended(self, name: str, task: asyncio.Task[None]) -> None:
+        """A background loop ended: an error is logged and counted now (R3OB-20).
+
+        Liveness turned false with no line saying why: only model loops were logged, and the
+        others only at `stop()`.
+        """
+        if self._stopping or task.cancelled() or task.exception() is None:
+            return
+        self._loop_died.add(name)
+        self.metrics.count("llmq_loop_died_total", loop=name)
+        logger.error("background_loop_died", loop=name, error=repr(task.exception()))
 
     def _sync_model_loops(self) -> None:
         """One receive loop per model of the current registry (RESCAN R3).
@@ -714,6 +754,7 @@ class Engine:
                 continue
             if task is not None and not task.cancelled() and task.exception() is not None:
                 logger.error("model_loop_died", model=alias, error=repr(task.exception()))
+                self.metrics.count("llmq_loop_died_total", loop="model")
             self._model_tasks[alias] = asyncio.create_task(
                 self._model_loop(alias), name=f"llmq:model:{alias}"
             )
@@ -944,12 +985,20 @@ class Engine:
                 "admission", hook_name, hook, ctx, default=None, metrics=self.metrics
             )
             if isinstance(verdict, hooks.Reject):
+                self.metrics.count("llmq_caller_failures_total", model=alias, outcome="rejected")
                 raise CallFailed("rejected", verdict.reason, request_id=rid)
         direct = force_direct or self._direct_route(view, alias, rid, user_id)
-        with self._caller_ref(rid):
-            return await self._call_in(
-                view, alias, envelope, params, priority, timeout, request_id, direct, stream
-            )
+        try:
+            with self._caller_ref(rid):
+                return await self._call_in(
+                    view, alias, envelope, params, priority, timeout, request_id, direct, stream
+                )
+        except CallFailed as exc:
+            # Every failure a caller sees, whether a worker took the call or not: queue_full,
+            # queue_unavailable and caller deadlines were in no counter, so llmq_calls_total
+            # fell during an outage and read as "traffic fell" (R3OB-5).
+            self.metrics.count("llmq_caller_failures_total", model=alias, outcome=str(exc.kind))
+            raise
 
     @contextlib.contextmanager
     def _caller_ref(self, rid: str) -> Iterator[None]:
@@ -1538,6 +1587,9 @@ class Engine:
         """
         for rid in rids:
             logger.info("call_cancel", request_id=rid, source=source, by=self.worker_id)
+        # The label is bounded: `source` is an argument of the public `cancel()` (owner Q5).
+        label = source if source in CANCEL_SOURCES else "other"
+        self.metrics.count("llmq_cancels_total", float(len(rids)), source=label)
         for start in range(0, len(rids), 500):
             await self.requests.cancel(
                 rids[start : start + 500],
@@ -1626,7 +1678,9 @@ class Engine:
         """
         mode = view.value(alias, "store_down")
         if exc is not None:
-            logger.warning("store_down", model=alias, mode=mode, error=str(exc))
+            self._limited(
+                logger.warning, "store_down", alias, model=alias, mode=mode, error=str(exc)
+            )
         if mode == "static_cap":
             reply = await self._static_cap(view, alias, envelope)
             if exc is not None:
@@ -1665,14 +1719,18 @@ class Engine:
                     )
                 except STORE_ERRORS as again:  # out of reach again: pause again
                     exc = again
-                    logger.warning("store_down", model=alias, mode=mode, error=str(exc))
+                    self._limited(
+                        logger.warning, "store_down", alias, model=alias, mode=mode, error=str(exc)
+                    )
                 except ResponseError as refused:  # as `call()`: one error family (S9)
                     if not _store_refused(refused):
                         raise CallFailed(
                             "queue_unavailable", _refusal(refused), request_id=retry.request_id
                         ) from refused
                     exc = refused  # down for writes (Q12): pause again
-                    logger.warning("store_down", model=alias, mode=mode, error=str(exc))
+                    self._limited(
+                        logger.warning, "store_down", alias, model=alias, mode=mode, error=str(exc)
+                    )
         elif exc is not None:
             # `fail_fast` after a failure that may have queued the call (a read timeout): it is
             # cancelled behind, so the app's retry does not make a second run (R3FM-2).
@@ -1695,6 +1753,8 @@ class Engine:
 
     def _remember_outage(self) -> None:
         """Remember a store outage for `outage_memo_secs`; a probe that succeeds ends it."""
+        if not self._outage_remembered():
+            self.metrics.count("llmq_outage_memo_set_total")
         self._outage_until_mono = time.monotonic() + self.settings.outage_memo_secs
 
     async def _store_back(self, secs: float) -> bool:
@@ -1781,7 +1841,15 @@ class Engine:
                     if info.kind is ErrorKind.THROTTLE:
                         kind = "rate_limited"
                     continue
-                meta = Meta(served_model=alias, deployment=dep.key, attempts=1)
+                meta = Meta(
+                    served_model=alias,
+                    deployment=dep.key,
+                    attempts=1,
+                    tokens_in=result.usage.input_tokens,
+                    tokens_out=result.usage.output_tokens,
+                )
+                # Tokens spent with no record before: the store is down, so only here (R3OB-5).
+                self._outcome(envelope, alias, dep.account, dep.region, "ok", meta, "static_cap")
                 return Reply(
                     request_id=envelope.request_id, ok=True, response=result.response, meta=meta
                 )
@@ -2193,7 +2261,7 @@ class Engine:
             try:
                 got = await self._receive_once(alias)
             except Exception as exc:  # a store blip must not end the loop
-                logger.warning("receive_failed", model=alias, error=str(exc))
+                self._limited(logger.warning, "receive_failed", alias, model=alias, error=str(exc))
                 if isinstance(exc, STORE_ERRORS):
                     # Not only the heartbeat (every lease/3): a block between two beats went
                     # unseen, and callers whose keys lapsed in it were dropped as gone (soak).
@@ -2259,6 +2327,7 @@ class Engine:
                 raise
             if back:
                 logger.warning("receive_reclaimed", model=alias, count=back)
+                self.metrics.count("llmq_reclaimed_total", float(back), model=alias)
         free = self._slots[alias].free
         if free <= 0:
             return None
@@ -2328,6 +2397,7 @@ class Engine:
             self.metrics.count("llmq_bad_messages_total", model=alias)
             return
         await self._reply(env, "dead_lettered", "the call failed too many times", final="failed")
+        self._outcome(env, alias, "", "", "dead_lettered", None, "dead_letter")
 
     async def _admit_new(self, alias: str, message: Message) -> bool:
         """Admit a newly received message; True when it is now held (its class stops)."""
@@ -2867,7 +2937,14 @@ class Engine:
                 for dep, raw in zip(deps, states, strict=True):
                     disabled = " (disabled)" if dep.key in due else ""
                     why[dep.key] = f"breaker {text(raw or b'closed')}{disabled}"
-            logger.error("model_unavailable", model=alias, deployments=why)
+            self._limited(
+                logger.error,
+                "model_unavailable",
+                alias,
+                model=alias,
+                request_id=held.envelope.request_id,
+                deployments=why,
+            )
             await self._finish_call(
                 held, "model_unavailable", "no usable deployment", retry_after=wait
             )
@@ -2907,7 +2984,11 @@ class Engine:
                     if not kept and held.message is message:
                         # A stale receipt: the message is another worker's now (its hold
                         # lapsed) or back on the queue. Admitting it here ran it twice.
-                        logger.warning("hold_lost", request_id=held.envelope.request_id)
+                        logger.warning(
+                            "hold_lost",
+                            request_id=held.envelope.request_id,
+                            model=held.envelope.model,
+                        )
                         self._drop(held)
                         return
                 now = self.clock.now()
@@ -2930,7 +3011,14 @@ class Engine:
         except Exception as exc:  # never leave the call held with nobody working on it
             if isinstance(exc, STORE_ERRORS):
                 self._store_trouble("hold")
-            logger.warning("hold_failed", request_id=held.envelope.request_id, error=str(exc))
+            self._limited(
+                logger.warning,
+                "hold_failed",
+                held.envelope.model,
+                request_id=held.envelope.request_id,
+                model=held.envelope.model,
+                error=str(exc),
+            )
             await self._release(held, unsure=True)
         finally:
             self._held_class.discard((alias, cls))
@@ -3063,9 +3151,12 @@ class Engine:
             # result is reused). A direct call has no message: its caller gets the error.
             if isinstance(exc, (*STORE_ERRORS, RedisError)):
                 self._store_trouble("run")
-            logger.warning(
+            self._limited(
+                logger.warning,
                 "run_failed",
+                held.envelope.model,
                 request_id=held.envelope.request_id,
+                model=held.envelope.model,
                 error=str(exc),
                 error_type=type(exc).__name__,
             )
@@ -3091,6 +3182,15 @@ class Engine:
             )
             held.grants.discard((alias, owner))
             outcome, kind, info, exc = result.outcome, result.kind, result.info, result.exc
+            # Which deployment failed, and how: failures carried no account or region (R3OB-4).
+            account, region = _where(view, alias, dep_key)
+            self.metrics.count(
+                "llmq_attempts_total",
+                model=alias,
+                account=account,
+                region=region,
+                result="ok" if outcome == "ok" else (kind or outcome),
+            )
             if outcome == "ok":
                 return
             if outcome in ("stream_failed", "invalid"):  # never switched once chunks were sent
@@ -3286,7 +3386,24 @@ class Engine:
                 lost = "the worker serving this stream was lost"
                 await writer.error("worker_lost", lost)
                 return _AttemptResult("stream_failed", "worker_lost", None, RuntimeError(lost))
+        held.last_dep, held.attempts = dep_key, attempt
+        if not held.granted_secs:
+            held.granted_secs = self.clock.now()
+        labels = {"model": alias, "account": deployment.account, "region": deployment.region}
         started = time.monotonic()
+        sink = None
+        if writer is not None:
+            add = writer.add
+            first = [True]
+
+            async def sink(event: Any) -> None:
+                # Time to first token (R3OB-3): one check per chunk.
+                if first[0]:
+                    first[0] = False
+                    elapsed = time.monotonic() - started
+                    self.metrics.observe("llmq_first_token_seconds", elapsed, **labels)
+                await add(event)
+
         outer = asyncio.timeout(remaining)  # the call's own deadline
         try:
             async with outer:
@@ -3295,7 +3412,7 @@ class Engine:
                     params,
                     route,
                     timing,
-                    sink=writer.add if writer else None,
+                    sink=sink,
                     **_api_kwargs(provider, view, alias),
                 )
             if writer is not None:
@@ -3322,6 +3439,7 @@ class Engine:
                 )
         except Exception as exc:
             latency = (time.monotonic() - started) * 1000
+            self.metrics.observe("llmq_provider_seconds", latency / 1000, **labels)  # (R3OB-3)
             info = provider.classify(exc)
             # Not the provider's doing (RESCAN P9): the stream's size cap, or the store under
             # the chunk writer. Counted as failures they opened healthy deployments' breakers.
@@ -3438,8 +3556,18 @@ class Engine:
                 if slow is None or slow.first or last is None:
                     backoff = min((last.backoff_secs if last else 2.5) * 2, 60.0)
                     self._bad_accounts[where] = _Backoff(time.monotonic() + backoff, backoff)
+                # Expired token, AccessDenied and a missing secret looked the same (R3OB-8).
                 logger.error(
                     "account_credentials_failed",
+                    account=deployment.account,
+                    region=deployment.region,
+                    model=alias,
+                    request_id=env.request_id,
+                    error_type=type(exc).__name__,
+                    error=str(exc)[:300],
+                )
+                self.metrics.count(
+                    "llmq_credentials_failed_total",
                     account=deployment.account,
                     region=deployment.region,
                 )
@@ -3447,6 +3575,7 @@ class Engine:
             # The request itself was refused: its own kind, not `provider_error` (plan P8).
             return _AttemptResult("fatal", request_error_kind(exc, info) or "fatal", None, exc)
         latency = (time.monotonic() - started) * 1000
+        self.metrics.observe("llmq_provider_seconds", latency / 1000, **labels)  # (R3OB-3)
         used = tokens.used_tokens(
             result.usage,
             output_weight=float(view.value(alias, "tpm_output_weight", dep_key)),
@@ -3679,41 +3808,102 @@ class Engine:
             held.envelope, kind, message, final=final, retry_after=retry_after, partial=partial
         )
         await self._count_target_errors(held, succeeded=False)
-        self._record(held, held.envelope.model, "", "", kind, None)
+        # The last deployment tried, so a failing region or account shows (R3OB-4).
+        view = self.registry.current
+        alias = held.envelope.model
+        account, region = _where(view, alias, held.last_dep)
+        self._record(held, alias, account, region, kind, None, error=message)
         await self._ack(held)
 
     def _record(
-        self, held: _Held, alias: str, account: str, region: str, outcome: str, meta: Meta | None
+        self,
+        held: _Held,
+        alias: str,
+        account: str,
+        region: str,
+        outcome: str,
+        meta: Meta | None,
+        *,
+        error: str | None = None,
     ) -> None:
-        """Metrics and the durable per-call record (`llmq_call_finished`, no text; E134)."""
+        """Metrics and the durable per-call record (`llmq_call_finished`, no text; E134).
+
+        Waits and durations (R3OB-2, R3OB-3): `llmq_wait_seconds` until a worker took the
+        call, `llmq_admission_wait_seconds` until its first grant (the budget hold included),
+        `llmq_call_seconds` until now, by outcome.
+        """
         env = held.envelope
+        priority = "1" if env.priority else "0"
+        start_secs = held.position_ms / 1000.0
+        wait = max(0.0, held.first_seen_secs - start_secs)
+        now = self.clock.now()
+        self.metrics.observe("llmq_wait_seconds", wait, model=env.model, priority=priority)
+        admit = max(0.0, held.granted_secs - start_secs) if held.granted_secs else None
+        if admit is not None:
+            self.metrics.observe(
+                "llmq_admission_wait_seconds", admit, model=env.model, priority=priority
+            )
+        total = max(0.0, now - start_secs)
+        self.metrics.observe("llmq_call_seconds", total, model=env.model, outcome=outcome)
+        self._outcome(
+            env,
+            alias,
+            account,
+            region,
+            outcome,
+            meta,
+            "queue" if held.message is not None else "direct",
+            deployment=(meta.deployment if meta else None) or held.last_dep or None,
+            attempts=(meta.attempts if meta else None) or held.attempts or None,
+            queue_wait_ms=int(wait * 1000),
+            admit_wait_ms=None if admit is None else int(admit * 1000),
+            duration_ms=int(total * 1000),
+            error=error[:300] if error else None,
+        )
+
+    def _outcome(
+        self,
+        env: Envelope,
+        alias: str,
+        account: str,
+        region: str,
+        outcome: str,
+        meta: Meta | None,
+        path: str,
+        **fields: Any,
+    ) -> None:
+        """Count one finished call and log `llmq_call_finished` (every path: R3OB-5, R3OB-8).
+
+        `path`: queue, direct, static_cap or dead_letter. Static-cap and dead-lettered calls
+        were in no counter and no record.
+        """
         labels = {"model": alias, "account": account or "-", "region": region or "-"}
         self.metrics.count("llmq_calls_total", 1.0, outcome=outcome, **labels)
-        wait = max(0.0, held.first_seen_secs - held.position_ms / 1000.0)
-        self.metrics.observe(
-            "llmq_wait_seconds", wait, model=env.model, priority="1" if env.priority else "0"
-        )
         if meta is not None:
             self.metrics.count("llmq_tokens_input_total", float(meta.tokens_in or 0), **labels)
             self.metrics.count("llmq_tokens_output_total", float(meta.tokens_out or 0), **labels)
             if meta.fallback:
                 self.metrics.count("llmq_fallback_total", kind=meta.fallback, model=env.model)
-        user = self.hash_id(env.user_id) if env.user_id else None
+        fields.setdefault("deployment", meta.deployment if meta else None)
+        fields.setdefault("attempts", meta.attempts if meta else None)
         logger.info(
             "llmq_call_finished",
             request_id=env.request_id,
             model=env.model,
             served_model=alias,
-            deployment=meta.deployment if meta else None,
             outcome=outcome,
+            path=path,
             priority=env.priority,
-            attempts=meta.attempts if meta else None,
+            account=account or None,
+            region=region or None,
+            worker=self.worker_id,
+            fallback=meta.fallback if meta else None,
             tokens_in=meta.tokens_in if meta else None,
             tokens_out=meta.tokens_out if meta else None,
-            queue_wait_ms=int(wait * 1000),
             provider_ms=meta.provider_ms if meta else None,
-            user=user,
+            user=self.hash_id(env.user_id) if env.user_id else None,
             tenant=self.hash_id(env.tenant_id) if env.tenant_id else None,  # (RESCAN X10)
+            **fields,
         )
 
     async def _debug(
@@ -3763,6 +3953,14 @@ class Engine:
             # (owner Q10): not ready, with the reason. It was a warning at start only.
             out["ready"] = False
             out["not_ready_reason"] = evicting
+        if not out["live"]:
+            out["live_reason"] = self._not_live_reason()
+        out["worker"] = self.worker_id
+        out["version"] = __version__
+        current = self.registry._current
+        out["registry_version"] = current.registry.version if current is not None else None
+        out["held"] = len(self._held)
+        out["heartbeat_age_secs"] = round(time.monotonic() - self._beat_ran_mono, 1)
         out["stores"] = stores
         out["eviction_policy"] = self._eviction.get("state", UNKNOWN_POLICY)
         if "queue" in self._eviction:
@@ -3835,6 +4033,17 @@ class Engine:
             if policy != UNKNOWN_POLICY:
                 self._eviction[name] = policy
 
+    def _not_live_reason(self) -> str:
+        """Why `_live()` is false: the loops that died, or the stalled heartbeat (R3OB-20)."""
+        dead = [
+            task.get_name().removeprefix("llmq:")
+            for task in [*self._tasks, *self._model_tasks.values()]
+            if task.done() and (task.cancelled() or task.exception() is not None)
+        ]
+        if dead:
+            return "loop died: " + ", ".join(sorted(dead))
+        return f"heartbeat stalled {time.monotonic() - self._beat_ran_mono:.0f} s"
+
     def _live(self) -> bool:
         """False when a background loop died, or the heartbeat made no progress for 3 beats."""
         if self._stopping:
@@ -3845,23 +4054,57 @@ class Engine:
         return time.monotonic() - self._beat_ran_mono <= self.settings.lease_secs  # 3 x lease/3
 
     def _report_gauges(self, report: Mapping[str, Any]) -> None:
-        """Gauges of every model from one status report (RESCAN O4: 6 metrics were not enough)."""
-        gauge = self.metrics.gauge
+        """Gauges of every model from one status report (RESCAN O4: 6 metrics were not enough).
+
+        Through `_cluster`, so series of removed models or deployments go away (R3OB-1). Limits
+        next to use, usability and routing switches (R3OB-16); held calls and the oldest call's
+        age (R3OB-2, R3OB-17); dead jobs (owner Q15).
+        """
+        gauge = self._cluster.gauge
+        routing_blocked = set(report.get("blocked_regions", ()))
+        regions: set[str] = set(routing_blocked)
+        view = self.registry.current
+        gauge("llmq_kill_switch", 1.0 if report.get("kill_switch") else 0.0)
         for model in report["models"]:
             alias = str(model["model"])
             for cls, count in model["waiting"].items():
                 gauge("llmq_queue_waiting", float(count), model=alias, priority=str(cls))
+            for cls, count in model.get("waiting_for_grant", {}).items():
+                gauge("llmq_held_waiting", float(count), model=alias, priority=str(cls))
             gauge("llmq_in_progress", float(model["in_progress"]), model=alias)
             gauge("llmq_dead_letters", float(model["dead_letters"]), model=alias)
+            oldest = model.get("oldest_waiting_secs")
+            gauge("llmq_oldest_waiting_seconds", float(oldest or 0.0), model=alias)
+            region_of = {d.key: d.region for d in view.deployments(alias)}
             for dep in model["deployments"]:
                 labels = {"model": alias, "deployment": str(dep["name"])}
+                if (region := region_of.get(str(dep["name"]))) is not None:
+                    regions.add(region)
+                usable = (
+                    dep["enabled"]
+                    and dep["account_enabled"]
+                    and not dep["blocked"]
+                    and dep["healthy"]
+                    and dep["breaker"] != "open"
+                )
                 gauge("llmq_breaker_open", 1.0 if dep["breaker"] == "open" else 0.0, **labels)
+                gauge("llmq_deployment_usable", 1.0 if usable else 0.0, **labels)
                 gauge("llmq_rpm_used", float(dep["rpm"]["used"]), **labels)
                 gauge("llmq_tpm_used", float(dep["tpm"]["used"]), **labels)
+                for budget in ("rpm", "tpm"):
+                    if dep[budget]["limit"] is not None:
+                        gauge(f"llmq_{budget}_limit", float(dep[budget]["limit"]), **labels)
                 gauge("llmq_concurrency_in_use", float(dep["concurrency"]["in_use"]), **labels)
+                gauge("llmq_concurrency_limit", float(dep["concurrency"]["limit"]), **labels)
                 gauge("llmq_throttles_1m", float(dep["throttles_1m"]), **labels)
-                if dep["latency_ms"] is not None:
-                    gauge("llmq_provider_latency_ms", float(dep["latency_ms"]), **labels)
+                if dep["latency_ms"] is not None:  # base units (R3OB-14): was _ms
+                    seconds = float(dep["latency_ms"]) / 1000
+                    gauge("llmq_provider_latency_seconds", seconds, **labels)
+        for region in sorted(regions):
+            gauge("llmq_region_blocked", 1.0 if region in routing_blocked else 0.0, region=region)
+        for job in report.get("jobs", ()):
+            gauge("llmq_job_dead_letters", float(job["dead_letters"]), job=str(job["job"]))
+            gauge("llmq_job_waiting", float(job["waiting"]), job=str(job["job"]))
 
     def _registry_gauges(self) -> None:
         """This pod's view of the stored registry (R1, C5): every pod, not only the alerter.
@@ -3876,28 +4119,71 @@ class Engine:
         gauge("llmq_registry_lib_too_old", 1.0 if store.lib_too_old else 0.0)
         gauge("llmq_registry_on_own_config", 1.0 if store.on_own_config else 0.0)
 
+    def _pod_gauges(self) -> None:
+        """This process: version, stores, held calls, heartbeat, readiness (R3OB-14, -15).
+
+        Also the outage memo (owner Q11) and the eviction policy that fails readiness in
+        strict mode (owner Q10). Every pod, every alert tick.
+        """
+        gauge = self.metrics.gauge
+        gauge("llmq_build_info", 1.0, version=__version__)
+        stores = self._stores[1] if self._stores is not None else {}
+        for name, state in stores.items():
+            gauge("llmq_store_up", 1.0 if state == "ok" else 0.0, store=name)
+        gauge("llmq_held_calls", float(len(self._held)))
+        gauge("llmq_heartbeat_age_seconds", time.monotonic() - self._beat_ran_mono)
+        gauge("llmq_outage_memo_active", 1.0 if self._outage_remembered() else 0.0)
+        evicting = self._evicting()
+        for name, policy in self._eviction.items():
+            unsafe = 1.0 if eviction_warning(policy) else 0.0
+            gauge("llmq_store_eviction_unsafe", unsafe, store=name)
+        loaded = self.registry._current is not None
+        ready = self.ready and loaded and not evicting
+        gauge("llmq_ready", 1.0 if ready else 0.0)
+
+    async def _alert_lock(self) -> bool:
+        """True when this process evaluates alerts this tick: it takes or keeps the lock.
+
+        The lock lived 25 s against a 30 s tick, so the evaluator rotated across pods every tick
+        and each pod's gauges held its last win (R3OB-1). The holder now renews it (45 s); a
+        holder that stops lets another take over within one tick or two.
+        """
+        key = f"{self.keys.prefix}:lock:alerts"
+        if await self.state.set(key, self.worker_id, nx=True, ex=ALERT_LOCK_SECS):
+            return True
+        if text(await self.state.get(key) or b"") != self.worker_id:
+            return False
+        await self.state.expire(key, ALERT_LOCK_SECS)
+        return True
+
     async def _alert_loop(self) -> None:
         """Every 30 s one process evaluates alerts: gauges every time, a log line per change."""
         while True:
-            await asyncio.sleep(30)
-            self._registry_gauges()
-            try:
-                lock = await self.state.set(
-                    f"{self.keys.prefix}:lock:alerts", self.worker_id, nx=True, ex=25
+            await asyncio.sleep(ALERT_EVERY_SECS)
+            await self._alert_tick()
+
+    async def _alert_tick(self) -> None:
+        """One evaluation: pod gauges here; cluster gauges and alerts on the lock holder only."""
+        self._registry_gauges()
+        self._pod_gauges()
+        try:
+            if not await self._alert_lock():
+                self._cluster.clear()  # another process evaluates: drop this one's (R3OB-1)
+                return
+            view = self.registry.current
+            report = await self.status_reader.report(view)
+            self._report_gauges(report)
+            alerts = self.alerts.evaluate(view, report)
+            for alert in alerts:
+                self._cluster.gauge(
+                    f"llmq_alert_{alert.name}", 1.0 if alert.on else 0.0, **alert.labels
                 )
-                if not lock:
-                    continue
-                view = self.registry.current
-                report = await self.status_reader.report(view)
-                self._report_gauges(report)
-                alerts = self.alerts.evaluate(view, report)
-                for alert in alerts:
-                    self.metrics.gauge(
-                        f"llmq_alert_{alert.name}", 1.0 if alert.on else 0.0, **alert.labels
-                    )
-                await self.alerts.changed(alerts)
-            except Exception as exc:
-                logger.warning("alerts_failed", error=str(exc))
+            self._cluster.finish()
+            await self.alerts.changed(alerts)
+            # Alarm on this not moving: evaluation stopped, which nothing showed (R3OB-17).
+            self.metrics.gauge("llmq_alerts_evaluated_timestamp_seconds", time.time())
+        except Exception as exc:
+            logger.warning("alerts_failed", error=str(exc), error_type=type(exc).__name__)
 
     async def _ack(self, held: _Held) -> None:
         """Ack a call's message and forget the call; a stale receipt is logged and counted.
@@ -4088,6 +4374,7 @@ class Engine:
             if self._deadline(held) >= late:
                 continue
             running = held.run is not None and not held.run.done()
+            self.metrics.count("llmq_stuck_calls_total", model=held.envelope.model)
             logger.error(
                 "held_call_stuck",
                 request_id=held.envelope.request_id,
@@ -4119,11 +4406,19 @@ class Engine:
             try:  # the only step outside a `try` before: an error here ended the heartbeat (FE-18)
                 self._free_stuck()
             except Exception as exc:
-                logger.warning("heartbeat_failed", step="free_stuck", error=str(exc))
+                self._limited(
+                    logger.warning,
+                    "heartbeat_failed",
+                    "free_stuck",
+                    step="free_stuck",
+                    error=str(exc),
+                )
             try:
                 self._sync_model_loops()
             except Exception as exc:
-                logger.warning("heartbeat_failed", step="loops", error=str(exc))
+                self._limited(
+                    logger.warning, "heartbeat_failed", "loops", step="loops", error=str(exc)
+                )
             renewed = False
             try:
                 held_now = list(self._held.values())
@@ -4150,7 +4445,9 @@ class Engine:
                 self._beat_ran_mono = now
                 renewed = True
             except Exception as exc:  # the heartbeat must survive store hiccups
-                logger.warning("heartbeat_failed", step="renew", error=str(exc))
+                self._limited(
+                    logger.warning, "heartbeat_failed", "renew", step="renew", error=str(exc)
+                )
                 self._store_trouble("heartbeat")
                 beat = 1.0  # renew the caller key as soon as the store is back
             if renewed:
@@ -4160,11 +4457,23 @@ class Engine:
                     try:
                         await self._reregister(set(lost))
                     except Exception as exc:
-                        logger.warning("heartbeat_failed", step="reregister", error=str(exc))
+                        self._limited(
+                            logger.warning,
+                            "heartbeat_failed",
+                            "reregister",
+                            step="reregister",
+                            error=str(exc),
+                        )
                 try:
                     await self._check_cancels()
                 except Exception as exc:
-                    logger.warning("heartbeat_failed", step="cancels", error=str(exc))
+                    self._limited(
+                        logger.warning,
+                        "heartbeat_failed",
+                        "cancels",
+                        step="cancels",
+                        error=str(exc),
+                    )
             view = self.registry.current
             holds: list[tuple[Message, float]] = []
             holders: list[_Held] = []
@@ -4174,8 +4483,10 @@ class Engine:
                 try:
                     visibility = float(view.value(held.envelope.model, "queue")["visibility_secs"])
                 except Exception as exc:  # e.g. a model removed by a reload: skip only this one
-                    logger.warning(
+                    self._limited(
+                        logger.warning,
                         "heartbeat_failed",
+                        "extend",
                         step="extend",
                         request_id=held.envelope.request_id,
                         error=str(exc),
@@ -4188,7 +4499,9 @@ class Engine:
             try:
                 kept = await self.queues.extend_many(holds)  # every hold in one call
             except Exception as exc:
-                logger.warning("heartbeat_failed", step="extend", error=str(exc))
+                self._limited(
+                    logger.warning, "heartbeat_failed", "extend", step="extend", error=str(exc)
+                )
             else:
                 self._holds_lost(holds, holders, kept)
             try:
@@ -4200,11 +4513,19 @@ class Engine:
                     self._store_trouble("clock")
                 await self._check_epoch(read=not renewed)
             except Exception as exc:
-                logger.warning("heartbeat_failed", step="clock", error=str(exc))
+                self._limited(
+                    logger.warning, "heartbeat_failed", "clock", step="clock", error=str(exc)
+                )
             try:
                 await self._check_replication()
             except Exception as exc:
-                logger.warning("heartbeat_failed", step="replication", error=str(exc))
+                self._limited(
+                    logger.warning,
+                    "heartbeat_failed",
+                    "replication",
+                    step="replication",
+                    error=str(exc),
+                )
             await asyncio.sleep(max(0.2, beat))
 
     def _holds_lost(
@@ -4222,7 +4543,9 @@ class Engine:
                 continue
             if not self._owns(held):
                 continue
-            logger.warning("hold_lost", request_id=held.envelope.request_id)
+            logger.warning(
+                "hold_lost", request_id=held.envelope.request_id, model=held.envelope.model
+            )
             self._drop(held)  # its hold ends at its next round (not cancelled: FE-4)
 
     async def _check_epoch(self, *, read: bool = True) -> None:
@@ -4236,6 +4559,7 @@ class Engine:
         missing = value is None
         if missing:
             logger.error("state_store_reset_detected")
+            self.metrics.count("llmq_store_resets_total")
             await self.state.set(self.keys.epoch, str(self.clock.now()), nx=True)
             await self.state.set(
                 f"{self.keys.prefix}:reset_minute", int(self.clock.now() // 60), ex=120
@@ -4245,6 +4569,7 @@ class Engine:
         if missing or (seen is not None and seen != self._epoch):
             if not missing:
                 logger.error("state_store_reset_detected", by="epoch_changed")
+                self.metrics.count("llmq_store_resets_total")
             self._sweep_now.set()  # waiting callers check their records now (R3RC-2)
             await self._reregister()
 
@@ -4318,7 +4643,11 @@ class Engine:
                 # One model that fails skips only itself: one `try` around the loop stopped the
                 # sweep (L4 lease pruning too) for every model after it, each round (FE-15).
                 try:
-                    await self.admission.sweep(alias, [d.key for d in view.deployments(alias)])
+                    swept = await self.admission.sweep(
+                        alias, [d.key for d in view.deployments(alias)]
+                    )
+                    if swept:  # the count was dropped: a lease leak showed nowhere (R3OB-15)
+                        self.metrics.count("llmq_swept_total", float(swept), model=alias)
                     # Dead letters age out on a timer too: only the next dead letter trimmed
                     # them, so a quiet queue kept its prompts for good (RESCAN X10).
                     keep = int(view.value(alias, "queue")["dlq_retention_secs"])

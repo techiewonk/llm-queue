@@ -74,7 +74,16 @@ class Handlers:
         liveness wait up to the probe timeout and fail the kubelet's 1 s default (FO-9).
         """
         live = self.engine._live()
-        return (200 if live else 503), {"live": live}
+        if live:
+            return 200, {"live": True}
+        # Why, so 50 pods do not need a log search to say which loop died (R3OB-20).
+        return 503, {"live": False, "reason": self.engine._not_live_reason()}
+
+    def metrics(self) -> tuple[bytes, str]:
+        """The Prometheus exposition of the engine's sink (body, content type) (R3OB-14)."""
+        from llm_queue.engine.metrics import prometheus_text
+
+        return prometheus_text(self.engine.metrics)
 
     async def ready(self) -> Response:
         """200 when the registry is loaded and the process is not draining (stores in the body)."""
@@ -174,8 +183,13 @@ def status_router(
     dependencies: Sequence[Any] = (),
     allow_writes: bool = False,
     actor: Callable[[Any], str] | None = None,
+    metrics_route: bool = False,
 ) -> Any:
     """A FastAPI `APIRouter` with the handlers (`pip install 'llm-queue[http]'`).
+
+    `metrics_route`: also `GET /metrics`, the Prometheus exposition of a `metrics_sink=
+    prometheus` engine (needs the `metrics` extra), open like the health routes so a scraper
+    can read it (R3OB-14: no route and no document said how to expose the registry).
 
     `dependencies` (the app's admin check) guard every route except `/health/live` and
     `/health/ready`. Writes need `dependencies` and `actor`: `actor` gets the request and
@@ -188,6 +202,7 @@ def status_router(
     try:
         from fastapi import APIRouter, Body, Depends, Request
         from fastapi.responses import JSONResponse
+        from fastapi.responses import Response as RawResponse
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
         raise MissingExtra("http_router", "http") from exc
     # Annotations are strings here (`from __future__ import annotations`); FastAPI resolves them
@@ -228,6 +243,13 @@ def status_router(
     @router.get("/health/live")
     async def live() -> Any:
         return reply(await handlers.live())
+
+    if metrics_route:
+
+        @router.get("/metrics")
+        async def metrics() -> Any:
+            body, content_type = handlers.metrics()
+            return RawResponse(body, media_type=content_type)
 
     @router.get("/health/ready")
     async def ready() -> Any:

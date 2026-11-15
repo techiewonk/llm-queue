@@ -283,7 +283,7 @@ HEALTH_DEFAULTS = {
     "slow_min_secs": 5,
     "slow_min_samples": 20,
 }
-ALERT_DEFAULTS = {"quota_used_pct": 90, "dlq_messages": 1}
+ALERT_DEFAULTS = {"quota_used_pct": 90, "dlq_messages": 1, "queue_age_secs": 600}
 # Alert settings removed in 0.1.0b2 (they did nothing): accepted with a warning until 0.2, so a
 # 0.1.0b1 document still loads (owner Q34, R3AP-5).
 REMOVED_ALERTS = dict.fromkeys(
@@ -476,7 +476,11 @@ SETTINGS: Mapping[str, Spec] = {
     "alerts": _spec(
         "D,M",
         obj(
-            {"quota_used_pct": number(1, 100), "dlq_messages": number(1, integer=True)},
+            {
+                "quota_used_pct": number(1, 100),
+                "dlq_messages": number(1, integer=True),
+                "queue_age_secs": number(1),  # queue_stalled (R3OB-17)
+            },
             deprecated=REMOVED_ALERTS,
         ),
         ALERT_DEFAULTS,

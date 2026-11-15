@@ -6,6 +6,7 @@ import io
 import sys
 import time
 
+import orjson
 import pytest
 
 from llm_queue.engine.metrics import EmfSink, _StdoutWriter
@@ -24,7 +25,7 @@ def test_a_slow_stdout_does_not_block_a_metric_point(monkeypatch: pytest.MonkeyP
     slow = _SlowStdout()
     monkeypatch.setattr(sys, "stdout", slow)
     writer = _StdoutWriter()
-    sink = EmfSink(writer)
+    sink = EmfSink(writer, flush_secs=0)  # one line per point, as before aggregation
     started = time.perf_counter()
     for _ in range(10):
         sink.count("llmq_calls_total", model="m")
@@ -51,7 +52,10 @@ def test_no_thread_until_the_first_line() -> None:
 
 
 def test_queued_lines_are_written_before_the_process_exits() -> None:
-    """EN-20 (verify pass): lines still queued at exit were lost with the daemon thread."""
+    """EN-20 (verify pass): lines still queued at exit were lost with the daemon thread.
+
+    R3PF-14: the 500 points are now added up into one line, written by the sink's exit flush.
+    """
     import subprocess
 
     code = (
@@ -62,7 +66,9 @@ def test_queued_lines_are_written_before_the_process_exits() -> None:
     out = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=60
     ).stdout
-    assert len(out.splitlines()) == 500
+    lines = out.splitlines()
+    assert len(lines) == 1
+    assert orjson.loads(lines[0])["llmq_calls_total"] == 500
 
 
 def test_a_writer_whose_thread_died_starts_a_new_one(monkeypatch: pytest.MonkeyPatch) -> None:
