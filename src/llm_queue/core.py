@@ -104,7 +104,8 @@ class DeploymentStatus(TypedDict):
     breaker: str
     latency_ms: float | None
     samples: int
-    throttles_1m: int
+    throttles_1m: int  # the larger of last minute and this one (R3OB-6)
+    throttles_this_minute: int
 
 
 class FairnessStatus(TypedDict):
