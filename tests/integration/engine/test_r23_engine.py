@@ -7,15 +7,21 @@ engine's store helpers; no real LLM is called.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import math
 from typing import Any
 
 import pytest
 from engine_testkit import CHAT, Make, away_from_minute_end
 from redis.exceptions import ConnectionError as StoreConnectionError
-from redis.exceptions import ReadOnlyError
+from redis.exceptions import OutOfMemoryError, ReadOnlyError, ResponseError
+from redis.exceptions import TimeoutError as StoreTimeoutError
 
 from llm_queue.engine.admission import Decision
+from llm_queue.engine.envelope import Reply, params_hash
+from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.queue import Message
+from llm_queue.engine.runtime import Engine, _store_refused
 
 pytestmark = pytest.mark.integration
 
@@ -304,3 +310,271 @@ async def test_fl3_a_receive_cancelled_in_flight_is_reclaimed(
     engine._slots["titan"].free = 0  # a full worker reclaims too
     assert await engine._receive_once("titan") is None
     assert reclaimed
+
+
+# ---------------------------------------------------------------- owner Q2-Q6, R3RC-1, FE-17
+
+
+async def test_q6_an_app_worker_id_gets_a_random_part(make: Make) -> None:
+    """R3RC-9 / owner Q6: an app's `worker_id` was used as is; two processes shared keys."""
+    engine, _ = await make()
+    one = Engine(engine.state, engine.registry, engine.providers, worker_id="pod-a")
+    two = Engine(engine.state, engine.registry, engine.providers, worker_id="pod-a")
+    assert one.worker_id.startswith("pod-a-")
+    assert one.worker_id != two.worker_id
+
+
+async def test_q4_send_refreshes_the_caller_key_for_two_beats(make: Make) -> None:
+    """R3FM-1 / owner Q4: the caller key lived 30 s, renewed every 20 s, never by a send.
+
+    One late renewal dropped a live caller's queued calls as `caller_gone`. It now lives two
+    beats at least and every send refreshes it.
+    """
+    engine, _ = await make(worker=False)
+    key = engine.keys.caller(engine.worker_id)
+    await engine.state.delete(key)
+    task = asyncio.create_task(engine.call("small", CHAT, timeout_secs=3))
+    await _until_async(lambda: engine.state.exists(key), what="the key set by the send")
+    ttl = await engine.state.ttl(key)
+    assert ttl >= math.ceil(2 * engine.settings.lease_secs / 3)
+    await _cancel(task)
+
+
+async def test_q2_a_failed_id_runs_again(make: Make) -> None:
+    """Owner Q2: a retry of an id that ended failed got the stored failure for 5 min.
+
+    Then `result_expired` for 30 min. Only a success is replayed now; a failure runs again.
+    """
+    engine, _ = await make()
+    rid = "q2-fail"
+    await engine.requests.register(
+        rid,
+        caller="old",
+        user_hash=engine.hash_id(""),
+        params_hash=params_hash({"m": "small", "p": CHAT}),
+        model="small",
+        priority=False,
+        app_id=True,
+    )
+    reply = Reply(request_id=rid, ok=False, error="provider_error", message="boom")
+    await engine.requests.put_result(reply, final_state="failed")
+    again = await engine.call("small", CHAT, request_id=rid)
+    assert again.ok  # the stored failure before
+
+
+async def test_q3_an_attach_after_a_cancel_is_cancelled(make: Make) -> None:
+    """Owner Q3: a pending cancel wins; an attach to that id gets `cancelled` too.
+
+    (After the call ended `cancelled`, a retry runs again: owner Q2.)
+    """
+    engine, _ = await make(worker=False)  # nobody runs it: the cancel stays pending
+    first = asyncio.create_task(engine.call("small", CHAT, request_id="q3", timeout_secs=2))
+    await _until_async(lambda: _confirmed(engine, "q3"), what="the call sent")
+    await engine.cancel("q3")
+    with pytest.raises(CallFailed) as info:
+        await engine.call("small", CHAT, request_id="q3", timeout_secs=2)
+    assert info.value.kind == "cancelled"  # attached and waited before
+    with pytest.raises(CallFailed):
+        await first
+
+
+async def test_r3rc1_two_pods_cancelling_a_shared_id_cancel_it(make: Make) -> None:
+    """R3RC-1: two pods waiting on one id never cancelled it, each seeing the other's entry.
+
+    The call ran to its end at the provider for nobody. Any caller's cancel wins now.
+    """
+    worker, _ = await make(None, SLOW)
+    a, _ = await make(worker=False)
+    b, _ = await make(worker=False)
+    one = asyncio.create_task(a.call("small", CHAT, request_id="rc1", timeout_secs=8))
+    await _until(lambda: "rc1" in worker._held, what="the call received")
+    two = asyncio.create_task(b.call("small", CHAT, request_id="rc1", timeout_secs=8))
+    await asyncio.sleep(0.3)
+    await _cancel(one)
+    await _until_async(
+        lambda: worker.state.exists(worker.keys.request("rc1", "cancel")), what="the cancel"
+    )
+    with pytest.raises(CallFailed):
+        await two
+
+
+async def test_fe17_a_caller_only_direct_run_stops_on_cancel(make: Make) -> None:
+    """FE-17: a caller-only process ran a cancelled direct call on to its own deadline."""
+    engine, _ = await make(None, SLOW, worker=False)
+    task = asyncio.create_task(
+        engine.call("small", CHAT, request_id="fe17", timeout_secs=8, force_direct=True)
+    )
+    await _until(lambda: "fe17" in engine._held, what="the direct run")
+    held = engine._held["fe17"]
+    await _until(lambda: held.run is not None, what="the attempt running")
+    await _cancel(task)
+    run = held.run
+    assert run is not None
+    await _until(run.done, secs=2, what="the direct run stopped")
+
+
+# ---------------------------------------------------------------- Q7, Q11, Q12, R3FM-2, FE-5
+
+
+def test_q12_refusals_count_as_the_store_down() -> None:
+    """R3FM-7 / owner Q12: NOREPLICAS, OOM, MISCONF and BUSY reached callers as refusals."""
+    assert _store_refused(ResponseError("NOREPLICAS Not enough good replicas to write."))
+    assert _store_refused(ResponseError("MISCONF Redis is configured to save RDB snapshots"))
+    assert _store_refused(ResponseError("BUSY Redis is busy running a script."))
+    assert _store_refused(OutOfMemoryError("command not allowed when used memory > maxmemory"))
+    assert not _store_refused(ResponseError("ERR wrong number of arguments"))
+
+
+async def test_q12_an_answer_in_hand_rides_out_a_refusal(make: Make) -> None:
+    """R3FM-7: a NOREPLICAS refusal of the result write dropped the answer; the call re-ran."""
+    engine, _ = await make()
+    tries: list[int] = []
+
+    async def write() -> None:
+        tries.append(1)
+        if len(tries) < 3:
+            raise ResponseError("NOREPLICAS Not enough good replicas to write.")
+
+    await engine._through_outage(write)
+    assert len(tries) == 3  # raised at the first refusal before
+
+
+async def test_q7_an_answer_in_hand_is_kept_to_the_calls_deadline(make: Make) -> None:
+    """Owner Q7: the answer in hand was dropped after one lease (3 s here) of store outage.
+
+    The call then ran again. It is now kept while its caller still waits (its deadline).
+    """
+    engine, _ = await make()
+    from test_audit_runtime import _a_held
+
+    held = _a_held(engine, "q7", deadline_in_secs=8.0)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    async def write() -> None:
+        if loop.time() - started < engine.settings.lease_secs + 1.0:
+            raise StoreConnectionError("connection refused")
+
+    await engine._through_outage(write, held)  # raised after one lease before
+
+
+async def test_q11_fail_fast_remembers_an_outage(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3FM-3 / owner Q11: every `fail_fast` call re-discovered the outage at full cost.
+
+    Each paid the client's retries (1.5-21.5 s). The outage is remembered for a few seconds.
+    """
+    engine, _ = await make({"small": {"store_down": "fail_fast"}})
+    tried: list[int] = []
+
+    async def down(*args: Any, **kwargs: Any) -> Any:
+        tried.append(1)
+        raise StoreConnectionError("connection refused")
+
+    monkeypatch.setattr(engine, "_call_routed", down)
+    monkeypatch.setattr(engine, "_spawn", lambda work, what="": _close(work))
+    for _ in range(3):
+        with pytest.raises(CallFailed) as info:
+            await engine.call("small", CHAT, timeout_secs=5)
+        assert info.value.kind == "queue_unavailable"
+    assert len(tried) == 1  # three tries of the store before
+
+
+def _close(work: Any) -> None:
+    """Drop a background write in a test (its coroutine closed unrun)."""
+    work.close()
+
+
+async def test_r3fm2_static_cap_answer_is_stored_for_the_queued_copy(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3FM-2: a send whose reply timed out ran at once under `static_cap`, and its queued
+    copy ran a second time. The static answer is now stored, so the copy meets `done`.
+    """
+    engine, _ = await make({"small": {"store_down": "static_cap"}})
+
+    async def timed_out(*args: Any, **kwargs: Any) -> Any:
+        raise StoreTimeoutError("Timeout reading from socket")
+
+    monkeypatch.setattr(engine, "_call_routed", timed_out)
+    reply = await engine.call("small", CHAT, request_id="fm2", timeout_secs=5)
+    assert reply.ok
+    key = engine.keys.request("fm2", "res")
+    await _until_async(lambda: engine.state.exists(key), what="the answer stored")
+
+
+async def test_fe5_a_failed_direct_run_stores_its_failure(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FE-5: a direct run that raised wrote no reply; callers in other processes waited.
+
+    A retry of the id attached to the dead record for 30 min. The failure is stored now.
+    """
+    engine, _ = await make()
+
+    async def refused(*args: Any, **kwargs: Any) -> Any:
+        raise ResponseError("ERR script failed")
+
+    monkeypatch.setattr(engine.admission, "pick_take", refused)
+    with pytest.raises(CallFailed):
+        await engine.call("small", CHAT, request_id="fe5", force_direct=True, timeout_secs=5)
+    job = await engine.requests.job("fe5")
+    assert job.get("state") == "failed"  # confirmed and running for 30 min before
+
+
+# ---------------------------------------------------------------- R3RC-5, R3RC-4, R3FM-4
+
+
+async def test_r3rc5_a_stored_result_is_read_at_once(make: Make) -> None:
+    """R3RC-5: a retry of an id whose result was stored waited for a wake-up first.
+
+    Nobody published again: it waited for the sweep (`poll_secs`, 5 s by default).
+    """
+    engine, _ = await make()
+    assert (await engine.call("small", CHAT, request_id="rc5")).ok
+    engine.settings = dataclasses.replace(engine.settings, poll_secs=3.0)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    assert (await engine.call("small", CHAT, request_id="rc5")).ok
+    assert loop.time() - started < 1.0
+
+
+async def test_r3rc4_an_attached_caller_takes_over_a_send_that_never_happened(
+    make: Make,
+) -> None:
+    """R3RC-4: a caller attached to an id whose sender died before sending waited 60 s.
+
+    Its recheck came only every `result_recheck_secs`; a 10 s call got `deadline_exceeded`.
+    It now checks after the takeover grace and takes the call over.
+    """
+    engine, _ = await make()
+    rid = "rc4"
+    await engine.requests.register(
+        rid,
+        caller="ghost",
+        user_hash=engine.hash_id(""),
+        params_hash=params_hash({"m": "small", "p": CHAT}),
+        model="small",
+        priority=False,
+        app_id=True,
+    )
+    reply = await engine.call("small", CHAT, request_id=rid, timeout_secs=10)
+    assert reply.ok
+
+
+async def test_r3fm4_a_call_whose_record_the_store_lost_is_sent_again(make: Make) -> None:
+    """R3FM-4 / R3RC-2: after a store lost its data, waiting callers sat to their deadline.
+
+    Only running grants were put back. At least once (owner D1): the result sweep finds the
+    record gone and the caller sends the call again.
+    """
+    caller, _ = await make(worker=False)
+    task = asyncio.create_task(caller.call("small", CHAT, request_id="fm4", timeout_secs=10))
+    await _until_async(lambda: _confirmed(caller, "fm4"), what="the call sent")
+    view = caller.registry.current
+    name = caller._queue_name(view, "small", False)
+    await caller.state.delete(caller.keys.request("fm4", "job"), *caller.queues.queue_keys(name))
+    await make()  # a worker
+    reply = await asyncio.wait_for(task, 8)
+    assert reply.ok  # deadline_exceeded before

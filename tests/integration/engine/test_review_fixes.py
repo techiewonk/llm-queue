@@ -249,11 +249,11 @@ async def test_store_error_after_send_waits_instead_of_running_twice(
     assert calls == 1  # one provider call, not a second one on the store_down path
 
 
-async def test_cancelling_one_local_waiter_keeps_the_shared_call(make: Make) -> None:
-    """Bug: two waiters in one process share a caller entry; cancelling one cancelled both.
+async def test_cancelling_one_local_waiter_cancels_the_shared_call(make: Make) -> None:
+    """Owner Q3 (cancel wins): cancelling one of two waiters on an id cancels it for both.
 
-    Also: the cancelled one removed the shared wake-up, so the other slept until the last read
-    at its deadline (15 s here) instead of waking with the reply.
+    Bug kept pinned: the cancelled one removed the shared wake-up, so the other slept until the
+    last read at its deadline (15 s here) instead of waking with the reply (now `cancelled`).
     """
     import time
 
@@ -266,8 +266,9 @@ async def test_cancelling_one_local_waiter_keeps_the_shared_call(make: Make) -> 
     first.cancel()
     with pytest.raises(asyncio.CancelledError):
         await first
-    reply = await second
-    assert reply.ok
+    with pytest.raises(CallFailed) as info:
+        await second
+    assert info.value.kind == "cancelled"
     assert time.monotonic() - started < 5  # woken by the reply, not by the deadline's read
     assert not engine._local_callers
 
