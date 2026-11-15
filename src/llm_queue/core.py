@@ -151,13 +151,17 @@ class Health(TypedDict):
 class EmbedResult:
     """Vectors (one per text, in order) and how the batches were served.
 
-    With `embed(partial=True)`, a text whose batch failed has the vector `[]` and its error
-    in `errors` (by text index); otherwise `errors` is always empty.
+    With `embed(partial=True)`, a text that failed has the vector `[]` and its error in
+    `errors` (by text index); otherwise `errors` is always empty. `meta.tokens_in` sums the
+    input tokens the replies reported; `batches` counts provider calls and `request_ids`
+    lists the answered ones, for cost and support (Q21).
     """
 
     vectors: list[list[float]]
     meta: Meta
     errors: dict[int, CallFailed] = field(default_factory=dict)
+    batches: int = 0
+    request_ids: list[str] = field(default_factory=list)
 
 
 # Every queue of the process, so a fork can mark them (weak: a dropped queue is not kept).
@@ -776,15 +780,16 @@ async def _embed(
     kwargs: dict[str, Any],
 ) -> EmbedResult:
     """`embed` on an engine: all or nothing, or per text with `partial`."""
-    from llm_queue.engine.embed import embed_partial
+    from llm_queue.engine.embed import embed_detailed
 
     if direct:
         kwargs = {**kwargs, "force_direct": True}
-    vectors, errors = await embed_partial(
+    out = await embed_detailed(
         engine, model, texts, input_type=input_type, partial=partial, **kwargs
     )
     alias = engine.registry.current.registry.alias_of(model)
-    return EmbedResult(vectors, Meta(served_model=alias), errors)
+    meta = Meta(served_model=alias, tokens_in=out.tokens_in, attempts=out.batches)
+    return EmbedResult(out.vectors, meta, out.errors, out.batches, out.request_ids)
 
 
 async def _close_offload(offload: ResultOffload | None) -> None:

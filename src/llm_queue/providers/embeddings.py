@@ -7,7 +7,7 @@ text per request, Cohere v3 up to 96, OpenAI `chunk_size` (2048 by default).
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, get_args
 
 _T = TypeVar("_T")  # PEP 695 syntax needs 3.12; the package supports 3.11
 
@@ -16,16 +16,43 @@ COHERE_MAX_BATCH = 96
 OPENAI_DEFAULT_CHUNK_SIZE = 2048
 
 CohereInputType = Literal["search_document", "search_query", "classification", "clustering"]
+COHERE_INPUT_TYPES = frozenset(get_args(CohereInputType))
 
 
-def max_batch_size(provider: str, model_id: str, *, chunk_size: int | None = None) -> int:
+# Longest text each Bedrock family takes, in characters (AWS model pages, not re-checked
+# here): Titan v2 50,000 (8,192 tokens), Cohere v3 2,048. A model's `embed_max_chars` wins.
+MAX_CHARS = {"titan": 50_000, "cohere": 2_048}
+
+
+def is_cohere(model_id: str, family: str | None = None) -> bool:
+    """True when the model takes Cohere's body: its registry `family`, else its id.
+
+    The id guess ignores case: it is the one rule for the calls, the batch size and the
+    health probe, which tested the id case-sensitively (R3JE-21). An ARN names no model, so
+    the registry's `family` says it (Q22).
+    """
+    if family is not None:
+        return family == "cohere"
+    return "cohere" in model_id.lower()
+
+
+def family_of(provider: str, model_id: str, family: str | None = None) -> str:
+    """`openai`, `cohere` or `titan` (every other Bedrock model is treated like Titan)."""
+    if provider == "openai":
+        return "openai"
+    return "cohere" if is_cohere(model_id, family) else "titan"
+
+
+def max_batch_size(
+    provider: str, model_id: str, *, chunk_size: int | None = None, family: str | None = None
+) -> int:
     """Largest number of texts one embedding request may carry for this provider and model.
 
     Bedrock models other than Cohere are treated like Titan (one text per request).
     """
     if provider == "openai":
         return chunk_size or OPENAI_DEFAULT_CHUNK_SIZE
-    return COHERE_MAX_BATCH if "cohere" in model_id.lower() else TITAN_MAX_BATCH
+    return COHERE_MAX_BATCH if is_cohere(model_id, family) else TITAN_MAX_BATCH
 
 
 def batches(items: Sequence[_T], size: int) -> Iterator[list[_T]]:
@@ -65,7 +92,7 @@ def cohere_body(
 
 def embedding_body(model_id: str, texts: Sequence[str], **options: Any) -> dict[str, Any]:
     """Pick the Titan or Cohere body builder by model id; Titan takes exactly one text."""
-    if "cohere" in model_id.lower():
+    if is_cohere(model_id):
         return cohere_body(texts, **options)
     if len(texts) != TITAN_MAX_BATCH:
         raise ValueError(f"Titan takes exactly one text per request, got {len(texts)}")
