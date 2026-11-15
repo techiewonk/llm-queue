@@ -58,6 +58,17 @@ class Lease:
     tasks: list[asyncio.Task[Any]] = field(default_factory=list)
     inflight: int = 0
     _idle: asyncio.Event | None = None
+    # Connections of the client's pool, and a cap on the calls borrowing it at once: a call
+    # beyond the pool waits here, before its provider timers, not for a socket inside them
+    # (R3PF-9: caller-only engines have no slots to bound their direct runs).
+    size: int = 0
+    limit: asyncio.Semaphore | None = None
+
+    def cap(self, size: int) -> None:
+        """Set the pool size and its borrow cap once (the first pool to build it decides)."""
+        if self.limit is None:
+            self.size = size
+            self.limit = asyncio.Semaphore(size)
 
     def enter(self) -> None:
         """One more call on the client."""
@@ -108,6 +119,9 @@ class ClientHub:
             with self._guard:
                 if self._entries.get(key) is lease:
                     del self._entries[key]
+                # Its lock too: keys use id(loop), and a new loop with the same id met a lock
+                # bound to the dead one ("bound to a different event loop", FC-14).
+                self._locks.pop(key, None)
             return None
         return lease
 
@@ -179,8 +193,10 @@ class ClientHub:
             # cancellation of this task: suppressing it lost the caller's cancel (CL-11).
             await asyncio.gather(*tasks, return_exceptions=True)
         finally:
-            with contextlib.suppress(Exception):
+            try:
                 await lease.close()
+            except Exception as exc:  # logged, not raised: the caller is closing too (FC-15)
+                logger.debug("client_close_failed", error=repr(exc))
 
     def reset_after_fork(self) -> None:
         """Forget every entry in a forked child: they belong to the parent's loops and sockets."""

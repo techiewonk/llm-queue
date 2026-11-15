@@ -73,6 +73,8 @@ _INVOKE_REPLY_HEADERS = {
     "serviceTier": "x-amzn-bedrock-service-tier",
 }
 _MEDIA = ("image", "document", "video", "audio")
+# Block keys that can hold a blob member (`_blob_paths`); a block with none of them has none.
+_BLOB_KEYS = frozenset({*_MEDIA, "guardContent", "reasoningContent", "toolResult"})
 
 
 def default_endpoint(region: str) -> str:
@@ -95,6 +97,10 @@ def _blob_paths(block: Mapping[str, Any]) -> list[tuple[Mapping[str, Any], str]]
     content and `guardContent.image`, and `reasoningContent.redactedContent`.
     """
     found: list[tuple[Mapping[str, Any], str]] = []
+    if type(block) is dict and _BLOB_KEYS.isdisjoint(block):
+        # A plain text block or delta (nearly all of them): the walk below costs 8 ABC checks,
+        # 5.9 us a block, more than the JSON it guards (FC-5).
+        return found
     for media in _MEDIA:
         source = (block.get(media) or {}).get("source")
         if isinstance(source, Mapping) and "bytes" in source:
