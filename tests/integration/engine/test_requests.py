@@ -117,6 +117,22 @@ async def test_app_ids_keep_their_result(store: redis.asyncio.Redis, prefix: str
     assert await store.ttl(f"{prefix}:{{r:req-1}}:res") > 250
 
 
+async def test_fl2_a_replayed_take_still_returns_the_result(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-2: RESULT_TAKE deleted a library id's result in the read itself; redis-py's replay
+    after a dropped reply found nothing and the caller waited out its deadline.
+    """
+    requests = RequestStore(store, Keys(prefix))  # result_dedupe_secs = 0, the default
+    await requests.put_result(Reply(request_id="r", ok=True, response={"x": 1}), final_state="done")
+    first = await requests.take_result("r")
+    replay = await requests.take_result("r")  # the same script again, as the retry runs it
+    assert first is not None
+    assert replay is not None
+    assert replay.response == {"x": 1}
+    assert 0 < await store.pttl(f"{prefix}:{{r:r}}:res") <= 10_000  # gone within seconds
+
+
 async def test_final_status_is_never_replaced(store: redis.asyncio.Redis, prefix: str) -> None:
     requests = _store(store, prefix)
     assert await requests.set_status("req-1", "waiting", model="m")

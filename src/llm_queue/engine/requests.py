@@ -5,8 +5,9 @@ never replaced. Used by the runtime on both the caller and the worker side.
 """
 
 # A call's record is written only if absent when it is sent and confirmed only after the send
-# succeeded, so a failed send never leaves a phantom (plan §3.18 R23). A library id's result is
-# deleted on its first read, an app id's kept `result_ttl_secs`. Scripts use the store's clock.
+# succeeded, so a failed send never leaves a phantom (plan §3.18 R23). A library id's result goes
+# seconds after its first read (FL-2), an app id's is kept `result_ttl_secs`. Scripts use the
+# store's clock.
 
 from __future__ import annotations
 
@@ -210,17 +211,27 @@ if redis.call('HGET', KEYS[2], 'app') ~= '1' then
 end
 """
 
-# KEYS: result, job. ARGV: dedupe secs, offload marker. Read a result (and drop it as above);
-# an offloaded one is only read: it is dropped once the offload read worked (RESULT_DROP).
-RESULT_TAKE = (
-    """
+# KEYS: result, job. ARGV: dedupe secs, offload marker, grace ms. Read a result (and drop it as
+# above, but never at once); an offloaded one is only read: it is dropped once the offload read
+# worked (RESULT_DROP).
+#
+# Replay-safe (FL-2): redis-py runs a script again when the connection drops after the server
+# ran it. A take that deleted the body made that replay return nil, and the caller waited out
+# its deadline for a call that had succeeded. With no dedupe window the body now lives `grace
+# ms` more (longer than the client's retry span), so a replay reads it again.
+TAKE_GRACE_MS = 10_000
+RESULT_TAKE = """
 local value = redis.call('GET', KEYS[1])
 if not value then return false end
 if ARGV[2] ~= '' and string.sub(value, 1, #ARGV[2]) == ARGV[2] then return value end
+if redis.call('HGET', KEYS[2], 'app') ~= '1' then
+  local keep_ms = tonumber(ARGV[3])
+  if tonumber(ARGV[1]) > 0 then keep_ms = tonumber(ARGV[1]) * 1000 end
+  local ttl = redis.call('PTTL', KEYS[1])
+  if ttl < 0 or ttl > keep_ms then redis.call('PEXPIRE', KEYS[1], keep_ms) end
+end
+return value
 """
-    + _DROP_READ
-    + "return value\n"
-)
 RESULT_DROP = _DROP_READ + "return 1\n"
 
 # KEYS: status. ARGV: state, ttl, then field / value pairs (see `_STATUS_FN`).
@@ -440,7 +451,7 @@ class RequestStore:
         return failed.dumps()
 
     async def take_result(self, request_id: str) -> Reply | None:
-        """A stored result; a library id's is then deleted (or kept `result_dedupe_secs`).
+        """A stored result; a library id's then expires in seconds (or `result_dedupe_secs`).
 
         An offloaded result is deleted only after its offload read worked (RESCAN S4): it was
         deleted first, and a blip in that read lost it. A failed or empty read raises
@@ -448,7 +459,7 @@ class RequestStore:
         """
         job, _, _, result = self._req(request_id)
         marker = MARKER if self.offload is not None else b""
-        raw = await self._take([result, job], [self.result_dedupe_secs, marker])
+        raw = await self._take([result, job], [self.result_dedupe_secs, marker, TAKE_GRACE_MS])
         if raw is None:
             return None
         if self.offload is not None and raw.startswith(MARKER):
