@@ -235,7 +235,9 @@ class _FakeEngine:
         self.registry = SimpleNamespace(current=current)
         self.queues = None
         self.metrics = None
-        self.settings = SimpleNamespace(queue_prefix="", drain_secs=0)
+        self.settings = SimpleNamespace(
+            queue_prefix="", drain_secs=0, queue_wait_replicas=0, queue_wait_ms=100
+        )
         self.loops: list[asyncio.AbstractEventLoop] = []
 
     async def start(self, **kw: Any) -> None:

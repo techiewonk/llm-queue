@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
+import inspect
 import random
+import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
@@ -35,6 +38,22 @@ ACK_TRIES = 3
 # store read timeout against the model loops' BLPOP (`idle_slow_secs`), and a BLPOP longer than
 # the read timeout fails. 2 BLPOPs/s idle, against ~7 RECEIVE scripts/s before (unverified).
 _BELL_WAIT_SECS = 0.5
+# A job name goes into store keys: no spaces, `:` or `{}` (hash tags), and a bounded length
+# (R3JE-12). Within the model queues' own rule, so `jobs-<name>` is a valid queue name.
+_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _is_async(fn: object) -> bool:
+    """True for an async function, a partial of one, or an object with an async `__call__`.
+
+    R3JE-5: a plain `def` ran, then failed on its result, five times over.
+    """
+    while isinstance(fn, functools.partial):
+        fn = fn.func
+    if inspect.iscoroutinefunction(fn):
+        return True
+    call = inspect.getattr_static(type(fn), "__call__", None)  # inherited ones too
+    return call is not None and inspect.iscoroutinefunction(call)
 
 
 class JobRunner:
@@ -50,7 +69,11 @@ class JobRunner:
         metrics: Metrics | None = None,
         replica_wait: ReplicaWait | None = None,
     ) -> None:
-        """Nothing runs until `start`. `replica_wait`: the process's (scope `jobs`, owner Q8)."""
+        """Nothing runs until `start`.
+
+        `replica_wait` is the process's (scope `jobs`): a send waits for the replicas as a
+        call's send does (R3JE-7, R3FM-5, owner Q8).
+        """
         self.queues = queues
         self.queue_prefix = queue_prefix
         self.settings = settings or QueueSettings(
@@ -66,6 +89,10 @@ class JobRunner:
         self._running: set[asyncio.Task[None]] = set()
         self._stop = asyncio.Event()
         self._paused = False
+        self._started = False
+        # The latest receipt of each running message, by (queue, id): a redelivery of a
+        # running job moves its receipt here instead of starting a second run (R3JE-9).
+        self._live: dict[tuple[str, str], Message] = {}
 
     def queue(self, name: str) -> str:
         """The queue of one job name."""
@@ -75,9 +102,20 @@ class JobRunner:
         """Allow this process to run job `name` (before `start`); `timeout_secs` bounds a run.
 
         A run past `timeout_secs` is cancelled and counts as a failure (retried, then dead).
+        `ConfigError` for a bad name, a function that is not async, or a call after `start`.
         """
-        if not name or not callable(fn):
-            raise ConfigError("a job needs a name and an async function")
+        if not _NAME_RE.match(name):
+            raise ConfigError(
+                f"job name {name!r}: use 1-64 letters, digits, '_' or '-' (it is part of a key)"
+            )
+        if not _is_async(fn):
+            # A plain `def` ran to the end (side effects done), then failed on its result:
+            # five runs, then a dead letter (R3JE-5). Blocking work goes in asyncio.to_thread.
+            raise ConfigError(f"job {name}: the function must be async (`async def`)")
+        if self._started:
+            # A name registered after `start` got no worker loop and its jobs waited unseen
+            # (R3JE-6).
+            raise ConfigError(f"job {name}: register jobs before start()")
         if timeout_secs is not None and timeout_secs <= 0:
             raise ConfigError(f"job {name}: timeout_secs must be above 0")
         self._jobs[name] = fn
@@ -86,11 +124,13 @@ class JobRunner:
     async def send(
         self, name: str, payload: Mapping[str, Any], *, job_id: str | None = None
     ) -> str:
-        """Queue a job; returns its id (jobs run at least once: make them idempotent)."""
+        """Queue a job; returns its id (jobs run at least once: make them idempotent).
+
+        Waits for replicas like a call send (R3JE-7, R3FM-5): a primary lost right after the
+        send lost the job for good, unnoticed. Too few replicas: sent anyway, warned (Q9).
+        """
         ident = job_id or new_id()
         body = orjson.dumps({"id": ident, "name": name, "payload": payload})
-        # Waits for replicas like a call send (R3FM-5): a primary lost right after the send
-        # lost the job for good, unnoticed. Too few replicas: sent anyway, warned (owner Q9).
         try:
             await self.queues.send(
                 self.queue(name),
@@ -118,7 +158,8 @@ class JobRunner:
             logger.warning("job_no_consumer", job=name, queue=self.queue(name))
 
     async def start(self) -> None:
-        """One worker loop per registered job."""
+        """One worker loop per registered job; later `register` calls are refused."""
+        self._started = True
         for name in self._jobs:
             self._tasks.append(asyncio.create_task(self._loop(name)))
 
@@ -189,7 +230,19 @@ class JobRunner:
                         await self.queues.return_(message)
                     gate.release()
                     return
-                task = asyncio.create_task(self._run(name, messages[0], gate))
+                message = messages[0]
+                key = (message.queue, message.id)
+                if key in self._live:
+                    # Its hold lapsed while it runs here (a blocked loop, a store outage): keep
+                    # one run and give it the new receipt; it ran twice in one process and its
+                    # ack was refused as stale (R3JE-9).
+                    self._live[key] = message
+                    gate.release()
+                    held = False
+                    logger.warning("job_redelivered_while_running", job=name, message=message.id)
+                    continue
+                self._live[key] = message
+                task = asyncio.create_task(self._run(name, message, gate))
                 held = False  # the job releases it
                 self._running.add(task)
                 task.add_done_callback(self._running.discard)
@@ -199,31 +252,58 @@ class JobRunner:
                 logger.warning("job_receive_failed", job=name, error=str(exc))
                 await asyncio.sleep(1)
 
+    def _receipt(self, message: Message) -> Message:
+        """The latest receipt of a running message (a redelivery may have replaced it)."""
+        return self._live.get((message.queue, message.id), message)
+
     async def _run(self, name: str, message: Message, gate: asyncio.Semaphore) -> None:
+        try:
+            await self._run_once(name, message, gate)
+        finally:
+            self._live.pop((message.queue, message.id), None)
+
+    async def _run_once(self, name: str, message: Message, gate: asyncio.Semaphore) -> None:
         keep = asyncio.create_task(self._keep_visible(message))
         ident = None
+        limit = asyncio.timeout(self._timeouts.get(name))
         try:
             body = orjson.loads(message.body)
             ident = body.get("id")
             # Per-job timeout (RESCAN S6): a hung job held a worker slot for good.
-            await asyncio.wait_for(self._jobs[name](body["payload"]), self._timeouts.get(name))
+            async with limit:
+                await self._jobs[name](body["payload"])
         except asyncio.CancelledError:
             if self._stop.is_set():  # shut down mid-job: back to the queue, not a failure (S5)
                 with contextlib.suppress(Exception):
-                    await asyncio.shield(self.queues.return_(message))
+                    await asyncio.shield(self.queues.return_(self._receipt(message)))
             raise
         except Exception as exc:
             try:
-                outcome = await self.queues.fail(message, self.settings, delay_secs=5.0)
+                outcome = await self.queues.fail(
+                    self._receipt(message), self.settings, delay_secs=5.0
+                )
             except Exception as fail_exc:
                 outcome = f"not counted: {fail_exc}"
-            kind = "timeout" if isinstance(exc, TimeoutError) else type(exc).__name__
-            logger.warning("job_failed", job=name, error=str(exc), kind=kind, outcome=outcome)
+            # `job_timeout` only when `timeout_secs` ran out: a TimeoutError raised inside the
+            # job (a database timeout) read as the job's own limit (R3JE-13). The traceback
+            # and the id go with it: a job bug could not be found from the logs (R3JE-11).
+            kind = "job_timeout" if limit.expired() else type(exc).__name__
+            log = logger.error if outcome == "dead" else logger.warning
+            log(
+                "job_failed",
+                job=name,
+                id=ident,
+                message=message.id,
+                error=str(exc),
+                kind=kind,
+                outcome=outcome,
+                exc_info=exc,
+            )
             return
         finally:
             keep.cancel()
             gate.release()
-        await self._ack(name, message, ident)
+        await self._ack(name, self._receipt(message), ident)
 
     async def _ack(self, name: str, message: Message, ident: Any) -> None:
         """Acknowledge a finished job, retried apart from the job (RESCAN S8).
@@ -243,7 +323,8 @@ class JobRunner:
                 logger.warning("job_ack_failed", job=name, id=ident, tries=tries, error=str(exc))
                 if time.monotonic() >= give_up:
                     break
-                await asyncio.sleep(random.uniform(0.05, min(2.0, 0.2 * 2**tries)))
+                # Capped exponent: 2**tries overflowed a float after ~1,000 fast failures.
+                await asyncio.sleep(random.uniform(0.05, min(2.0, 0.2 * 2 ** min(tries, 10))))
                 continue
             if acked:
                 logger.info("job_done", job=name, id=ident)
@@ -259,7 +340,9 @@ class JobRunner:
         while True:
             await asyncio.sleep(max(1.0, self.settings.visibility_secs / 3))
             try:
-                if not await self.queues.extend(message, self.settings.visibility_secs):
+                if not await self.queues.extend(
+                    self._receipt(message), self.settings.visibility_secs
+                ):
                     logger.warning("job_lost_visibility", queue=message.queue, message=message.id)
             except Exception as exc:
                 logger.warning("job_extend_failed", message=message.id, error=str(exc))

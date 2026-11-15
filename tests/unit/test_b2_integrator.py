@@ -109,7 +109,9 @@ async def test_liveness_route_reports_dead_loops() -> None:
 def test_register_job_takes_a_timeout() -> None:
     """17: `LLMQueue.register_job` could not pass the job runner's `timeout_secs`."""
     engine = SimpleNamespace(
-        queues=None, settings=SimpleNamespace(queue_prefix=""), metrics=MagicMock()
+        queues=None,
+        settings=SimpleNamespace(queue_prefix="", queue_wait_replicas=0, queue_wait_ms=100),
+        metrics=MagicMock(),
     )
     queue = LLMQueue(engine)  # type: ignore[arg-type]
 
@@ -134,7 +136,11 @@ async def test_send_job_at_the_limit_is_queue_full(monkeypatch: pytest.MonkeyPat
     """send_job raised the queue's internal `QueueFull` (not an LLMQueueError) at the limit."""
     from llm_queue.engine.queue import QueueFull
 
-    engine = SimpleNamespace(queues=None, settings=SimpleNamespace(queue_prefix=""), metrics=None)
+    engine = SimpleNamespace(
+        queues=None,
+        settings=SimpleNamespace(queue_prefix="", queue_wait_replicas=0, queue_wait_ms=100),
+        metrics=None,
+    )
     queue = LLMQueue(engine)  # type: ignore[arg-type]
 
     async def full(*args: Any, **kwargs: Any) -> str:

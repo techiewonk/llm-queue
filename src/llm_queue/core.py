@@ -692,8 +692,11 @@ class LLMQueue:
         """Allow this process to run job `name` (call before `start`).
 
         A run longer than `timeout_secs` is cancelled and counts as a failure (retried, then
-        dead-lettered); None (the default) lets it run as long as it takes.
+        dead-lettered); None (the default) lets it run as long as it takes. `ConfigError` in
+        `caller` mode, which runs no jobs: the job waited unseen (R3JE-6).
         """
+        if self.settings is not None and self.settings.mode == "caller":
+            raise ConfigError(f"job {name}: a process in caller mode runs no jobs")
         self._jobs.register(name, fn, timeout_secs=timeout_secs)
 
     @store_op
