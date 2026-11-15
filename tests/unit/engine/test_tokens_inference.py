@@ -9,6 +9,7 @@ import pytest
 from llm_queue.clients import Usage
 from llm_queue.engine import inference, tokens
 from llm_queue.errors import ConfigError
+from llm_queue.providers.embeddings import COHERE, TITAN
 
 CHAT: dict[str, Any] = {
     "messages": [{"role": "user", "content": [{"text": "x" * 400}]}],
@@ -113,6 +114,7 @@ def test_openai_and_embedding_defaults() -> None:
         {"body": {"inputText": "a"}},
         {"dimensions": 256, "normalize": True, "input_type": "x"},
         {},
+        codec=TITAN,
     )
     assert titan["body"] == {"inputText": "a", "dimensions": 256, "normalize": True}
     cohere = inference.apply(
@@ -121,6 +123,7 @@ def test_openai_and_embedding_defaults() -> None:
         {"body": {"texts": ["a"]}},
         {"input_type": "search_document", "truncate": "END", "dimensions": 256},
         {},
+        codec=COHERE,
     )
     assert cohere["body"] == {"texts": ["a"], "input_type": "search_document", "truncate": "END"}
     assert (

@@ -1,4 +1,4 @@
-"""Provider helpers shared by the clients: error classification, embedding bodies, host checks.
+"""Provider helpers shared by the clients: error classification, embedding codecs, host checks.
 
 The providers themselves (one attempt on a route) live in `llm_queue.clients`. Importing
 this package never imports aiobotocore or openai.
@@ -21,31 +21,33 @@ from llm_queue.providers.embeddings import (
     COHERE_MAX_BATCH,
     OPENAI_DEFAULT_CHUNK_SIZE,
     TITAN_MAX_BATCH,
+    EmbeddingCodec,
     batches,
-    cohere_body,
-    embedding_body,
-    max_batch_size,
-    parse_embeddings,
-    titan_body,
+    codec_for,
+    embedding_families,
+    register_embedding_family,
+    request_body,
+    vector,
 )
 
 __all__ = [
     "COHERE_MAX_BATCH",
     "OPENAI_DEFAULT_CHUNK_SIZE",
     "TITAN_MAX_BATCH",
+    "EmbeddingCodec",
     "StreamTruncated",
     "batches",
     "classify_bedrock",
     "classify_openai",
-    "cohere_body",
-    "embedding_body",
+    "codec_for",
+    "embedding_families",
     "error_family",
     "is_auth_error",
     "is_connection_reset",
     "is_target_error",
-    "max_batch_size",
-    "parse_embeddings",
     "parse_retry_after",
+    "register_embedding_family",
+    "request_body",
     "request_error_kind",
-    "titan_body",
+    "vector",
 ]

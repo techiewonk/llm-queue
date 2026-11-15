@@ -10,6 +10,7 @@ Named hooks an app registers to change one decision without forking the library.
 | Sticky key | `register_sticky_key(name, fn)` | `sticky.key: "custom:<name>"` | `fn(ctx)` returns a key or None (hashed) |
 | Probe | `register_probe(name, fn)` | `probe` | `fn(alias, op) -> params or None` (type `Probe`) for health probes; `op` is `converse`, `chat`, `embeddings` or `invoke_model`; None sends the built-in probe |
 | Token estimator | `register_token_estimator(name, fn)` | `token_estimator` | `fn(op, params) -> input tokens` |
+| Embedding family | `register_embedding_family(name, codec)` | model `family`, or the codec's id `patterns` | an `EmbeddingCodec`: `build_request(texts, options)`, `parse_reply(body)`, `max_batch`, `max_chars`; register before the registry loads ([Embedding families](../how-to/call.md#embedding-families)) |
 | Provider, account kind | `register_provider(name, factory)`, `register_account_kind(kind, provider)` | model `provider`, account `kind` | a `Provider` with `call(op, params, route, timing, sink=None, *, converse_api="converse")` and `classify(exc)` |
 | Others | `register_job`; `from_env(credentials=, secrets=, metrics=, offload=, offload_bytes=, worker_id=)` | | credentials per account, secret source, metrics sink, S3 offload |
 

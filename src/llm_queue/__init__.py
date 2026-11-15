@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     from llm_queue.engine.offload import ResultOffload, S3Offload
     from llm_queue.engine.store_client import Secrets
     from llm_queue.engine.tokens import register_token_estimator
+    from llm_queue.providers.embeddings import EmbeddingCodec, register_embedding_family
     from llm_queue.registry import RegistryError, register_account_kind
     from llm_queue.registry.store import (
         LiveEditRefused,
@@ -99,6 +100,9 @@ _LAZY = {
     "register_provider": "llm_queue.clients.providers",
     "run": "llm_queue.clients.hub",
     "register_token_estimator": "llm_queue.engine.tokens",
+    # Embedding families an app adds without a release (Cohere v4, Nova, ...).
+    "EmbeddingCodec": "llm_queue.providers.embeddings",
+    "register_embedding_family": "llm_queue.providers.embeddings",
     # Types an app writes against (owner decision Q35): a custom provider, its route, a job
     # function, a secrets lookup, and what a publish or rollback did.
     "Provider": "llm_queue.clients.providers",
@@ -121,6 +125,7 @@ __all__ = [
     "DeploymentStatus",
     "DeploymentView",
     "EmbedResult",
+    "EmbeddingCodec",
     "EmfSink",
     "EngineTimings",
     "Health",
@@ -165,6 +170,7 @@ __all__ = [
     "register_account_kind",
     "register_admission",
     "register_balancer",
+    "register_embedding_family",
     "register_fallback_policy",
     "register_probe",
     "register_provider",

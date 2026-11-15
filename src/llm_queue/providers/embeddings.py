@@ -1,13 +1,23 @@
-"""Embedding batching limits and Bedrock request-body builders (Titan, Cohere).
+"""Embedding families: one codec per request / reply shape, and the table that resolves them.
 
-An embed call is split into tasks of at most `max_batch_size` texts: Titan takes one
-text per request, Cohere v3 up to 96, OpenAI `chunk_size` (2048 by default).
+An `EmbeddingCodec` holds everything that differs between embedding model families: how many
+texts one call takes, the longest text, the request body and how the reply becomes vectors.
+`codec_for` picks a model's codec (registry `family`, then provider, then the model id), and
+`register_embedding_family` lets an app add a family (Cohere v4, Nova, ...) without a release.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+import base64
+import re
+import sys
+from array import array
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import Any, Literal, TypeVar, get_args
+
+from llm_queue.errors import ConfigError
 
 _T = TypeVar("_T")  # PEP 695 syntax needs 3.12; the package supports 3.11
 
@@ -18,41 +28,227 @@ OPENAI_DEFAULT_CHUNK_SIZE = 2048
 CohereInputType = Literal["search_document", "search_query", "classification", "clustering"]
 COHERE_INPUT_TYPES = frozenset(get_args(CohereInputType))
 
+# The same rule as a registry alias (`NAME_RE`): a family name goes into the registry document.
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}\Z")
 
-# Longest text each Bedrock family takes, in characters (AWS model pages, not re-checked
-# here): Titan v2 50,000 (8,192 tokens), Cohere v3 2,048. A model's `embed_max_chars` wins.
-MAX_CHARS = {"titan": 50_000, "cohere": 2_048}
+BuildRequest = Callable[[Sequence[str], Mapping[str, Any]], dict[str, Any]]
+ParseReply = Callable[[Any], list[list[float]]]
 
 
-def is_cohere(model_id: str, family: str | None = None) -> bool:
-    """True when the model takes Cohere's body: its registry `family`, else its id.
+@dataclass(frozen=True, slots=True)
+class EmbeddingCodec:
+    """One embedding family: its limits, its request body and how its reply is read.
 
-    The id guess ignores case: it is the one rule for the calls, the batch size and the
-    health probe, which tested the id case-sensitively (R3JE-21). An ARN names no model, so
-    the registry's `family` says it (Q22).
+    `build_request(texts, options)` returns the model's JSON body (Bedrock InvokeModel's `body`,
+    or the OpenAI `embeddings.create` arguments); `options` holds the per-call `input_type` when
+    one is given (registry `inference` defaults are merged later by the worker).
+    `parse_reply(body)` gets the decoded reply body and returns one vector per text, in order;
+    it raises `ValueError` / `TypeError` / `KeyError` on a body it cannot read.
+    `patterns` are case-insensitive substrings of a model id that name this family.
+    `input_types`, when set, is the closed set of `input_type` values the family takes (others
+    fail before any call). `probe_options` go into the health probe's one-text request.
+    `inference_names` are the registry `inference` names (`dimensions`, `normalize`,
+    `input_type`, `truncate`, `embedding_types`) an InvokeModel body of this family takes: the
+    worker fills those from the registry and drops the others; None leaves the body as built.
+    """
+
+    name: str
+    build_request: BuildRequest
+    parse_reply: ParseReply
+    max_batch: int
+    max_chars: int | None = None
+    patterns: tuple[str, ...] = ()
+    input_types: frozenset[str] | None = None
+    probe_options: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    inference_names: frozenset[str] | None = None
+
+    def matches(self, model_id: str) -> bool:
+        """True when one of `patterns` is in the model id, whatever its case (R3JE-21)."""
+        lowered = model_id.lower()
+        return any(pattern.lower() in lowered for pattern in self.patterns)
+
+
+def vector(value: Any) -> list[float]:
+    """One vector as floats: a JSON list of numbers, or base64 of little-endian float32.
+
+    Anything else raises: a base64 string read as a list gave a "vector" of single
+    characters (R3JE-22), and `array` refuses a list holding anything but numbers. Codecs an
+    app registers can use it for the same checks.
+    """
+    if isinstance(value, str):
+        raw = base64.b64decode(value, validate=True)
+        if not raw or len(raw) % 4:
+            raise ValueError("a base64 embedding is not float32")
+        floats = array("f")
+        floats.frombytes(raw)
+        if sys.byteorder == "big":
+            floats.byteswap()
+        return floats.tolist()
+    if not isinstance(value, list) or not value:
+        raise TypeError("an embedding is not a list of numbers")
+    return array("d", value).tolist()
+
+
+def _bedrock_vectors(body: Any) -> list[list[float]]:
+    """Vectors of a Titan (`embedding`) or Cohere (`embeddings`) reply body.
+
+    Both Bedrock families read either shape, as before the codecs; Cohere's typed form
+    (`{"embeddings": {"float": [...]}}`) is accepted too.
+    """
+    if not isinstance(body, Mapping):
+        raise TypeError("the embedding reply is not a JSON object")
+    if "embedding" in body:
+        return [vector(body["embedding"])]
+    vectors = body.get("embeddings")
+    if isinstance(vectors, Mapping):
+        vectors = vectors.get("float")
+    if not isinstance(vectors, list):
+        raise ValueError("response has no 'embedding' or 'embeddings'")
+    return [vector(v) for v in vectors]
+
+
+def _titan_request(texts: Sequence[str], options: Mapping[str, Any]) -> dict[str, Any]:
+    """Titan: exactly one `inputText`; v2 also takes `dimensions` and `normalize`."""
+    if len(texts) != TITAN_MAX_BATCH:
+        raise ValueError(f"Titan takes exactly one text per request, got {len(texts)}")
+    body: dict[str, Any] = {"inputText": texts[0]}
+    for name in ("dimensions", "normalize"):
+        if options.get(name) is not None:
+            body[name] = options[name]
+    return body
+
+
+def _cohere_request(texts: Sequence[str], options: Mapping[str, Any]) -> dict[str, Any]:
+    """Cohere v3: up to 96 `texts`, and `input_type`, `truncate`, `embedding_types` if given."""
+    if len(texts) > COHERE_MAX_BATCH:
+        raise ValueError(f"Cohere takes at most {COHERE_MAX_BATCH} texts, got {len(texts)}")
+    body: dict[str, Any] = {"texts": list(texts)}
+    for name in ("input_type", "truncate", "embedding_types"):
+        if options.get(name):
+            body[name] = options[name]
+    return body
+
+
+def _openai_request(texts: Sequence[str], options: Mapping[str, Any]) -> dict[str, Any]:
+    """OpenAI-compatible: `input`, with the vectors asked for as base64.
+
+    base64 float32 on the way back: the reply is about 3x smaller in the store and far
+    cheaper to write and read than a JSON list of floats (R3PF-10). The SDK asks for base64
+    anyway and decodes it itself; asked explicitly, it hands the string through.
+    """
+    return {"input": list(texts), "encoding_format": "base64"}
+
+
+def _openai_reply(body: Any) -> list[list[float]]:
+    """`data[i].embedding` in `index` order; the indices must be exactly 0..n-1.
+
+    A missing or repeated index put a vector on the wrong text without an error.
+    """
+    data = sorted(body.get("data", []), key=lambda item: item.get("index", 0))
+    if [item.get("index", 0) for item in data] != list(range(len(data))):
+        raise ValueError("embedding indices are not 0..n-1")
+    return [vector(item["embedding"]) for item in data]
+
+
+# Longest text per family, in characters (AWS model pages, not re-checked here): Titan v2
+# 50,000 (8,192 tokens), Cohere v3 2,048. OpenAI counts tokens, so the server decides. A
+# model's `embed_max_chars` wins over these.
+TITAN = EmbeddingCodec(
+    "titan",
+    _titan_request,
+    _bedrock_vectors,
+    TITAN_MAX_BATCH,
+    50_000,
+    ("titan-embed",),
+    # `embedding_types` is kept as the worker kept it before the codecs (unverified that
+    # Titan accepts it; its own field is `embeddingTypes`).
+    inference_names=frozenset({"dimensions", "normalize", "embedding_types"}),
+)
+COHERE = EmbeddingCodec(
+    "cohere",
+    _cohere_request,
+    _bedrock_vectors,
+    COHERE_MAX_BATCH,
+    2_048,
+    ("cohere.embed",),
+    input_types=COHERE_INPUT_TYPES,
+    # Cohere refuses a body without `input_type`; the probe skips the registry defaults.
+    probe_options=MappingProxyType({"input_type": "search_query"}),
+    inference_names=frozenset({"input_type", "truncate", "embedding_types"}),
+)
+OPENAI = EmbeddingCodec("openai", _openai_request, _openai_reply, OPENAI_DEFAULT_CHUNK_SIZE)
+
+_FAMILIES: dict[str, EmbeddingCodec] = {c.name: c for c in (TITAN, COHERE, OPENAI)}
+
+
+def register_embedding_family(name: str, codec: EmbeddingCodec) -> None:
+    """Add (or replace) an embedding family, so a registry model can name it in `family`.
+
+    Register before the registry is loaded, in every process that loads it (callers and
+    workers). Patterns of the newest registration are tried first, so a narrower pattern
+    (`cohere.embed-v4`) wins over a built-in one (`cohere.embed`).
+    """
+    # Checked at run time too: apps call this from untyped code, and a bad codec found here
+    # fails at boot instead of on the first embed call.
+    raw_name: Any = name
+    if not (isinstance(raw_name, str) and _NAME_RE.match(raw_name)):
+        raise ConfigError(f"embedding family name {name!r}: 1-64 lowercase letters, digits, _.-")
+    raw: Any = codec
+    if not isinstance(raw, EmbeddingCodec):
+        raise ConfigError("register_embedding_family needs an EmbeddingCodec")
+    build: Any = codec.build_request
+    parse: Any = codec.parse_reply
+    max_batch: Any = codec.max_batch
+    max_chars: Any = codec.max_chars
+    if not callable(build) or not callable(parse):
+        raise ConfigError(f"embedding family {name!r}: build_request, parse_reply not callable")
+    if not (isinstance(max_batch, int) and max_batch >= 1):
+        raise ConfigError(f"embedding family {name!r}: max_batch must be an int of 1 or more")
+    if max_chars is not None and not (isinstance(max_chars, int) and max_chars >= 0):
+        raise ConfigError(f"embedding family {name!r}: max_chars must be None or an int >= 0")
+    _FAMILIES.pop(name, None)  # re-registering moves it to the front of the id search
+    _FAMILIES[name] = codec if codec.name == name else replace(codec, name=name)
+
+
+def embedding_families() -> tuple[str, ...]:
+    """The names a registry `family` may take: the built-in ones, then the registered ones."""
+    return tuple(_FAMILIES)
+
+
+def codec_for(provider: str, model_id: str, family: str | None = None) -> EmbeddingCodec:
+    """The codec of an embedding model: its registry `family`, its provider, then its id.
+
+    An id no codec matches is a `ConfigError`: it used to be sent Titan's body (one text per
+    call) whatever the model was. Registry validation raises it at load, never mid-call.
     """
     if family is not None:
-        return family == "cohere"
-    return "cohere" in model_id.lower()
-
-
-def family_of(provider: str, model_id: str, family: str | None = None) -> str:
-    """`openai`, `cohere` or `titan` (every other Bedrock model is treated like Titan)."""
+        codec = _FAMILIES.get(family)
+        if codec is None:
+            raise ConfigError(
+                f"unknown embedding family {family!r} (one of {', '.join(_FAMILIES)})"
+            )
+        return codec
     if provider == "openai":
-        return "openai"
-    return "cohere" if is_cohere(model_id, family) else "titan"
+        return _FAMILIES["openai"]
+    for codec in reversed(_FAMILIES.values()):
+        if codec.matches(model_id):
+            return codec
+    raise ConfigError(
+        f"cannot tell the embedding family of {model_id}; set `family` "
+        f"(one of {', '.join(_FAMILIES)})"
+    )
 
 
-def max_batch_size(
-    provider: str, model_id: str, *, chunk_size: int | None = None, family: str | None = None
-) -> int:
-    """Largest number of texts one embedding request may carry for this provider and model.
+def request_body(
+    provider: str, codec: EmbeddingCodec, texts: Sequence[str], options: Mapping[str, Any]
+) -> dict[str, Any]:
+    """The request the engine sends: the codec's body, under `body` for an InvokeModel call.
 
-    Bedrock models other than Cohere are treated like Titan (one text per request).
+    OpenAI-compatible servers take the body as the `embeddings.create` arguments; every other
+    provider (Bedrock, custom ones) as InvokeModel's `body`.
     """
-    if provider == "openai":
-        return chunk_size or OPENAI_DEFAULT_CHUNK_SIZE
-    return COHERE_MAX_BATCH if is_cohere(model_id, family) else TITAN_MAX_BATCH
+    body = codec.build_request(texts, options)
+    return body if provider == "openai" else {"body": body}
 
 
 def batches(items: Sequence[_T], size: int) -> Iterator[list[_T]]:
@@ -61,54 +257,3 @@ def batches(items: Sequence[_T], size: int) -> Iterator[list[_T]]:
         raise ValueError("batch size must be >= 1")
     for start in range(0, len(items), size):
         yield list(items[start : start + size])
-
-
-def titan_body(
-    text: str, *, dimensions: int | None = None, normalize: bool | None = None
-) -> dict[str, Any]:
-    """InvokeModel body for Amazon Titan text embeddings (v2 accepts dimensions/normalize)."""
-    body: dict[str, Any] = {"inputText": text}
-    if dimensions is not None:
-        body["dimensions"] = dimensions
-    if normalize is not None:
-        body["normalize"] = normalize
-    return body
-
-
-def cohere_body(
-    texts: Sequence[str],
-    *,
-    input_type: CohereInputType = "search_document",
-    truncate: Literal["NONE", "START", "END"] | None = None,
-) -> dict[str, Any]:
-    """InvokeModel body for Cohere embed v3 on Bedrock (at most 96 texts)."""
-    if len(texts) > COHERE_MAX_BATCH:
-        raise ValueError(f"Cohere takes at most {COHERE_MAX_BATCH} texts, got {len(texts)}")
-    body: dict[str, Any] = {"texts": list(texts), "input_type": input_type}
-    if truncate is not None:
-        body["truncate"] = truncate
-    return body
-
-
-def embedding_body(model_id: str, texts: Sequence[str], **options: Any) -> dict[str, Any]:
-    """Pick the Titan or Cohere body builder by model id; Titan takes exactly one text."""
-    if is_cohere(model_id):
-        return cohere_body(texts, **options)
-    if len(texts) != TITAN_MAX_BATCH:
-        raise ValueError(f"Titan takes exactly one text per request, got {len(texts)}")
-    return titan_body(texts[0], **options)
-
-
-def parse_embeddings(decoded: Mapping[str, Any]) -> list[list[float]]:
-    """Vectors from a decoded Titan (`embedding`) or Cohere (`embeddings`) response body.
-
-    Cohere's typed form (`{"embeddings": {"float": [...]}}`) is accepted too.
-    """
-    if "embedding" in decoded:
-        return [list(decoded["embedding"])]
-    vectors = decoded.get("embeddings")
-    if isinstance(vectors, Mapping):
-        vectors = vectors.get("float")
-    if not isinstance(vectors, list):
-        raise ValueError("response has no 'embedding' or 'embeddings'")
-    return [list(v) for v in vectors]

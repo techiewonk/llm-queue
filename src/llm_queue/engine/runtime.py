@@ -90,7 +90,7 @@ from llm_queue.providers.classify import (
     is_target_error,
     request_error_kind,
 )
-from llm_queue.providers.embeddings import is_cohere
+from llm_queue.providers.embeddings import codec_for, request_body
 from llm_queue.registry.validate import tpm_refuses
 from llm_queue.tuning import EngineTimings
 
@@ -123,14 +123,15 @@ _MODEL_SPECIFIC = ("additionalModelRequestFields",)
 _TOOL_FIELDS = ("toolConfig", "tools", "tool_choice")
 
 
-def _probe_params(provider: str, kind: str, model_id: str) -> dict[str, Any]:
+def _probe_params(
+    provider: str, kind: str, model_id: str, family: str | None = None
+) -> dict[str, Any]:
     """The default probe request: one short word, one output token."""
     if kind == "embedding":
-        if provider == "openai":
-            return {"input": "ping"}
-        if is_cohere(model_id):  # one rule with the calls: the case of the id ignored (R3JE-21)
-            return {"body": {"texts": ["ping"], "input_type": "search_query"}}
-        return {"body": {"inputText": "ping"}}
+        # The calls' own codec: the probe guessed from the id alone and sent Titan's body to
+        # a Cohere model behind an ARN (registry `family`), which refused every probe.
+        codec = codec_for(provider, model_id, family)
+        return request_body(provider, codec, ["ping"], codec.probe_options)
     if provider == "openai":
         return {"messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}
     return {
@@ -2610,12 +2611,14 @@ class Engine:
                 dropped = (*dropped, *_TOOL_FIELDS)
             params = {k: v for k, v in params.items() if k not in dropped}
             limits = {**limits, "on_exceed": "clamp"}
+        embedding = entry.type == "embedding"
         request = inference.apply(
             entry.provider,
             env.op,
             params,
             view.value(alias, "inference", dep) or {},
             limits,
+            codec=codec_for(entry.provider, entry.model_id, entry.family) if embedding else None,
         )
         extra = view.value(alias, "params", dep) if dep else None
         return inference.merge_params(request, extra or {})
@@ -3625,7 +3628,7 @@ class Engine:
         hook = hooks.get("probe", name)
         params = (
             hooks.call_safely("probe", name, hook, alias, op, default=None) if hook else None
-        ) or _probe_params(entry.provider, entry.type, entry.model_id)
+        ) or _probe_params(entry.provider, entry.type, entry.model_id, entry.family)
         provider = self.providers.get(entry.provider)
         try:
             await provider.call(

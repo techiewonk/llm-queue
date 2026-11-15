@@ -26,7 +26,9 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
 3. **Registry:** rename secret references to `LLMQ_ACCOUNT_*`; fix numbers, names and queue
    names the load error lists (bounds, no trailing newline, no `jobs-` queue names); set
    `queue.retention_secs` where calls wait longer than a day; delete the four removed alert
-   names (they warn until 0.2); keep `inference.embedding_types` at `["float"]`.
+   names (they warn until 0.2); keep `inference.embedding_types` at `["float"]`; set
+   `family` on a Bedrock embedding model whose id names neither `titan-embed` nor
+   `cohere.embed` (an ARN, or a family the app registers).
 4. **Code:** await calls on the queue's own loop instead of using `*_sync` there (Q1); catch
    `request_too_large` for oversize messages and add `invalid_request`,
    `context_length_exceeded` and `worker_shutdown` to kind tables (`llm_queue.Kind`); register
@@ -294,8 +296,27 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
 - `converse_api` is passed only to providers whose `call` accepts it (Q33).
 - A call's send carries its queue's own `retention_secs` (Q27).
 - Performance: <!-- filled at release -->
+- **Embedding families come from one codec table.** Each family (`titan`, `cohere`, `openai`)
+  is an `EmbeddingCodec` holding its batch limit, longest text, request body, reply parser and
+  health-probe options; a model's codec is its registry `family`, else its provider (`openai`),
+  else the first codec whose id pattern matches (`titan-embed`, `cohere.embed`, any case).
+  Batch size, the text-length check, the request, the reply, the health probe and the registry
+  `inference` fields the worker fills all use it (the probe ignored `family`, so a Cohere model
+  behind an ARN was probed with Titan's body; the worker told the families apart by looking
+  for `inputText`).
+  An embedding id no codec matches is now a registry load error ("cannot tell the embedding
+  family of <id>; set `family` (one of ...)"); it used to be sent Titan's body (one text,
+  `inputText`) and every call failed at the provider. `family` is allowed on any embedding
+  model. `llm_queue.providers` no longer has `titan_body`, `cohere_body`, `embedding_body`,
+  `max_batch_size` or `parse_embeddings` (the codecs' `build_request` / `parse_reply` replace
+  them). Request and reply shapes are unchanged.
 
 ### Added
+
+- **`register_embedding_family(name, codec)` and `EmbeddingCodec`**: an app adds an embedding
+  family (Cohere v4, Nova, ...) without a library release; the registry's `family` accepts its
+  name, and its id patterns are tried before the built-in ones. Register it in every process
+  before the registry loads (see docs/how-to/call.md, "Embedding families").
 
 - **`llm-queue cancel ID ... --yes|--dry-run`** (owner Q5, R3SE-5): cancels calls for every
   caller of each id, logs `call_cancel` with `source=cli` and writes an audit entry (`registry

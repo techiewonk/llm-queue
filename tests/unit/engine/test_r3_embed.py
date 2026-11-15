@@ -15,6 +15,7 @@ import pytest
 from llm_queue.engine import embed
 from llm_queue.engine.envelope import Meta, Reply
 from llm_queue.engine.errors import CallFailed
+from llm_queue.providers.embeddings import OPENAI
 from llm_queue.registry.settings import EMBED_INFERENCE
 
 
@@ -107,20 +108,20 @@ def test_r3je22_embedding_types_float_only() -> None:
 def test_r3je22_r3pf10_vectors_are_numbers_or_base64() -> None:
     """R3JE-22: a base64 string became a list of characters. R3PF-10: base64 is decoded."""
     packed = base64.b64encode(struct.pack("<3f", 0.5, -1.0, 2.0)).decode()
-    assert embed.vectors_of("openai", {"data": [{"index": 0, "embedding": packed}]}) == [
+    assert embed.vectors_of("openai", OPENAI, {"data": [{"index": 0, "embedding": packed}]}) == [
         [0.5, -1.0, 2.0]
     ]
     for bad in ("AAA", ["a", "b"], []):
         with pytest.raises((ValueError, TypeError)):
-            embed.vectors_of("openai", {"data": [{"index": 0, "embedding": bad}]})
-    assert embed.request_for("openai", "m", ["a"])["encoding_format"] == "base64"
+            embed.vectors_of("openai", OPENAI, {"data": [{"index": 0, "embedding": bad}]})
+    assert embed.request_for("openai", OPENAI, ["a"])["encoding_format"] == "base64"
 
 
 def test_openai_indices_must_be_complete() -> None:
     """A missing or repeated `index` put a vector on the wrong text with no error."""
     data = [{"index": 0, "embedding": [1.0]}, {"index": 0, "embedding": [2.0]}]
     with pytest.raises(ValueError, match="indices"):
-        embed.vectors_of("openai", {"data": data})
+        embed.vectors_of("openai", OPENAI, {"data": data})
 
 
 async def test_r3je23_mixed_lengths_fail() -> None:

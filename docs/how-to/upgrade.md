@@ -38,6 +38,7 @@ sends it to Bedrock as is. Before the first 0.1.0b2 pod starts:
 | Removed alerts `quota_used_mins`, `spill_pct`, `spill_window_secs`, `waiting_age_secs` | Delete them; they load with a deprecation warning until 0.2 |
 | `inference.extra` takes plain lowercase names only, never SDK arguments | Move refused names into the request |
 | `inference.embedding_types` takes only `["float"]` | Drop other types |
+| An embedding model whose id names no family (`titan-embed`, `cohere.embed`) fails the load; it was sent Titan's body | Set its `family`, or register one ([Embedding families](call.md#embedding-families)) |
 | Checks that were warnings are errors (residency leaving no deployment, a fallback `after_secs` that can never fire, ...) | Fix what the load error names |
 | A `role_arn` must be an IAM role ARN; padded `model_id` / `profile_id` are refused | Fix the values |
 | `min_lib_version` must be a version such as `0.1.0b2` | Fix it or remove it |
