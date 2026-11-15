@@ -86,7 +86,7 @@ def test_r3cf13_allowed_hosts_are_bare_names() -> None:
         ({"LLMQ_CFG_RELOAD_SECS": "1e-9"}, "LLMQ_CFG_RELOAD_SECS must be at least 1"),
         ({"LLMQ_RESULT_TTL_SECS": "9" * 23}, "LLMQ_RESULT_TTL_SECS must be at most"),
         ({"LLMQ_STORE_MAX_CONNECTIONS": "1"}, "LLMQ_STORE_MAX_CONNECTIONS must be at least 4"),
-        ({"LLMQ_STATUS_TTL_SECS": "1"}, "LLMQ_STATUS_TTL_SECS must be at least 60"),
+        ({"LLMQ_STATUS_TTL_SECS": "0"}, "LLMQ_STATUS_TTL_SECS must be at least 1"),
         ({"LLMQ_QUEUE_WAIT_REPLICAS": "99"}, "LLMQ_QUEUE_WAIT_REPLICAS must be at most 16"),
         ({"LLMQ_STORE_MAX_CONNECTIONS": "200.0"}, "must be a whole number"),
     ],

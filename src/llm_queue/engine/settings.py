@@ -314,7 +314,8 @@ class InfraSettings:
             cfg_reload_secs=number("CFG_RELOAD_SECS", 30.0, lo=1, hi=3600),
             result_ttl_secs=number("RESULT_TTL_SECS", 300, int),
             result_dedupe_secs=number("RESULT_DEDUPE_SECS", 0, int, zero=True),
-            status_ttl_secs=number("STATUS_TTL_SECS", 1800, int, lo=60),
+            # At least 1 s; that it outlives a call is the start cross-check's job (R3CF-10).
+            status_ttl_secs=number("STATUS_TTL_SECS", 1800, int, lo=1),
             audit_retention_days=number("AUDIT_RETENTION_DAYS", 90, int, hi=3650),
             lease_secs=lease,
             caller_ttl_secs=caller_ttl,
