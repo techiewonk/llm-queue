@@ -45,6 +45,7 @@ import argparse
 import asyncio
 import collections
 import dataclasses
+import json
 import random
 import statistics
 import sys
@@ -70,12 +71,30 @@ PROXY_PORT = free_port()
 # After a chaos event ends: reconnect backoff, a registry reload, a breaker cooldown (15 s).
 SETTLE_SECS = 20.0
 DRIFT = 0.10  # the last sixth may be this much above the second sixth
+
+
+@dataclasses.dataclass(frozen=True)
+class Options:
+    """The soak's diagnostic switches (on by default; `--no-...` turns one off).
+
+    `driver_accounting`: judge the driver's RSS without its own result list (callers only).
+    `process_numbers`: print each process's start -> end numbers behind the verdict.
+    `save_samples`: write every process sample to `soak-processes.json` in the log folder.
+    """
+
+    driver_accounting: bool = True
+    process_numbers: bool = True
+    save_samples: bool = True
+
+
+RESULT_BYTES = 160  # one gates.Result (slots, interned strings), measured with tracemalloc
 SLACK = {  # plus this much, for small absolute numbers
     "memory_mb": 2.0,
     "keys": 50,
     "scripts_per_s": 10,
     "connections": 4,
     "rss_mb": 8.0,
+    "callers_rss_mb": 8.0,
     "tasks": 5,
 }
 
@@ -120,11 +139,12 @@ def live_env(env_file: Path) -> tuple[dict[str, str], str]:
     return {**env, "AWS_DEFAULT_REGION": region}, region
 
 
-async def soak(profile: Profile, live: Path | None = None) -> bool:
+async def soak(profile: Profile, live: Path | None = None, opts: Options | None = None) -> bool:
     """Run the soak; print a sample every `sample_secs` and the verdict.
 
     With `live` (an env file), the workers call real Bedrock at a small budget (`LIVE_*`).
     """
+    opts = opts or Options()
     minutes, chaos_secs = profile.minutes, profile.chaos_secs
     timeouts = {"timeout_secs": 30, "attempt_timeout_secs": 10, "max_wait_secs": 20}
     rate = 70.0  # calls per second
@@ -277,7 +297,14 @@ async def soak(profile: Profile, live: Path | None = None) -> bool:
                         stats = await worker.stats()
                         if stats is not None:
                             processes.append({"minute": sample["minute"], **stats})
-                    processes.append({"minute": sample["minute"], **process_stats(), "pid": 0})
+                    # The driver also holds every call's result (the run's own record, about
+                    # 150 bytes each): counted apart so its RSS check judges the callers only.
+                    driver = process_stats()
+                    results_mb = len(run.results) * RESULT_BYTES / 1e6
+                    driver["callers_rss_mb"] = driver["rss_mb"] - (
+                        results_mb if opts.driver_accounting else 0.0
+                    )
+                    processes.append({"minute": sample["minute"], **driver, "pid": 0})
                     print(
                         f"  [{sample['minute']:5.1f} min] ok {ok}, failed {len(recent) - ok}, "
                         f"memory {sample['memory_mb']:.0f} MB, keys {keys}, "
@@ -335,9 +362,15 @@ async def soak(profile: Profile, live: Path | None = None) -> bool:
         before = [p for p in mine if warm_min <= p["minute"] <= warm_end]
         after = [p for p in mine if p["minute"] >= last_min]
         if before and after:
-            leaks += [
-                f"{pid or 'driver'} {f}" for f in ("rss_mb", "tasks") if grew(f, before, after)
-            ]
+            # The driver is judged without its own result list (callers_rss_mb).
+            fields = ("callers_rss_mb", "tasks") if pid == 0 else ("rss_mb", "tasks")
+            leaks += [f"{pid or 'driver'} {f}" for f in fields if grew(f, before, after)]
+            for f in fields if opts.process_numbers else ():  # the numbers behind the verdict
+                a = statistics.median(x[f] for x in before)
+                b = statistics.median(x[f] for x in after)
+                print(f"    {pid or 'driver'} {f}: {a:.1f} -> {b:.1f}")
+    if opts.save_samples:  # every process sample (the verdict alone hid the driver's numbers)
+        (log_dir() / "soak-processes.json").write_text(json.dumps(processes), encoding="utf-8")
 
     # Throughput outside chaos: a sample whose stretch touches no chaos window.
     offered = rate * profile.sample_secs
@@ -392,12 +425,21 @@ def main() -> int:
     parser.add_argument("--live", action="store_true", help="real Bedrock, small budget")
     parser.add_argument("--env-file", type=Path, default=Path(__file__).parents[3] / ".env")
     parser.add_argument("--seed", type=int, help="seed of every random choice (default: new)")
+    for name, what in (
+        ("driver-accounting", "judge the driver's RSS without its own result list"),
+        ("process-numbers", "print each process's start -> end numbers"),
+        ("save-samples", "write soak-processes.json to the log folder"),
+    ):
+        parser.add_argument(
+            f"--{name}", action=argparse.BooleanOptionalAction, default=True, help=what
+        )
     args = parser.parse_args()
+    opts = Options(args.driver_accounting, args.process_numbers, args.save_samples)
     seed = args.seed if args.seed is not None else random.randrange(2**31)
     random.seed(seed)
     print(f"  seed {seed} (replay with --seed {seed})", flush=True)
     live = args.env_file if args.live else None
-    return 0 if asyncio.run(soak(PROFILES[args.minutes], live)) else 1
+    return 0 if asyncio.run(soak(PROFILES[args.minutes], live, opts)) else 1
 
 
 if __name__ == "__main__":

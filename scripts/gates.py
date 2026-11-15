@@ -78,9 +78,9 @@ def chat(text: str = "hi", *, tools: bool = False) -> dict[str, Any]:
     return request
 
 
-@dataclass
+@dataclass(slots=True)
 class Result:
-    """One call's outcome."""
+    """One call's outcome (slots, interned strings: a soak keeps ~80,000 of them)."""
 
     sent: float
     ok: bool
@@ -124,9 +124,9 @@ class Run:
                 True,
                 wait_secs=max(0.0, began - sent),
                 total_secs=done - sent,
-                deployment=reply.meta.deployment,
-                model=reply.meta.served_model,
-                worker=reply.meta.worker,
+                deployment=sys.intern(reply.meta.deployment or ""),
+                model=sys.intern(reply.meta.served_model or ""),
+                worker=sys.intern(reply.meta.worker or ""),
                 seen_secs=reply.meta.queue_wait_ms / 1000,
                 priority=bool(kw.get("priority")),
                 order=order,
