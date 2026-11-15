@@ -73,6 +73,30 @@ async def test_a_stored_document_with_live_numbers_is_accepted(full: dict[str, A
     assert protected_mismatches(full, stored) == []
 
 
+@pytest.mark.parametrize("bump", [1, 0])
+def test_only_a_newer_deploy_may_add_or_remove_models(full: dict[str, Any], bump: int) -> None:
+    """Q25 vs R3: a model added or removed by a newer publish was refused by running pods.
+
+    A higher `registry_version` (a newer deploy) may add or remove whole models; at the same
+    version that is still a mismatch (a live edit cannot add a model).
+    """
+    stored = copy.deepcopy(full)
+    stored["registry_version"] = full["registry_version"] + bump
+    stored["models"]["extra"] = copy.deepcopy(stored["models"]["gpt20b"])
+    del stored["models"]["embed-cohere"]
+    assert (protected_mismatches(full, stored) == []) is bool(bump)
+
+
+def test_mode_all_does_not_compare_what_it_edits_live(full: dict[str, Any]) -> None:
+    """Q25: under `live_edit: all` a region list edited live made the pod refuse its own edit."""
+    stored = copy.deepcopy(full)
+    stored["models"]["gpt20b"]["deployments"]["aws-main"]["fallback"] = ["us-east-1"]
+    assert protected_mismatches(full, stored)
+    assert protected_mismatches(full, stored, "all") == []
+    stored["models"]["gpt20b"]["model_id"] = "other.model-v1:0"  # deploy-only in every mode
+    assert protected_mismatches(full, stored, "all")
+
+
 async def test_rollback_keeps_and_lists_the_live_blocks(full: dict[str, Any]) -> None:
     """Q41: the rollback reply did not say which live blocks and kill switch it kept."""
     live = copy.deepcopy(full)

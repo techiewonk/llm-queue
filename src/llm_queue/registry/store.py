@@ -244,19 +244,34 @@ def refused_edits(before: Mapping[str, Any], after: Mapping[str, Any], mode: str
 
 
 def protected_mismatches(
-    config: Mapping[str, Any], stored: Mapping[str, Any]
+    config: Mapping[str, Any], stored: Mapping[str, Any], mode: str = "safe"
 ) -> list[tuple[str, str]]:
     """(path, why) of every protected or deploy-only field where `stored` differs from `config`.
 
-    The same rules as a live edit under `registry_live_edit=safe` (`_deploy_only`,
-    `_protected`, models and accounts added or removed), plus `live_edit` itself. The version
-    fields and the live routing switches are not compared.
+    The same rules as a live edit under `registry_live_edit=mode` (`_deploy_only` always,
+    `_protected` under `safe`, accounts added or removed), plus `live_edit` itself: what that
+    mode lets an operator edit live is not a mismatch. A stored document with a higher
+    `registry_version` (a newer deploy) may add or remove whole models; their accounts and the
+    protected fields of the models both keep are still compared. The version fields and the
+    live routing switches are not compared.
     """
+    old_version, new_version = config.get("registry_version"), stored.get("registry_version")
+    newer = (
+        isinstance(old_version, int) and isinstance(new_version, int) and new_version > old_version
+    )
+    old_models, new_models = config.get("models"), stored.get("models")
+    swapped = (
+        set(old_models) ^ set(new_models)
+        if newer and isinstance(old_models, Mapping) and isinstance(new_models, Mapping)
+        else set()
+    )
     out: list[tuple[str, str]] = []
     for path, _, _ in diff(dict(config), dict(stored)):
         if path[:1] in (("registry_version",), ("min_lib_version",)):
             continue
-        why = _deploy_only(path) or _protected(path)
+        if path[:1] == ("models",) and len(path) >= 2 and path[1] in swapped:
+            continue  # a model a newer deploy added or removed (R3: it must reach running pods)
+        why = _deploy_only(path) or (_protected(path) if mode == "safe" else None)
         if why is None and path[:1] in (("models",), ("accounts",)) and len(path) == 2:
             why = "adding or removing a model or an account changes only with a deploy"
         if why is not None:
@@ -527,7 +542,8 @@ class RegistryStore:
         A pod that holds its own config also refuses a stored document whose protected fields
         (accounts and their roles, model ids, residency, region lists, `live_edit`, ...) differ
         from it (owner decision Q25, R3SE-3): anyone who could write the key could send prompts
-        to another AWS account or model after a schema check only.
+        to another AWS account or model after a schema check only. What the config's live-edit
+        mode allows live, and models a newer deploy adds or removes, are not mismatches.
         """
         registry, errors, _ = check(doc, strict=False, allowed_hosts=self._hosts)
         if registry is not None and needs_newer_lib(registry.min_lib_version):
@@ -537,7 +553,7 @@ class RegistryStore:
             ]
             registry = None
         mismatched = (
-            protected_mismatches(self.config, doc)
+            protected_mismatches(self.config, doc, self.live_edit_mode(self.config))
             if registry is not None and self.config is not None
             else []
         )
