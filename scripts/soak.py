@@ -237,7 +237,10 @@ async def soak(profile: Profile, live: Path | None = None) -> bool:
                         victim = random.choice([w for w in gate.fleet if w.proc.poll() is None])
                         await gate.workers(1)
                         await victim.stop()
-                    chaos_windows.append((start - 1, time.monotonic() - run.t0 + SETTLE_SECS))
+                    # FT-20: the settle scales with the profile (20 s after every 30 s event
+                    # made almost all of soak3 'chaos', so its calm checks judged little).
+                    settle = min(SETTLE_SECS, chaos_secs / 3)
+                    chaos_windows.append((start - 1, time.monotonic() - run.t0 + settle))
                     print(f"  [{start / 60:5.1f} min] chaos: {event}", flush=True)
 
             async def sampler() -> None:
@@ -359,14 +362,16 @@ async def soak(profile: Profile, live: Path | None = None) -> bool:
         <= {"rate_limited", "deadline_exceeded", "queue_unavailable"},
         "no answer after its deadline": not late,
         "nothing in progress at the end": inprog == 0,
+        "8 workers alive at the end (every killed one replaced)": held == 8,
         "store memory flat": flat("memory_mb"),
         "store keys flat": flat("keys"),
         "store calls per second flat": flat("scripts_per_s"),
         "store connections flat": flat("connections"),
         f"per process RSS and tasks flat {leaks or ''}".rstrip(): not leaks,
-        f"outside chaos >= 0.9 x offered served ({len(calm)} samples) {slow or ''}".rstrip(): bool(
+        f"outside chaos >= 0.9 x offered served ({len(calm)} samples) {slow or ''}".rstrip(): len(
             calm
         )
+        >= 2  # FT-20: one calm sample is too few to judge throughput
         and not slow,
     }
     for name, ok in checks.items():
