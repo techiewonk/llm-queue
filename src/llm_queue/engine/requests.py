@@ -23,6 +23,7 @@ from redis.exceptions import OutOfMemoryError, ReadOnlyError, ResponseError
 from redis.exceptions import TimeoutError as StoreTimeoutError
 
 from llm_queue._logging import get_logger
+from llm_queue.engine._admission_lua import _COMMON, _SETTLE
 from llm_queue.engine._codec import text as _text
 from llm_queue.engine.envelope import Reply
 from llm_queue.engine.errors import CallFailed
@@ -254,6 +255,46 @@ return 0
 """
 )
 
+# The end of a call that succeeded, when the queues share the state store (FL-22): RESULT_PUT,
+# then the message's ACK, then FINISH of the grant, in one round trip (three scripts in two
+# round trips before, and a window where the result was stored while the slot waited). KEYS:
+# result, job, callers, status, then the queue's keys (`_PARTS` order). ARGV: prefix, FINISH's
+# JSON, clock ('' : the store's), reply JSON, result ttl, final state, keep secs, channel
+# prefix, request id, status ttl, message id, generation, then status field / value pairs.
+# FINISH runs under `pcall`: a failing settle never undoes the stored result or the ack (they
+# were separate scripts, and a refused FINISH only logged). Reply: {written, acked, settled},
+# settled -1 when FINISH raised (its error is the 4th element).
+SETTLE_DONE = (
+    _COMMON
+    + _SETTLE
+    + _STATUS_FN
+    + """
+local written = redis.call('SET', KEYS[1], ARGV[4], 'NX', 'EX', tonumber(ARGV[5]))
+if redis.call('EXISTS', KEYS[2]) == 1 then
+  redis.call('HSET', KEYS[2], 'state', ARGV[6])
+  redis.call('EXPIRE', KEYS[2], tonumber(ARGV[7]))
+end
+for _, caller in ipairs(redis.call('SMEMBERS', KEYS[3])) do
+  redis.call('PUBLISH', ARGV[8] .. caller, ARGV[9])
+end
+redis.call('EXPIRE', KEYS[3], tonumber(ARGV[7]))
+set_status(KEYS[4], ARGV[6], tonumber(ARGV[10]), 13)
+local acked = 0
+if redis.call('HGET', KEYS[7], ARGV[11]) == ARGV[12] then
+  redis.call('XDEL', KEYS[5], ARGV[11])
+  redis.call('ZREM', KEYS[6], ARGV[11])
+  redis.call('HDEL', KEYS[7], ARGV[11])
+  redis.call('HDEL', KEYS[8], ARGV[11])
+  redis.call('HDEL', KEYS[9], ARGV[11])
+  acked = 1
+end
+local ok, settled = pcall(settle, req.alias, req.owner, req.request_id, num(req.refund_r, 0),
+  num(req.refund_t, 0), true, req.outcome, num(req.latency_ms, -1), num(req.retry_after_ms, 0))
+if not ok then return {written and 1 or 0, acked, -1, tostring(settled)} end
+return {written and 1 or 0, acked, settled}
+"""
+)
+
 # KEYS: result, job. ARGV: dedupe secs. After its first read a result of a library-made id lives
 # only `dedupe secs` more (an app-supplied id keeps its TTL).
 _DROP_READ = """
@@ -380,6 +421,7 @@ class RequestStore:
         self._drop_read = client.register_script(RESULT_DROP)
         self._status = client.register_script(STATUS_SET)
         self._cancel = client.register_script(CANCEL)
+        self._settle_done = client.register_script(SETTLE_DONE)
 
     def _req(self, request_id: str) -> tuple[str, str, str, str]:
         k = self.keys
@@ -521,6 +563,57 @@ class RequestStore:
             # stay until the bucket rule removed it (R3JE-29).
             await self._delete_object(data[len(MARKER) :].decode())
         return bool(written)
+
+    async def put_result_settled(
+        self,
+        reply: Reply,
+        *,
+        final_state: str,
+        status: Mapping[str, Any],
+        queue_keys: Sequence[str],
+        message_id: str,
+        generation: int | str,
+        finish: Sequence[Any],
+    ) -> tuple[bool, bool, int]:
+        """`put_result`, the message's ack and the grant's FINISH in one round trip (FL-22).
+
+        Only when the queue lives in this store. `finish` is `Admission.finish_args(...)`.
+        Safe to call again after a store error, as each part is (the result is set once, the
+        ack checks its receipt, FINISH its owner). Returns (result written, acked, settled);
+        settled is -1 when FINISH raised (logged; the result and the ack stand).
+        """
+        job, callers, status_key, result = self._req(reply.request_id)
+        data = await self._prepared(reply)
+        prefix, finish_json, clock = finish
+        args: list[Any] = [
+            prefix,
+            finish_json,
+            clock,
+            data,
+            self.result_ttl_secs,
+            final_state,
+            self.status_ttl_secs,
+            f"{self.keys.prefix}:done:",
+            reply.request_id,
+            self.status_ttl_secs,
+            message_id,
+            generation,
+            *_pairs(status),
+        ]
+        try:
+            out = await self._settle_done([result, job, callers, status_key, *queue_keys], args)
+        except BaseException:
+            self._unsent[reply.request_id] = (reply, data)  # as `put_result` (EN-3)
+            while len(self._unsent) > _UNSENT_MAX:
+                self._unsent.pop(next(iter(self._unsent)))
+            raise
+        self._unsent.pop(reply.request_id, None)
+        written, acked, settled = bool(out[0]), bool(out[1]), int(out[2])
+        if settled < 0:
+            logger.warning("finish_failed", request_id=reply.request_id, error=_text(out[3]))
+        if not written and data.startswith(MARKER):
+            await self._delete_object(data[len(MARKER) :].decode())
+        return written, acked, settled
 
     async def _delete_object(self, ref: str) -> None:
         """Delete an offloaded object no marker points to; a failure is only logged."""

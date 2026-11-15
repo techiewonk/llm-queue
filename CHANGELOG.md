@@ -862,6 +862,12 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
   per-caller inbox stream (one key per read) is not done.
 - `stream()` reads each chunk entry with one queue get; a Task and an `asyncio.wait` per entry
   cost 42 us each (R3PF-11, caller side; the worker still flushes one pipeline per stream).
+- A queued call that succeeded ends in one script when the queues share the state store
+  (`SETTLE_DONE`: result, status, ack, then FINISH): one round trip instead of two (RESULT_PUT,
+  then FINISH and ACK together), and no window where the result is stored while the slot
+  waits (FL-22). A separate queue store keeps the old path. Local Valkey 8.1, 1,000 calls per
+  side, interleaved, 2 KB answer: 4.4-4.6 ms -> 2.2-2.3 ms median, p90 11.0-11.4 -> 5.0-5.5 ms
+  (Python 3.12.13, Windows, 2026-11-15).
 - A call's params are encoded once: the size cap's orjson bytes are spliced into the message
   (`orjson.Fragment`) instead of `Envelope.dumps` encoding them again (FO-21). Size cap plus
   message, median: a 2 MB image request 16.3 -> 9.4 ms, a 200 KB text request 70 -> 47 us, a

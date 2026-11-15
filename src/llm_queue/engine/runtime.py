@@ -3702,6 +3702,17 @@ class Engine:
                 await self._debug(env.request_id, params, result.response)  # (never in prod)
             except Exception as exc:
                 logger.warning("debug_capture_failed", request_id=env.request_id, error=str(exc))
+        status = {
+            "deployment": dep_key,
+            "served_model": alias,
+            "attempts": attempt,
+            "tokens_in": result.usage.input_tokens,
+            "tokens_out": result.usage.output_tokens,
+        }
+        if self.queues_shared and held.message is not None:
+            await self._settle_done(held, alias, owner, reply, status, refund, latency)
+            await self._count_target_errors(held, succeeded=True)
+            return _AttemptResult("ok")
         # The caller first: its result, with the final status in the same script. Then the
         # grant and the message are settled together (four round trips one after another
         # before the caller was woken, before).
@@ -3709,17 +3720,7 @@ class Engine:
         # released the message, which ran a second time once it showed again (failover drills:
         # 1 call run twice, 61 s). Held meanwhile, so the heartbeat keeps its grant and message.
         await self._through_outage(
-            lambda: self.requests.put_result(
-                reply,
-                final_state="done",
-                status={
-                    "deployment": dep_key,
-                    "served_model": alias,
-                    "attempts": attempt,
-                    "tokens_in": result.usage.input_tokens,
-                    "tokens_out": result.usage.output_tokens,
-                },
-            )
+            lambda: self.requests.put_result(reply, final_state="done", status=status)
         )
         # Settled from here: a failure below must neither renew the grant nor refund the whole
         # estimate of a call that succeeded (`_release`). `return_exceptions`: a FINISH refused
@@ -3751,6 +3752,59 @@ class Engine:
             raise acked
         await self._count_target_errors(held, succeeded=True)
         return _AttemptResult("ok")
+
+    async def _settle_done(
+        self,
+        held: _Held,
+        alias: str,
+        owner: str,
+        reply: Reply,
+        status: Mapping[str, Any],
+        refund: tokens.Refund,
+        latency: float,
+    ) -> None:
+        """Result, ack and FINISH of a call that succeeded, in one round trip (FL-22).
+
+        Queues in the state store only. It was RESULT_PUT, then FINISH and ACK together: two
+        round trips, three scripts, and a window where the result was stored while the slot
+        waited. Through a store outage as the result and ack were (the answer is in hand).
+        """
+        message = held.message
+        assert message is not None  # the caller checks: a direct run has no message
+        env = held.envelope
+        finish = self.admission.finish_args(
+            alias,
+            owner,
+            env.request_id,
+            refund_r=refund.requests,
+            refund_t=refund.tokens,
+            outcome="ok",
+            latency_ms=latency,
+        )
+        out: list[tuple[bool, bool, int]] = []
+
+        async def write() -> None:
+            out.append(
+                await self.requests.put_result_settled(
+                    reply,
+                    final_state="done",
+                    status=status,
+                    queue_keys=self.queues.queue_keys(message.queue),
+                    message_id=message.id,
+                    generation=message.generation,
+                    finish=finish,
+                )
+            )
+
+        await self._through_outage(write, held)
+        held.grants.discard((alias, owner))  # settled: never renewed or refunded again
+        _, acked, settled = out[-1]
+        if settled == 0:
+            self.admission.grant_lost(alias, env.request_id)
+        if not acked:
+            logger.warning("ack_stale_receipt", request_id=env.request_id, model=env.model)
+            self.metrics.count("llmq_stale_acks_total", model=env.model)
+        self._drop(held)
 
     async def _target_error(
         self, view: ResolvedRegistry, alias: str, held: _Held, dep_key: str, exc: BaseException

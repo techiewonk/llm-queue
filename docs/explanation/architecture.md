@@ -79,7 +79,7 @@ flowchart LR
 | `engine/runtime.py` | `Engine`: caller (register, send, wait), worker loops, held calls, attempts, retries, fallback, direct path, `store_down`, cancel, every background task |
 | `engine/_admission_lua.py`, `engine/admission.py` | Lua `PICK_TAKE`, `FINISH`, `UNDO`, `RENEW`, `SWEEP`, `REREGISTER` and their Python wrapper |
 | `engine/queue.py` | `StreamQueues`: a queue on a stream with visibility, generation, failures and dead letters (`SEND`, `RECEIVE`, `RETURN`, `EXTEND`, `FAIL`, `ACK`, `DEPTH`, `REDRIVE`), doorbells |
-| `engine/requests.py` | `RequestStore`: claim record, callers set, result, status (`REGISTER`, `CONFIRM`, `ABANDON`, `RESULT_PUT`, `RESULT_TAKE`, `STATUS_SET`, `CALLERS_ALIVE`) |
+| `engine/requests.py` | `RequestStore`: claim record, callers set, result, status (`REGISTER`, `CONFIRM`, `ABANDON`, `RESULT_PUT`, `SETTLE_DONE`, `RESULT_TAKE`, `STATUS_SET`, `CALLERS_ALIVE`) |
 | `engine/streaming.py` | `ChunkWriter` (worker) and `ChunkReader` (one per caller process) over `P:{r:ID}:chunks` |
 | `engine/status.py` | `StatusReader` (one `_MODEL_STATUS` script per model) and `AlertEvaluator` |
 | `engine/health.py` | Target-error counting, auto-disable, probe outcomes (`RECORD`, `PROBED`) |

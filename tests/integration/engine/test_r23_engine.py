@@ -908,6 +908,31 @@ async def test_cg3_a_failing_queue_store_sends_calls_direct(make: Make) -> None:
         await queue_store.aclose()
 
 
+async def test_fl22_a_call_ends_in_one_script_on_a_shared_store(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FL-22: the end of a queued call was RESULT_PUT, then FINISH and ACK (two round trips).
+
+    With the queue in the state store it is one script: the three separate writes are not
+    used, and the grant, the message and the result are all settled.
+    """
+    engine, _ = await make()
+
+    async def unused(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("settled by its own script")
+
+    monkeypatch.setattr(engine.requests, "put_result", unused)
+    monkeypatch.setattr(engine.admission, "finish", unused)
+    monkeypatch.setattr(engine.queues, "ack", unused)
+    reply = await engine.call("small", CHAT, request_id="fl22", timeout_secs=10)
+    assert reply.ok
+    await _until(lambda: not engine._held, what="the call settled")  # woken inside the script
+    name = engine._queue_name(engine.registry.current, "small", False)
+    assert await engine.state.xlen(engine.queues.queue_keys(name)[0]) == 0  # acked
+    entry = f"{engine.keys.prefix}:{{m:small}}:inprog:fl22"
+    assert not await engine.state.exists(entry)  # the grant is finished
+
+
 async def test_fe5_amend_callers_take_over_a_dead_direct_run(make: Make) -> None:
     """AMEND FE-5: a direct run whose process died left the record confirmed with no result;
     attached callers and every retry of the id waited to their deadline (`deadline_exceeded`).

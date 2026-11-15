@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import asyncio
 
+import orjson
 import pytest
 import redis.asyncio
 
 from llm_queue.engine.envelope import Envelope, Reply, params_hash, parse
 from llm_queue.engine.keys import Keys
-from llm_queue.engine.queue import QueueSettings
+from llm_queue.engine.queue import QueueSettings, StreamQueues
 from llm_queue.engine.requests import RequestStore
 from llm_queue.errors import UnsupportedEnvelopeError
 
@@ -291,3 +292,45 @@ async def test_fe5_a_dead_direct_runner_is_taken_over(
     await requests.confirm("req-1", keep_secs=120)
     await store.delete(keys.caller("pod-c"))
     assert await _register(requests, "pod-d") == "attached"
+
+
+async def test_fl22_result_ack_and_finish_in_one_script(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-22: the end of a call was RESULT_PUT, then FINISH and ACK: two round trips.
+
+    One script now stores the result, acks the message and finishes the grant. A FINISH that
+    raises (here a corrupt grant entry) leaves the result and the ack standing, as when they
+    were separate scripts; a replay stores nothing twice.
+    """
+    keys = Keys(prefix)
+    requests = _store(store, prefix)
+    queues = StreamQueues(store, keys)
+    settings = QueueSettings(visibility_secs=60, max_receives=3, max_waiting=0)
+    await _register(requests, "pod-a")
+    await queues.send("q", b"body", settings)
+    [message], _ = await queues.receive("q", 1, settings)
+    entry = f"{prefix}:{{m:m}}:inprog:req-1"
+    await store.hset(entry, mapping={"owner": "o1", "bud": "{bad", "mode": "fixed"})
+    finish = [prefix, orjson.dumps({"alias": "m", "owner": "o1", "request_id": "req-1"}), ""]
+
+    async def settle(response: dict[str, int]) -> tuple[bool, bool, int]:
+        return await requests.put_result_settled(
+            Reply(request_id="req-1", ok=True, response=response),
+            final_state="done",
+            status={"served_model": "m"},
+            queue_keys=queues.queue_keys("q"),
+            message_id=message.id,
+            generation=message.generation,
+            finish=finish,
+        )
+
+    assert await settle({"x": 1}) == (True, True, -1)
+    assert await store.xlen(keys.queue("q", "s")) == 0  # acked
+    taken = await requests.take_result("req-1")
+    assert taken is not None
+    assert taken.response == {"x": 1}
+    assert (await requests.status("req-1"))["state"] == "done"
+    assert await settle({"x": 2}) == (False, False, -1)  # a replay: nothing written twice
+    await store.delete(entry)
+    assert await settle({"x": 3}) == (False, False, 0)  # the grant is gone: settled 0
