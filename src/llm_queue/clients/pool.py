@@ -380,6 +380,14 @@ class ClientPool:
         size = self._sizes.get((account.name, route.region), self._options.max_pool_connections)
         transport = self._options.transport
         unknown = sorted(set(extra) - _AWS_KEYS)
+        if extra.get("verify") is False or extra.get("use_ssl") is False:
+            # Owner decision Q31 (R3SE-12): allowed everywhere, never silent.
+            self._warn_once(
+                "bedrock_tls_verify_off",
+                account.name,
+                hint="credentials= turned TLS verification off; set AWS_CA_BUNDLE or "
+                "REQUESTS_CA_BUNDLE to trust a private CA instead",
+            )
         if transport == "aiohttp" and unknown and not account.role_arn and expiry is None:
             # Never raise into a call for this (CL-6): botocore takes these keys. botocore
             # follows redirects (CL-4), re-sending the signed request and session token to
