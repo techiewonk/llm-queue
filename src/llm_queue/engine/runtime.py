@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import hmac
 import inspect
@@ -2742,40 +2743,53 @@ class Engine:
                 await self.queues.return_(held.message, delay_secs=delay)
             return None
         if decision.kind == "none":
-            has_fallback = any(d.group == "fallback" for d in view.deployments(alias))
-            rule = view.value(alias, "fallback")
-            if not held.broken and has_fallback and rule and "broken" in rule["on"]:
-                held.broken = True
-                age = self.clock.now() - held.position_ms / 1000.0
-                if age < float(rule["after_secs"]):
-                    return Decision(
-                        "wait", wait_secs=float(rule["after_secs"]) - age, reason="broken"
-                    )
-                return await self._decide(view, alias, held, attempt, failed)
-            fell = await self._model_fallback(view, alias, held, attempt, 1e9, broken=True)
-            if not fell:
-                due = await self.health.disabled(alias)
-                wait = max(1.0, min(due.values()) - self.clock.now()) if due else 60.0
-                # Why no deployment was usable, per deployment: an operator needs to tell an
-                # open breaker from a disabled deployment (the bare line said neither).
-                # The breakers in one pipelined round trip: one HGETALL per deployment, one
-                # after another, on a path that already failed (audit RT-31).
-                why: dict[str, str] = {}
-                deps = list(view.deployments(alias))
-                with contextlib.suppress(*STORE_ERRORS):  # the line goes out without them
-                    async with self.state.pipeline(transaction=False) as pipe:
-                        for dep in deps:
-                            pipe.hget(self.keys.breaker(alias, dep.key), "state")
-                        states = await pipe.execute()
-                    for dep, raw in zip(deps, states, strict=True):
-                        disabled = " (disabled)" if dep.key in due else ""
-                        why[dep.key] = f"breaker {text(raw or b'closed')}{disabled}"
-                logger.error("model_unavailable", model=alias, deployments=why)
-                await self._finish_call(
-                    held, "model_unavailable", "no usable deployment", retry_after=wait
-                )
-            return None
+            return await self._none_usable(view, alias, held, attempt, failed)
         return decision
+
+    async def _none_usable(
+        self,
+        view: ResolvedRegistry,
+        alias: str,
+        held: _Held,
+        attempt: int,
+        failed: frozenset[str],
+    ) -> Decision | None:
+        """No deployment is usable: the fallback group, then fallback models, else unavailable.
+
+        `model_unavailable` says why per deployment. Its own method: `_decide` mixed it with
+        admission and registry repair in 125 lines (FE-22).
+        """
+        has_fallback = any(d.group == "fallback" for d in view.deployments(alias))
+        rule = view.value(alias, "fallback")
+        if not held.broken and has_fallback and rule and "broken" in rule["on"]:
+            held.broken = True
+            age = self.clock.now() - held.position_ms / 1000.0
+            if age < float(rule["after_secs"]):
+                return Decision("wait", wait_secs=float(rule["after_secs"]) - age, reason="broken")
+            return await self._decide(view, alias, held, attempt, failed)
+        fell = await self._model_fallback(view, alias, held, attempt, 1e9, broken=True)
+        if not fell:
+            due = await self.health.disabled(alias)
+            wait = max(1.0, min(due.values()) - self.clock.now()) if due else 60.0
+            # Why no deployment was usable, per deployment: an operator needs to tell an
+            # open breaker from a disabled deployment (the bare line said neither).
+            # The breakers in one pipelined round trip: one HGETALL per deployment, one
+            # after another, on a path that already failed (audit RT-31).
+            why: dict[str, str] = {}
+            deps = list(view.deployments(alias))
+            with contextlib.suppress(*STORE_ERRORS):  # the line goes out without them
+                async with self.state.pipeline(transaction=False) as pipe:
+                    for dep in deps:
+                        pipe.hget(self.keys.breaker(alias, dep.key), "state")
+                    states = await pipe.execute()
+                for dep, raw in zip(deps, states, strict=True):
+                    disabled = " (disabled)" if dep.key in due else ""
+                    why[dep.key] = f"breaker {text(raw or b'closed')}{disabled}"
+            logger.error("model_unavailable", model=alias, deployments=why)
+            await self._finish_call(
+                held, "model_unavailable", "no usable deployment", retry_after=wait
+            )
+        return None
 
     async def _registry_step(self, step: Awaitable[object], name: str) -> bool:
         """Run a registry reload or refresh for a call; False (logged) when its data is bad.
@@ -3110,6 +3124,8 @@ class Engine:
         attempt was counted for the retry budget by its grant (PICK_TAKE, `count_first`).
         """
         env = held.envelope
+        # This grant's FINISH: alias, owner and request id were repeated at nine sites (FE-22).
+        settle = functools.partial(self.admission.finish, alias, owner, env.request_id)
         entry = view.registry.models.get(alias)
         deployment = (
             next((d for d in view.deployments(alias) if d.key == dep_key), None) if entry else None
@@ -3119,10 +3135,7 @@ class Engine:
             # back in full and try another. `next()` without a default raised StopIteration,
             # logged as a bare `run_failed` and the call was run again (audit RT-16).
             charged = held.estimates.get((alias, owner))
-            await self.admission.finish(
-                alias,
-                owner,
-                env.request_id,
+            await settle(
                 refund_r=1,
                 refund_t=charged.total if charged else 0,
                 outcome="none",
@@ -3138,9 +3151,7 @@ class Engine:
         try:
             params = self._params(view, alias, env, dep_key)
         except inference.InferenceRejected as exc:  # this deployment's own limit (RESCAN P4)
-            await self.admission.finish(
-                alias, owner, env.request_id, refund_r=1, refund_t=estimate.total, outcome="none"
-            )
+            await settle(refund_r=1, refund_t=estimate.total, outcome="none")
             return _AttemptResult("invalid", "invalid_request", None, exc)
         remaining = max(0.1, self._deadline(held) - self.clock.now())
         attempt_budget = float(view.value(alias, "attempt_timeout_secs", dep_key))
@@ -3179,10 +3190,7 @@ class Engine:
                 streamed = await self.state.xlen(writer.key)
             if streamed:
                 # Another worker already streamed part of this answer (plan R19).
-                await self.admission.finish(
-                    alias,
-                    owner,
-                    env.request_id,
+                await settle(
                     refund_r=1,
                     refund_t=estimate.total,
                     outcome="none",
@@ -3219,10 +3227,7 @@ class Engine:
             if writer is not None and writer.sent:
                 # Chunks reached the caller: end the stream with the partial text (plan §3.13).
                 refund = tokens.refund(estimate, "cut")
-                await self.admission.finish(
-                    alias,
-                    owner,
-                    env.request_id,
+                await settle(
                     refund_r=refund.requests,
                     refund_t=refund.tokens,
                     outcome="none" if ours else "fail",
@@ -3247,10 +3252,7 @@ class Engine:
                     )
                 return _AttemptResult("stream_failed", kind, writer.partial_text, exc)
             if ours:  # nothing sent: the call is given back and runs again (`_run`)
-                await self.admission.finish(
-                    alias,
-                    owner,
-                    env.request_id,
+                await settle(
                     refund_r=1,
                     refund_t=estimate.total,
                     outcome="none",
@@ -3263,10 +3265,7 @@ class Engine:
             # (scripts/load.py). Only that timer: an attempt's own first-response or idle
             # timeout is the provider's, so a hung region trips its breaker (RESCAN P3).
             if outer.expired():
-                await self.admission.finish(
-                    alias,
-                    owner,
-                    env.request_id,
+                await settle(
                     refund_r=0,
                     refund_t=0,
                     outcome="none",
@@ -3275,10 +3274,7 @@ class Engine:
                 return _AttemptResult("retry", "retryable", None, exc)
             if info.kind is ErrorKind.THROTTLE:
                 refund = tokens.refund(estimate, "throttle")
-                await self.admission.finish(
-                    alias,
-                    owner,
-                    env.request_id,
+                await settle(
                     refund_r=refund.requests,
                     refund_t=refund.tokens,
                     outcome="throttle",
@@ -3292,10 +3288,7 @@ class Engine:
                 # region; one retry on another deployment, without charging the breaker (P9).
                 held.model_retried = True
                 refund = tokens.refund(estimate, "fail")
-                await self.admission.finish(
-                    alias,
-                    owner,
-                    env.request_id,
+                await settle(
                     refund_r=refund.requests,
                     refund_t=refund.tokens,
                     outcome="none",
@@ -3303,10 +3296,7 @@ class Engine:
                 return _AttemptResult("retry", "model_error", None, exc)
             if info.kind is ErrorKind.RETRYABLE or isinstance(exc, TimeoutError):
                 refund = tokens.refund(estimate, "cut" if cut else "fail")
-                await self.admission.finish(
-                    alias,
-                    owner,
-                    env.request_id,
+                await settle(
                     refund_r=refund.requests,
                     refund_t=refund.tokens,
                     outcome="fail",
@@ -3314,10 +3304,7 @@ class Engine:
                 )
                 return _AttemptResult("retry", "retryable", None, exc)
             refund = tokens.refund(estimate, "throttle")  # refused before it ran: all back
-            await self.admission.finish(
-                alias,
-                owner,
-                env.request_id,
+            await settle(
                 refund_r=refund.requests,
                 refund_t=refund.tokens,
                 outcome="none",

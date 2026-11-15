@@ -110,6 +110,52 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 - OpenAI stream events keep the wire shape: nulls the server sent (`finish_reason: null`,
   `content: null`) are kept, so `chunk["choices"][0]["finish_reason"]` no longer raises
   `KeyError`; `partial_text` counts only choice 0 (R3ST-10).
+- **Breaking: a sync call on the queue's own event loop is refused** (Q1, R3AP-1).
+  `converse_sync` / `chat_sync` / `embed_sync` (and LangChain's `invoke`) on the thread that
+  runs a started queue's loop would deadlock; it raises `LLMQueueError` naming the fix.
+  **Migration:** in async code await the call: `await llmq.converse(...)` (or `chat` /
+  `embed`), and in LangChain `await chat.ainvoke(...)` / `await chat.astream(...)`. Sync code
+  on another thread (or a process with no started loop) is unchanged.
+- **Delivery is at least once** (D1). A caller whose call record the store lost (restart
+  without persistence, flush, a promotion that lost writes) sends it again: the result sweep
+  finds records gone, and an epoch or `master_replid` change runs it at once (R3FM-4, R3RC-2,
+  R3FM-8). A rare second provider run is the accepted cost.
+- **Only a success is replayed for an app request id** (Q2): a retry of an id whose last run
+  ended failed, expired or cancelled runs again.
+- **Cancel wins for a shared id** (Q3, Q5, R3RC-1): any caller's cancel (an explicit
+  `cancel()` or a cancelled awaiting task) stops the call for every caller of the id, in one
+  atomic script; an attach while the cancel is pending gets `cancelled`. Every cancel is logged
+  (`call_cancel`, with its `source`). Two local waiters on one id are no longer exempt.
+- **The caller liveness key lives two heartbeats at least** (`max(LLMQ_CALLER_TTL_SECS,
+  2 x LLMQ_LEASE_SECS / 3 + 5)`, 45 s with the defaults) and every send and attach refreshes
+  it; the heartbeat renews it inside RENEW (Q4, R3FM-1, R3RC-3, FL-21).
+- **An app's `worker_id` is a prefix**: a random part is always added (Q6, R3RC-9).
+- **Store refusals count as the store down** (Q12, R3FM-7): `NOREPLICAS`, `OOM`, `MISCONF`,
+  `BUSY` (and `LOADING`, `MASTERDOWN`, `TRYAGAIN`) follow the model's `store_down` rule, an
+  answer in hand rides them out, a waiting caller keeps waiting, and a stored result is read
+  with a plain `GET` when its drop is refused. With `store_down: pause` an out-of-memory store
+  now holds a call up to its deadline instead of failing it at once.
+- **An answer in hand is kept until the call's deadline** during a store outage, not one lease
+  (Q7).
+- **`fail_fast` / `static_cap` answer at once during a known outage** (Q11, R3FM-3): a store
+  outage a call saw is remembered `outage_memo_secs` (3 s; a good write probe clears it).
+- **`LLMQ_QUEUE_WAIT_REPLICAS` covers call sends, job sends and registry live edits** (Q8, Q51),
+  each switchable with `LLMQ_QUEUE_WAIT_SCOPES` (`all`, `none`, or a list of `calls`, `jobs`,
+  `registry`; all by default). Too few replicas no longer runs the call direct: it is sent
+  anyway, warned at most once a minute (`replicas_short`) and counted
+  (`llmq_send_not_replicated_total{scope}`) (Q9). The WAIT is skipped while the store reports
+  no replica (R3FM-11).
+- **Strict mode fails readiness on an evicting store policy** (Q10, R3FM-8): `health_check()`
+  answers `ready: false` with `not_ready_reason`; the policy is re-read each minute.
+- **A full store connection pool is busy, not down** (R3PF-6): `CallFailed("rate_limited")`
+  with a 1 s `retry_after`, counted (`llmq_store_pool_busy_total`); no `store_down` path.
+- **`timeout_secs` and `default_output_tokens` are read at their most specific level**
+  (account, deployment) (Q39); before the deployment is known, the largest over the model's
+  deployments is used.
+- **A live `max_concurrency` / `worker_slots` edit resizes the Bedrock pools** on the next
+  heartbeat, through `ClientPool.plan` (Q43).
+- `converse_api` is passed only to providers whose `call` accepts it (Q33).
+- A call's send carries its queue's own `retention_secs` (Q27).
 - Performance: <!-- filled at release -->
 
 ### Added
@@ -180,6 +226,30 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 
 ### Fixed
 
+- Engine audit (FE-*, RV-*, R3RC-*, R3FM-*): a given-back call releases its claim, so another
+  pod runs it at once (FE-1, FL-1); a call received while `stop()` runs is returned (FE-2);
+  `stop(drain_secs=0)` still returns waiting calls (FE-6); a hold is dropped, not cancelled
+  inside its admission, and an admission that failed without an answer undoes its possible
+  grant (FE-4, RV-N1); a hold cancelled before its first step frees its class (RV-N2); paused
+  calls resume only when the store takes writes (FE-7); a direct run that raised stores its
+  failure (FE-5); a caller-only process stops its direct run on cancel (FE-17); an unreadable
+  message whose return or fail errs is returned (FE-9); a retry admits against the current
+  view (FE-13); a stale ack is logged and counted, `llmq_stale_acks_total` (FE-14); one model's
+  failing sweep skips only itself (FE-15); `_free_stuck` cannot end the heartbeat (FE-18);
+  background tasks are named (FE-19); `ring_again`'s error reply no longer ends a model loop
+  (FE-20); a receive cancelled in flight is reclaimed, also by a full worker and at `stop()`
+  (FE-8, FL-3); no canceller starts after `stop()` (RV-N3); the probe lock goes back to its
+  5 s spacing (RV-N6); `InferenceRejected` on the `static_cap` path is
+  `CallFailed("invalid_request")` (RV-EN14).
+- An attached caller checks the record after the takeover grace and takes over a send that
+  never happened (R3RC-4); a retry whose result is stored reads it at once (R3RC-5);
+  `static_cap` stores its answer and `fail_fast` cancels behind, so a queued copy of an
+  ambiguous send does not run twice (R3FM-2); job sends wait for replicas and a job ack is
+  retried for a visibility time (R3FM-5).
+- A slow `TIME` read keeps the old store-clock offset and a clock jump is logged,
+  `store_clock_jump` (R3RC-7, R3FM-10); a subscriber is pinged and reset when silent, or when
+  the sweep keeps finding results it never announced, `llmq_pubsub_resubscribes_total`
+  (R3RC-6, R3FM-12); a duplicate goes back when the claim lapses, if the script says (R3RC-8).
 - Lua audit (FL-*): UNDO now releases the call's claim, so another pod runs a given-back call at
   once instead of answering `duplicate` for a lease (FL-1; `undo(keep_claim=True)` keeps it,
   `Admission.release_claims` does it for calls given back without a grant). RESULT_TAKE no longer

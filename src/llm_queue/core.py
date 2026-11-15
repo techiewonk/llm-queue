@@ -185,7 +185,7 @@ class LLMQueue:
             engine.queues,
             queue_prefix=engine.settings.queue_prefix,
             metrics=engine.metrics,
-            replica_wait=engine.replica_wait,  # one replica wait per process (R3FM-5, Q8)
+            replica_wait=getattr(engine, "replica_wait", None),  # one per process (R3FM-5, Q8)
         )
         self._builder = builder
         self._offload = offload
