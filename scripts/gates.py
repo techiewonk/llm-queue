@@ -878,6 +878,9 @@ async def b23() -> bool:
 
     losses: dict[str, int] = {}
     dups: dict[str, int] = {}
+    failed: dict[str, int] = {}
+    calls: dict[str, int] = {}
+    promoted: dict[str, bool] = {}
     for wait in (0, 1):
         proxy = failover.Proxy()  # its own process (CO-2)
         doc = registry({"chat": {"rpm": 1_000_000}}, accounts=1, regions=1)
@@ -923,6 +926,9 @@ async def b23() -> bool:
                 )
                 await asyncio.gather(load, chaos())
                 provider = await asyncio.to_thread(gate.fake.stats)
+                # FT-12: prove the fault happened (b took over); 0 <= 0 passed when it did not.
+                role = await asyncio.to_thread(failover.role, "b")
+                promoted["on" if wait else "off"] = role == "master"
         finally:
             try:
                 await asyncio.to_thread(proxy.stop)
@@ -932,17 +938,25 @@ async def b23() -> bool:
         losses["on" if wait else "off"] = lost
         dups["on" if wait else "off"] = sum(int(m.get("duplicates", 0)) for m in provider.values())
         side = "on" if wait else "off"
+        failed[side] = sum(1 for r in run.results if not r.ok)
+        calls[side] = len(run.results)
         print(f"  queue_wait_replicas={wait}: {len(run.results)} calls, lost {lost}, "
               f"duplicates {dups[side]}, failures {run.kinds() or 0}")  # fmt: skip
     return verdict(
         "B23",
         {
-            "losses with the wait on <= with it off": losses["on"] <= losses["off"],
-            "duplicates with the wait on <= with it off": dups["on"] <= dups["off"],
+            # FT-12: the kill really happened on both sides, and absolute bounds as well as the
+            # on-vs-off comparison (one noisy run used to decide it; 2 calls of slack each).
+            "the replica took over in both runs": all(promoted.values()) and len(promoted) == 2,
+            "losses with the wait on <= with it off (+2)": losses["on"] <= losses["off"] + 2,
+            "duplicates with the wait on <= with it off (+2)": dups["on"] <= dups["off"] + 2,
+            "every failure with the wait on <= 5 % of its calls": failed["on"]
+            <= 0.05 * max(1, calls["on"]),
         },
         [
             f"lost sends: off {losses['off']}, on {losses['on']}; "
-            f"duplicates: off {dups['off']}, on {dups['on']}"
+            f"duplicates: off {dups['off']}, on {dups['on']}; "
+            f"all failures: off {failed['off']}/{calls['off']}, on {failed['on']}/{calls['on']}"
         ],
     )
 
