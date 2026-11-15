@@ -756,7 +756,11 @@ async def b33() -> bool:
     (a live edit keeps `version` and bumps the counter).
     """
     doc = registry({"chat": {"rpm": 1_000_000}}, accounts=1, regions=1)
-    async with Gate(doc) as gate:
+    # A caller sees another process's live edit at its next reload: every 30 s by default, so
+    # the last edit (~33 s in, after four restarts) came after the edit-free caller's first
+    # reload whenever a restart took a little longer, and the 2 s wait below could not catch it.
+    # Reload every second, as the registry scenarios do.
+    async with Gate(doc, LLMQ_CFG_RELOAD_SECS="1") as gate:
         await gate.workers(4)
         queues = await gate.callers(2)
         run = Run()
@@ -786,7 +790,7 @@ async def b33() -> bool:
 
         load = paced(50, 40, lambda i: run.call(queues[i % 2], "chat", chat(), priority=i % 4 == 0))
         await asyncio.gather(load, restarts(), sample())
-        await asyncio.sleep(2)  # LLMQ_CFG_RELOAD_SECS default: every caller has the last edit
+        await asyncio.sleep(2)  # LLMQ_CFG_RELOAD_SECS 1: every caller has the last edit
         final = [q.registry.changes for q in queues]
     start = seen[0][0] if seen[0] else 0
     return verdict(
