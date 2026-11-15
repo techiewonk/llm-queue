@@ -3,6 +3,11 @@
 Each script takes the key prefix and one JSON argument and builds its key names itself, which
 needs the single-primary store 0.3 supports. Times are the store's clock in ms. Budgets are GCRA
 clocks (`smooth`) or minute counters (`fixed`); class clocks enforce the priority shares.
+
+Not cluster-safe, by design (FL-14): these scripts pass no KEYS and touch keys of several hash
+tags in one call (`{m:alias}`, a fallback's `{m:from_alias}`, `{r:id}`, `{a:account}`) and
+untagged ones (`:epoch`, `:reset_minute`, `:caller:*`). The start-up check refuses a store
+with cluster mode on; supporting cluster would need one hash tag per environment.
 """
 
 # ruff: noqa: E501  # Lua source in strings; wrapping its lines hurts reading it

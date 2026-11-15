@@ -8,6 +8,9 @@ queues, E92), the job runner and the CLI.
 # for the visibility time; `return_` makes it visible again in its place without a failure; a
 # lapsed hold (the worker died) counts one failure, and `max_receives` failures move it to the
 # dead-letter stream, reported to the receiver so the caller can be told (plan §3.18).
+# A hold that lapses because the store was out of reach (the heartbeat could not extend it)
+# counts a failure like a crash, by design (FL-26): the store cannot tell the two apart, so an
+# outage longer than the visibility time adds one failure to every held message.
 
 from __future__ import annotations
 
