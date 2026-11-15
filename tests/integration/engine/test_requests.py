@@ -178,7 +178,8 @@ async def test_q3_cancel_wins_for_every_caller_of_a_shared_id(
     """Q3 / R3RC-1: a shared id was never cancelled (callers {A, B} is not a subset of {A}).
 
     One caller's cancel now marks the call, in one script with the final-state check; a
-    finished call is not marked, and an attach after the mark joins the cancelled call.
+    finished call is not marked, and an attach after the mark is told `cancelled` (cancel wins
+    for every caller of the id, owner decision Q3).
     """
     requests = RequestStore(store, Keys(prefix))  # a 5 s takeover grace: B attaches
     keys = Keys(prefix)
@@ -196,7 +197,7 @@ async def test_q3_cancel_wins_for_every_caller_of_a_shared_id(
             break
     assert heard == b"req-1"
     await pubsub.aclose()  # type: ignore[no-untyped-call]  # redis-py stubs lack it
-    assert await _register(requests, "pod-c") == "attached"  # joins the cancelled call
+    assert await _register(requests, "pod-c") == "cancelled"  # cancel wins (Q3)
     await requests.put_result(Reply(request_id="req-1", ok=True), final_state="done")
     await store.delete(f"{prefix}:{{r:req-1}}:cancel")
     assert await requests.cancel(["req-1"], ttl_secs=60, channel=keys.cancel_channel) == 0
