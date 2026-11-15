@@ -184,7 +184,10 @@ def _scripts() -> dict[str, str]:
 
 SCRIPTS = _scripts()
 # Per call, caller and worker: the only scripts of a plain converse.
-HOT_PATH = {"REGISTER_SEND", "RECEIVE_FIRST", "PICK_TAKE", "RESULT_PUT", "FINISH", "ACK"}
+# FL-22: on a shared store a success ends in one SETTLE_DONE (was RESULT_PUT, FINISH, ACK).
+HOT_PATH = {"REGISTER_SEND", "RECEIVE_FIRST", "PICK_TAKE", "SETTLE_DONE"}
+# What the idle receive loops of every model send on their own, whatever the call does.
+IDLE_LOOPS = {"RECEIVE_FIRST", "BLPOP", "SWEEP", "TRIM_DEAD_MANY"}
 
 
 class _Sends:
@@ -239,7 +242,12 @@ async def test_one_converse_costs_few_round_trips(make: Make, sends: _Sends) -> 
     assert hot.keys() == HOT_PATH, sends.commands
     assert all(n == 1 for name, n in hot.items() if name != "RECEIVE_FIRST"), sends.commands
     # Folded away: no REGISTER / SEND / CONFIRM, CALLERS_ALIVE, STATUS_SET, single RECEIVE,
-    # nor the retry budget's HINCRBY pipeline.
-    for gone in ("REGISTER", "SEND", "CONFIRM", "STATUS_SET", "RECEIVE", "HINCRBY", "HSET"):
+    # the retry budget's HINCRBY pipeline, nor the separate end of a call (FL-22).
+    folded = ("REGISTER", "SEND", "CONFIRM", "STATUS_SET", "RECEIVE", "HINCRBY", "HSET")
+    for gone in (*folded, "RESULT_PUT", "FINISH", "ACK"):
         assert gone not in sends.commands, sends.commands
     assert sends.commands["RESULT_TAKE"] == 1, sends.commands
+    # The call's own round trips, idle polling aside: send, pick, settle, result check, take
+    # and one SET. One more fails here (7 before FL-22, ~19 before B3-B5).
+    own = sum(n for name, n in sends.commands.items() if name not in IDLE_LOOPS)
+    assert own <= 6, sends.commands
