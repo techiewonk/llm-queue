@@ -152,6 +152,7 @@ from 0.1 s to 600 s. Alert gauges are named `llmq_alert_<name>`, labels `model` 
 | `llmq_provider_seconds` | histogram | model, account, region | Seconds | worker | Duration of each provider attempt |
 | `llmq_first_token_seconds` | histogram | model, account, region | Seconds | worker | Streams: from the attempt's start to its first chunk |
 | `llmq_admission_refusals_total` | counter | model, reason | Count | worker | Calls refused by admission, once each |
+| `llmq_tenant_refusals_total` | counter | model, mode | Count | worker | Calls held back by tenant fairness, once each: quota (failed rate_limited) or share (waited while tenants within their share wait); never labelled by tenant |
 | `llmq_retries_total` | counter | model, reason | Count | worker | Retries after a failed attempt, by error kind |
 | `llmq_grants_lost_total` | counter | model, step | Count | worker | Grants found gone at renew or finish |
 | `llmq_store_errors_total` | counter | where | Count | every pod | Store errors by step |

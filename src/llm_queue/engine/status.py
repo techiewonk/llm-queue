@@ -107,7 +107,7 @@ class StatusReader:
             self._deployment(view, alias, dep, raw[3 + i], health, minute)
             for i, dep in enumerate(deps)
         ]
-        return {
+        report: dict[str, Any] = {
             "model": alias,
             "enabled": bool(view.effective(alias, "enabled").value),
             "waiting": waiting,
@@ -118,6 +118,31 @@ class StatusReader:
             "in_progress": int(inprog),
             "dead_letters": dead,
             "deployments": deployments,
+        }
+        fairness = view.value(alias, "fairness")
+        if fairness.get("mode", "off") != "off":
+            report["fairness"] = await self._fairness(alias, fairness, now_secs)
+        return report
+
+    async def _fairness(
+        self, alias: str, setting: Mapping[str, Any], now_secs: int
+    ) -> dict[str, Any]:
+        """Tenant fairness of one model, as counts only (never a tenant or its hash).
+
+        `active_tenants`: tenants that asked within `active_secs`; `waiting_within_share`:
+        refused calls of tenants within their share, which others may not borrow ahead of.
+        Read only when the mode is on: one pipelined round trip.
+        """
+        now_ms = now_secs * 1000
+        active_ms = int(float(setting.get("active_secs", 60)) * 1000)
+        async with self._client.pipeline(transaction=False) as pipe:
+            pipe.zcount(self.keys.model(alias, "tf:act"), now_ms - active_ms, "+inf")
+            pipe.zcount(self.keys.model(alias, "tf:need"), now_ms, "+inf")
+            active, need = await pipe.execute()
+        return {
+            "mode": setting["mode"],
+            "active_tenants": int(active),
+            "waiting_within_share": int(need),
         }
 
     async def _first_id(self, queue: str) -> int | None:
