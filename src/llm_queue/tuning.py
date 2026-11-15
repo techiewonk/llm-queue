@@ -192,11 +192,66 @@ class Tuning:
                 f"registry.edit_retries must be {_EDIT_RETRIES_MAX} or less "
                 "(each try backs off up to 2 s)"
             )
+        out += self._upper_bounds(bad)
         session = self.bedrock.role_session_secs
         if "bedrock.role_session_secs" not in bad and not 900 <= session <= 43200:
             out.append("bedrock.role_session_secs must be 900 to 43200 (STS limits)")
         return out
 
+    def _upper_bounds(self, bad: set[str]) -> list[str]:
+        """Upper bounds and pairs `_check_part` cannot see field by field (R3CF-15).
+
+        Each of these passed: `job_ttl_ms=1`, `budget_key_ms=10**30`, `history_size=1` (nothing
+        to roll back to), `store.retries=10**9`, a warm refresh slower than the keep-alive, more
+        keep-alive connections than connections, a 1 ms Bedrock read timeout.
+        """
+        out: list[str] = []
+        for part, section in (
+            (self.store, "store"),
+            (self.bedrock, "bedrock"),
+            (self.engine, "engine"),
+            (self.openai, "openai"),
+            (self.warm, "warm"),
+        ):
+            for spec in fields(part):
+                name = f"{section}.{spec.name}"
+                value = getattr(part, spec.name)
+                if name in bad or not isinstance(value, int | float):
+                    continue
+                top = _MAX_BY_SUFFIX.get(spec.name.rsplit("_", 1)[-1], _MAX_NUMBER)
+                if value > top:
+                    out.append(f"{name} must be at most {top}")
+        least = {
+            "engine.job_ttl_ms": (self.engine.job_ttl_ms, 60_000),
+            "engine.slow_stale_ms": (self.engine.slow_stale_ms, 1000),
+            "bedrock.read_timeout_secs": (self.bedrock.read_timeout_secs, 1),
+            "openai.read_timeout_secs": (self.openai.read_timeout_secs, 1),
+            "registry.history_size": (self.registry.history_size, 2),
+        }
+        for name, (value, floor) in least.items():
+            if name not in bad and value < floor:
+                out.append(f"{name} must be at least {floor:g}")
+        if "store.retries" not in bad and self.store.retries > 100:
+            out.append("store.retries must be at most 100")
+        warm = self.warm
+        if {"warm.refresh_secs", "warm.keepalive_secs"}.isdisjoint(bad) and (
+            0 < warm.keepalive_secs <= warm.refresh_secs
+        ):
+            out.append(
+                "warm.refresh_secs must be below warm.keepalive_secs, or the warm connections "
+                "close before they are refreshed"
+            )
+        pool = {"openai.max_keepalive_connections", "openai.max_connections"}
+        if pool.isdisjoint(bad) and (
+            self.openai.max_keepalive_connections > self.openai.max_connections
+        ):
+            out.append("openai.max_keepalive_connections must not be above openai.max_connections")
+        return out
+
+
+# Upper bounds by unit suffix: a day for times, every number exact as a double (R3CF-15).
+_MAX_NUMBER = 2**53 - 1
+_MAX_BY_SUFFIX = {"secs": 86_400, "ms": 86_400_000}
 
 BEDROCK_TRANSPORTS = ("botocore", "aiohttp")
 # Live-edit tries at most: with the 2 s backoff cap, a publish backs off 12.5 s at most (NB-3).
