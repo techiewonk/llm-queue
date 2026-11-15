@@ -34,6 +34,7 @@ from llm_queue.clients import (
 from llm_queue.clients import pool as pool_module
 from llm_queue.clients.hub import Lease
 from llm_queue.registry import ResolvedRegistry, load_registry
+from llm_queue.tuning import BedrockOptions
 
 CHAT = {"messages": [{"role": "user", "content": [{"text": "hello"}]}]}
 PLAIN = Timing(5, 5, attempt_secs=5)
@@ -358,3 +359,31 @@ async def test_a_missing_private_openai_module_is_not_a_missing_extra(
         assert await pool.openai(route) is not None
     finally:
         await pool.aclose()
+
+
+@pytest.mark.parametrize("transport", ["botocore", "aiohttp"])
+async def test_both_transports_choose_credentials_in_one_place(
+    start_fake: StartFake, transport: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FC-17: each transport chose role / expiry / static / chain itself, kept in step by hand."""
+    url, _ = await start_fake()
+    route = _route(load_registry(registry_doc(url)))
+    pool = ClientPool(
+        bedrock_endpoint_url=url,
+        credentials=_keys,
+        options=BedrockOptions(transport=transport),
+        warm=NO_WARM,
+    )
+    asked: list[str] = []
+    original = pool._credential_source
+
+    async def spy(*args: Any) -> Any:
+        asked.append(transport)
+        return await original(*args)
+
+    monkeypatch.setattr(pool, "_credential_source", spy)
+    try:
+        await pool.bedrock(route)
+    finally:
+        await pool.aclose()
+    assert asked == [transport]

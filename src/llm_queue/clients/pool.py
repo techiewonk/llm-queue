@@ -535,12 +535,7 @@ class ClientPool:
                 # Idle pooled connections live this long (aiobotocore's default is 12 s).
                 connector_args={"keepalive_timeout": self._warm.keepalive_secs},
             )
-            session, kwargs = self._session, extra
-            if account.role_arn:  # AssumeRole only when the hub has no client for it yet
-                session, kwargs = await self._role_session(route), {}
-            elif expiry is not None:
-                session, kwargs = self._refreshing_session(account, extra, expiry), {}
-            assert session is not None
+            session, kwargs = await self._credential_source(route, extra, expiry)
             if not kwargs and session is self._session:
                 await self._chain_credentials(account, session)
             context = session.create_client(
@@ -571,21 +566,18 @@ class ClientPool:
 
         from llm_queue.clients.bedrock_http import BedrockHTTP
 
-        account = route.account
         credentials: Any
-        if account.role_arn:
-            credentials = await (await self._role_session(route)).get_credentials()
-        elif expiry is not None:
-            credentials = await self._refreshing_session(account, extra, expiry).get_credentials()
-        elif extra:
+        session, kwargs = await self._credential_source(route, extra, expiry)
+        if kwargs:  # static keys
             credentials = Credentials(
-                str(extra.get("aws_access_key_id") or ""),
-                str(extra.get("aws_secret_access_key") or ""),
-                extra.get("aws_session_token"),
+                str(kwargs.get("aws_access_key_id") or ""),
+                str(kwargs.get("aws_secret_access_key") or ""),
+                kwargs.get("aws_session_token"),
             )
-        else:
-            assert self._session is not None
-            credentials = await self._chain_credentials(account, self._session)
+        elif session is self._session:
+            credentials = await self._chain_credentials(route.account, session)
+        else:  # an assumed role or refreshable `credentials=`
+            credentials = await session.get_credentials()
         client = await BedrockHTTP.open(
             region=route.region,
             credentials=credentials,
@@ -596,6 +588,23 @@ class ClientPool:
             keepalive_secs=self._warm.keepalive_secs,
         )
         return client, client.close
+
+    async def _credential_source(
+        self, route: Route, extra: dict[str, Any], expiry: Any
+    ) -> tuple[AioSession, dict[str, Any]]:
+        """Where an AWS account's keys come from: (session, extra `create_client` keys).
+
+        An assumed role or `credentials=` with an expiry give a refreshing session and no
+        keys; static keys come back as keys on the base session; neither means the pod's
+        chain (the base session, no keys). Both transports use it, so the choice can no
+        longer drift between them (FC-17).
+        """
+        if route.account.role_arn:  # AssumeRole only when the hub has no client for it yet
+            return await self._role_session(route), {}
+        if expiry is not None:
+            return self._refreshing_session(route.account, extra, expiry), {}
+        assert self._session is not None
+        return self._session, extra
 
     @staticmethod
     async def _chain_credentials(account: Account, session: AioSession) -> Any:
