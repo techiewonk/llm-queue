@@ -2914,7 +2914,7 @@ class Engine:
             if held.message is not None:
                 # When the claim lapses, if the script says (`ms`); else half a lease. The fixed
                 # half lease made a lower `visibility_secs` take over a dead pod's call later
-                # (R3RC-8). The `ms` field of the reply is the Lua owner's part.
+                # (R3RC-8). PICK_TAKE's `duplicate` carries `ms`; the half lease is a fallback.
                 delay = (
                     decision.wait_secs if decision.wait_secs > 0 else self.settings.lease_secs / 2
                 )

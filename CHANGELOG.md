@@ -514,7 +514,8 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
 - A slow `TIME` read keeps the old store-clock offset and a clock jump is logged,
   `store_clock_jump` (R3RC-7, R3FM-10); a subscriber is pinged and reset when silent, or when
   the sweep keeps finding results it never announced, `llmq_pubsub_resubscribes_total`
-  (R3RC-6, R3FM-12); a duplicate goes back when the claim lapses, if the script says (R3RC-8).
+  (R3RC-6, R3FM-12); a duplicate goes back when the claim lapses: PICK_TAKE's `duplicate`
+  reply carries the claim's time left (`ms`), where it went back after a fixed half lease (R3RC-8).
 - A job delivered again while it still ran in the same process ran twice (R3JE-9); a failed job
   was logged without its traceback or id (R3JE-11) and any `TimeoutError` as the job's own
   limit (now `job_timeout` only when `timeout_secs` ran out: R3JE-13).
