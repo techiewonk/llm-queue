@@ -45,6 +45,29 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
 
 ### Changed (behaviour)
 
+- **Metric renames and EMF format** (R3OB-12, R3OB-14, R3PF-14): `llmq_provider_latency_ms` is
+  now `llmq_provider_latency_seconds` (base units). EMF points are added up per label set and
+  written as one line per label set about once a second (counters summed, gauges last value,
+  samples as a value array) instead of one line per point; `EmfSink(flush_secs=0)` keeps one
+  line per point. Every EMF line from `LLMQueue.from_env` has the `environment` dimension and the
+  plain fields `pod` and `version`, so CloudWatch alarms on the old dimension sets need the
+  `environment` dimension added. `llmq_throttles_1m` and the status field `throttles_1m` are now
+  the larger of the last full minute and this one (`throttles_this_minute` is the raw count).
+- **The alert lock is kept by its holder** (R3OB-1): it lasts 45 s and the holder renews it
+  each 30 s tick, so one process evaluates alerts until it stops; every other process removes
+  the cluster gauges (queues, budgets, breakers, `llmq_alert_*`) from its own Prometheus
+  registry, and series of removed models or deployments go away.
+- **Quota alerts are steady** (R3OB-6): `quota_near_limit` and `quota_above_observed` turn on
+  at once and off after two clear samples in a row; they flipped at each minute rollover.
+- **Outage log lines are rate-limited** (R3OB-7): `receive_failed`, `heartbeat_failed`,
+  `store_down`, `hold_failed`, `run_failed` and `model_unavailable` go out at most once per
+  event and key (model or step) every 10 s, the next one with `suppressed=<n>`.
+- **`llmq_call_finished` for every call and more fields** (R3OB-5, R3OB-8): also static-cap and
+  dead-lettered calls (`path`); failed calls carry their last deployment, account, region and
+  attempts (they were `-` / None); new fields `account`, `region`, `worker`, `fallback`,
+  `path`, `admit_wait_ms`, `duration_ms` and `error`. `account_credentials_failed` carries
+  `model`, `request_id`, `error_type` and `error`; `hold_lost`, `hold_failed` and `run_failed`
+  carry `model`. `/health/live` answers `{"live": false, "reason": ...}` when it fails.
 - **Mixed 0.1.0b1 / 0.1.0b2 fleets are not supported** (owner Q32, R3AP-8): drain the 0.1.0b1
   workers before starting 0.1.0b2. Bytes in a message travel as `{"__llmq_b64__": ...}` (was
   `{"__b64__": ...}`, which also decoded a caller's own dict of that shape and failed the
@@ -317,7 +340,31 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
   family (Cohere v4, Nova, ...) without a library release; the registry's `family` accepts its
   name, and its id patterns are tried before the built-in ones. Register it in every process
   before the registry loads (see docs/how-to/call.md, "Embedding families").
-
+- **Monitoring** (R3OB-2, -3, -4, -5, -14, -15, -16, -17, -19, -20; owner Q5, Q9, Q10, Q11,
+  Q15, Q25): [Monitor](docs/how-to/monitor.md) lists every metric with kind, labels, unit and
+  emitter (from `llm_queue.engine.metrics.METRICS`; a test fails on an unlisted name), with
+  CloudWatch and Prometheus alarms, Logs Insights queries and a page per incident. New:
+  histograms `llmq_call_seconds`, `llmq_provider_seconds`, `llmq_first_token_seconds`,
+  `llmq_admission_wait_seconds` (the wait for budget included; `llmq_wait_seconds` stops when a
+  worker takes the call), with buckets up to 600 s; counters `llmq_attempts_total{result}`,
+  `llmq_caller_failures_total`, `llmq_swept_total`, `llmq_reclaimed_total`,
+  `llmq_stuck_calls_total`, `llmq_store_resets_total`, `llmq_credentials_failed_total`,
+  `llmq_loop_died_total`, `llmq_cancels_total{source}`, `llmq_outage_memo_set_total`; cluster
+  gauges `llmq_held_waiting`, `llmq_oldest_waiting_seconds`, `llmq_rpm_limit`,
+  `llmq_tpm_limit`, `llmq_concurrency_limit`, `llmq_deployment_usable`, `llmq_kill_switch`,
+  `llmq_region_blocked`, `llmq_job_dead_letters`, `llmq_job_waiting`,
+  `llmq_alerts_evaluated_timestamp_seconds`; pod gauges `llmq_build_info`, `llmq_store_up`,
+  `llmq_held_calls`, `llmq_heartbeat_age_seconds`, `llmq_ready`, `llmq_outage_memo_active`,
+  `llmq_store_eviction_unsafe`. Status reports `waiting_for_grant` and `oldest_waiting_secs`
+  per model; health reports `worker`, `version`, `registry_version`, `held`,
+  `heartbeat_age_secs` and `live_reason`. A background loop that dies is logged at once
+  (`background_loop_died`).
+- **Alerts `breaker_open`, `kill_switch_on` and `queue_stalled`** (R3OB-17), with the registry
+  threshold `alerts.queue_age_secs` (default 600). An alert whose model or deployment left the
+  registry is logged off.
+- **`status_router(..., metrics_route=True)`** serves `GET /metrics` (Prometheus exposition),
+  and `llm_queue.engine.metrics.prometheus_text(sink)` for an app's own route (R3OB-14).
+  Prometheus metrics have help text from the table, not their name.
 - **`llm-queue cancel ID ... --yes|--dry-run`** (owner Q5, R3SE-5): cancels calls for every
   caller of each id, logs `call_cancel` with `source=cli` and writes an audit entry (`registry
   log`) with the actor.
@@ -738,6 +785,14 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
 
 ### Performance
 
+- Log values are checked for control characters with one compiled regex (R3PF-5). Python
+  3.12, Windows, 2026-11-15, micro-benchmark of `_value`: the 13 fields of `llmq_call_finished`
+  20.2 -> 5.6 us, a 2,000-character error 362 -> 19 us; same output.
+- EMF writes one line per label set per second instead of one per point (R3PF-14, R3OB-11): a
+  successful call wrote 4-5 lines (17.7 us, 1,322 bytes measured in the audit), now its points
+  join the label set's next line; the alert tick wrote one line per gauge, now one per
+  deployment. Dropped lines are warned about once a minute with a count (once per process
+  before). Unverified end to end: no CloudWatch run.
 - OpenAI embeddings are asked for as base64 float32 and decoded once by the reader (R3PF-10).
   A 96 x 1024 reply, Python 3.12.13, Windows, 2026-11-15, micro-benchmark of `Reply.dumps` and
   of `orjson.loads` + validate + `vectors_of`: stored value 1.95 MB -> 0.53 MB, worker write

@@ -178,3 +178,13 @@ def test_a_removed_deployment_series_goes_away() -> None:
     gauges.finish()
     assert registry.get_sample_value("llmq_rpm_used", {"model": "m", "deployment": "d1"}) == 6.0
     assert registry.get_sample_value("llmq_rpm_used", {"model": "m", "deployment": "d2"}) is None
+
+
+def test_every_metric_is_documented_in_monitor_md() -> None:
+    """R3OB-19 / R3OB-18: the docs listed some metrics, without labels or units; now all."""
+    from pathlib import Path
+
+    page = Path(__file__).parents[3] / "docs" / "how-to" / "monitor.md"
+    text = page.read_text("utf-8")
+    missing = [name for name in METRICS if f"| `{name}` |" not in text]
+    assert missing == []

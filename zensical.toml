@@ -32,6 +32,7 @@ nav = [
   { "Run background jobs" = "how-to/jobs.md" },
   { "Keep large results in S3" = "how-to/large-results.md" },
     { "Operate" = "how-to/operate.md" },
+    { "Monitor" = "how-to/monitor.md" },
     { "Many services, one model" = "how-to/share-models.md" },
     { "Secure a deployment" = "how-to/secure.md" },
     { "Test" = "how-to/test.md" },

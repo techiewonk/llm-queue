@@ -76,8 +76,8 @@ METRICS: dict[str, MetricSpec] = {
     ),
     "llmq_caller_failures_total": _c(
         "model outcome",
-        "Calls that failed in the caller before any worker took them (rejected, queue_full, "
-        "queue_unavailable, deadline_exceeded, store_down)",
+        "Every failure a caller saw, by kind: also those no worker counts (rejected, "
+        "queue_full, queue_unavailable, a caller-side deadline)",
         "caller",
     ),
     "llmq_attempts_total": _c(
