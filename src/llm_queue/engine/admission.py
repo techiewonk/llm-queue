@@ -21,6 +21,7 @@ from redis.exceptions import TimeoutError as StoreTimeoutError
 
 from llm_queue._logging import get_logger
 from llm_queue.engine import _admission_lua as lua
+from llm_queue.engine.fairness import Fairness
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.metrics import Metrics, NullSink
 from llm_queue.tuning import EngineTimings
@@ -82,6 +83,8 @@ class Ask:
     callers_ttl: int | None = None
     count_first: int | None = None
     chunks: bool = False
+    # Per-tenant fairness (engine/fairness.py); None (fairness off) sends nothing extra.
+    fairness: Fairness | None = None
 
     @property
     def job_owner(self) -> str:
@@ -100,7 +103,9 @@ class Decision:
 
     `kind`: granted, wait, duplicate, done, cancelled, stale_config, no_config, none (no
     deployment usable), busy (another model refused a fallback call), gone (every caller of a
-    call asked with `callers_ttl` is gone).
+    call asked with `callers_ttl` is gone), tenant_limited (the tenant's fairness quota is
+    used up: `wait_secs` until it has room). A fair_queue wait carries the call's round in
+    `extra["fr"]`.
     """
 
     kind: str
@@ -209,6 +214,8 @@ class Admission:
             body["count_first"] = ask.count_first
         if ask.chunks:
             body["chunks"] = True
+        if ask.fairness is not None:
+            body["tf"] = ask.fairness.body()
         raw = orjson.loads(await self._call(self._pick, body))
         kind = str(raw.pop("r"))
         return Decision(
