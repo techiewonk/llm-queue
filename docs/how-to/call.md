@@ -55,7 +55,7 @@ reply = await llmq.converse("claude-sonnet", request)
 
 - Bytes travel through the queue encoded (`{"__llmq_b64__": ...}`) and reach the provider as bytes.
 - The whole message, bytes included, may be at most the model's `max_message_bytes` (default
-  4 MB). A larger one fails `CallFailed("invalid_request")` at once, before it is queued. For
+  4 MB). A larger one fails `CallFailed("request_too_large")` at once, before it is queued. For
   larger files, use a smaller image or an S3 location the model can read.
 - The token estimate does not read the bytes: each binary block costs a fixed 1,000 tokens until
   the real usage corrects the budget after the call (see

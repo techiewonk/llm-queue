@@ -75,18 +75,31 @@ class RateStatus(TypedDict):
     left: int | None
 
 
+class ConcurrencyStatus(TypedDict):
+    """Calls in flight on one deployment and its (adaptive) limit."""
+
+    limit: float
+    in_use: int
+
+
 class DeploymentStatus(TypedDict):
-    """One deployment of a model: switches, budgets, concurrency, breaker and latency."""
+    """One deployment of a model: switches, budgets, concurrency, breaker and latency.
+
+    `account_enabled` and `blocked` (a routing block on its region or account) were returned
+    but not declared, so a type checker refused reading them (R3AP-3).
+    """
 
     name: str
     group: str
     enabled: bool
+    account_enabled: bool
+    blocked: bool
     healthy: bool
     next_probe: float | None
     outside_residency: bool
     rpm: RateStatus
     tpm: RateStatus
-    concurrency: dict[str, Any]
+    concurrency: ConcurrencyStatus
     breaker: str
     latency_ms: float | None
     samples: int
@@ -124,9 +137,11 @@ class StatusReport(TypedDict):
 
 
 class RequestStatus(TypedDict, total=False):
-    """One call's status record as stored, all values text (empty when the id is unknown).
+    """One call's status record as stored (empty when the id is unknown).
 
-    `<state>_at` timestamps (e.g. `done_at`) are there too, one per state reached.
+    Every value is text, as the store keeps it: convert the numbers with `int()` (`attempts`,
+    `tokens_in`, `tokens_out`) and the `*_at` times (Unix seconds) with `float()`. One `*_at`
+    key is there per state the call reached (R3AP-4).
     """
 
     request_id: str
@@ -134,6 +149,11 @@ class RequestStatus(TypedDict, total=False):
     model: str
     priority: str
     enqueued_at: str
+    in_progress_at: str
+    done_at: str
+    failed_at: str
+    expired_at: str
+    cancelled_at: str
     served_model: str
     deployment: str
     attempts: str

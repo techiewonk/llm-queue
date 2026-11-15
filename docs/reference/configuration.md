@@ -71,7 +71,7 @@ Settings added or changed in 0.1.0b2:
 | Setting | Levels | Default | Meaning |
 |---|---|---|---|
 | `converse_api` | defaults, model | `converse` | Non-stream Bedrock chat: `converse` (plain Converse, IAM `bedrock:InvokeModel`) or `stream` (ConverseStream, `bedrock:InvokeModelWithResponseStream`, with the first-response timer). See [Bedrock APIs and IAM](../how-to/bedrock.md) |
-| `max_message_bytes` | defaults, model | 4194304 (4 MB) | A call whose message (inline images and documents included) is larger fails `invalid_request` before it is queued; at least 1024 |
+| `max_message_bytes` | defaults, model | 4194304 (4 MB) | A call whose message (inline images and documents included) is larger fails `request_too_large` before it is queued; 1024 to 268435456 |
 | `inference.extra` | as `inference` | | Provider-specific fields: plain lowercase names only; SDK arguments and request fields (`extra_body`, `store`, `metadata`, `user`, `model`, `messages`, `stream`, `tools`, ...) are refused. Protected in `safe` live-edit mode |
 | `queue.retention_secs`, `queue.dlq_retention_secs` | | | Now at most two weeks (1209600): dead letters hold the prompt |
 | `embed_max_chars` | model (embedding) | the family's: Titan 50000, Cohere 2048, OpenAI none | Longest text an `embed` sends; a longer one fails `invalid_request` with its index before any call. 0 turns the check off |

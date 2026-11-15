@@ -78,7 +78,7 @@ def message_size_bytes(params: Any) -> int:
     """The JSON size of a call's params as they travel (bytes base64-encoded): the size cap.
 
     Checked against `max_message_bytes` before a call is sent; above it the call fails with
-    `CallFailed("invalid_request")` instead of reaching the store or Bedrock.
+    `CallFailed("request_too_large")` instead of reaching the store or Bedrock.
     """
     return len(orjson.dumps(params, default=json_default))
 
