@@ -25,7 +25,7 @@ from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.inference import InferenceRejected
 from llm_queue.engine.queue import Message, NotReplicated
 from llm_queue.engine.runtime import Engine, _store_refused
-from llm_queue.engine.store_client import StorePoolBusy
+from llm_queue.engine.store_client import StorePoolBusy, store_client
 
 pytestmark = pytest.mark.integration
 
@@ -853,3 +853,80 @@ async def test_q43_a_live_edit_replans_the_bedrock_pools(
     engine._replan_pools()
     assert planned == [engine._pool_slots(engine.registry.current)]
     assert planned[0][("aws-a", "r1")] >= 2
+
+
+# ---------------------------------------------------------------- CG-1, CG-3, CG-5
+
+
+async def test_cg1_callers_recover_soon_after_a_store_block_under_load(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CG-1 (pins FT-9): callers after a store block at 300 % load got `queue_unavailable`.
+
+    Seen 11 s after the block in drills; no test pinned the recovery time. 60 calls (three
+    times the model's slots) meet a 2 s block: every one is answered, within 6 s of its end.
+    """
+    engine, _ = await make({"small": {"store_down": "pause", "worker_slots": 20}})
+    real = engine.requests.register_send
+    loop = asyncio.get_running_loop()
+    block_end = loop.time() + 2.0
+
+    async def blocked(*args: Any, **kwargs: Any) -> Any:
+        if loop.time() < block_end:
+            raise StoreConnectionError("Connection refused")
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(engine.requests, "register_send", blocked)
+    replies = await asyncio.gather(
+        *(engine.call("small", CHAT, timeout_secs=15) for _ in range(60))
+    )
+    assert all(r.ok for r in replies)
+    assert loop.time() - block_end < 6.0
+
+
+async def test_cg3_a_failing_queue_store_sends_calls_direct(make: Make) -> None:
+    """CG-3: `LLMQ_QUEUE_FAILOVER_SECS` (a separate queue store that keeps failing sends the
+    call down the direct path) had no test. A queue store on a refused port, failover 0.5 s.
+
+    Only the refused case: a blackholed store still costs the client's full budget per call
+    (R3FM-3's send bound is not done).
+    """
+    base, _ = await make(worker=False)
+    queue_store = store_client("redis://:x@127.0.0.1:1/0")
+    engine = Engine(
+        base.state,
+        base.registry,
+        base.providers,
+        queue_store=queue_store,
+        settings=dataclasses.replace(base.settings, queue_failover_secs=0.5),
+    )
+    await engine.start(worker=False)
+    try:
+        reply = await engine.call("small", CHAT, timeout_secs=20)
+        assert reply.ok
+    finally:
+        await engine.stop(drain_secs=0)
+        await queue_store.aclose()
+
+
+async def test_cg5_a_caller_whose_key_expired_is_gone(make: Make, store: Any) -> None:
+    """CG-5: `caller_gone` (a queued call whose caller's liveness key lapsed is dropped
+    unrun) was exercised only by timing in scenarios B95 and C2.
+    """
+    worker, _ = await make()
+    caller, _ = await make(worker=False)
+    worker.pause_receiving()
+    secs, _ = await store.time()
+    await store.set(worker.keys.epoch, str(secs - 100))  # the store has been up a while
+    heartbeat = next(t for t in caller._tasks if t.get_name() == "llmq:heartbeat")
+    await _cancel(heartbeat)  # the caller stops renewing
+    task = asyncio.create_task(caller.call("small", CHAT, request_id="cg5", timeout_secs=8))
+    await _until_async(lambda: _confirmed(caller, "cg5"), what="the call sent")
+    await store.delete(caller.keys.caller(caller.worker_id))  # its key lapsed
+    worker._paused = False
+    worker.ready = True
+    with pytest.raises(CallFailed) as info:
+        await task
+    assert info.value.kind == "cancelled"
+    status = await worker.requests.status("cg5")
+    assert status["state"] == "cancelled"
