@@ -440,3 +440,37 @@ async def test_a_dead_probe_is_freed_by_the_sweep(store: redis.asyncio.Redis, pr
     assert removed == 1
     assert (await store.hget(cb, "probe")) == b""
     assert (await r.ask("next", worker="w2", candidates=one)).kind == "granted"
+
+
+async def test_fl1_a_given_back_call_is_granted_to_another_pod_at_once(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-1: UNDO never released the call's claim, so another pod that received the given-back
+    message got `duplicate` for about one lease (the claim stayed `running`, hb fresh).
+    """
+    r = await rig(store, prefix)
+    a = await r.ask("c1", worker="pod-a", tag="m1")
+    assert a.kind == "granted"
+    assert await r.admission.undo("m", owner_token("c1", "pod-a@m1", 1), "c1")
+    b = await r.ask("c1", worker="pod-b", tag="m1")
+    assert b.kind == "granted"  # `duplicate` before the fix
+    job = f"{prefix}:{{r:c1}}:job"
+    assert await store.hget(job, "owner") == b"pod-b@m1"
+    # `keep_claim`: this worker still holds the call, so its claim stays.
+    assert await r.admission.undo("m", owner_token("c1", "pod-b@m1", 1), "c1", keep_claim=True)
+    assert (await r.ask("c1", worker="pod-c", tag="m1")).kind == "duplicate"
+
+
+async def test_fl1_release_claims_of_calls_held_without_a_grant(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-1: a call handed back while waiting (no grant) kept its claim `running` too."""
+    r = await rig(store, prefix)
+    assert (await r.ask("c1", worker="pod-a", tag="m1")).kind == "granted"
+    await r.admission.finish(
+        "m", owner_token("c1", "pod-a@m1", 1), "c1", refund_r=0, refund_t=0, outcome="fail"
+    )  # between retries: no grant, the claim still `running` under pod-a
+    assert (await r.ask("c1", worker="pod-b", tag="m1")).kind == "duplicate"
+    assert await r.admission.release_claims([("c1", "pod-x@m1")]) == 0  # not its owner
+    assert await r.admission.release_claims([("c1", "pod-a@m1")]) == 1
+    assert (await r.ask("c1", worker="pod-b", tag="m1")).kind == "granted"

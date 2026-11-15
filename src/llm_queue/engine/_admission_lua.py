@@ -545,7 +545,7 @@ redis.call('ZADD', mk(alias, 'inprog'), now + lease_ms, req.owner)
 redis.call('HSET', entry_key, 'owner', req.owner, 'worker', req.worker, 'dep', chosen.key,
   'cls', cls, 'minute', minute, 'cost_r', cost_r, 'cost_t', cost_t, 'account', row.account,
   'started', now, 'request', rid, 'served', alias, 'mode', row.rate_window or 'smooth',
-  'bud', cjson.encode(res.taken))
+  'bud', cjson.encode(res.taken), 'job_owner', job_owner)
 redis.call('PEXPIRE', entry_key, lease_ms * 2)
 if res.probe then
   local cb = mk(alias, 'cb:' .. chosen.key)
@@ -699,15 +699,53 @@ return settle(req.alias, req.owner, req.request_id, num(req.refund_r, 0), num(re
 """
 )
 
-# req: alias, owner, request_id. Give everything back; no limiter or breaker learning.
+# The claim of a call this worker lets go (FL-1): `running` under job owner `jo` becomes
+# `queued` again, so another pod's receive of it is granted at once. It stayed `running` with a
+# fresh `hb`, and every other pod got `duplicate` for about one lease (60 s). Another owner's
+# claim, or a final state, is left alone.
+_RELEASE_FN = r"""
+local function release_claim(rid, jo)
+  if not jo or jo == '' then return 0 end
+  local job = P .. ':{r:' .. rid .. '}:job'
+  if redis.call('HGET', job, 'state') ~= 'running' or redis.call('HGET', job, 'owner') ~= jo then
+    return 0
+  end
+  redis.call('HSET', job, 'state', 'queued', 'hb', 0)
+  redis.call('HDEL', job, 'owner')
+  return 1
+end
+-- The job owner (`worker@tag`) inside an owner token `request|job owner|attempt`.
+local function job_owner_of(owner) return string.match(owner, '^.*|([^|]*)|[^|]*$') end
+"""
+
+# req: alias, owner, request_id, keep_claim (optional). Give everything back; no limiter or
+# breaker learning. Every give-back lets go of the call too, so the claim is released (FL-1)
+# unless `keep_claim` says this worker still holds the call.
 UNDO = (
     _COMMON
     + _SETTLE
+    + _RELEASE_FN
     + r"""
 local entry_key = mk(req.alias, 'inprog:' .. req.request_id)
 if redis.call('HGET', entry_key, 'owner') ~= req.owner then return 0 end
-return settle(req.alias, req.owner, req.request_id, hnum(entry_key, 'cost_r', 0),
+local jo = redis.call('HGET', entry_key, 'job_owner') or job_owner_of(req.owner)
+local done = settle(req.alias, req.owner, req.request_id, hnum(entry_key, 'cost_r', 0),
   hnum(entry_key, 'cost_t', 0), false, 'none', -1, 0)
+if done == 1 and not req.keep_claim then release_claim(req.request_id, jo) end
+return done
+"""
+)
+
+# req: {jobs: [{request_id, owner}]} (owner: the job owner `worker@tag`). Release the claims of
+# calls given back with no grant (waiting, or between retries: the drain's hand-back), as UNDO
+# does for a granted one (FL-1). Reply: how many were released.
+RELEASE = (
+    _COMMON
+    + _RELEASE_FN
+    + r"""
+local n = 0
+for _, item in ipairs(req.jobs or {}) do n = n + release_claim(item.request_id, item.owner) end
+return n
 """
 )
 
