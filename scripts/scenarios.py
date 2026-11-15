@@ -697,7 +697,7 @@ async def caller_dies(ctx: Ctx) -> None:
         env={**ctx.gate.env, "LLMQ_MODE": "caller"},
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=log_file("dying-caller"),  # FT-30: a start failure leaves a trace
     )
     # Killed and reaped whatever happens: it used to be left running if the ready line never
     # came (a readline with no timeout), and never waited for (a zombie on POSIX) (CO-17).
@@ -727,7 +727,10 @@ async def caller_dies(ctx: Ctx) -> None:
     await asyncio.sleep(4)
     last = sum([await ctx.provider_calls(r, ORPHAN_ID) for r in REGIONS])
     ctx.checks["provider: the dead caller's calls stopped"] = last == first
-    ctx.checks["provider: fewer calls than the dead caller sent"] = last < 100
+    # FT-28: bounded by what its budget lets start before its liveness key lapses:
+    # the burst (10 % of rpm) plus rpm / 60 per second over the TTL and the fault (C2 rpm 60).
+    bound = 6 + int(60 / 60 * (ttl + ctx.profile.fault_secs + 5))
+    ctx.checks[f"provider: at most {bound} of the dead caller's calls ran"] = last <= bound
     ctx.notes.append(f"dead caller: {last} of its 100 calls reached the provider")
 
 

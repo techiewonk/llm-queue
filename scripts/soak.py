@@ -244,9 +244,16 @@ async def soak(profile: Profile, live: Path | None = None) -> bool:
                 while time.monotonic() < stop_at:
                     c0, t0 = gate.store.script_calls(), time.monotonic()
                     await asyncio.sleep(profile.sample_secs)
-                    info = gate.store.client.info("memory")
-                    keys = sum(
-                        1 for _ in gate.store.client.scan_iter(match=f"{gate.prefix}:*", count=2000)
+                    # Off the driver loop, which sends the traffic (FT-33): INFO and a full
+                    # SCAN are blocking redis calls.
+                    info = await asyncio.to_thread(gate.store.client.info, "memory")
+                    keys = await asyncio.to_thread(
+                        lambda: sum(
+                            1
+                            for _ in gate.store.client.scan_iter(
+                                match=f"{gate.prefix}:*", count=2000
+                            )
+                        )
                     )
                     rate = (gate.store.script_calls() - c0) / (time.monotonic() - t0)
                     since = time.monotonic() - run.t0 - profile.sample_secs
@@ -258,7 +265,7 @@ async def soak(profile: Profile, live: Path | None = None) -> bool:
                         "memory_mb": int(info["used_memory"]) / 1e6,
                         "keys": keys,
                         "scripts_per_s": rate,
-                        "connections": gate.store.connections(name),
+                        "connections": await asyncio.to_thread(gate.store.connections, name),
                         "ok": ok,
                         "failed": len(recent) - ok,
                     }

@@ -742,7 +742,7 @@ async def b33() -> bool:
 
     Here 3K / min and one version.
 
-    Pass: 0 lost, 0 failed priority calls; with a live edit at each restart, the
+    Pass: 0 lost (priority calls included); with a live edit at each restart, the
     registry change counter each caller sees never goes back and ends at the last edit
     (a live edit keeps `version` and bumps the counter).
     """
@@ -784,7 +784,6 @@ async def b33() -> bool:
         "B33",
         {
             "0 lost": all(r.ok for r in run.results),
-            "0 failed priority calls": all(r.ok for r in run.results if r.priority),
             "registry changes never go back": all(v == sorted(v) for v in seen),
             "every caller ends on the last edit": final == [start + edits] * 2,
         },
