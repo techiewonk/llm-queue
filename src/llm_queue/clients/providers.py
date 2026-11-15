@@ -379,6 +379,81 @@ def split_params(method: Callable[..., Any], params: Mapping[str, Any]) -> dict[
     return out
 
 
+# Owner decision D2 (R3SE-1): a caller's params must not reach what the registry and the
+# account decide. The SDK merges `extra_body` over the JSON body and `extra_headers` over the
+# headers, so `{"extra_body": {"model": "other", "max_tokens": 999999}}` replaced the route's
+# model and undid the `inference_limits` cap, and `extra_headers` replaced `Authorization`.
+_PROTECTED_PARAMS = frozenset(
+    {"model", "stream", "stream_options", "store", "api_key", "base_url", "extra_query"}
+)
+_PROTECTED_BODY = frozenset(
+    {
+        "model",
+        "messages",
+        "input",
+        "stream",
+        "stream_options",
+        "n",
+        "max_tokens",
+        "max_completion_tokens",
+        "store",
+        "tools",
+        "tool_choice",
+        "api_key",
+        "base_url",
+    }
+)
+_PROTECTED_HEADERS = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "api-key",
+        "x-api-key",
+        "cookie",
+        "host",
+        "content-length",
+        "content-type",
+        "transfer-encoding",
+        "openai-organization",
+        "openai-project",
+    }
+)
+
+
+class InvalidRequestParams(ValueError):
+    """Caller params that touch a protected field (D2): the call fails as `invalid_request`.
+
+    Its name classifies it: FATAL with the `invalidrequest` family (`request_error_kind`).
+    """
+
+
+def check_params(params: Mapping[str, Any]) -> None:
+    """Refuse caller params that would override the route's model, limits or credentials.
+
+    Top-level `model`, `stream`, `store` and SDK client arguments; in `extra_body` the request
+    fields and the capped ones (`max_tokens`, `n`, ...); in `extra_headers` the credentials and
+    framing headers. Harmless keys pass. Raised before anything is sent (R3SE-1).
+    """
+    bad = sorted(_PROTECTED_PARAMS.intersection(params))
+    body = params.get("extra_body")
+    if body is not None:
+        if not isinstance(body, Mapping):
+            raise InvalidRequestParams("extra_body must be an object")
+        bad += [f"extra_body.{k}" for k in sorted(_PROTECTED_BODY.intersection(body))]
+    headers = params.get("extra_headers")
+    if headers is not None:
+        if not isinstance(headers, Mapping):
+            raise InvalidRequestParams("extra_headers must be an object")
+        bad += [
+            f"extra_headers.{k}" for k in sorted(headers) if str(k).lower() in _PROTECTED_HEADERS
+        ]
+    if bad:
+        raise InvalidRequestParams(
+            f"params set protected fields ({', '.join(bad)}): the registry and the account "
+            "decide these"
+        )
+
+
 def _choice_body(slot: dict[str, Any]) -> dict[str, Any]:
     message: dict[str, Any] = {"role": "assistant", "content": "".join(slot["text"]) or None}
     if slot["reasoning"]:
@@ -539,6 +614,7 @@ class OpenAIProvider:
         self, params: Mapping[str, Any], route: Route, timing: Timing
     ) -> AsyncGenerator[Any, None]:
         """Chat completion chunks of one attempt, each within the attempt timers."""
+        check_params(params)  # before any client or connection (R3SE-1)
         async with self._pool.borrow_openai(route) as client:
             create = client.chat.completions.create
             request = split_params(
@@ -589,6 +665,7 @@ class OpenAIProvider:
         return Result(body, _openai_usage(body.get("usage")))
 
     async def _embeddings(self, params: Mapping[str, Any], route: Route, timing: Timing) -> Result:
+        check_params(params)  # R3SE-1
         async with self._pool.borrow_openai(route) as client:
             create = client.embeddings.create
             reply = await first(
