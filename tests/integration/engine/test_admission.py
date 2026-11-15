@@ -577,6 +577,18 @@ async def test_fl17_a_refused_weighted_pick_leaves_the_rotation_alone(
     assert await store.exists(f"{prefix}:{{m:other}}:rot")
 
 
+async def test_fl18_a_class_share_of_zero_never_fits(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-18: an account priority_reserve of 1 gave normal calls a share of 0, which dropped
+    their budget, so normal calls ran with no account cap of their own.
+    """
+    r = await rig(store, prefix, account={"shared_rpm": 10, "priority_reserve": 1})
+    normal = await r.ask("n1")
+    assert (normal.kind, normal.reason) == ("wait", "reserve")  # granted before the fix
+    assert (await r.ask("p1", cls="p")).kind == "granted"
+
+
 async def test_fl1_release_claims_of_calls_held_without_a_grant(
     store: redis.asyncio.Redis, prefix: str
 ) -> None:

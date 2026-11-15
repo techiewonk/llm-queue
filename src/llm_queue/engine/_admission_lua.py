@@ -110,13 +110,19 @@ local function budgets(alias, row, model, cls, account)
   local function add(key, f, L, kind)
     if present(L) and tonumber(L) > 0 then table.insert(list, {key, f, tonumber(L), kind}) end
   end
+  -- A class share of 0 (a reserve of 1) leaves the class no room at all: limit 0, which never
+  -- fits (FL-18: `add` dropped it, and the class ran with no rate cap of its own).
+  local function add_share(key, f, L, sh, kind)
+    if not present(L) or tonumber(L) <= 0 then return end
+    if sh <= 0 then table.insert(list, {key, f, 0, kind}) else add(key, f, L * sh, kind) end
+  end
   if limits == 'both' or limits == 'rpm' then
     add(rkey, 'rpm', row.rpm, 'r')
-    if share < 1 and present(row.rpm) then add(rkey, cls .. '_rpm', row.rpm * share, 'r') end
+    if share < 1 then add_share(rkey, cls .. '_rpm', row.rpm, share, 'r') end
   end
   if limits == 'both' or limits == 'tpm' then
     add(rkey, 'tpm', row.tpm, 't')
-    if share < 1 and present(row.tpm) then add(rkey, cls .. '_tpm', row.tpm * share, 't') end
+    if share < 1 then add_share(rkey, cls .. '_tpm', row.tpm, share, 't') end
   end
   if account then
     local akey = P .. ':{a:' .. row.account .. '}:rate'
@@ -125,8 +131,8 @@ local function budgets(alias, row, model, cls, account)
     add(akey, 'rpm', row.shared_rpm, 'r')
     add(akey, 'tpm', row.shared_tpm, 't')
     if ashare < 1 then
-      if present(row.shared_rpm) then add(akey, 'n_rpm', row.shared_rpm * ashare, 'r') end
-      if present(row.shared_tpm) then add(akey, 'n_tpm', row.shared_tpm * ashare, 't') end
+      add_share(akey, 'n_rpm', row.shared_rpm, ashare, 'r')
+      add_share(akey, 'n_tpm', row.shared_tpm, ashare, 't')
     end
   end
   return list
@@ -351,6 +357,7 @@ local function evaluate(cand)
   local most = nil
   local taken = budgets(alias, row, model, cls, true)
   for _, b in ipairs(taken) do
+    if b[3] <= 0 then return {wait = (minute + 1) * 60000 - now, reason = 'reserve'} end
     local cost = cost_r
     local R = res.r
     if b[4] == 't' then cost, R = cost_t, res.t end
