@@ -11,8 +11,11 @@ from typing import Any
 
 import pytest
 from engine_testkit import CHAT, Make, away_from_minute_end
+from redis.exceptions import ConnectionError as StoreConnectionError
+from redis.exceptions import ReadOnlyError
 
 from llm_queue.engine.admission import Decision
+from llm_queue.engine.queue import Message
 
 pytestmark = pytest.mark.integration
 
@@ -157,3 +160,147 @@ async def test_rvn2_a_hold_cancelled_before_its_first_step_frees_its_class(make:
     await asyncio.gather(task, return_exceptions=True)
     await asyncio.sleep(0)
     assert key not in engine._held_class
+
+
+# ---------------------------------------------------------------- FE-7 to FE-20, RV-N3, FL-3
+
+
+async def test_fe7_a_read_only_store_is_not_back(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FE-7: paused calls were released on a PING, which a read-only replica answers.
+
+    During a failover they were released on a store that still refused writes, failed, paused
+    again and repeated each second. The probe is now the bounded write probe.
+    """
+    engine, _ = await make()
+
+    async def read_only(*args: Any, **kwargs: Any) -> Any:
+        raise ReadOnlyError("You can't write against a read only replica.")
+
+    monkeypatch.setattr(engine.state, "set", read_only)
+    engine._store_waiting = 1
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(engine._ping_until_back(), 2.5)  # True after 1 s before
+
+
+async def test_fe9_a_bad_message_whose_fail_errs_is_returned(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FE-9: an unreadable message whose `fail` met a store blip was in no list.
+
+    It was hidden for its visibility time and charged a failure. It is now returned.
+    """
+    engine, _ = await make()
+    returned: list[str] = []
+
+    async def fail(*args: Any, **kwargs: Any) -> None:
+        raise StoreConnectionError("connection reset")
+
+    async def return_(message: Any, delay_secs: float = 0.0) -> bool:
+        returned.append(message.id)
+        return True
+
+    monkeypatch.setattr(engine.queues, "fail", fail)
+    monkeypatch.setattr(engine.queues, "return_", return_)
+    view = engine.registry.current
+    name = engine._queue_name(view, "small", False)
+    await engine.queues.send(name, b"not an envelope", engine._queue_settings(view, "small"))
+    await _until(lambda: bool(returned), what="the bad message returned")
+
+
+async def test_fe14_a_stale_ack_is_logged(make: Make, caplog: pytest.LogCaptureFixture) -> None:
+    """FE-14: `_ack` dropped the answer of `queues.ack`; a run that lost its message was silent."""
+    engine, _ = await make()
+    from test_audit_runtime import _a_held
+
+    held = _a_held(engine, "fe14")
+    held.message = Message(queue="q", id="1-0", generation=1, body=b"")
+
+    async def ack(message: Any) -> bool:
+        return False
+
+    engine.queues.ack = ack  # type: ignore[method-assign]  # a stale receipt
+    await engine._ack(held)
+    assert "ack_stale_receipt" in caplog.text
+
+
+async def test_fe15_one_failing_model_does_not_stop_the_sweep(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FE-15: one model whose sweep raised stopped the sweep for every model after it."""
+    engine, _ = await make()
+    swept: list[str] = []
+
+    async def sweep(alias: str, deployments: Any = ()) -> int:
+        if alias == "big":
+            raise RuntimeError("bad model")
+        swept.append(alias)
+        return 0
+
+    monkeypatch.setattr(engine.admission, "sweep", sweep)
+    await _until(lambda: "small" in swept, secs=4, what="the models after it swept")
+
+
+async def test_fe18_a_failing_free_stuck_does_not_end_the_heartbeat(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FE-18: `_free_stuck` was the only heartbeat step outside a `try`; it ended the beat."""
+    engine, _ = await make()
+
+    def broken() -> None:
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(engine, "_free_stuck", broken)
+    seen = engine._beat_ok_mono
+    await _until(lambda: engine._beat_ok_mono > seen + 0.5, secs=4, what="two more beats")
+    assert engine._live()
+
+
+async def test_fe19_background_loops_are_named(make: Make) -> None:
+    """FE-19: `stop_task_failed` logged `Task-123`: no background task had a name."""
+    engine, _ = await make()
+    names = [t.get_name() for t in [*engine._tasks, *engine._model_tasks.values()]]
+    assert names
+    assert all(name.startswith("llmq:") for name in names)
+
+
+async def test_rvn3_a_cancel_after_stop_starts_no_canceller(make: Make) -> None:
+    """RV-N3: a cancel after `stop()` started a new canceller writing to closing clients."""
+    engine, _ = await make()
+    await engine.stop(drain_secs=0)
+    done = engine._cancel_later("rvn3")
+    assert done.done()
+    assert engine._canceller is None or engine._canceller.done()
+
+
+async def test_fl3_a_receive_cancelled_in_flight_is_reclaimed(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FL-3 / FE-8: a receive cancelled in flight left its batch hidden for the visibility time.
+
+    Only store errors recorded the claim; a cancel (loop restart, shutdown) did not, and a
+    full worker never reclaimed. Both now reclaim.
+    """
+    engine, _ = await make()
+    blocked = asyncio.Event()
+
+    async def receive_first(*args: Any, **kwargs: Any) -> Any:
+        blocked.set()
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(engine.queues, "receive_first", receive_first)
+    task = asyncio.create_task(engine._receive_once("titan"))
+    await asyncio.wait_for(blocked.wait(), 2)
+    await _cancel(task)
+    assert "titan" in engine._unclaimed
+    reclaimed: list[Any] = []
+
+    async def reclaim(key: str, nonce: str) -> int:
+        reclaimed.append((key, nonce))
+        return 0
+
+    monkeypatch.setattr(engine.queues, "reclaim", reclaim)
+    engine._slots["titan"].free = 0  # a full worker reclaims too
+    assert await engine._receive_once("titan") is None
+    assert reclaimed

@@ -15,7 +15,15 @@ import hashlib
 import hmac
 import random
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -412,6 +420,7 @@ class Engine:
         self._pubsub: Any = None
         self._cancels: Any = None
         self._stopping = False
+        self._closed = False  # `stop()` cancelled the background tasks: start no new one
         self._paused = False
         self._local_callers: dict[str, int] = {}  # request id -> coroutines waiting on it here
         self._wake: dict[str, asyncio.Event] = {}  # model -> wakes its receive loop
@@ -490,21 +499,25 @@ class Engine:
             )
         if caller:
             self._pubsub = self.state.pubsub()
-            self._tasks.append(asyncio.create_task(self._result_reader()))
-            self._tasks.append(asyncio.create_task(self._result_sweep()))
+            self._loop(self._result_reader(), "result_reader")
+            self._loop(self._result_sweep(), "result_sweep")
         if worker:
             self._worker = True
             self._sync_model_loops()
-            self._tasks.append(asyncio.create_task(self._sweeper()))
-            self._tasks.append(asyncio.create_task(self._prober()))
-            self._tasks.append(asyncio.create_task(self._alert_loop()))
+            self._loop(self._sweeper(), "sweeper")
+            self._loop(self._prober(), "prober")
+            self._loop(self._alert_loop(), "alerts")
             self._cancels = self.state.pubsub()
-            self._tasks.append(asyncio.create_task(self._cancel_reader()))
-            self._tasks.append(asyncio.create_task(self._warm_clients()))
-        self._tasks.append(asyncio.create_task(self._heartbeat()))
-        self._tasks.append(asyncio.create_task(self._store_prober()))
-        self._tasks.append(asyncio.create_task(self.registry.run(self.settings.cfg_reload_secs)))
+            self._loop(self._cancel_reader(), "cancel_reader")
+            self._loop(self._warm_clients(), "warm_clients")
+        self._loop(self._heartbeat(), "heartbeat")
+        self._loop(self._store_prober(), "store_prober")
+        self._loop(self.registry.run(self.settings.cfg_reload_secs), "registry_reload")
         self.ready = True
+
+    def _loop(self, work: Coroutine[Any, Any, None], name: str) -> None:
+        """Start a background loop, named: `stop_task_failed` logged `Task-123` (FE-19)."""
+        self._tasks.append(asyncio.create_task(work, name=f"llmq:{name}"))
 
     def _sync_model_loops(self) -> None:
         """One receive loop per model of the current registry (RESCAN R3).
@@ -534,7 +547,9 @@ class Engine:
                 continue
             if task is not None and not task.cancelled() and task.exception() is not None:
                 logger.error("model_loop_died", model=alias, error=repr(task.exception()))
-            self._model_tasks[alias] = asyncio.create_task(self._model_loop(alias))
+            self._model_tasks[alias] = asyncio.create_task(
+                self._model_loop(alias), name=f"llmq:model:{alias}"
+            )
 
     def pause_receiving(self) -> None:
         """Not ready, and take no new calls from the queues; running and held calls go on.
@@ -591,6 +606,7 @@ class Engine:
             task.cancel()
         # `gather` lets a cancel of `stop()` itself through (a k8s hook timing out) and keeps
         # each result: a loop that died with an error is logged, not swallowed (audit RT-7).
+        self._closed = True
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for task, result in zip(tasks, results, strict=True):
             if isinstance(result, Exception):
@@ -600,6 +616,7 @@ class Engine:
                     error=str(result),
                     error_type=type(result).__name__,
                 )
+        await self._reclaim_lost()
         closes: list[tuple[str, Callable[[], Awaitable[object]]]] = [
             ("chunk_reader", self.chunks.aclose)
         ]
@@ -607,6 +624,21 @@ class Engine:
             if pubsub is not None:
                 closes.append((name, pubsub.aclose))
         await _close_all(closes)  # each on its own, the first failure raised at the end (CO-1)
+
+    async def _reclaim_lost(self) -> None:
+        """At stop, put back what receives with a lost reply took (FE-8, FL-3): time-bound.
+
+        Left alone, those calls stayed hidden for the visibility time and were charged a
+        failure, as the next round of the receive loop never came.
+        """
+        lost, self._unclaimed = list(self._unclaimed.values()), {}
+        if not lost:
+            return
+        try:
+            async with asyncio.timeout(self.settings.timings.health_probe_secs):
+                await asyncio.gather(*(self.queues.reclaim(*claim) for claim in lost))
+        except Exception as exc:  # their visibility timeout brings them back
+            logger.warning("stop_reclaim_failed", claims=len(lost), error=str(exc))
 
     async def _hand_back_held(self, until: float) -> None:
         """Return every call held while waiting for budget, at once and by the drain's end.
@@ -1224,6 +1256,12 @@ class Engine:
         (audit RT-3).
         """
         done = asyncio.get_running_loop().create_future()
+        if self._closed:
+            # After `stop()`'s last gather: a new canceller would write to closing clients,
+            # tracked by nobody (RV-N3). The worker settles the call by its deadline.
+            logger.warning("cancel_after_stop", request_id=rid)
+            done.set_result(None)
+            return done
         self._cancel_queue.append((rid, done))
         task = self._canceller
         if task is None or task.done():
@@ -1406,19 +1444,18 @@ class Engine:
         return probe.done() and not probe.cancelled() and probe.result()
 
     async def _ping_until_back(self) -> bool:
-        """Ping every second until the store answers (True) or no paused call waits (False).
+        """Probe every second until the store takes writes (True) or no call waits (False).
 
-        A store that answers with an error (loading, auth) is not back either.
+        The bounded write probe of readiness, not a PING: a read-only replica answers PING, so
+        during a failover every paused call was released on a store that still refused writes
+        and paused again each second (FE-7). An error answer (loading, auth) is not back either.
         """
         while True:
             await asyncio.sleep(1.0)
             if not self._store_waiting:
                 return False
-            try:
-                await self.state.ping()
-            except (*STORE_ERRORS, RedisError):
-                continue
-            return True
+            if (await self._probe_stores())["state"] == "ok":
+                return True
 
     async def _static_cap(self, view: ResolvedRegistry, alias: str, envelope: Envelope) -> Reply:
         """Run without the store: at most `local_limit_cap` calls per process and model."""
@@ -1769,7 +1806,9 @@ class Engine:
                 and not got
                 and (got is None or (alias, names.get(rung)) in self._held_class)
             ):
-                with contextlib.suppress(*STORE_ERRORS):
+                # A plain error reply too (`UNBLOCKED` in a failover): only connection errors
+                # were caught, and it ended the loop until the next heartbeat (FE-20).
+                with contextlib.suppress(*STORE_ERRORS, RedisError):
                     await self.queues.ring_again(rung)
             rung = None
             held = (alias, "p") in self._held_class or (alias, "n") in self._held_class
@@ -1807,6 +1846,18 @@ class Engine:
         if alias not in view.registry.models:
             await asyncio.sleep(1)
             return False
+        lost = self._unclaimed.pop(alias, None)
+        if lost is not None:
+            # The last receive's reply was lost (scenario S11): what it took is ours and hidden
+            # for the visibility timeout (60 s). It goes back to the queue now, receipt-checked.
+            # Before the slot check: a full worker left the lost batch hidden (FE-8).
+            try:
+                back = await self.queues.reclaim(*lost)
+            except BaseException:
+                self._unclaimed[alias] = lost
+                raise
+            if back:
+                logger.warning("receive_reclaimed", model=alias, count=back)
         free = self._slots[alias].free
         if free <= 0:
             return None
@@ -1817,24 +1868,15 @@ class Engine:
             if (alias, "p" if priority else "n") not in self._held_class
         ]
         key = self.queues.claim_key(f"{self.worker_id}:{alias}")
-        lost = self._unclaimed.pop(alias, None)
-        if lost is not None:
-            # The last receive's reply was lost (scenario S11): what it took is ours and hidden
-            # for the visibility timeout (60 s). It goes back to the queue now, receipt-checked.
-            try:
-                back = await self.queues.reclaim(*lost)
-            except BaseException:
-                self._unclaimed[alias] = lost
-                raise
-            if back:
-                logger.warning("receive_reclaimed", model=alias, count=back)
         claim = (key, new_id())
         try:
             messages, dead = await self.queues.receive_first(
                 names, min(free, self.settings.receive_batch), settings, claim=claim
             )
-        except (*STORE_ERRORS, RedisError):
-            self._unclaimed[alias] = claim  # it may have run: reclaim it on the next round
+        except BaseException:
+            # It may have run: reclaim it on the next round, or at `stop()`. A cancel too (a
+            # loop restarted, shutdown): only store errors were recorded (FL-3, FE-8).
+            self._unclaimed[alias] = claim
             raise
         rest = list(messages)  # not admitted yet: back to the queue whatever happens
         try:
@@ -1899,14 +1941,19 @@ class Engine:
             if now - self._newer_warned_mono >= 60:
                 self._newer_warned_mono = now
                 logger.warning("message_needs_newer_library", model=alias, error=str(exc))
-            await self.queues.return_(message, delay_secs=NEWER_MESSAGE_DELAY_SECS)
+            await self._pass_on(
+                message, self.queues.return_(message, delay_secs=NEWER_MESSAGE_DELAY_SECS)
+            )
             return False
         except Exception as exc:
             # The type only: the validation text can quote the prompt (RESCAN X10). The model's
             # own queue settings decide when it is dead-lettered (A12).
             logger.warning("bad_message", queue=message.queue, error_type=type(exc).__name__)
             self.metrics.count("llmq_bad_messages_total", model=alias)
-            await self.queues.fail(message, self._queue_settings(self.registry.current, alias))
+            await self._pass_on(
+                message,
+                self.queues.fail(message, self._queue_settings(self.registry.current, alias)),
+            )
             return False
         current = self._held.get(env.request_id)
         if current is not None:
@@ -1936,6 +1983,18 @@ class Engine:
             return await self._try(held)
         except Exception:
             await self._release(held, unsure=True)
+            raise
+
+    async def _pass_on(self, message: Message, step: Awaitable[object]) -> None:
+        """Run the store step that passes an unadmitted message on; on failure return it.
+
+        The message was already out of the receive's list: a store blip in that step left it
+        hidden for its visibility time and charged a failure (FE-9).
+        """
+        try:
+            await step
+        except Exception:
+            await self._return_all([message])
             raise
 
     def _callers_judgeable(self) -> bool:
@@ -2661,6 +2720,9 @@ class Engine:
                 if self.clock.now() >= self._deadline(held):
                     await self._finish_call(held, "deadline_exceeded", f"last error: {kind}")
                     return
+                # The view now: one read before the failed attempt still offered a deployment
+                # a reload had removed (FE-13).
+                view = self.registry.current
                 next_decision = await self._decide(view, alias, held, attempt, frozenset(failed))
                 if next_decision is None:
                     return
@@ -3092,6 +3154,12 @@ class Engine:
                     await self.probe_due(alias, lock_key=key)
                 except Exception as exc:  # one model's failure does not skip the others
                     logger.warning("prober_failed", model=alias, error=str(exc))
+            # Back to one pass per period: a probe stretched the lock to 35 s, and no pod
+            # (this one included) probed again for that long after the last probe (RV-N6).
+            try:
+                await self.state.expire(key, int(PROBE_EVERY_SECS))
+            except Exception as exc:
+                logger.warning("prober_failed", step="lock", error=str(exc))
 
     async def probe_due(self, alias: str, *, lock_key: str | None = None) -> dict[str, str]:
         """Probe every disabled deployment of a model that is due; their outcomes.
@@ -3365,8 +3433,16 @@ class Engine:
                 logger.warning("alerts_failed", error=str(exc))
 
     async def _ack(self, held: _Held) -> None:
-        if held.message is not None:
-            await self.queues.ack(held.message)
+        """Ack a call's message and forget the call; a stale receipt is logged and counted.
+
+        A stale receipt means another worker took the message over (this one stalled past its
+        visibility time): the call may have run twice. The ack's answer was dropped (FE-14).
+        """
+        if held.message is not None and not await self.queues.ack(held.message):
+            logger.warning(
+                "ack_stale_receipt", request_id=held.envelope.request_id, model=held.envelope.model
+            )
+            self.metrics.count("llmq_stale_acks_total", model=held.envelope.model)
         self._drop(held)
 
     def _drop(self, held: _Held) -> None:
@@ -3549,7 +3625,10 @@ class Engine:
         while True:
             beat = self.settings.lease_secs / 3
             self._beat_ran_mono = time.monotonic()
-            self._free_stuck()
+            try:  # the only step outside a `try` before: an error here ended the heartbeat (FE-18)
+                self._free_stuck()
+            except Exception as exc:
+                logger.warning("heartbeat_failed", step="free_stuck", error=str(exc))
             try:
                 self._sync_model_loops()
             except Exception as exc:
@@ -3706,14 +3785,21 @@ class Engine:
                     nx=True,
                     px=max(1, int(self.settings.sweep_secs * 1000)),  # ex=0 for < 1 s (A13)
                 )
-                if lock:
-                    view = self.registry.current
-                    for alias in view.registry.models:
-                        await self.admission.sweep(alias, [d.key for d in view.deployments(alias)])
-                        # Dead letters age out on a timer too: only the next dead letter trimmed
-                        # them, so a quiet queue kept its prompts for good (RESCAN X10).
-                        keep = int(view.value(alias, "queue")["dlq_retention_secs"])
-                        names = [self._queue_name(view, alias, p) for p in (True, False)]
-                        await self.queues.trim_dead_many(names, keep)  # one round trip (FL-20)
             except Exception as exc:
                 logger.warning("sweep_failed", error=str(exc))
+                continue
+            if not lock:
+                continue
+            view = self.registry.current
+            for alias in view.registry.models:
+                # One model that fails skips only itself: one `try` around the loop stopped the
+                # sweep (L4 lease pruning too) for every model after it, each round (FE-15).
+                try:
+                    await self.admission.sweep(alias, [d.key for d in view.deployments(alias)])
+                    # Dead letters age out on a timer too: only the next dead letter trimmed
+                    # them, so a quiet queue kept its prompts for good (RESCAN X10).
+                    keep = int(view.value(alias, "queue")["dlq_retention_secs"])
+                    names = [self._queue_name(view, alias, p) for p in (True, False)]
+                    await self.queues.trim_dead_many(names, keep)  # one round trip (FL-20)
+                except Exception as exc:
+                    logger.warning("sweep_failed", model=alias, error=str(exc))
