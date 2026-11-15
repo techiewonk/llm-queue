@@ -132,6 +132,16 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 - OpenAI stream events keep the wire shape: nulls the server sent (`finish_reason: null`,
   `content: null`) are kept, so `chunk["choices"][0]["finish_reason"]` no longer raises
   `KeyError`; `partial_text` counts only choice 0 (R3ST-10).
+- A stream caller waits `stream_idle_secs` + `stream_flush_ms` + `caller_margin_secs` between
+  chunks (was `stream_idle_secs`), so the worker's own idle error, with `partial_text`, arrives
+  first; before, the two timers raced and the kind flipped between `provider_error` and
+  `deadline_exceeded` (R3ST-1). Every `CallFailed` a stream raises itself carries the text
+  already yielded.
+- A second `stream()` with the same `request_id` in one process while the first runs fails
+  with `CallFailed("invalid_request")`; both streams starved before (R3ST-8).
+- A stream cut mid-answer keeps its input and the output written so far charged against TPM and
+  gives the rest of the `max_tokens` reservation back; it kept all of it, also when the cause was
+  ours (`StreamTooLarge`, the store) (R3ST-13).
 - **Breaking: a sync call on the queue's own event loop is refused** (Q1, R3AP-1).
   `converse_sync` / `chat_sync` / `embed_sync` (and LangChain's `invoke`) on the thread that
   runs a started queue's loop would deadlock; it raises `LLMQueueError` naming the fix.
@@ -182,6 +192,10 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 
 ### Added
 
+- `converse_stream(..., meta_event=True)` (and `chat_stream`) ends a complete stream with one
+  library event, `{"llmq": {"usage": {...}, "meta": {...}}}`: input, output and cache tokens,
+  the served model, deployment, fallback, attempts and worker. A stream caller never sees the
+  call's `Reply`, so after a model fallback it could not tell which model answered (R3ST-9).
 - Jobs: `current_job()` (`JobContext`: name, `job_id`, attempt, `max_attempts`) inside a job
   (Q13, R3JE-1); `LLMQueue.job_dead_letters(name)` and `redrive_jobs(name)`, `llm-queue dlq
   list|show|redrive|purge --job NAME`, job queues in `llm-queue queues list`, a `jobs` entry in
@@ -483,6 +497,26 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   caller's own cancellation (EN-7); a failed background flush is logged when it happens
   (EN-19); during a store outage the reader logs the first failure and the recovery and backs
   off to 5 s (it warned every 0.5 s), and `aclose` also cancels pending wake-ups (EN-18).
+- Chunk streams no longer lose a chunk or the end of a stream when a write is cut. `end` and
+  `error` cancelled the flush timer inside its write, and an `add` could be cancelled there too
+  (a deadline, a cancel, shutdown): the batch was dropped, or, when the store had taken it, the
+  next entry reused its seq and the reader skipped it, so the caller never saw `end` / `error`
+  and failed `worker_lost` on a complete answer (FE-3, R3ST-7). An entry in doubt is now sent
+  again under its own seq, and stopping the timer waits for a flush in flight.
+- The call's deadline passing mid-stream ends the stream `deadline_exceeded` ("the call's
+  deadline passed mid-stream") without charging the deployment's breaker; it was
+  `provider_error` with an empty message, counted as a provider failure (R3ST-2).
+- A stream cancelled with `cancel(request_id)` gets an error entry with `partial_text` at once
+  and its flush timer is stopped; the caller waited out `stream_idle_secs` (30 s) and got
+  `cancelled` with no text. A stream whose call failed after its last entry ends after a short
+  grace, not the idle time (R3ST-3).
+- An app request id streamed again after its chunks expired (30 s after `end`) while its
+  result is still kept replays the kept reply as events (ConverseStream events, or one chat
+  chunk plus a usage chunk); it ended with no event and no error (R3ST-6).
+- Every event up to the first with answer content is written at once: the first text delta
+  waited up to `stream_flush_ms` behind `messageStart` (R3ST-12). The `end` entry is not counted
+  against `stream_max_bytes`; an answer that fit failed `StreamTooLarge` on its last entry
+  (R3ST-13).
 - `llm-queue redrive` drops (and reports) a dead letter without a body instead of failing
   part-way with some letters already moved, rings the queue's doorbell so an idle worker takes
   the redriven calls at once, and trims the stream like a send (EN-12). `ring_again` sets the
@@ -590,6 +624,14 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   Converse request (inference with `stop` and `extra`, a guardrail in `params`): a memoised
   settings read stays 232 ns (freezing happens once per view), but the request build goes
   13.6 -> 21.1 us (+55 %) with the copy (Python 3.12.13, Windows, 2026-11-15).
+- The caller's shared chunk read packs each open stream's key once and joins the command,
+  instead of redis-py rebuilding and packing every key and id on each read: 0.30 -> 0.05 ms per
+  read at 100 open streams, 3.1 -> 0.42 ms at 1,000, 16.0 -> 2.5 ms at 5,000. With eight writers
+  at 33 entries/s per stream on the local Valkey, reader CPU per entry 41.8 -> 24.7 us (100
+  streams), 15.8 -> 12.8 us (1,000) (R3PF-2; Python 3.12.13, Windows, 2026-11-15). A
+  per-caller inbox stream (one key per read) is not done.
+- `stream()` reads each chunk entry with one queue get; a Task and an `asyncio.wait` per entry
+  cost 42 us each (R3PF-11, caller side; the worker still flushes one pipeline per stream).
 
 ### Packaging and CI
 
