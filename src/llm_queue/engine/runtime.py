@@ -842,6 +842,7 @@ class Engine:
                     error_type=type(result).__name__,
                 )
         await self._reclaim_lost()
+        self._flush_metrics()
         closes: list[tuple[str, Callable[[], Awaitable[object]]]] = [
             ("chunk_reader", self.chunks.aclose)
         ]
@@ -849,6 +850,20 @@ class Engine:
             if pubsub is not None:
                 closes.append((name, pubsub.aclose))
         await _close_all(closes)  # each on its own, the first failure raised at the end (CO-1)
+
+    def _flush_metrics(self) -> None:
+        """At stop, write the points a buffering sink still holds (`EmfSink` adds up a second).
+
+        Only the default stdout writer flushes at exit; a sink given its own `write` kept the
+        last second of points until the next point, which never came after a stop.
+        """
+        flush = getattr(self.metrics, "flush", None)
+        if not callable(flush):
+            return
+        try:
+            flush()
+        except Exception as exc:  # a failing sink never fails the stop
+            logger.warning("stop_metrics_flush_failed", error=str(exc))
 
     async def _reclaim_lost(self) -> None:
         """At stop, put back what receives with a lost reply took (FE-8, FL-3): time-bound.

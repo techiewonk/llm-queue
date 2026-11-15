@@ -89,20 +89,20 @@ async def test_metrics_and_call_record(make: Make, caplog: pytest.LogCaptureFixt
     engine.metrics = EmfSink(lines.append)
     caplog.set_level(logging.INFO, logger="llm_queue.engine.runtime")
     await engine.call("big", CHAT, user_id="ann", tenant_id="desk")
+    # The sink adds points up for a second (R3OB-11, R3PF-14); stop writes what it holds.
+    await engine.stop(drain_secs=0)
     logs = [getattr(r, "llmq", {}) for r in caplog.records]
-    names = [
-        next(
-            k
-            for k in json.loads(line)
-            if not k.startswith("_")
-            and k not in ("model", "account", "region", "outcome", "priority", "kind", "reason")
-        )
-        for line in lines
-    ]
-    assert "llmq_calls_total" in names
-    assert "llmq_tokens_output_total" in names
-    point = json.loads(lines[names.index("llmq_calls_total")])
+    # One line per label set, with every metric of that set (its `_aws` Metrics list).
+    points = [json.loads(line) for line in lines]
+    named = {
+        metric["Name"]: point
+        for point in points
+        for metric in point["_aws"]["CloudWatchMetrics"][0]["Metrics"]
+    }
+    assert "llmq_tokens_output_total" in named
+    point = named["llmq_calls_total"]
     assert (point["model"], point["region"], point["outcome"]) == ("big", "r1", "ok")
+    assert point["llmq_calls_total"] == 1
     record = [entry for entry in logs if entry.get("event") == "llmq_call_finished"]
     assert len(record) == 1
     assert record[0]["tenant"] != "desk"  # the tenant id is hashed too (RESCAN X10)
