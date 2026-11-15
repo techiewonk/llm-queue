@@ -89,6 +89,7 @@ STORE_RETRY_BASE_SECS = 0.1
 STORE_RETRY_CAP_SECS = 1.0
 PROBE_EVERY_SECS = 5.0  # how often one process looks for disabled deployments due a probe
 PROBE_TIMEOUT_SECS = 30.0  # one probe call's budget (first response, idle and whole call)
+HAND_BACK_FLOOR_SECS = 2.0  # `stop()` returns waiting calls within at least this (FE-6)
 START_PROBE_SECS = 10.0  # each store step of `start()`: a dead store never holds the pod's start
 # Request fields a fallback model may not understand (another family's knobs): dropped from the
 # caller's params when the call is served by another model (RESCAN P6). The target's own
@@ -177,6 +178,22 @@ for i = 2, #ARGV do
   end
 end
 return out
+"""
+
+# ARGV: prefix, then (request id, job owner) pairs. Let go of the claims this process held: a
+# claim whose owner is still the given `worker@tag` gets heartbeat 0, so another pod's PICK_TAKE
+# takes the returned message at once. The claim kept a fresh heartbeat, and every other pod
+# answered `duplicate` until it was a lease old: 30-60 s per given-back call (FE-1).
+_RELEASE_CLAIMS = """
+local released = 0
+for i = 2, #ARGV - 1, 2 do
+  local job = ARGV[1] .. ':{r:' .. ARGV[i] .. '}:job'
+  if redis.call('HGET', job, 'owner') == ARGV[i + 1] then
+    redis.call('HSET', job, 'hb', 0)
+    released = released + 1
+  end
+end
+return released
 """
 
 
@@ -409,6 +426,7 @@ class Engine:
         # Per model: the claim (key, nonce) of a receive whose reply was lost (S11).
         self._unclaimed: dict[str, tuple[str, str]] = {}
         self._results_exist = state.register_script(_RESULTS_EXIST)
+        self._release_claims_script = state.register_script(_RELEASE_CLAIMS)
         self.ready = False
         self._direct_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.health = Health(state, self.keys)
@@ -604,14 +622,19 @@ class Engine:
             if not h.grants and h.run is None and h.message is not None
         ]
         for held in handed:
+            # Dropped, not cancelled: its hold sees that within a second and ends. A cancel
+            # inside its admission lost a grant the store had made (FE-4, RV-N1).
             self._drop(held)  # else the heartbeat hides it again for the whole drain
-            if held.hold is not None:
-                held.hold.cancel()
         messages = [h.message for h in handed if h.message is not None]
         if not messages:
             return
+        # At least a short floor: with `drain_secs=0` (or a grace already spent) the deadline
+        # had passed, nothing was returned and every waiting call was hidden for its whole
+        # visibility time and charged a failure (FE-6).
+        loop = asyncio.get_running_loop()
         try:
-            async with asyncio.timeout_at(until):
+            async with asyncio.timeout_at(max(until, loop.time() + HAND_BACK_FLOOR_SECS)):
+                await self._release_claims(handed)
                 results = await asyncio.gather(
                     *(self.queues.return_(m) for m in messages), return_exceptions=True
                 )
@@ -1912,7 +1935,7 @@ class Engine:
         try:
             return await self._try(held)
         except Exception:
-            await self._release(held)
+            await self._release(held, unsure=True)
             raise
 
     def _callers_judgeable(self) -> bool:
@@ -2186,11 +2209,37 @@ class Engine:
             return False
         if await self._model_fallback(view, alias, held, 1, now - held.position_ms / 1000.0):
             return False
-        self._held_class.add((alias, _cls(env)))
+        if self._stopping:
+            # Received while `stop()` ran, after it handed the held calls back: a hold here
+            # ended at once without returning the message, hidden for the drain plus its
+            # visibility time and charged a failure (FE-2).
+            await self._release(held)
+            return False
+        key = (alias, _cls(env))
+        self._held_class.add(key)
         task = held.hold = asyncio.create_task(self._hold(held, decision.wait_secs))
         self._running.add(task)
         task.add_done_callback(self._running.discard)
+        task.add_done_callback(lambda done: self._hold_cancelled(done, key))
         return True
+
+    def _hold_cancelled(self, task: asyncio.Task[None], key: tuple[str, str]) -> None:
+        """Free a hold's class when the hold was cancelled before its first step (RV-N2).
+
+        Its `finally` never ran then, so the class stayed held and this process never
+        received that class of the model again.
+        """
+        if not task.cancelled():
+            return
+        others = (
+            h.hold
+            for h in self._held.values()
+            if h.hold is not None
+            and h.hold is not task
+            and (h.envelope.model, _cls(h.envelope)) == key
+        )
+        if not any(not other.done() for other in others):
+            self._held_class.discard(key)
 
     async def _expire_if_due(
         self, held: _Held, now: float, *, retry_after: float | None = None
@@ -2393,11 +2442,15 @@ class Engine:
                     self._start_run(held, decision, 1)
                     return
                 wait_secs = decision.wait_secs
+            if self._owns(held) and held.run is None and not held.grants:
+                # `stop()` began after this call was received and handed back the holds it
+                # saw: return this one too, or it stayed hidden for the drain (FE-2).
+                await self._release(held)
         except Exception as exc:  # never leave the call held with nobody working on it
             if isinstance(exc, STORE_ERRORS):
                 self._store_trouble("hold")
             logger.warning("hold_failed", request_id=held.envelope.request_id, error=str(exc))
-            await self._release(held)
+            await self._release(held, unsure=True)
         finally:
             self._held_class.discard((alias, cls))
             if (event := self._wake.get(alias)) is not None:
@@ -3356,6 +3409,7 @@ class Engine:
                 )
             elif held.message is not None:
                 self._drop(held)
+                await self._release_claims([held])
                 await self.queues.return_(held.message)
             else:  # a direct call: its caller is in this process, which is stopping
                 await self._finish_call(held, "worker_shutdown", "the worker shut down")
@@ -3364,16 +3418,25 @@ class Engine:
                 "shutdown_give_back_failed", request_id=held.envelope.request_id, error=str(exc)
             )
 
-    async def _release(self, held: _Held, delay_secs: float = 0.0) -> None:
+    async def _release(self, held: _Held, delay_secs: float = 0.0, *, unsure: bool = False) -> None:
         """Let go of a call after an unexpected error: grants back, not held, message returned.
 
         The return waits out a store outage: one that failed left the message hidden for its
-        whole visibility timeout (60 s), and its caller waited that long.
+        whole visibility timeout (60 s), and its caller waited that long. `unsure`: its first
+        admission failed without an answer (a read timeout): the script may have granted, so
+        that grant is undone too (owner-checked, a no-op when none was made; AMEND FE-4).
         """
+        if unsure and held.run is None and not held.grants and self._owns(held):
+            alias, rid = held.envelope.model, held.envelope.request_id
+            try:
+                await self.admission.undo(alias, self._owner(held, 1), rid)
+            except RedisError as exc:
+                logger.warning("give_back_failed", request_id=rid, error=str(exc))
         await self._give_back(held)
         self._drop(held)
         message = held.message
         if message is not None:
+            await self._release_claims([held])
             try:
                 await self._through_outage(
                     lambda: self.queues.return_(message, delay_secs=delay_secs)
@@ -3387,6 +3450,31 @@ class Engine:
                     error=str(exc),
                     error_type=type(exc).__name__,
                 )
+
+    async def _release_claims(self, helds: Sequence[_Held]) -> None:
+        """Let go of the claims of calls this process gives back: best effort, time-bound.
+
+        Without it a given-back call ran elsewhere only once its claim was a lease old (FE-1):
+        a 30 s call missed its deadline on every graceful restart, drain timeout or failed run.
+        """
+        pairs = [
+            part
+            for held in helds
+            if held.message is not None
+            for part in (held.envelope.request_id, f"{self.worker_id}@{held.tag}")
+        ]
+        if not pairs:
+            return
+        try:
+            async with asyncio.timeout(self.settings.timings.health_probe_secs):
+                await self._release_claims_script([], [self.keys.prefix, *pairs])
+        except Exception as exc:  # the claim then ages out after a lease, as before
+            logger.warning(
+                "release_claims_failed",
+                calls=len(pairs) // 2,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
 
     async def _through_outage(self, write: Callable[[], Awaitable[object]]) -> None:
         """Run a store write that must land, again every 0.5 s while the store is out of reach.
@@ -3445,8 +3533,8 @@ class Engine:
             if running:
                 assert held.run is not None
                 held.run.cancel()
-            if held.hold is not None and not held.hold.done():
-                held.hold.cancel()  # its next round must not grant and run a freed call
+            # A hold is not cancelled: dropped, it ends at its next round, and a grant its
+            # admission got meanwhile goes back in `_start_run` (FE-4, RV-N1).
             task = asyncio.create_task(self._release(held))
             self._running.add(task)
             task.add_done_callback(self._running.discard)
@@ -3556,9 +3644,7 @@ class Engine:
             if not self._owns(held):
                 continue
             logger.warning("hold_lost", request_id=held.envelope.request_id)
-            self._drop(held)
-            if held.hold is not None and not held.hold.done():
-                held.hold.cancel()
+            self._drop(held)  # its hold ends at its next round (not cancelled: FE-4)
 
     async def _check_epoch(self) -> None:
         """The store lost its data (restart, failover): re-register running calls (T10).
