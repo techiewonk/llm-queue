@@ -34,16 +34,30 @@ local DAY_MS = 86400000
 local function slide(key, ms) redis.call('PEXPIRE', key, ms) end
 local function held_ms() return math.max(KEY_MS, 2 * num(req.lease_ms, 60000)) end
 
+-- Budget hashes read once per script into a table (FL-11: each budget read the same fields with
+-- 2 to 3 HGETs, 16 to 24 reads a candidate where one HGETALL per hash does); `write` drops it.
+local rcache = {}
+local function rnum(key, field, d)
+  local h = rcache[key]
+  if h == nil then
+    h = {}
+    local flat = redis.call('HGETALL', key)
+    for i = 1, #flat, 2 do h[flat[i]] = flat[i + 1] end
+    rcache[key] = h
+  end
+  return num(h[field], d)
+end
+
 -- One budget: field prefix f, limit L per minute, burst fraction bf, window mode.
 local function avail(key, f, L, bf, mode)
   local burst = math.max(1, math.floor(L * bf))
   if mode == 'fixed' then
     local n = 0
-    if hnum(key, f .. '_win', -1) == minute then n = hnum(key, f .. '_n', 0) end
+    if rnum(key, f .. '_win', -1) == minute then n = rnum(key, f .. '_n', 0) end
     return L - n, n
   end
   local per = 60000 / L
-  local tat = math.max(hnum(key, f .. '_tat', now), now)
+  local tat = math.max(rnum(key, f .. '_tat', now), now)
   return (now + burst * per - tat) / per, tat
 end
 
@@ -53,7 +67,7 @@ local function room(key, f, L, c, R, bf, mode)
   local burst = math.max(1, math.floor(L * bf))
   if mode == 'fixed' then
     -- After a store reset, a fixed window holds until the next minute (plan T10).
-    if reset_minute == minute and hnum(key, f .. '_win', -1) ~= minute then
+    if reset_minute == minute and rnum(key, f .. '_win', -1) ~= minute then
       return (minute + 1) * 60000 - now, nil
     end
     local _, n = avail(key, f, L, bf, mode)
@@ -61,7 +75,7 @@ local function room(key, f, L, c, R, bf, mode)
     return (minute + 1) * 60000 - now, nil
   end
   local per = 60000 / L
-  local tat = math.max(hnum(key, f .. '_tat', now), now)
+  local tat = math.max(rnum(key, f .. '_tat', now), now)
   if c > burst and R == 0 then
     if tat <= now then return 0, now + c * per end
     return tat - now, nil
@@ -72,6 +86,7 @@ local function room(key, f, L, c, R, bf, mode)
 end
 
 local function write(key, f, mode, value)
+  rcache[key] = nil
   if mode == 'fixed' then
     redis.call('HSET', key, f .. '_win', minute, f .. '_n', value)
   else
@@ -358,7 +373,7 @@ local function evaluate(cand)
   if prio then
     local floor = num(model.normal_min_share, 0) * num(row.rpm, 0)
     local used = 0
-    if hnum(rkey, 'seen_win', -1) == minute then used = hnum(rkey, 'seen_n', 0) end
+    if rnum(rkey, 'seen_win', -1) == minute then used = rnum(rkey, 'seen_n', 0) end
     if floor <= 0 or used >= floor then
       res = {r = res.r + prio.r, t = res.t + prio.t, s = res.s + prio.s}
     end
