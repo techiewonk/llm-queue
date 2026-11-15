@@ -188,6 +188,13 @@ class FakeLLM:
 
     def start(self) -> None:
         """Start and wait until it answers."""
+        # FT-17: a listener already on the port (the stack's fakellm, or another drill's) used
+        # to count as "started", and the drill then measured someone else's counters.
+        with (
+            contextlib.suppress(OSError),
+            socket.create_connection(("127.0.0.1", FAKE_PORT), timeout=0.2),
+        ):
+            raise RuntimeError(f"port {FAKE_PORT} is already in use; fakellm cannot start there")
         env = dict(os.environ, PYTHONPATH=str(ROOT / "tools" / "fakellm"))
         cmd = [PY, "-m", "fakellm", "--host", "127.0.0.1", "--port", str(FAKE_PORT)]
         log = log_file("fakellm")
@@ -202,6 +209,8 @@ class FakeLLM:
         )
         log.close()  # the process keeps its own handle
         for _ in range(100):
+            if self.proc.poll() is not None:  # it died (for example, the port was taken)
+                break
             try:
                 with socket.create_connection(("127.0.0.1", FAKE_PORT), timeout=0.2):
                     return

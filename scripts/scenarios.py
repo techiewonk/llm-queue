@@ -692,13 +692,17 @@ async def caller_cancel(ctx: Ctx) -> None:
 
 async def caller_dies(ctx: Ctx) -> None:
     """A caller process with 100 calls waiting is killed; its calls must not stay held."""
-    proc = subprocess.Popen(  # noqa: ASYNC220  # one process, started once
-        [PY, str(Path(__file__).parent / "gates_fleet.py"), "caller", "100", "orphan"],
-        env={**ctx.gate.env, "LLMQ_MODE": "caller"},
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=log_file("dying-caller"),  # FT-30: a start failure leaves a trace
-    )
+    log = log_file("dying-caller")  # FT-30: a start failure leaves a trace
+    try:
+        proc = subprocess.Popen(  # noqa: ASYNC220  # one process, started once
+            [PY, str(Path(__file__).parent / "gates_fleet.py"), "caller", "100", "orphan"],
+            env={**ctx.gate.env, "LLMQ_MODE": "caller"},
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=log,
+        )
+    finally:
+        log.close()  # the child keeps its own handle
     # Killed and reaped whatever happens: it used to be left running if the ready line never
     # came (a readline with no timeout), and never waited for (a zombie on POSIX) (CO-17).
     try:

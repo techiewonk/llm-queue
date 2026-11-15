@@ -584,15 +584,19 @@ async def b96() -> bool:
     async with Gate(doc) as gate:
         try:
             for _ in range(4):
-                procs.append(
-                    subprocess.Popen(  # noqa: ASYNC220  # started once, before the measurement
-                        [PY, str(FLEET), "caller", "500", "chat"],
-                        env={**gate.env, "LLMQ_MODE": "caller"},
-                        stdin=subprocess.PIPE,
-                        stdout=subprocess.PIPE,
-                        stderr=log_file("b96-caller"),
+                log = log_file("b96-caller")
+                try:
+                    procs.append(
+                        subprocess.Popen(  # noqa: ASYNC220  # started once, before measuring
+                            [PY, str(FLEET), "caller", "500", "chat"],
+                            env={**gate.env, "LLMQ_MODE": "caller"},
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=log,
+                        )
                     )
-                )
+                finally:
+                    log.close()  # the child keeps its own handle
             for proc in procs:
                 assert proc.stdout is not None
                 try:
