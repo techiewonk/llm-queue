@@ -17,6 +17,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import orjson
 from redis.connection import parse_url, to_bool
 
+from llm_queue.engine.store_guard import WAIT_SCOPES, parse_scopes
 from llm_queue.errors import ConfigError
 from llm_queue.registry.validate import parse_document
 
@@ -114,6 +115,8 @@ class InfraSettings:
     queue_failover_secs: float = 5.0
     queue_wait_replicas: int = 0
     queue_wait_ms: int = 100
+    # What the replica wait covers (owner Q8 / Q51), LLMQ_QUEUE_WAIT_SCOPES: all by default.
+    queue_wait_scopes: frozenset[str] = frozenset(WAIT_SCOPES)
     debug_capture_from_config: bool = False
 
     @property
@@ -224,6 +227,8 @@ class InfraSettings:
                 problems.append(f"LLMQ_{name} must be {'0 or more' if zero else 'above 0'}")
             return value
 
+        scopes, scope_problems = parse_scopes(str(get("QUEUE_WAIT_SCOPES", "all")))
+        problems.extend(scope_problems)
         lease = number("LEASE_SECS", 60.0)
         caller_ttl = number("CALLER_TTL_SECS", 30, int)
         # The caller key is renewed every lease / 3; it must outlive one beat with room for a
@@ -263,6 +268,7 @@ class InfraSettings:
             queue_failover_secs=number("QUEUE_FAILOVER_SECS", 5.0, zero=True),
             queue_wait_replicas=number("QUEUE_WAIT_REPLICAS", 0, int, zero=True),
             queue_wait_ms=number("QUEUE_WAIT_MS", 100, int),
+            queue_wait_scopes=scopes,
             debug_capture_from_config=capture,
         )
         if problems:

@@ -332,11 +332,23 @@ async def test_rt6_shutdown_give_back_is_awaited_by_stop(make: Make) -> None:
     a kept task `stop()` waits for: none is left when `stop()` returns.
     """
     engine, _ = await make(None, SLOW)
-    caller = asyncio.create_task(engine.call("small", CHAT, timeout_secs=8))
+    caller = asyncio.create_task(engine.call("small", CHAT, timeout_secs=8, request_id="rt6"))
     await _until(lambda: any(h.run for h in engine._held.values()), what="a running call")
+    returned: list[str] = []
+    real_return = engine.queues.return_
+
+    async def return_(message: Any, delay_secs: float = 0.0) -> bool:
+        returned.append(message.id)
+        return await real_return(message, delay_secs)
+
+    engine.queues.return_ = return_  # type: ignore[method-assign]  # record the give-back
     await engine.stop(drain_secs=0)
     assert not engine._settling
     assert not engine._held
+    # The give-back really ran before `stop()` returned (RV-T1: the test checked only the set).
+    assert returned
+    job = await engine.requests.job("rt6")
+    assert job.get("hb") == "0"  # its claim released too (FE-1)
     caller.cancel()
     await asyncio.gather(caller, return_exceptions=True)
 
@@ -549,7 +561,8 @@ async def test_rt12_debug_capture_failure_never_reruns_the_call(
 ) -> None:
     """Audit RT-12: a store error writing the debug capture released a call that succeeded.
 
-    It ran again at the provider. The capture now comes after the result and never fails it.
+    It ran again at the provider. The capture still comes before the result (the docstring
+    said after: RV-T1) and never fails it.
     """
     engine, fake = await make({"small": {"debug_capture": True}})
     engine.settings = dataclasses.replace(engine.settings, debug_capture_allowed=True)

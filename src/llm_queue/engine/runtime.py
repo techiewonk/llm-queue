@@ -11,16 +11,27 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import hmac
+import inspect
+import math
 import random
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
+from redis.exceptions import BusyLoadingError, OutOfMemoryError, RedisError, ResponseError
 from redis.exceptions import ConnectionError as StoreConnectionError
-from redis.exceptions import OutOfMemoryError, RedisError, ResponseError
 from redis.exceptions import ReadOnlyError as StoreReadOnlyError
 from redis.exceptions import TimeoutError as StoreTimeoutError
 
@@ -61,7 +72,9 @@ from llm_queue.engine.queue import (
 from llm_queue.engine.requests import RequestStore
 from llm_queue.engine.status import AlertEvaluator, StatusReader
 from llm_queue.engine.store_checks import UNKNOWN as UNKNOWN_POLICY
-from llm_queue.engine.store_checks import check_store
+from llm_queue.engine.store_checks import check_store, eviction_policy, eviction_warning
+from llm_queue.engine.store_client import StorePoolBusy
+from llm_queue.engine.store_guard import WAIT_SCOPES, ReplicaWait
 from llm_queue.engine.streaming import ChunkReader, ChunkWriter, StreamTooLarge
 from llm_queue.errors import ErrorKind, UnsupportedEnvelopeError
 from llm_queue.ids import new_id
@@ -89,6 +102,12 @@ STORE_RETRY_BASE_SECS = 0.1
 STORE_RETRY_CAP_SECS = 1.0
 PROBE_EVERY_SECS = 5.0  # how often one process looks for disabled deployments due a probe
 PROBE_TIMEOUT_SECS = 30.0  # one probe call's budget (first response, idle and whole call)
+POLICY_EVERY_ROUNDS = 12  # the stores' eviction policy is read again each minute (R3FM-8)
+HAND_BACK_FLOOR_SECS = 2.0  # `stop()` returns waiting calls within at least this (FE-6)
+CLOCK_MAX_RTT_SECS = 0.25  # a TIME read slower than this keeps the old offset (R3RC-7)
+CLOCK_JUMP_SECS = 2.0  # the store clock moving this much against ours is a jump (R3FM-10)
+PUBSUB_PING_SECS = 5.0  # a subscriber pings this often; silent for two pings is reset (R3RC-6)
+PUBSUB_SWEEP_MISSES = 3  # sweeps in a row finding unannounced results reset the reader (R3FM-12)
 START_PROBE_SECS = 10.0  # each store step of `start()`: a dead store never holds the pod's start
 # Request fields a fallback model may not understand (another family's knobs): dropped from the
 # caller's params when the call is served by another model (RESCAN P6). The target's own
@@ -124,9 +143,21 @@ def _op_of(view: ResolvedRegistry, alias: str) -> str:
     return OPS.get((entry.provider, entry.type), "chat" if entry.type == "chat" else "embeddings")
 
 
+def _by_deployment(view: ResolvedRegistry, alias: str, name: str) -> float:
+    """A setting at its most specific level, the largest over the model's deployments.
+
+    Owner Q39: `timeout_secs` and `default_output_tokens` set on an account (or deployment)
+    were never read, as both were looked up for the model alone. The deployment is not known
+    when they are needed (the call's deadline, the estimate charged at admission), so the
+    largest of the deployments' values is used: no deployment gets less than its own.
+    """
+    values = [float(view.value(alias, name, d.key)) for d in view.deployments(alias)]
+    return max(values) if values else float(view.value(alias, name))
+
+
 def _call_timeout_secs(view: ResolvedRegistry, alias: str, asked: float | None) -> float:
-    """A call's timeout: the one asked for (else the model's), capped at `timeout_max_secs`."""
-    timeout = float(asked or view.value(alias, "timeout_secs"))
+    """A call's timeout: the one asked for (else its levels'), capped at `timeout_max_secs`."""
+    timeout = float(asked or _by_deployment(view, alias, "timeout_secs"))
     return min(timeout, float(view.value(alias, "timeout_max_secs")))
 
 
@@ -164,19 +195,31 @@ class EngineSettings:
     queue_failover_secs: float = 5.0  # queue-store errors this long before calls run direct
     queue_wait_replicas: int = 0  # a send waits for this many replicas (0: off)
     queue_wait_ms: int = 100  # how long it waits for them
+    # What the replica wait covers (owner Q8): calls, jobs, registry; all by default.
+    queue_wait_scopes: frozenset[str] = frozenset(WAIT_SCOPES)
+    # Strict mode (outside dev / test): an evicting store fails readiness (owner Q10).
+    strict: bool = False
     debug_capture_allowed: bool = False  # LLMQ_DEBUG_CAPTURE_FROM_CONFIG (never in prod)
+    # A store outage seen by a call is remembered this long (owner Q11, R3FM-3): `fail_fast` and
+    # `static_cap` then answer at once instead of re-trying the store (1.5-21.5 s per call).
+    outage_memo_secs: float = 3.0
     timings: EngineTimings = field(default_factory=EngineTimings)  # `Tuning.engine`
 
 
-# ARGV: key prefix, request ids... Reply: the 0-based indexes of the ids with a stored result.
+# ARGV: key prefix, request ids... Reply: {the 0-based indexes of the ids with a stored result,
+# those whose record is gone too (the store lost it: R3FM-4, they are sent again)}.
 _RESULTS_EXIST = """
 local out = {}
+local gone = {}
 for i = 2, #ARGV do
-  if redis.call('EXISTS', ARGV[1] .. ':{r:' .. ARGV[i] .. '}:res') == 1 then
+  local base = ARGV[1] .. ':{r:' .. ARGV[i] .. '}:'
+  if redis.call('EXISTS', base .. 'res') == 1 then
     table.insert(out, i - 2)
+  elseif redis.call('EXISTS', base .. 'job') == 0 then
+    table.insert(gone, i - 2)
   end
 end
-return out
+return {out, gone}
 """
 
 
@@ -195,6 +238,30 @@ async def _close_all(steps: Sequence[tuple[str, Callable[[], Awaitable[object]]]
         raise first
 
 
+_ACCEPTS_API: dict[type, bool] = {}
+
+
+def _api_kwargs(provider: Any, view: ResolvedRegistry, alias: str) -> dict[str, Any]:
+    """`converse_api` for a provider whose `call` accepts it; nothing for one that does not.
+
+    Owner Q33: a custom provider written for 0.1.0b1 has no such parameter, and passing it
+    raised `TypeError` on every call. Checked once per provider class.
+    """
+    kind = type(provider)
+    accepts = _ACCEPTS_API.get(kind)
+    if accepts is None:
+        try:
+            params = inspect.signature(provider.call).parameters.values()
+        except (TypeError, ValueError):
+            accepts = True
+        else:
+            accepts = any(
+                p.name == "converse_api" or p.kind is inspect.Parameter.VAR_KEYWORD for p in params
+            )
+        _ACCEPTS_API[kind] = accepts
+    return {"converse_api": str(view.value(alias, "converse_api"))} if accepts else {}
+
+
 def _seen(task: asyncio.Future[Any]) -> None:
     """Mark a finished task's exception as read (no "exception was never retrieved")."""
     if not task.cancelled():
@@ -206,6 +273,25 @@ def _refusal(exc: BaseException) -> str:
     if isinstance(exc, OutOfMemoryError) or "OOM" in str(exc):
         return "the state store is out of memory"  # redis-py strips the "OOM" prefix
     return f"the state store refused the call: {exc}"
+
+
+# Refusals a store answers while it cannot take writes for a while: out of memory, a failed
+# save (MISCONF), too few replicas under `min-replicas-to-write` (NOREPLICAS), a long script
+# (BUSY), loading, no primary. Treated as the store being down (owner Q12, R3FM-7): they reached
+# callers as `queue_unavailable` and threw away answers in hand.
+_REFUSAL_CODES = frozenset(
+    {"OOM", "MISCONF", "NOREPLICAS", "BUSY", "LOADING", "MASTERDOWN", "TRYAGAIN"}
+)
+
+
+def _store_refused(exc: BaseException) -> bool:
+    """True for a store answer that refuses writes for a while (counted as the store down)."""
+    if isinstance(exc, (OutOfMemoryError, BusyLoadingError)):
+        return True
+    if not isinstance(exc, ResponseError):
+        return False
+    words = str(exc).split(maxsplit=1)
+    return bool(words) and words[0].upper() in _REFUSAL_CODES
 
 
 # READONLY: a failover left this connection on the old primary (now a replica). `OSError` takes
@@ -314,12 +400,29 @@ class _Slots:
         self._sem.release()
 
 
+@dataclass(slots=True)
+class _Alive:
+    """When a subscriber last delivered anything (a message or a pong) and last pinged."""
+
+    name: str
+    seen_mono: float = field(default_factory=time.monotonic)
+    pinged_mono: float = field(default_factory=time.monotonic)
+
+    def reset(self) -> None:
+        """A fresh subscription: alive now."""
+        self.seen_mono = self.pinged_mono = time.monotonic()
+
+    def seen(self) -> None:
+        """It delivered something."""
+        self.seen_mono = time.monotonic()
+
+
+class _StaleSubscription(Exception):
+    """A subscriber stopped delivering: reset it and subscribe again."""
+
+
 class _QueueDown(Exception):
     """The queue store refused a send while the state store works: run the call direct."""
-
-
-class _SendNotReplicated(Exception):  # internal signal, never raised to callers
-    """The send reached the primary but no replica in time: the caller runs it direct."""
 
 
 class StoreClock:
@@ -328,13 +431,28 @@ class StoreClock:
     def __init__(self) -> None:
         """No offset until `sync`."""
         self._offset = 0.0
+        self._synced = False
 
-    async def sync(self, client: redis.asyncio.Redis) -> None:
-        """Measure the offset between the store's clock and this process."""
+    async def sync(self, client: redis.asyncio.Redis) -> str | None:
+        """Measure the offset between the store's clock and this process.
+
+        Returns None, `slow` (the read took too long: the old offset is kept) or `jump` (the
+        store's clock moved against the local one). The midpoint of a read that took 6-15 s
+        (a failover's retries, a loop stall) put the clock seconds ahead for a whole beat:
+        calls were settled `rate_limited` before their deadline (R3RC-7, R3FM-10).
+        """
         before = time.monotonic()
         secs, micros = await client.time()
         after = time.monotonic()
-        self._offset = (secs + micros / 1e6) - (before + after) / 2
+        offset = (secs + micros / 1e6) - (before + after) / 2
+        if not self._synced:
+            self._offset, self._synced = offset, True
+            return None
+        if after - before > CLOCK_MAX_RTT_SECS:
+            return "slow"
+        moved = abs(offset - self._offset) > CLOCK_JUMP_SECS
+        self._offset = offset
+        return "jump" if moved else None
 
     def now(self) -> float:
         """Seconds on the store's clock."""
@@ -359,6 +477,11 @@ class Engine:
     ) -> None:
         """Wire the stores; nothing runs until `start`."""
         self.settings = settings or EngineSettings()
+        # Two heartbeats at least (owner Q4): one late or lost renewal no longer makes a live
+        # caller look gone (R3FM-1, R3RC-3). Send and attach refresh it too (REGISTER).
+        self.caller_ttl_secs = max(
+            self.settings.caller_ttl_secs, math.ceil(2 * self.settings.lease_secs / 3) + 5
+        )
         self.keys = Keys(registry.prefix)
         self.state = state
         self.registry = registry
@@ -367,12 +490,20 @@ class Engine:
         self.metrics: Metrics = metrics or NullSink()
         registry.metrics = self.metrics  # reload failures are counted too (CO-4)
         self.queues = StreamQueues(queue_store or state, self.keys)
+        self.replica_wait = ReplicaWait(
+            replicas=self.settings.queue_wait_replicas,
+            wait_ms=self.settings.queue_wait_ms,
+            scopes=self.settings.queue_wait_scopes,
+        )
+        self._planned: dict[tuple[str, str], int] | None = None  # Bedrock pool sizes (Q43)
+        self._replid: str | None = None  # the state store's `master_replid` last seen (R3FM-8)
         self.requests = RequestStore(
             state,
             self.keys,
             result_ttl_secs=self.settings.result_ttl_secs,
             result_dedupe_secs=self.settings.result_dedupe_secs,
             status_ttl_secs=self.settings.status_ttl_secs,
+            caller_ttl_secs=self.caller_ttl_secs,
             offload=offload,
             offload_bytes=offload_bytes,
         )
@@ -384,7 +515,11 @@ class Engine:
             timings=self.settings.timings,
             metrics=self.metrics,
         )
-        self.worker_id = worker_id or new_id()[-14:]  # the random tail: the head is time
+        # An app's id is a prefix plus a random part (owner Q6): two processes started with one
+        # id (prefork workers given the pod name) shared every per-process key, and a second
+        # delivery to the sibling looked like this process's own (R3RC-9).
+        tail = new_id()[-14:]  # the random tail: the head is time
+        self.worker_id = f"{worker_id}-{tail[-6:]}" if worker_id else tail
         self.clock = StoreClock()
         self._tasks: list[asyncio.Task[None]] = []
         self._running: set[asyncio.Task[None]] = set()
@@ -392,14 +527,23 @@ class Engine:
         self._held_class: set[tuple[str, str]] = set()
         self._slots: dict[str, _Slots] = {}
         self._waiters: dict[str, asyncio.Future[None]] = {}
+        # Waited-on ids whose record the store lost (R3FM-4, R3RC-2): their callers send again.
+        self._gone: set[str] = set()
+        self._sweep_now = asyncio.Event()  # wakes the result sweep (an epoch change)
+        # Readers to reset: their subscription stopped delivering (R3RC-6, R3FM-12).
+        self._stale_readers: set[str] = set()
+        self._sweep_misses = 0  # sweeps in a row that found results pub/sub did not announce
+        self._cancel_misses = 0  # cancel checks in a row that found cancels never announced
         self._pubsub: Any = None
         self._cancels: Any = None
         self._stopping = False
+        self._closed = False  # `stop()` cancelled the background tasks: start no new one
         self._paused = False
         self._local_callers: dict[str, int] = {}  # request id -> coroutines waiting on it here
         self._wake: dict[str, asyncio.Event] = {}  # model -> wakes its receive loop
         self._beat_ok_mono = time.monotonic()  # last heartbeat that reached the store
         self._store_trouble_mono = -1e9  # monotonic time this process last saw the store fail
+        self._outage_until_mono = -1e9  # a call saw the store down: skip it until then (Q11)
         self._store_ping: asyncio.Task[bool] | None = None  # pings for paused calls
         self._store_waiting = 0  # calls paused on the store_down path, waiting on the probe
         # Calls whose awaiting task was cancelled, for the one canceller (`_cancel_later`).
@@ -472,21 +616,25 @@ class Engine:
             )
         if caller:
             self._pubsub = self.state.pubsub()
-            self._tasks.append(asyncio.create_task(self._result_reader()))
-            self._tasks.append(asyncio.create_task(self._result_sweep()))
+            self._loop(self._result_reader(), "result_reader")
+            self._loop(self._result_sweep(), "result_sweep")
         if worker:
             self._worker = True
             self._sync_model_loops()
-            self._tasks.append(asyncio.create_task(self._sweeper()))
-            self._tasks.append(asyncio.create_task(self._prober()))
-            self._tasks.append(asyncio.create_task(self._alert_loop()))
+            self._loop(self._sweeper(), "sweeper")
+            self._loop(self._prober(), "prober")
+            self._loop(self._alert_loop(), "alerts")
             self._cancels = self.state.pubsub()
-            self._tasks.append(asyncio.create_task(self._cancel_reader()))
-            self._tasks.append(asyncio.create_task(self._warm_clients()))
-        self._tasks.append(asyncio.create_task(self._heartbeat()))
-        self._tasks.append(asyncio.create_task(self._store_prober()))
-        self._tasks.append(asyncio.create_task(self.registry.run(self.settings.cfg_reload_secs)))
+            self._loop(self._cancel_reader(), "cancel_reader")
+            self._loop(self._warm_clients(), "warm_clients")
+        self._loop(self._heartbeat(), "heartbeat")
+        self._loop(self._store_prober(), "store_prober")
+        self._loop(self.registry.run(self.settings.cfg_reload_secs), "registry_reload")
         self.ready = True
+
+    def _loop(self, work: Coroutine[Any, Any, None], name: str) -> None:
+        """Start a background loop, named: `stop_task_failed` logged `Task-123` (FE-19)."""
+        self._tasks.append(asyncio.create_task(work, name=f"llmq:{name}"))
 
     def _sync_model_loops(self) -> None:
         """One receive loop per model of the current registry (RESCAN R3).
@@ -496,6 +644,10 @@ class Engine:
         """
         if not self._worker or self._stopping:
             return
+        try:
+            self._replan_pools()
+        except Exception as exc:  # the pools keep their size; calls go on
+            logger.warning("pool_replan_failed", error=str(exc), error_type=type(exc).__name__)
         view = self.registry.current
         for alias in view.registry.models:
             wanted = int(view.value(alias, "worker_slots"))
@@ -516,7 +668,9 @@ class Engine:
                 continue
             if task is not None and not task.cancelled() and task.exception() is not None:
                 logger.error("model_loop_died", model=alias, error=repr(task.exception()))
-            self._model_tasks[alias] = asyncio.create_task(self._model_loop(alias))
+            self._model_tasks[alias] = asyncio.create_task(
+                self._model_loop(alias), name=f"llmq:model:{alias}"
+            )
 
     def pause_receiving(self) -> None:
         """Not ready, and take no new calls from the queues; running and held calls go on.
@@ -573,6 +727,7 @@ class Engine:
             task.cancel()
         # `gather` lets a cancel of `stop()` itself through (a k8s hook timing out) and keeps
         # each result: a loop that died with an error is logged, not swallowed (audit RT-7).
+        self._closed = True
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for task, result in zip(tasks, results, strict=True):
             if isinstance(result, Exception):
@@ -582,6 +737,7 @@ class Engine:
                     error=str(result),
                     error_type=type(result).__name__,
                 )
+        await self._reclaim_lost()
         closes: list[tuple[str, Callable[[], Awaitable[object]]]] = [
             ("chunk_reader", self.chunks.aclose)
         ]
@@ -589,6 +745,21 @@ class Engine:
             if pubsub is not None:
                 closes.append((name, pubsub.aclose))
         await _close_all(closes)  # each on its own, the first failure raised at the end (CO-1)
+
+    async def _reclaim_lost(self) -> None:
+        """At stop, put back what receives with a lost reply took (FE-8, FL-3): time-bound.
+
+        Left alone, those calls stayed hidden for the visibility time and were charged a
+        failure, as the next round of the receive loop never came.
+        """
+        lost, self._unclaimed = list(self._unclaimed.values()), {}
+        if not lost:
+            return
+        try:
+            async with asyncio.timeout(self.settings.timings.health_probe_secs):
+                await asyncio.gather(*(self.queues.reclaim(*claim) for claim in lost))
+        except Exception as exc:  # their visibility timeout brings them back
+            logger.warning("stop_reclaim_failed", claims=len(lost), error=str(exc))
 
     async def _hand_back_held(self, until: float) -> None:
         """Return every call held while waiting for budget, at once and by the drain's end.
@@ -604,14 +775,19 @@ class Engine:
             if not h.grants and h.run is None and h.message is not None
         ]
         for held in handed:
+            # Dropped, not cancelled: its hold sees that within a second and ends. A cancel
+            # inside its admission lost a grant the store had made (FE-4, RV-N1).
             self._drop(held)  # else the heartbeat hides it again for the whole drain
-            if held.hold is not None:
-                held.hold.cancel()
         messages = [h.message for h in handed if h.message is not None]
         if not messages:
             return
+        # At least a short floor: with `drain_secs=0` (or a grace already spent) the deadline
+        # had passed, nothing was returned and every waiting call was hidden for its whole
+        # visibility time and charged a failure (FE-6).
+        loop = asyncio.get_running_loop()
         try:
-            async with asyncio.timeout_at(until):
+            async with asyncio.timeout_at(max(until, loop.time() + HAND_BACK_FLOOR_SECS)):
+                await self._release_claims(handed)
                 results = await asyncio.gather(
                     *(self.queues.return_(m) for m in messages), return_exceptions=True
                 )
@@ -779,11 +955,27 @@ class Engine:
                     return await self._store_down(
                         view, alias, envelope, None, deadline, direct=direct
                     )
+                mode = view.value(alias, "store_down")
+                if not stream and mode != "pause" and self._outage_remembered():
+                    # A store outage seen moments ago (owner Q11): `fail_fast` and `static_cap`
+                    # answer now; each call re-discovered it at the client's full retry budget.
+                    return await self._store_down(
+                        view, alias, envelope, None, deadline, direct=direct
+                    )
                 try:
                     return await self._call_routed(
                         view, alias, envelope, params, priority, call_secs, request_id, direct
                     )
+                except StorePoolBusy as exc:
+                    # Every pooled connection was in use: the process is busy, the store is
+                    # up. Read as store_down it paused or ran calls outside their budgets and
+                    # set the outage memo for everyone (R3PF-6).
+                    self.metrics.count("llmq_store_pool_busy_total", model=alias)
+                    raise CallFailed(
+                        "rate_limited", str(exc), retry_after_secs=1.0, request_id=rid
+                    ) from exc
                 except STORE_ERRORS as exc:
+                    self._remember_outage()
                     if stream:  # chunks travel through the state store
                         message = "the state store is unreachable"
                         raise CallFailed("queue_unavailable", message, request_id=rid) from exc
@@ -791,23 +983,36 @@ class Engine:
                         view, alias, envelope, exc, deadline, direct=direct
                     )
                 except ResponseError as exc:
-                    # The store answered but refused (out of memory, a script error): still one
-                    # error family for callers. A refused registration raised redis-py's
-                    # OutOfMemoryError straight to the app (scenario S9).
+                    if _store_refused(exc) and not stream:
+                        # NOREPLICAS, OOM, MISCONF, BUSY: the store is down for writes (Q12).
+                        self._remember_outage()
+                        return await self._store_down(
+                            view, alias, envelope, exc, deadline, direct=direct
+                        )
+                    # The store answered but refused (a script error): still one error family
+                    # for callers. A refused registration raised redis-py's error straight to
+                    # the app (scenario S9).
                     raise CallFailed("queue_unavailable", _refusal(exc), request_id=rid) from exc
         except TimeoutError as exc:
             raise CallFailed("deadline_exceeded", "no reply in time", request_id=rid) from exc
         except asyncio.CancelledError:
-            # The awaiting task was cancelled: cancel the call unless others wait on its id,
-            # in other processes or in this one (they share this process's caller entry).
-            if self._local_callers.get(rid, 0) <= 1:  # shared here: the others still wait
-                # Waited for until the deadline at most, then it goes on behind: a slow store
-                # (its client's retries) held the cancellation up to 1.9 s past the deadline
-                # (scenario L4: a deadline cancelling the call retried on the store_down path).
-                cleanup = self._cancel_later(rid)
-                remaining = deadline - asyncio.get_running_loop().time()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await asyncio.wait({cleanup}, timeout=max(0.0, remaining))
+            # The awaiting task was cancelled: cancel the call for every caller of its id, here
+            # and in other processes (owner Q3: cancel wins).
+            held = self._held.get(rid)
+            if held is not None and held.message is None:
+                # Its direct run is here: stopped now. In a caller-only process nothing reads
+                # the cancel channel, and it ran on to its own deadline (FE-17).
+                held.cancelled = True
+                task = held.run or held.hold
+                if task is not None and not task.done():
+                    task.cancel()
+            # Waited for until the deadline at most, then it goes on behind: a slow store
+            # (its client's retries) held the cancellation up to 1.9 s past the deadline
+            # (scenario L4: a deadline cancelling the call retried on the store_down path).
+            cleanup = self._cancel_later(rid)
+            remaining = deadline - asyncio.get_running_loop().time()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait({cleanup}, timeout=max(0.0, remaining))
             raise
 
     async def stream(
@@ -1027,7 +1232,7 @@ class Engine:
         }
         # Queues in the state store: register, send and confirm are one script (3 round trips
         # before). Not with `queue_wait_replicas`: that send needs its own WAIT.
-        combined = not direct and self.queues_shared and not self.settings.queue_wait_replicas
+        combined = not direct and self.queues_shared and not self.replica_wait.replicas_for("calls")
 
         async def register() -> tuple[str, bool]:
             """The registration's outcome, and whether the call was sent with it.
@@ -1043,13 +1248,15 @@ class Engine:
                 )
             if outcome == "expired":
                 raise CallFailed("result_expired", "the id finished earlier", request_id=rid)
+            if outcome == "cancelled":  # cancel wins for every caller of the id (owner Q3)
+                raise CallFailed("cancelled", "the call was cancelled", request_id=rid)
             return outcome, sent
 
         async def registered() -> tuple[str, bool]:
             if not combined:
                 return (await self.requests.register(rid, **record)).outcome, False
             name = self._queue_name(view, alias, priority)
-            settings = QueueSettings(max_waiting=int(view.value(alias, "max_waiting")))
+            settings = self._queue_settings(view, alias)  # its own retention (Q27)
             try:
                 found = await self.requests.register_send(
                     rid,
@@ -1079,13 +1286,16 @@ class Engine:
                     await self.requests.confirm(rid, keep_secs=call_secs)
                     run = self._start_direct(envelope)
                 else:
-                    try:
-                        await self._send(rid, envelope, view, alias, priority, call_secs)
-                    except _SendNotReplicated:
-                        await self.requests.confirm(rid, keep_secs=call_secs)
-                        run = self._start_direct(envelope)
+                    await self._send(rid, envelope, view, alias, priority, call_secs)
             reply = await self._wait_result(
-                rid, waiter, until - loop.time(), recheck=outcome == "attached", watch=run
+                rid,
+                waiter,
+                until - loop.time(),
+                recheck=outcome == "attached",
+                watch=run,
+                # A stored result is read at once: `done` waited for a wake-up nobody sent, up
+                # to the sweep's `poll_secs` (R3RC-5).
+                read_first=outcome in ("attached", "done"),
             )
             if reply is not None:
                 return reply
@@ -1128,10 +1338,11 @@ class Engine:
 
         A separate queue store that keeps failing for `queue_failover_secs` sends the call
         down the direct path; shorter blips are retried. With `queue_wait_replicas`, a send
-        that no replica acknowledged in time is a failed send (plan B23) and the call runs
-        direct.
+        that too few replicas acknowledged in time stays sent (owner Q9): warned at most once
+        a minute and counted. It ran direct in the caller before, its copy bouncing on the
+        queue as a duplicate every 30 s.
         """
-        settings = QueueSettings(max_waiting=int(view.value(alias, "max_waiting")))
+        settings = self._queue_settings(view, alias)  # its own retention_secs (Q27)
         loop = asyncio.get_running_loop()
         give_up = loop.time() + self.settings.queue_failover_secs
         body = envelope.dumps()
@@ -1143,8 +1354,8 @@ class Engine:
                         self._queue_name(view, alias, priority),
                         body,
                         settings,
-                        wait_replicas=self.settings.queue_wait_replicas,
-                        wait_ms=self.settings.queue_wait_ms,
+                        wait_replicas=self.replica_wait.replicas_for("calls"),
+                        wait_ms=self.replica_wait.wait_ms,
                     )
                     break
                 except STORE_ERRORS:
@@ -1154,11 +1365,9 @@ class Engine:
                         continue
                     raise
             except NotReplicated as exc:
-                # A failed send (plan B23): the call runs direct now, under this same record
-                # (re-registering raced the unreplicated copy's claim into a conflict). Not
-                # re-sent: each try would add a copy; the copy meets a claimed job and stops.
-                logger.warning("send_not_replicated", request_id=rid, error=str(exc))
-                raise _SendNotReplicated from exc
+                # On the primary, not on enough replicas: sent anyway (owner Q9).
+                self.replica_wait.short("calls", self.metrics, str(exc))
+                break
             except BaseException as exc:
                 # One cleanup for every failure, cancels included: four handlers awaited the
                 # abandon bare, so its own store error replaced the original (a cancel turned
@@ -1185,12 +1394,13 @@ class Engine:
         """True when queues live in the state store (one store for both)."""
         return self._queue_store is None
 
-    async def cancel(self, request_id: str) -> None:
-        """Cancel a call: a waiting one never starts, a running one is stopped."""
-        await self.state.set(
-            self.keys.request(request_id, "cancel"), "1", ex=self.settings.status_ttl_secs
-        )
-        await self.state.publish(self.keys.cancel_channel, request_id)
+    async def cancel(self, request_id: str, *, source: str = "api") -> None:
+        """Cancel a call for every caller of its id: a waiting one never starts, running ones end.
+
+        Anyone may cancel any id (owner Q5); each cancel is logged with its `source`. One
+        pipelined round trip (two before, FE-21).
+        """
+        await self._cancel_batch([request_id], source=source)
 
     def _cancel_later(self, rid: str) -> asyncio.Future[None]:
         """Queue the cancel of a call its awaiting task gave up on; resolved once tried.
@@ -1201,6 +1411,12 @@ class Engine:
         (audit RT-3).
         """
         done = asyncio.get_running_loop().create_future()
+        if self._closed:
+            # After `stop()`'s last gather: a new canceller would write to closing clients,
+            # tracked by nobody (RV-N3). The worker settles the call by its deadline.
+            logger.warning("cancel_after_stop", request_id=rid)
+            done.set_result(None)
+            return done
         self._cancel_queue.append((rid, done))
         task = self._canceller
         if task is None or task.done():
@@ -1232,40 +1448,36 @@ class Engine:
                     if not done.done():
                         done.set_result(None)
 
-    async def _cancel_batch(self, rids: Sequence[str]) -> None:
-        """Cancel each call no other process waits on: two pipelined round trips per 500."""
+    async def _cancel_batch(self, rids: Sequence[str], *, source: str = "caller_task") -> None:
+        """Cancel each call for every caller of its id: one pipelined round trip per 500.
+
+        Cancel wins (owner Q3). It cancelled only when no other caller was registered, read in
+        one round trip and acted on in a second: two pods waiting on one id never cancelled it,
+        and an attach between the two round trips was cancelled unasked (R3RC-1). A pending
+        cancel now also refuses an attach (REGISTER answers `cancelled`).
+        """
+        for rid in rids:
+            logger.info("call_cancel", request_id=rid, source=source, by=self.worker_id)
         for start in range(0, len(rids), 500):
-            part = rids[start : start + 500]
-            async with self.state.pipeline(transaction=False) as pipe:
-                for rid in part:
-                    pipe.smembers(self.keys.request(rid, "callers"))
-                found = await pipe.execute()
-            mine = {self.worker_id}
-            alone = [
-                rid
-                for rid, callers in zip(part, found, strict=True)
-                if {text(c) for c in callers or ()} <= mine
-            ]
-            if not alone:
-                continue
-            async with self.state.pipeline(transaction=False) as pipe:
-                for rid in alone:
-                    pipe.set(
-                        self.keys.request(rid, "cancel"), "1", ex=self.settings.status_ttl_secs
-                    )
-                    pipe.publish(self.keys.cancel_channel, rid)
-                await pipe.execute()
+            await self.requests.cancel(
+                rids[start : start + 500],
+                ttl_secs=self.settings.status_ttl_secs,
+                channel=self.keys.cancel_channel,
+            )
 
     async def _cancel_reader(self) -> None:
         """Stop running attempts whose call was cancelled (by any process)."""
         subscribed = False
+        alive = _Alive("cancel_reader")
         while True:
             try:
                 if not subscribed:
                     await self._cancels.subscribe(self.keys.cancel_channel)
                     subscribed = True
+                    alive.reset()
                     # Cancels published while unsubscribed were missed: read the keys (C9).
                     await self._check_cancels()
+                await self._keep_alive(self._cancels, alive)
                 message = await self._cancels.get_message(
                     ignore_subscribe_messages=True, timeout=1.0
                 )
@@ -1277,6 +1489,9 @@ class Engine:
                 await asyncio.sleep(1)
                 continue
             if not message:
+                continue
+            alive.seen()
+            if message.get("type") == "pong":
                 continue
             data = message["data"]
             rid = data.decode() if isinstance(data, bytes) else str(data)
@@ -1301,10 +1516,16 @@ class Engine:
             return
         keys = [self.keys.request(h.envelope.request_id, "cancel") for h in running]
         flags = await self.state.mget(keys)
+        missed = False
         for held, flag in zip(running, flags, strict=True):
             if flag is not None and held.run is not None and not held.run.done():
+                missed = missed or not held.cancelled  # the channel never announced it
                 held.cancelled = True
                 held.run.cancel()
+        self._cancel_misses = self._cancel_misses + 1 if missed else 0
+        if self._cancel_misses >= PUBSUB_SWEEP_MISSES:
+            self._cancel_misses = 0
+            self._reader_stale("cancel_reader")
 
     async def _store_down(
         self,
@@ -1327,7 +1548,18 @@ class Engine:
         if exc is not None:
             logger.warning("store_down", model=alias, mode=mode, error=str(exc))
         if mode == "static_cap":
-            return await self._static_cap(view, alias, envelope)
+            reply = await self._static_cap(view, alias, envelope)
+            if exc is not None:
+                # The failed register / send may have reached the store (a read timeout): its
+                # queued copy then meets this answer (`done`) instead of running a second time
+                # outside every budget (R3FM-2). Written behind, through the outage.
+                self._spawn(
+                    self._through_outage(
+                        lambda: self.requests.put_result(reply, final_state="done")
+                    ),
+                    "static_cap_result",
+                )
+            return reply
         if mode == "pause":
             loop = asyncio.get_running_loop()
             until = deadline - self.settings.caller_margin_secs
@@ -1355,12 +1587,35 @@ class Engine:
                     exc = again
                     logger.warning("store_down", model=alias, mode=mode, error=str(exc))
                 except ResponseError as refused:  # as `call()`: one error family (S9)
-                    raise CallFailed(
-                        "queue_unavailable", _refusal(refused), request_id=retry.request_id
-                    ) from refused
+                    if not _store_refused(refused):
+                        raise CallFailed(
+                            "queue_unavailable", _refusal(refused), request_id=retry.request_id
+                        ) from refused
+                    exc = refused  # down for writes (Q12): pause again
+                    logger.warning("store_down", model=alias, mode=mode, error=str(exc))
+        elif exc is not None:
+            # `fail_fast` after a failure that may have queued the call (a read timeout): it is
+            # cancelled behind, so the app's retry does not make a second run (R3FM-2).
+            rid = envelope.request_id
+            self._spawn(
+                self._through_outage(lambda: self._cancel_batch([rid], source="fail_fast")),
+                "fail_fast_cancel",
+            )
+        # A refusal says what it was (out of memory...): the app's fix differs (S9, Q12).
+        message = _refusal(exc) if exc is not None and _store_refused(exc) else None
         raise CallFailed(
-            "queue_unavailable", "the state store is unreachable", request_id=envelope.request_id
+            "queue_unavailable",
+            message or "the state store is unreachable",
+            request_id=envelope.request_id,
         ) from exc
+
+    def _outage_remembered(self) -> bool:
+        """True while a store outage a call saw is remembered (owner Q11)."""
+        return time.monotonic() < self._outage_until_mono
+
+    def _remember_outage(self) -> None:
+        """Remember a store outage for `outage_memo_secs`; a probe that succeeds ends it."""
+        self._outage_until_mono = time.monotonic() + self.settings.outage_memo_secs
 
     async def _store_back(self, secs: float) -> bool:
         """True once the state store answers again; False when `secs` pass first.
@@ -1383,19 +1638,18 @@ class Engine:
         return probe.done() and not probe.cancelled() and probe.result()
 
     async def _ping_until_back(self) -> bool:
-        """Ping every second until the store answers (True) or no paused call waits (False).
+        """Probe every second until the store takes writes (True) or no call waits (False).
 
-        A store that answers with an error (loading, auth) is not back either.
+        The bounded write probe of readiness, not a PING: a read-only replica answers PING, so
+        during a failover every paused call was released on a store that still refused writes
+        and paused again each second (FE-7). An error answer (loading, auth) is not back either.
         """
         while True:
             await asyncio.sleep(1.0)
             if not self._store_waiting:
                 return False
-            try:
-                await self.state.ping()
-            except (*STORE_ERRORS, RedisError):
-                continue
-            return True
+            if (await self._probe_stores())["state"] == "ok":
+                return True
 
     async def _static_cap(self, view: ResolvedRegistry, alias: str, envelope: Envelope) -> Reply:
         """Run without the store: at most `local_limit_cap` calls per process and model."""
@@ -1409,7 +1663,14 @@ class Engine:
                 if not view.value(alias, "enabled", dep.key) or view.outside_residency(dep):
                     continue
                 route = route_for(view, dep)
-                params = self._params(view, alias, envelope, dep.key)
+                try:
+                    params = self._params(view, alias, envelope, dep.key)
+                except inference.InferenceRejected as exc:
+                    # One error family: `on_exceed: reject` raised its own type to the app on
+                    # this path (RV-EN14).
+                    raise CallFailed(
+                        "invalid_request", str(exc), request_id=envelope.request_id
+                    ) from exc
                 budget = float(view.value(alias, "attempt_timeout_secs", dep.key))
                 timing = Timing(budget, float(view.value(alias, "stream_idle_secs")), budget)
                 try:
@@ -1418,7 +1679,7 @@ class Engine:
                         params,
                         route,
                         timing,
-                        converse_api=str(view.value(alias, "converse_api")),
+                        **_api_kwargs(provider, view, alias),
                     )
                 except Exception as exc:
                     # Classified as `_attempt` does (audit RT-19): every error was retried on
@@ -1473,6 +1734,11 @@ class Engine:
         """
         if not task.done() or task.cancelled() or (exc := task.exception()) is None:
             return None
+        return Engine._as_failure(exc, rid)
+
+    @staticmethod
+    def _as_failure(exc: BaseException, rid: str) -> CallFailed:
+        """A direct run's error as the one `CallFailed` its callers get."""
         if isinstance(exc, CallFailed):
             exc.request_id = exc.request_id or rid
             return exc
@@ -1498,6 +1764,7 @@ class Engine:
             position_ms=int(self.clock.now() * 1000),
             tag=f"d{new_id()[-10:]}",  # random tail (a v7 id starts with the time)
         )
+        held.hold = asyncio.current_task()  # stopped by its caller's cancel (FE-17)
         self._held[env.request_id] = held
         alias = env.model
         cls = _cls(env)
@@ -1507,6 +1774,17 @@ class Engine:
                 decision = await self._direct_wait(held)
             if decision is not None:
                 await self._run(held, decision, 1, alias)
+        except Exception as exc:
+            # The failure is also stored, best effort and time-bound: it wrote no reply, so
+            # callers attached from other processes waited to their deadline, and a retry of the
+            # id attached to the dead record for 30 min (FE-5).
+            failure = self._as_failure(exc, env.request_id)
+            reply = self._spawn(
+                self._reply(env, failure.kind, str(failure).removeprefix(f"{failure.kind}: ")),
+                "direct_failure_reply",
+            )
+            await asyncio.wait({reply}, timeout=self.settings.timings.health_probe_secs)
+            raise
         finally:
             if not held.grants:
                 self._drop(held)
@@ -1572,14 +1850,19 @@ class Engine:
         *,
         recheck: bool = False,
         watch: asyncio.Task[None] | None = None,
+        read_first: bool = False,
     ) -> Reply | None:
-        """The reply; None (only with `recheck`) when the call's record disappeared.
+        """The reply; None when the call's record disappeared (its caller sends it again).
 
         `watch`: this call's direct run; its failure is raised at once (it writes no reply).
+        `recheck` (attached): the record is checked on each wake-up, the first time after the
+        takeover grace. Any caller's record found gone by the sweep returns None too: at least
+        once (owner D1), a store that lost its data no longer leaves callers to their deadline.
         """
         loop = asyncio.get_running_loop()
         until = loop.time() + secs
-        if not recheck:
+        first_check = loop.time() + self.requests.takeover_grace_secs + 1.0
+        if not read_first:
             # Just sent: the reply cannot be there yet. Wait for the wake-up (or one poll)
             # before the first read; reading at once cost a round trip on every call.
             watch = await self._wake_or_fail(rid, waiter, min(secs, self.settings.poll_secs), watch)
@@ -1589,8 +1872,11 @@ class Engine:
         while True:
             try:
                 reply = await self.requests.take_result(rid)
-                gone = reply is None and recheck and not await self.requests.job(rid)
-            except STORE_ERRORS as exc:
+                gone = reply is None and (recheck or rid in self._gone) and await self._lost(rid)
+            except (*STORE_ERRORS, ResponseError) as exc:
+                if isinstance(exc, ResponseError) and not _store_refused(exc):
+                    raise
+                # A refusal too (NOREPLICAS, OOM...): the caller keeps waiting (Q12, R3FM-7).
                 # The call is already sent or running: wait for the store, never re-run it
                 # on the store_down path (that ran it twice, once outside the budget).
                 if until - loop.time() <= 0:
@@ -1620,13 +1906,55 @@ class Engine:
                 raise CallFailed("deadline_exceeded", "no reply in time", request_id=rid)
             # The wake-up comes by pub/sub (published with the result), or from this process's
             # one result sweep (`_result_sweep`); a read per waiting caller made store load
-            # grow with the backlog (B56). The timeout is only a last-resort recheck.
+            # grow with the backlog (B56). The timeout is only a last-resort recheck. An
+            # attached caller checks first after the takeover grace: the send it attached to
+            # may have failed or its sender died, noticed only after 60 s (R3RC-4).
             tries = 0
-            watch = await self._wake_or_fail(
-                rid, waiter, min(left, self.settings.timings.result_recheck_secs), watch
-            )
+            pace = self.settings.timings.result_recheck_secs
+            if recheck and loop.time() < first_check:
+                pace = first_check - loop.time()
+            watch = await self._wake_or_fail(rid, waiter, min(left, pace), watch)
             if waiter.done():
                 waiter = self._rearm(rid, waiter)
+
+    async def _lost(self, rid: str) -> bool:
+        """True when a waited-on call must be registered again: its record is gone or stale.
+
+        Stale: still unconfirmed past the takeover grace (its send failed or its sender died),
+        so a new registration takes it over (R3RC-4).
+        """
+        self._gone.discard(rid)
+        job = await self.requests.job(rid)
+        if not job:
+            return True
+        if job.get("confirmed") != "0":
+            return False
+        created = float(job.get("created") or 0)
+        return self.clock.now() - created >= self.requests.takeover_grace_secs
+
+    async def _keep_alive(self, pubsub: Any, alive: _Alive) -> None:
+        """Ping a subscriber; raise (reset and resubscribe) when it went silent.
+
+        redis-py's health check writes a PING and never needs the answer, so a half-open
+        socket went unnoticed for about 15 min: results came only by the 5 s sweep, cancels by
+        the 20 s heartbeat (R3RC-6). An old primary cut off by a partition answers the PING but
+        delivers nothing: the sweep and the cancel check mark that reader stale (R3FM-12).
+        """
+        now = time.monotonic()
+        if alive.name in self._stale_readers:
+            self._stale_readers.discard(alive.name)
+            raise _StaleSubscription(f"{alive.name}: results arrive only by the sweep")
+        if now - alive.seen_mono > 2 * PUBSUB_PING_SECS + 1:
+            raise _StaleSubscription(f"{alive.name}: no answer to its pings")
+        if now - alive.pinged_mono >= PUBSUB_PING_SECS:
+            alive.pinged_mono = now
+            await pubsub.ping("llmq-alive")
+
+    def _reader_stale(self, name: str) -> None:
+        """Reset a subscriber that stopped delivering (counted)."""
+        logger.warning("pubsub_stale", reader=name)
+        self.metrics.count("llmq_pubsub_resubscribes_total", reader=name)
+        self._stale_readers.add(name)
 
     async def _warm_clients(self) -> None:
         """Create every Bedrock deployment's client now, not on its first call.
@@ -1639,21 +1967,52 @@ class Engine:
         warned about at start, not first met by a call (CL-6).
         """
         view = self.registry.current
-        routes = []
-        slots: dict[tuple[str, str], int] = {}
-        for alias, entry in view.registry.models.items():
-            places = set()
-            for deployment in view.deployments(alias):
-                routes.append(route_for(view, deployment))
-                places.add((deployment.account, deployment.region))
-            if entry.provider != "bedrock":
-                continue
-            for place in places:
-                slots[place] = slots.get(place, 0) + int(view.value(alias, "worker_slots"))
+        routes = [
+            route_for(view, deployment)
+            for alias in view.registry.models
+            for deployment in view.deployments(alias)
+        ]
+        slots = self._pool_slots(view)
+        self._planned = slots
         try:
             await self.providers.pool.warm(routes, slots=slots)
         except Exception as exc:  # a call meets the problem again; start goes on (RT-24)
             logger.warning("warm_clients_failed", error=str(exc), error_type=type(exc).__name__)
+
+    @staticmethod
+    def _pool_slots(view: ResolvedRegistry) -> dict[tuple[str, str], int]:
+        """Concurrent Bedrock calls this process may make per (account, region).
+
+        Per model, its worker slots, or a deployment's `max_concurrency` when that is lower
+        (no more connections than calls the deployment admits).
+        """
+        slots: dict[tuple[str, str], int] = {}
+        for alias, entry in view.registry.models.items():
+            if entry.provider != "bedrock":
+                continue
+            workers = int(view.value(alias, "worker_slots"))
+            places: dict[tuple[str, str], int] = {}
+            for deployment in view.deployments(alias):
+                cap = view.value(alias, "max_concurrency", deployment.key)
+                want = min(workers, int(cap)) if cap else workers
+                place = (deployment.account, deployment.region)
+                places[place] = max(places.get(place, 0), want)
+            for place, want in places.items():
+                slots[place] = slots.get(place, 0) + want
+        return slots
+
+    def _replan_pools(self) -> None:
+        """Resize the Bedrock pools when a reload changed their sizes (owner Q43).
+
+        A live `max_concurrency` or `worker_slots` edit changed nothing until a restart: the
+        pool retires a client whose size changed (closed once idle) and builds the new one.
+        """
+        if not self._worker or self._planned is None:
+            return  # not warmed yet: `_warm_clients` plans the first sizes
+        slots = self._pool_slots(self.registry.current)
+        if slots != self._planned:
+            self._planned = slots
+            self.providers.pool.plan(slots)
 
     async def _result_sweep(self) -> None:
         """Every `poll_secs`, one store call finds results of this process's waiting callers.
@@ -1662,16 +2021,32 @@ class Engine:
         many calls wait (a read per waiting caller grew with the backlog, plan B56).
         """
         while True:
-            await asyncio.sleep(self.settings.poll_secs)
+            with contextlib.suppress(TimeoutError):  # an epoch change wakes it at once
+                await asyncio.wait_for(self._sweep_now.wait(), self.settings.poll_secs)
+            self._sweep_now.clear()
             waiting = [rid for rid, w in self._waiters.items() if not w.done()]
             for start in range(0, len(waiting), 500):
                 chunk = waiting[start : start + 500]
                 try:
-                    found = await self._results_exist([], [self.keys.prefix, *chunk])
+                    found, gone = await self._results_exist([], [self.keys.prefix, *chunk])
                 except Exception as exc:  # the sweep must survive store hiccups
                     logger.warning("result_sweep_failed", error=str(exc))
                     break
-                for index in found or ():
+                misses = [
+                    i
+                    for i in found
+                    if (w := self._waiters.get(chunk[int(i)])) is not None and not w.done()
+                ]
+                self._sweep_misses = self._sweep_misses + 1 if misses else 0
+                if self._sweep_misses >= PUBSUB_SWEEP_MISSES:
+                    self._sweep_misses = 0
+                    self._reader_stale("result_reader")
+                if gone:
+                    # The store lost these records (restart without persistence, flush, a
+                    # failover that lost writes): their callers send them again (R3FM-4).
+                    logger.warning("waiting_calls_lost", count=len(gone))
+                    self._gone.update(chunk[int(index)] for index in gone)
+                for index in [*found, *gone]:
                     waiter = self._waiters.get(chunk[int(index)])
                     if waiter is not None and not waiter.done():
                         waiter.set_result(None)
@@ -1679,15 +2054,18 @@ class Engine:
     async def _result_reader(self) -> None:
         """Wake waiting callers when their result is published (re-subscribes after errors)."""
         subscribed = False
+        alive = _Alive("result_reader")
         while True:
             try:
                 if not subscribed:
                     await self._pubsub.subscribe(self.keys.done_channel(self.worker_id))
                     subscribed = True
+                    alive.reset()
                     # Results published while unsubscribed were missed: every waiter re-reads.
                     for pending in list(self._waiters.values()):
                         if not pending.done():
                             pending.set_result(None)
+                await self._keep_alive(self._pubsub, alive)
                 message = await self._pubsub.get_message(
                     ignore_subscribe_messages=True, timeout=1.0
                 )
@@ -1699,6 +2077,9 @@ class Engine:
                 await asyncio.sleep(1)
                 continue
             if not message:
+                continue
+            alive.seen()
+            if message.get("type") == "pong":
                 continue
             rid = (
                 message["data"].decode()
@@ -1746,7 +2127,9 @@ class Engine:
                 and not got
                 and (got is None or (alias, names.get(rung)) in self._held_class)
             ):
-                with contextlib.suppress(*STORE_ERRORS):
+                # A plain error reply too (`UNBLOCKED` in a failover): only connection errors
+                # were caught, and it ended the loop until the next heartbeat (FE-20).
+                with contextlib.suppress(*STORE_ERRORS, RedisError):
                     await self.queues.ring_again(rung)
             rung = None
             held = (alias, "p") in self._held_class or (alias, "n") in self._held_class
@@ -1784,6 +2167,18 @@ class Engine:
         if alias not in view.registry.models:
             await asyncio.sleep(1)
             return False
+        lost = self._unclaimed.pop(alias, None)
+        if lost is not None:
+            # The last receive's reply was lost (scenario S11): what it took is ours and hidden
+            # for the visibility timeout (60 s). It goes back to the queue now, receipt-checked.
+            # Before the slot check: a full worker left the lost batch hidden (FE-8).
+            try:
+                back = await self.queues.reclaim(*lost)
+            except BaseException:
+                self._unclaimed[alias] = lost
+                raise
+            if back:
+                logger.warning("receive_reclaimed", model=alias, count=back)
         free = self._slots[alias].free
         if free <= 0:
             return None
@@ -1794,24 +2189,15 @@ class Engine:
             if (alias, "p" if priority else "n") not in self._held_class
         ]
         key = self.queues.claim_key(f"{self.worker_id}:{alias}")
-        lost = self._unclaimed.pop(alias, None)
-        if lost is not None:
-            # The last receive's reply was lost (scenario S11): what it took is ours and hidden
-            # for the visibility timeout (60 s). It goes back to the queue now, receipt-checked.
-            try:
-                back = await self.queues.reclaim(*lost)
-            except BaseException:
-                self._unclaimed[alias] = lost
-                raise
-            if back:
-                logger.warning("receive_reclaimed", model=alias, count=back)
         claim = (key, new_id())
         try:
             messages, dead = await self.queues.receive_first(
                 names, min(free, self.settings.receive_batch), settings, claim=claim
             )
-        except (*STORE_ERRORS, RedisError):
-            self._unclaimed[alias] = claim  # it may have run: reclaim it on the next round
+        except BaseException:
+            # It may have run: reclaim it on the next round, or at `stop()`. A cancel too (a
+            # loop restarted, shutdown): only store errors were recorded (FL-3, FE-8).
+            self._unclaimed[alias] = claim
             raise
         rest = list(messages)  # not admitted yet: back to the queue whatever happens
         try:
@@ -1876,14 +2262,19 @@ class Engine:
             if now - self._newer_warned_mono >= 60:
                 self._newer_warned_mono = now
                 logger.warning("message_needs_newer_library", model=alias, error=str(exc))
-            await self.queues.return_(message, delay_secs=NEWER_MESSAGE_DELAY_SECS)
+            await self._pass_on(
+                message, self.queues.return_(message, delay_secs=NEWER_MESSAGE_DELAY_SECS)
+            )
             return False
         except Exception as exc:
             # The type only: the validation text can quote the prompt (RESCAN X10). The model's
             # own queue settings decide when it is dead-lettered (A12).
             logger.warning("bad_message", queue=message.queue, error_type=type(exc).__name__)
             self.metrics.count("llmq_bad_messages_total", model=alias)
-            await self.queues.fail(message, self._queue_settings(self.registry.current, alias))
+            await self._pass_on(
+                message,
+                self.queues.fail(message, self._queue_settings(self.registry.current, alias)),
+            )
             return False
         current = self._held.get(env.request_id)
         if current is not None:
@@ -1912,7 +2303,19 @@ class Engine:
         try:
             return await self._try(held)
         except Exception:
-            await self._release(held)
+            await self._release(held, unsure=True)
+            raise
+
+    async def _pass_on(self, message: Message, step: Awaitable[object]) -> None:
+        """Run the store step that passes an unadmitted message on; on failure return it.
+
+        The message was already out of the receive's list: a store blip in that step left it
+        hidden for its visibility time and charged a failure (FE-9).
+        """
+        try:
+            await step
+        except Exception:
+            await self._return_all([message])
             raise
 
     def _callers_judgeable(self) -> bool:
@@ -1928,7 +2331,7 @@ class Engine:
         from a gap means the store was out of reach here as well.
         """
         beat = self.settings.lease_secs / 3
-        grace = self.settings.caller_ttl_secs + beat + 5
+        grace = self.caller_ttl_secs + beat + 5
         now = time.monotonic()
         return not (
             now - self._store_trouble_mono < grace or now - self._beat_ok_mono > 2 * beat + 1
@@ -2062,7 +2465,7 @@ class Engine:
             foreign_from=foreign_from,
             require_pct=require_pct,
             tag=held.tag,
-            callers_ttl=self.settings.caller_ttl_secs if held.check_callers else None,
+            callers_ttl=self.caller_ttl_secs if held.check_callers else None,
             count_first=int(self.clock.now() // 60) if attempt == 1 else None,
             chunks=env.stream and env.op in ("converse", "chat"),
         )
@@ -2156,7 +2559,7 @@ class Engine:
             env.op,
             params,
             embedding=entry.type == "embedding",
-            default_output_tokens=int(view.value(alias, "default_output_tokens")),
+            default_output_tokens=int(_by_deployment(view, alias, "default_output_tokens")),
             output_weight=float(view.value(alias, "tpm_output_weight")),
             estimator=view.value(alias, "token_estimator"),
         )
@@ -2186,11 +2589,37 @@ class Engine:
             return False
         if await self._model_fallback(view, alias, held, 1, now - held.position_ms / 1000.0):
             return False
-        self._held_class.add((alias, _cls(env)))
+        if self._stopping:
+            # Received while `stop()` ran, after it handed the held calls back: a hold here
+            # ended at once without returning the message, hidden for the drain plus its
+            # visibility time and charged a failure (FE-2).
+            await self._release(held)
+            return False
+        key = (alias, _cls(env))
+        self._held_class.add(key)
         task = held.hold = asyncio.create_task(self._hold(held, decision.wait_secs))
         self._running.add(task)
         task.add_done_callback(self._running.discard)
+        task.add_done_callback(lambda done: self._hold_cancelled(done, key))
         return True
+
+    def _hold_cancelled(self, task: asyncio.Task[None], key: tuple[str, str]) -> None:
+        """Free a hold's class when the hold was cancelled before its first step (RV-N2).
+
+        Its `finally` never ran then, so the class stayed held and this process never
+        received that class of the model again.
+        """
+        if not task.cancelled():
+            return
+        others = (
+            h.hold
+            for h in self._held.values()
+            if h.hold is not None
+            and h.hold is not task
+            and (h.envelope.model, _cls(h.envelope)) == key
+        )
+        if not any(not other.done() for other in others):
+            self._held_class.discard(key)
 
     async def _expire_if_due(
         self, held: _Held, now: float, *, retry_after: float | None = None
@@ -2305,43 +2734,62 @@ class Engine:
         if decision.kind == "duplicate":
             self._drop(held)
             if held.message is not None:
-                await self.queues.return_(held.message, delay_secs=self.settings.lease_secs / 2)
+                # When the claim lapses, if the script says (`ms`); else half a lease. The fixed
+                # half lease made a lower `visibility_secs` take over a dead pod's call later
+                # (R3RC-8). The `ms` field of the reply is the Lua owner's part.
+                delay = (
+                    decision.wait_secs if decision.wait_secs > 0 else self.settings.lease_secs / 2
+                )
+                await self.queues.return_(held.message, delay_secs=delay)
             return None
         if decision.kind == "none":
-            has_fallback = any(d.group == "fallback" for d in view.deployments(alias))
-            rule = view.value(alias, "fallback")
-            if not held.broken and has_fallback and rule and "broken" in rule["on"]:
-                held.broken = True
-                age = self.clock.now() - held.position_ms / 1000.0
-                if age < float(rule["after_secs"]):
-                    return Decision(
-                        "wait", wait_secs=float(rule["after_secs"]) - age, reason="broken"
-                    )
-                return await self._decide(view, alias, held, attempt, failed)
-            fell = await self._model_fallback(view, alias, held, attempt, 1e9, broken=True)
-            if not fell:
-                due = await self.health.disabled(alias)
-                wait = max(1.0, min(due.values()) - self.clock.now()) if due else 60.0
-                # Why no deployment was usable, per deployment: an operator needs to tell an
-                # open breaker from a disabled deployment (the bare line said neither).
-                # The breakers in one pipelined round trip: one HGETALL per deployment, one
-                # after another, on a path that already failed (audit RT-31).
-                why: dict[str, str] = {}
-                deps = list(view.deployments(alias))
-                with contextlib.suppress(*STORE_ERRORS):  # the line goes out without them
-                    async with self.state.pipeline(transaction=False) as pipe:
-                        for dep in deps:
-                            pipe.hget(self.keys.breaker(alias, dep.key), "state")
-                        states = await pipe.execute()
-                    for dep, raw in zip(deps, states, strict=True):
-                        disabled = " (disabled)" if dep.key in due else ""
-                        why[dep.key] = f"breaker {text(raw or b'closed')}{disabled}"
-                logger.error("model_unavailable", model=alias, deployments=why)
-                await self._finish_call(
-                    held, "model_unavailable", "no usable deployment", retry_after=wait
-                )
-            return None
+            return await self._none_usable(view, alias, held, attempt, failed)
         return decision
+
+    async def _none_usable(
+        self,
+        view: ResolvedRegistry,
+        alias: str,
+        held: _Held,
+        attempt: int,
+        failed: frozenset[str],
+    ) -> Decision | None:
+        """No deployment is usable: the fallback group, then fallback models, else unavailable.
+
+        `model_unavailable` says why per deployment. Its own method: `_decide` mixed it with
+        admission and registry repair in 125 lines (FE-22).
+        """
+        has_fallback = any(d.group == "fallback" for d in view.deployments(alias))
+        rule = view.value(alias, "fallback")
+        if not held.broken and has_fallback and rule and "broken" in rule["on"]:
+            held.broken = True
+            age = self.clock.now() - held.position_ms / 1000.0
+            if age < float(rule["after_secs"]):
+                return Decision("wait", wait_secs=float(rule["after_secs"]) - age, reason="broken")
+            return await self._decide(view, alias, held, attempt, failed)
+        fell = await self._model_fallback(view, alias, held, attempt, 1e9, broken=True)
+        if not fell:
+            due = await self.health.disabled(alias)
+            wait = max(1.0, min(due.values()) - self.clock.now()) if due else 60.0
+            # Why no deployment was usable, per deployment: an operator needs to tell an
+            # open breaker from a disabled deployment (the bare line said neither).
+            # The breakers in one pipelined round trip: one HGETALL per deployment, one
+            # after another, on a path that already failed (audit RT-31).
+            why: dict[str, str] = {}
+            deps = list(view.deployments(alias))
+            with contextlib.suppress(*STORE_ERRORS):  # the line goes out without them
+                async with self.state.pipeline(transaction=False) as pipe:
+                    for dep in deps:
+                        pipe.hget(self.keys.breaker(alias, dep.key), "state")
+                    states = await pipe.execute()
+                for dep, raw in zip(deps, states, strict=True):
+                    disabled = " (disabled)" if dep.key in due else ""
+                    why[dep.key] = f"breaker {text(raw or b'closed')}{disabled}"
+            logger.error("model_unavailable", model=alias, deployments=why)
+            await self._finish_call(
+                held, "model_unavailable", "no usable deployment", retry_after=wait
+            )
+        return None
 
     async def _registry_step(self, step: Awaitable[object], name: str) -> bool:
         """Run a registry reload or refresh for a call; False (logged) when its data is bad.
@@ -2393,11 +2841,15 @@ class Engine:
                     self._start_run(held, decision, 1)
                     return
                 wait_secs = decision.wait_secs
+            if self._owns(held) and held.run is None and not held.grants:
+                # `stop()` began after this call was received and handed back the holds it
+                # saw: return this one too, or it stayed hidden for the drain (FE-2).
+                await self._release(held)
         except Exception as exc:  # never leave the call held with nobody working on it
             if isinstance(exc, STORE_ERRORS):
                 self._store_trouble("hold")
             logger.warning("hold_failed", request_id=held.envelope.request_id, error=str(exc))
-            await self._release(held)
+            await self._release(held, unsure=True)
         finally:
             self._held_class.discard((alias, cls))
             if (event := self._wake.get(alias)) is not None:
@@ -2608,6 +3060,9 @@ class Engine:
                 if self.clock.now() >= self._deadline(held):
                     await self._finish_call(held, "deadline_exceeded", f"last error: {kind}")
                     return
+                # The view now: one read before the failed attempt still offered a deployment
+                # a reload had removed (FE-13).
+                view = self.registry.current
                 next_decision = await self._decide(view, alias, held, attempt, frozenset(failed))
                 if next_decision is None:
                     return
@@ -2669,6 +3124,8 @@ class Engine:
         attempt was counted for the retry budget by its grant (PICK_TAKE, `count_first`).
         """
         env = held.envelope
+        # This grant's FINISH: alias, owner and request id were repeated at nine sites (FE-22).
+        settle = functools.partial(self.admission.finish, alias, owner, env.request_id)
         entry = view.registry.models.get(alias)
         deployment = (
             next((d for d in view.deployments(alias) if d.key == dep_key), None) if entry else None
@@ -2678,10 +3135,7 @@ class Engine:
             # back in full and try another. `next()` without a default raised StopIteration,
             # logged as a bare `run_failed` and the call was run again (audit RT-16).
             charged = held.estimates.get((alias, owner))
-            await self.admission.finish(
-                alias,
-                owner,
-                env.request_id,
+            await settle(
                 refund_r=1,
                 refund_t=charged.total if charged else 0,
                 outcome="none",
@@ -2697,9 +3151,7 @@ class Engine:
         try:
             params = self._params(view, alias, env, dep_key)
         except inference.InferenceRejected as exc:  # this deployment's own limit (RESCAN P4)
-            await self.admission.finish(
-                alias, owner, env.request_id, refund_r=1, refund_t=estimate.total, outcome="none"
-            )
+            await settle(refund_r=1, refund_t=estimate.total, outcome="none")
             return _AttemptResult("invalid", "invalid_request", None, exc)
         remaining = max(0.1, self._deadline(held) - self.clock.now())
         attempt_budget = float(view.value(alias, "attempt_timeout_secs", dep_key))
@@ -2738,10 +3190,7 @@ class Engine:
                 streamed = await self.state.xlen(writer.key)
             if streamed:
                 # Another worker already streamed part of this answer (plan R19).
-                await self.admission.finish(
-                    alias,
-                    owner,
-                    env.request_id,
+                await settle(
                     refund_r=1,
                     refund_t=estimate.total,
                     outcome="none",
@@ -2760,7 +3209,7 @@ class Engine:
                     route,
                     timing,
                     sink=writer.add if writer else None,
-                    converse_api=str(view.value(alias, "converse_api")),
+                    **_api_kwargs(provider, view, alias),
                 )
             if writer is not None:
                 await writer.end(
@@ -2778,10 +3227,7 @@ class Engine:
             if writer is not None and writer.sent:
                 # Chunks reached the caller: end the stream with the partial text (plan §3.13).
                 refund = tokens.refund(estimate, "cut")
-                await self.admission.finish(
-                    alias,
-                    owner,
-                    env.request_id,
+                await settle(
                     refund_r=refund.requests,
                     refund_t=refund.tokens,
                     outcome="none" if ours else "fail",
@@ -2806,10 +3252,7 @@ class Engine:
                     )
                 return _AttemptResult("stream_failed", kind, writer.partial_text, exc)
             if ours:  # nothing sent: the call is given back and runs again (`_run`)
-                await self.admission.finish(
-                    alias,
-                    owner,
-                    env.request_id,
+                await settle(
                     refund_r=1,
                     refund_t=estimate.total,
                     outcome="none",
@@ -2822,10 +3265,7 @@ class Engine:
             # (scripts/load.py). Only that timer: an attempt's own first-response or idle
             # timeout is the provider's, so a hung region trips its breaker (RESCAN P3).
             if outer.expired():
-                await self.admission.finish(
-                    alias,
-                    owner,
-                    env.request_id,
+                await settle(
                     refund_r=0,
                     refund_t=0,
                     outcome="none",
@@ -2834,10 +3274,7 @@ class Engine:
                 return _AttemptResult("retry", "retryable", None, exc)
             if info.kind is ErrorKind.THROTTLE:
                 refund = tokens.refund(estimate, "throttle")
-                await self.admission.finish(
-                    alias,
-                    owner,
-                    env.request_id,
+                await settle(
                     refund_r=refund.requests,
                     refund_t=refund.tokens,
                     outcome="throttle",
@@ -2851,10 +3288,7 @@ class Engine:
                 # region; one retry on another deployment, without charging the breaker (P9).
                 held.model_retried = True
                 refund = tokens.refund(estimate, "fail")
-                await self.admission.finish(
-                    alias,
-                    owner,
-                    env.request_id,
+                await settle(
                     refund_r=refund.requests,
                     refund_t=refund.tokens,
                     outcome="none",
@@ -2862,10 +3296,7 @@ class Engine:
                 return _AttemptResult("retry", "model_error", None, exc)
             if info.kind is ErrorKind.RETRYABLE or isinstance(exc, TimeoutError):
                 refund = tokens.refund(estimate, "cut" if cut else "fail")
-                await self.admission.finish(
-                    alias,
-                    owner,
-                    env.request_id,
+                await settle(
                     refund_r=refund.requests,
                     refund_t=refund.tokens,
                     outcome="fail",
@@ -2873,10 +3304,7 @@ class Engine:
                 )
                 return _AttemptResult("retry", "retryable", None, exc)
             refund = tokens.refund(estimate, "throttle")  # refused before it ran: all back
-            await self.admission.finish(
-                alias,
-                owner,
-                env.request_id,
+            await settle(
                 refund_r=refund.requests,
                 refund_t=refund.tokens,
                 outcome="none",
@@ -2968,7 +3396,7 @@ class Engine:
                 outcome="ok",
                 latency_ms=latency,
             ),
-            self._through_outage(lambda: self._ack(held)),
+            self._through_outage(lambda: self._ack(held), held),
             return_exceptions=True,
         )
         if isinstance(finished, BaseException):  # SWEEP frees the slot after its lease
@@ -3039,6 +3467,12 @@ class Engine:
                     await self.probe_due(alias, lock_key=key)
                 except Exception as exc:  # one model's failure does not skip the others
                     logger.warning("prober_failed", model=alias, error=str(exc))
+            # Back to one pass per period: a probe stretched the lock to 35 s, and no pod
+            # (this one included) probed again for that long after the last probe (RV-N6).
+            try:
+                await self.state.expire(key, int(PROBE_EVERY_SECS))
+            except Exception as exc:
+                logger.warning("prober_failed", step="lock", error=str(exc))
 
     async def probe_due(self, alias: str, *, lock_key: str | None = None) -> dict[str, str]:
         """Probe every disabled deployment of a model that is due; their outcomes.
@@ -3087,7 +3521,7 @@ class Engine:
                 params,
                 route_for(view, deployment),
                 Timing(PROBE_TIMEOUT_SECS, PROBE_TIMEOUT_SECS, PROBE_TIMEOUT_SECS),
-                converse_api=str(view.value(alias, "converse_api")),  # the calls' own API (IAM)
+                **_api_kwargs(provider, view, alias),  # the calls' own API (IAM)
             )
         except Exception as exc:
             return provider.classify(exc).kind is ErrorKind.THROTTLE
@@ -3208,6 +3642,12 @@ class Engine:
             stores = cached[1]
         loaded = self.registry._current is not None
         out: dict[str, Any] = {"live": self._live(), "ready": bool(self.ready and loaded)}
+        evicting = self._evicting()
+        if evicting:
+            # Strict mode and a store that may evict queue keys, results and caller keys
+            # (owner Q10): not ready, with the reason. It was a warning at start only.
+            out["ready"] = False
+            out["not_ready_reason"] = evicting
         out["stores"] = stores
         out["eviction_policy"] = self._eviction.get("state", UNKNOWN_POLICY)
         if "queue" in self._eviction:
@@ -3236,16 +3676,49 @@ class Engine:
             state, queue = await asyncio.gather(check(self.state), check(self._queue_store))
         stores = {"state": state, "queue": queue}
         self._stores = (time.monotonic(), stores)
+        if state == "ok":
+            self._outage_until_mono = -1e9  # the store is back: calls try it again (Q11)
         return stores
+
+    def _evicting(self) -> str | None:
+        """In strict mode, why a store's eviction policy makes this process not ready."""
+        if not self.settings.strict:
+            return None
+        for name, policy in self._eviction.items():
+            warning = eviction_warning(policy)
+            if warning:
+                return f"{name} store: {warning}"
+        return None
 
     async def _store_prober(self) -> None:
         """Keep the stores' state for `health_check` fresh (one probe per few seconds)."""
+        rounds = 0
         while True:
             try:
                 await self._probe_stores()
             except Exception as exc:  # store trouble reads "down" there: this is a bug (RT-24)
                 logger.warning("store_probe_failed", error=str(exc), error_type=type(exc).__name__)
+            if rounds % POLICY_EVERY_ROUNDS == 0 and rounds:
+                # Re-read: a parameter-group change or a failover to a node of another group
+                # went unseen; it was read once at start (R3FM-8, owner Q10).
+                await self._read_policies()
+            rounds += 1
             await asyncio.sleep(HEALTH_PROBE_EVERY_SECS)
+
+    async def _read_policies(self) -> None:
+        """Read each store's eviction policy again (an unreadable one keeps its old value)."""
+        stores = [("state", self.state)]
+        if self._queue_store is not None:
+            stores.append(("queue", self._queue_store))
+        for name, client in stores:
+            try:
+                async with asyncio.timeout(self.settings.timings.health_probe_secs):
+                    policy = await eviction_policy(client)
+            except Exception as exc:
+                logger.debug("policy_read_failed", store=name, error=str(exc))
+                continue
+            if policy != UNKNOWN_POLICY:
+                self._eviction[name] = policy
 
     def _live(self) -> bool:
         """False when a background loop died, or the heartbeat made no progress for 3 beats."""
@@ -3312,8 +3785,16 @@ class Engine:
                 logger.warning("alerts_failed", error=str(exc))
 
     async def _ack(self, held: _Held) -> None:
-        if held.message is not None:
-            await self.queues.ack(held.message)
+        """Ack a call's message and forget the call; a stale receipt is logged and counted.
+
+        A stale receipt means another worker took the message over (this one stalled past its
+        visibility time): the call may have run twice. The ack's answer was dropped (FE-14).
+        """
+        if held.message is not None and not await self.queues.ack(held.message):
+            logger.warning(
+                "ack_stale_receipt", request_id=held.envelope.request_id, model=held.envelope.model
+            )
+            self.metrics.count("llmq_stale_acks_total", model=held.envelope.model)
         self._drop(held)
 
     def _drop(self, held: _Held) -> None:
@@ -3356,6 +3837,7 @@ class Engine:
                 )
             elif held.message is not None:
                 self._drop(held)
+                await self._release_claims([held])
                 await self.queues.return_(held.message)
             else:  # a direct call: its caller is in this process, which is stopping
                 await self._finish_call(held, "worker_shutdown", "the worker shut down")
@@ -3364,16 +3846,25 @@ class Engine:
                 "shutdown_give_back_failed", request_id=held.envelope.request_id, error=str(exc)
             )
 
-    async def _release(self, held: _Held, delay_secs: float = 0.0) -> None:
+    async def _release(self, held: _Held, delay_secs: float = 0.0, *, unsure: bool = False) -> None:
         """Let go of a call after an unexpected error: grants back, not held, message returned.
 
         The return waits out a store outage: one that failed left the message hidden for its
-        whole visibility timeout (60 s), and its caller waited that long.
+        whole visibility timeout (60 s), and its caller waited that long. `unsure`: its first
+        admission failed without an answer (a read timeout): the script may have granted, so
+        that grant is undone too (owner-checked, a no-op when none was made; AMEND FE-4).
         """
+        if unsure and held.run is None and not held.grants and self._owns(held):
+            alias, rid = held.envelope.model, held.envelope.request_id
+            try:
+                await self.admission.undo(alias, self._owner(held, 1), rid)
+            except RedisError as exc:
+                logger.warning("give_back_failed", request_id=rid, error=str(exc))
         await self._give_back(held)
         self._drop(held)
         message = held.message
         if message is not None:
+            await self._release_claims([held])
             try:
                 await self._through_outage(
                     lambda: self.queues.return_(message, delay_secs=delay_secs)
@@ -3388,19 +3879,53 @@ class Engine:
                     error_type=type(exc).__name__,
                 )
 
-    async def _through_outage(self, write: Callable[[], Awaitable[object]]) -> None:
-        """Run a store write that must land, again every 0.5 s while the store is out of reach.
+    async def _release_claims(self, helds: Sequence[_Held]) -> None:
+        """Let go of the claims of calls this process gives back: best effort, time-bound.
 
-        Gives up (raises) once the outage outlasts a lease: past that the grant may be swept.
-        Only for writes that are safe to run twice (each checks its own receipt or key).
+        Without it a given-back call ran elsewhere only once its claim was a lease old (FE-1):
+        a 30 s call missed its deadline on every graceful restart, drain timeout or failed run.
         """
-        give_up = time.monotonic() + self.settings.lease_secs
+        jobs = [
+            (held.envelope.request_id, f"{self.worker_id}@{held.tag}")
+            for held in helds
+            if held.message is not None
+        ]
+        if not jobs:
+            return
+        try:
+            async with asyncio.timeout(self.settings.timings.health_probe_secs):
+                await self.admission.release_claims(jobs)  # owner-checked (FL-1)
+        except Exception as exc:  # the claim then ages out after a lease, as before
+            logger.warning(
+                "release_claims_failed",
+                calls=len(jobs),
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+
+    async def _through_outage(
+        self, write: Callable[[], Awaitable[object]], held: _Held | None = None
+    ) -> None:
+        """Run a store write that must land, again while the store is out of reach or refuses.
+
+        Gives up (raises) once the outage outlasts a lease, or with `held` the call's deadline
+        when that is later (owner Q7: an answer in hand is kept while its caller still waits;
+        it was dropped after one lease and the call ran again). A refusal (NOREPLICAS, OOM,
+        MISCONF, BUSY) counts as the store down (Q12, R3FM-7). Only for writes that are safe
+        to run twice (each checks its own receipt or key).
+        """
+        wait_secs = self.settings.lease_secs
+        if held is not None:
+            wait_secs = max(wait_secs, self._deadline(held) - self.clock.now())
+        give_up = time.monotonic() + wait_secs
         tries = 0
         while True:
             try:
                 await write()
                 return
-            except STORE_ERRORS:
+            except (*STORE_ERRORS, ResponseError) as exc:
+                if isinstance(exc, ResponseError) and not _store_refused(exc):
+                    raise
                 self._store_trouble("settle")
                 if time.monotonic() >= give_up:
                     raise
@@ -3445,8 +3970,8 @@ class Engine:
             if running:
                 assert held.run is not None
                 held.run.cancel()
-            if held.hold is not None and not held.hold.done():
-                held.hold.cancel()  # its next round must not grant and run a freed call
+            # A hold is not cancelled: dropped, it ends at its next round, and a grant its
+            # admission got meanwhile goes back in `_start_run` (FE-4, RV-N1).
             task = asyncio.create_task(self._release(held))
             self._running.add(task)
             task.add_done_callback(self._running.discard)
@@ -3461,16 +3986,16 @@ class Engine:
         while True:
             beat = self.settings.lease_secs / 3
             self._beat_ran_mono = time.monotonic()
-            self._free_stuck()
+            try:  # the only step outside a `try` before: an error here ended the heartbeat (FE-18)
+                self._free_stuck()
+            except Exception as exc:
+                logger.warning("heartbeat_failed", step="free_stuck", error=str(exc))
             try:
                 self._sync_model_loops()
             except Exception as exc:
                 logger.warning("heartbeat_failed", step="loops", error=str(exc))
             renewed = False
             try:
-                await self.state.set(
-                    self.keys.caller(self.worker_id), "1", ex=self.settings.caller_ttl_secs
-                )
                 held_now = list(self._held.values())
                 items = [
                     (alias, owner, held.envelope.request_id)
@@ -3484,7 +4009,10 @@ class Engine:
                     for held in held_now
                     if not held.grants
                 ]
-                _, lost = await self.admission.renew_all(items, jobs)
+                # The caller key and the epoch ride on the same script (FL-21: two round trips).
+                _, lost = await self.admission.renew_all(
+                    items, jobs, caller=(self.keys.caller(self.worker_id), self.caller_ttl_secs)
+                )
                 now = time.monotonic()
                 if now - self._beat_ok_mono > 2 * beat + 1:  # a gap: the store was out of reach
                     self._store_trouble_mono = now
@@ -3534,10 +4062,19 @@ class Engine:
             else:
                 self._holds_lost(holds, holders, kept)
             try:
-                await self.clock.sync(self.state)
-                await self._check_epoch()
+                clock = await self.clock.sync(self.state)
+                if clock == "jump":
+                    # A promoted replica with another wall clock, a VM resume: TTLs and holds
+                    # moved with it; callers count as alive for a while (R3FM-10).
+                    logger.error("store_clock_jump")
+                    self._store_trouble("clock")
+                await self._check_epoch(read=not renewed)
             except Exception as exc:
                 logger.warning("heartbeat_failed", step="clock", error=str(exc))
+            try:
+                await self._check_replication()
+            except Exception as exc:
+                logger.warning("heartbeat_failed", step="replication", error=str(exc))
             await asyncio.sleep(max(0.2, beat))
 
     def _holds_lost(
@@ -3556,18 +4093,16 @@ class Engine:
             if not self._owns(held):
                 continue
             logger.warning("hold_lost", request_id=held.envelope.request_id)
-            self._drop(held)
-            if held.hold is not None and not held.hold.done():
-                held.hold.cancel()
+            self._drop(held)  # its hold ends at its next round (not cancelled: FE-4)
 
-    async def _check_epoch(self) -> None:
+    async def _check_epoch(self, *, read: bool = True) -> None:
         """The store lost its data (restart, failover): re-register running calls (T10).
 
         Each process remembers the epoch it saw and re-registers when it is missing or changed
         (RESCAN A2): only the first process to notice re-registered before; the others found
-        the new epoch and did nothing.
+        the new epoch and did nothing. `read` False: this beat's RENEW read it (FL-21).
         """
-        value = await self.state.get(self.keys.epoch)
+        value = await self.state.get(self.keys.epoch) if read else self.admission.last_epoch
         missing = value is None
         if missing:
             logger.error("state_store_reset_detected")
@@ -3580,6 +4115,29 @@ class Engine:
         if missing or (seen is not None and seen != self._epoch):
             if not missing:
                 logger.error("state_store_reset_detected", by="epoch_changed")
+            self._sweep_now.set()  # waiting callers check their records now (R3RC-2)
+            await self._reregister()
+
+    async def _check_replication(self) -> None:
+        """Read the state store's replication: replicas connected, and a promotion.
+
+        A promotion that lost writes leaves the old epoch key in place, so `_check_epoch` saw
+        nothing; a changed `master_replid` now re-registers running grants and has waiting
+        callers check their records (R3FM-8). The replica count lets the replica wait skip a
+        WAIT that cannot succeed (R3FM-11). One INFO per beat.
+        """
+        info = await self.state.info("replication")
+        connected = info.get("connected_slaves")
+        if connected is not None:
+            self.replica_wait.connected = int(connected)
+        replid = info.get("master_replid")
+        if replid is None:
+            return
+        replid, seen = text(replid), self._replid
+        self._replid = replid
+        if seen is not None and seen != replid:
+            logger.error("state_store_promoted", by="master_replid")
+            self._sweep_now.set()
             await self._reregister()
 
     async def _reregister(self, owners: set[str] | None = None) -> None:
@@ -3620,14 +4178,21 @@ class Engine:
                     nx=True,
                     px=max(1, int(self.settings.sweep_secs * 1000)),  # ex=0 for < 1 s (A13)
                 )
-                if lock:
-                    view = self.registry.current
-                    for alias in view.registry.models:
-                        await self.admission.sweep(alias, [d.key for d in view.deployments(alias)])
-                        # Dead letters age out on a timer too: only the next dead letter trimmed
-                        # them, so a quiet queue kept its prompts for good (RESCAN X10).
-                        keep = int(view.value(alias, "queue")["dlq_retention_secs"])
-                        names = [self._queue_name(view, alias, p) for p in (True, False)]
-                        await self.queues.trim_dead_many(names, keep)  # one round trip (FL-20)
             except Exception as exc:
                 logger.warning("sweep_failed", error=str(exc))
+                continue
+            if not lock:
+                continue
+            view = self.registry.current
+            for alias in view.registry.models:
+                # One model that fails skips only itself: one `try` around the loop stopped the
+                # sweep (L4 lease pruning too) for every model after it, each round (FE-15).
+                try:
+                    await self.admission.sweep(alias, [d.key for d in view.deployments(alias)])
+                    # Dead letters age out on a timer too: only the next dead letter trimmed
+                    # them, so a quiet queue kept its prompts for good (RESCAN X10).
+                    keep = int(view.value(alias, "queue")["dlq_retention_secs"])
+                    names = [self._queue_name(view, alias, p) for p in (True, False)]
+                    await self.queues.trim_dead_many(names, keep)  # one round trip (FL-20)
+                except Exception as exc:
+                    logger.warning("sweep_failed", model=alias, error=str(exc))

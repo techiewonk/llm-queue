@@ -305,7 +305,8 @@ async def test_sync_calls_run_on_the_started_queue_loop(no_default: None) -> Non
         assert reply.ok
         assert queue._engine.loops[-1] is main  # type: ignore[attr-defined]
         assert queue._sync is None  # no private engine was built
-        with pytest.raises(LLMQueueError, match="deadlock"):
+        # Refused, naming the fix (owner Q1): await it there, or `ainvoke` in LangChain.
+        with pytest.raises(LLMQueueError, match=r"deadlock.*ainvoke"):
             queue.converse_sync("m", {"messages": []})  # on the loop's own thread
     finally:
         await queue.stop()

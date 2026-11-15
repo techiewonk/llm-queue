@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import orjson
 from redis.exceptions import ConnectionError as StoreConnectionError
-from redis.exceptions import ReadOnlyError
+from redis.exceptions import OutOfMemoryError, ReadOnlyError, ResponseError
 from redis.exceptions import TimeoutError as StoreTimeoutError
 
 from llm_queue._logging import get_logger
@@ -47,15 +47,23 @@ local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 """
 
 # KEYS: job, callers, status, result. ARGV: user hash, params hash, caller, unconfirmed ttl,
-# status ttl, model, priority, takeover grace secs, app id ('1': kept after its first read).
-# Returns new | attached | takeover | done | expired | conflict. Only a success is replayed
-# (owner decision Q2): an id whose last run ended failed, expired or cancelled runs again (`new`),
-# its old result, status and cancel mark dropped in the same script.
+# status ttl, model, priority, takeover grace secs, app id ('1': kept after its first read);
+# `register(caller_ttl)` takes the caller key's TTL (its ARGV place differs per script).
+# Returns new | attached | takeover | done | expired | conflict | cancelled. Only a success is
+# replayed (owner decision Q2): an id whose last run ended failed, expired or cancelled runs
+# again (`new`), its old result, status and cancel mark dropped in the same script.
 _REGISTER_FN = """
-local function register()
+local function register(caller_ttl)
 local job = redis.call('HGETALL', KEYS[1])
 local clock = redis.call('TIME')
 local now = tonumber(clock[1])
+local cancel_key = string.sub(KEYS[1], 1, -4) .. 'cancel'
+-- Every send and attach refreshes the caller's liveness key (owner Q4): a live caller whose
+-- heartbeat was late was taken for gone and its queued calls dropped (R3FM-1, R3RC-3).
+if tonumber(caller_ttl or '') and tonumber(caller_ttl) > 0 then
+  local prefix = string.match(KEYS[1], '^(.*):{r:')
+  redis.call('SET', prefix .. ':caller:' .. ARGV[3], '1', 'EX', tonumber(caller_ttl))
+end
 -- The callers set lives as long as the record: an attach made it a set with no TTL (S9).
 local function keep_callers()
   local ttl = redis.call('TTL', KEYS[1])
@@ -76,7 +84,10 @@ local function create()
   end
   return 'new'
 end
-if #job == 0 then return create() end
+if #job == 0 then
+  redis.call('DEL', cancel_key)  -- a cancel left by an earlier run of this id
+  return create()
+end
 local fields = {}
 for i = 1, #job, 2 do fields[job[i]] = job[i + 1] end
 if fields['params'] == nil then
@@ -101,6 +112,8 @@ if state == 'failed' or state == 'expired' or state == 'cancelled' then
   redis.call('DEL', KEYS[1], KEYS[2], KEYS[3], KEYS[4], base .. 'cancel', base .. 'chunks')
   return create()
 end
+-- A cancel is pending: it wins for every caller of the id (owner Q3), an attach after it too.
+if redis.call('EXISTS', cancel_key) == 1 then return 'cancelled' end
 -- An unconfirmed record older than the grace: its send failed or its sender died; take over.
 if fields['confirmed'] == '0' and now - tonumber(fields['created'] or '0') >= tonumber(ARGV[8]) then
   redis.call('HSET', KEYS[1], 'caller', ARGV[3], 'created', now)
@@ -114,7 +127,7 @@ return 'attached'
 end
 """
 
-REGISTER = _REGISTER_FN + "return register()\n"
+REGISTER = _REGISTER_FN + "return register(ARGV[10])\n"
 
 # KEYS: REGISTER's, then the queue's keys (stream first, `_PARTS` order). ARGV: REGISTER's, then
 # body, max waiting, retention ms, doorbell key, keep secs. Register, send a new call and
@@ -125,7 +138,7 @@ REGISTER_SEND = (
     + SEND_FN
     + _REGISTER_FN
     + """
-local outcome = register()
+local outcome = register(ARGV[15])
 if outcome ~= 'new' and outcome ~= 'takeover' then return {outcome} end
 local sent = send(KEYS[5], ARGV[10], tonumber(ARGV[11]), tonumber(ARGV[12]), ARGV[13])
 if sent[1] == 'full' then
@@ -271,7 +284,7 @@ STATUS_SET = _STATUS_FN + "return set_status(KEYS[1], ARGV[1], tonumber(ARGV[2])
 
 @dataclass(frozen=True, slots=True)
 class Registration:
-    """What `register` found: `new`, `attached`, `takeover`, `done`, `expired` or `conflict`."""
+    """What `register` found: new, attached, takeover, done, expired, conflict or cancelled."""
 
     outcome: str
 
@@ -289,6 +302,7 @@ class RequestStore:
         status_ttl_secs: int = 1800,
         unconfirmed_secs: int = 30,
         takeover_grace_secs: int = 5,
+        caller_ttl_secs: int = 0,
         offload: ResultOffload | None = None,
         offload_bytes: int | None = None,
     ) -> None:
@@ -309,6 +323,7 @@ class RequestStore:
         self.status_ttl_secs = status_ttl_secs
         self.unconfirmed_secs = unconfirmed_secs
         self.takeover_grace_secs = takeover_grace_secs
+        self.caller_ttl_secs = caller_ttl_secs  # 0: registration leaves the caller key alone
         self.offload = offload
         self.offload_bytes = offload_bytes
         self._unsent: dict[str, tuple[Reply, bytes]] = {}
@@ -355,6 +370,7 @@ class RequestStore:
                 "1" if priority else "0",
                 self.takeover_grace_secs,
                 "1" if app_id else "0",
+                self.caller_ttl_secs,
             ],
         )
         return Registration(_text(outcome))
@@ -399,6 +415,7 @@ class RequestStore:
                 retention_secs * 1000,
                 bell,
                 int(keep_secs) + self.status_ttl_secs,
+                self.caller_ttl_secs,
             ],
         )
         outcome = _text(reply[0])
@@ -491,7 +508,15 @@ class RequestStore:
         """
         job, _, _, result = self._req(request_id)
         marker = MARKER if self.offload is not None else b""
-        raw = await self._take([result, job], [self.result_dedupe_secs, marker, TAKE_GRACE_MS])
+        try:
+            raw = await self._take([result, job], [self.result_dedupe_secs, marker, TAKE_GRACE_MS])
+        except ResponseError as exc:
+            # RESULT_TAKE writes (it drops a read result): a store refusing writes (NOREPLICAS,
+            # OOM, MISCONF) made a stored answer unreadable (R3FM-7). Read it plainly; the drop
+            # is skipped and the result expires with its TTL.
+            if not _refuses_writes(exc):
+                raise
+            raw = await self._client.get(result)
         if raw is None:
             return None
         if self.offload is not None and raw.startswith(MARKER):
@@ -509,7 +534,7 @@ class RequestStore:
                 )
             try:
                 await self._drop_read([result, job], [self.result_dedupe_secs])
-            except _STORE_ERRORS as exc:
+            except (*_STORE_ERRORS, ResponseError) as exc:
                 # The body is in hand and the offload may have deleted it on read: raising
                 # here made the caller read again, find it gone and get `result_expired`
                 # (EN-4). The marker expires with the result TTL.
@@ -554,6 +579,14 @@ class RequestStore:
         """The claim record (for tests and status views)."""
         raw = await self._client.hgetall(self._req(request_id)[0])
         return {_text(k): _text(v) for k, v in (raw or {}).items()}
+
+
+def _refuses_writes(exc: ResponseError) -> bool:
+    """True for a refusal of writes only (the store still answers reads)."""
+    words = str(exc).split(maxsplit=1)
+    return isinstance(exc, OutOfMemoryError) or (
+        bool(words) and words[0].upper() in ("OOM", "MISCONF", "NOREPLICAS", "READONLY")
+    )
 
 
 def _pairs(fields: Mapping[str, Any]) -> list[str]:

@@ -352,6 +352,8 @@ async def test_caller_gone_is_dropped(make: Make, store: redis.asyncio.Redis) ->
         app_id=False,
     )
     await engine.requests.confirm("ghost-call", keep_secs=5)
+    # Registration refreshes the registering caller's key (owner Q4): the ghost then dies.
+    await store.delete(engine.keys.caller("ghost"))
     await engine.queues.send(
         engine._queue_name(engine.registry.current, "big", False), env.dumps(), QueueSettings()
     )

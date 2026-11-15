@@ -165,7 +165,7 @@ async def test_paused_calls_share_one_store_probe(
     come while others wait join them, and every call is still served once the store is back.
     """
     engine, _ = await make({"small": {"store_down": "pause"}})
-    real_send, real_ping = engine.requests.register_send, engine.state.ping
+    real_send, real_probe = engine.requests.register_send, engine._probe_stores
     outage = {"until": time.monotonic() + 2.5}
     pings = {"n": 0}
     tried = {"n": 0}
@@ -176,14 +176,14 @@ async def test_paused_calls_share_one_store_probe(
             raise StoreConnectionError("Connection closed by server.")
         return await real_send(*args, **kwargs)
 
-    async def ping(**kwargs: Any) -> Any:
+    async def probe() -> dict[str, str]:  # the write probe since FE-7 (a PING before)
         pings["n"] += 1
         if time.monotonic() < outage["until"]:
-            raise StoreConnectionError("Connection closed by server.")
-        return await real_ping(**kwargs)
+            return {"state": "down", "queue": "down"}
+        return await real_probe()
 
     monkeypatch.setattr(engine.requests, "register_send", send)
-    monkeypatch.setattr(engine.state, "ping", ping)
+    monkeypatch.setattr(engine, "_probe_stores", probe)
     first = asyncio.create_task(engine.call("small", CHAT))
     for _ in range(100):  # until it waits for the store
         if engine._store_waiting:
