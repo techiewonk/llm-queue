@@ -25,7 +25,7 @@ from redis.exceptions import ReadOnlyError as StoreReadOnlyError
 from redis.exceptions import TimeoutError as StoreTimeoutError
 
 from llm_queue._logging import get_logger
-from llm_queue.clients.pool import CredentialsUnavailable, route_for
+from llm_queue.clients.pool import CredentialsRefreshSlow, CredentialsUnavailable, route_for
 from llm_queue.clients.providers import Providers
 from llm_queue.clients.timing import AttemptTimeout, Timing
 from llm_queue.engine import hooks, inference, tokens
@@ -2885,11 +2885,16 @@ class Engine:
             if is_target_error(exc, info):
                 return await self._target_error(view, alias, held, dep_key, exc)
             if isinstance(exc, CredentialsUnavailable) or is_auth_error(exc, info):
-                self.providers.pool.forget(route)
+                # FC-2: a slow refresh keeps its client and shared refresh task, and only its
+                # first cut call takes a back-off step (five cut together doubled it five times).
+                slow = exc if isinstance(exc, CredentialsRefreshSlow) else None
+                if slow is None:
+                    self.providers.pool.forget(route)
                 where = (deployment.account, deployment.region)
                 last = self._bad_accounts.get(where)
-                backoff = min((last.backoff_secs if last else 2.5) * 2, 60.0)
-                self._bad_accounts[where] = _Backoff(time.monotonic() + backoff, backoff)
+                if slow is None or slow.first or last is None:
+                    backoff = min((last.backoff_secs if last else 2.5) * 2, 60.0)
+                    self._bad_accounts[where] = _Backoff(time.monotonic() + backoff, backoff)
                 logger.error(
                     "account_credentials_failed",
                     account=deployment.account,

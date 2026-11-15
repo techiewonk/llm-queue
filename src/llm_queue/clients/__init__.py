@@ -15,6 +15,7 @@ from llm_queue.clients.hub import (
 )
 from llm_queue.clients.pool import (
     ClientPool,
+    CredentialsRefreshSlow,
     CredentialsUnavailable,
     Route,
     route_for,
@@ -38,6 +39,7 @@ __all__ = [
     "BedrockProvider",
     "ClientHub",
     "ClientPool",
+    "CredentialsRefreshSlow",
     "CredentialsUnavailable",
     "OpenAIOptions",
     "OpenAIProvider",

@@ -139,6 +139,20 @@ class CredentialsUnavailable(LLMQueueError):
     """An account's credentials could not be obtained (STS refused or unreachable)."""
 
 
+class CredentialsRefreshSlow(CredentialsUnavailable):
+    """The attempt timer fired while expiring credentials were being refreshed (FC-2).
+
+    The worker backs the account off but keeps its client and the shared refresh task (the
+    next call finds the refresh done). `first` is True for the first call cut by one refresh:
+    only that one takes a back-off step, so five calls cut together do not double it five times.
+    """
+
+    def __init__(self, message: str, *, first: bool) -> None:
+        """Keep `first` (see the class)."""
+        super().__init__(message)
+        self.first = first
+
+
 def _metadata(extra: Mapping[str, Any], expiry: Any) -> dict[str, Any]:
     """The refreshable-credential metadata of `create_client` style arguments."""
     when = expiry.isoformat() if isinstance(expiry, datetime) else str(expiry)
@@ -150,36 +164,44 @@ def _metadata(extra: Mapping[str, Any], expiry: Any) -> dict[str, Any]:
     }
 
 
-# Set by `borrow_bedrock` for one attempt: `_single_flight` marks it when the attempt was
-# cancelled (its timer fired) while waiting for a credentials refresh (CL-8).
-_refresh_cut: contextvars.ContextVar[list[bool] | None] = contextvars.ContextVar(
+# Set by `borrow_bedrock` for one attempt: `_single_flight` adds (mandatory, first) when the
+# attempt was cancelled (its timer fired) while waiting for a credentials refresh (CL-8, FC-2).
+_refresh_cut: contextvars.ContextVar[list[tuple[bool, bool]] | None] = contextvars.ContextVar(
     "llmq_refresh_cut", default=None
 )
 
 
 def _single_flight(
     fetch: Callable[[], Awaitable[dict[str, Any]]],
+    mandatory: Callable[[], bool] = lambda: True,
 ) -> Callable[[], Awaitable[dict[str, Any]]]:
     """`fetch` run as one shared task: a caller cancelled while waiting does not abort it.
 
     aiobotocore refreshes inside the caller's attempt timer; when the timer fired it cancelled
     the refresh, so inside the mandatory window a slow STS was never waited out and every call
-    failed (CL-8). The next caller now awaits the same task.
+    failed (CL-8). The next caller now awaits the same task. A cut records whether the keys
+    were inside the mandatory window (`mandatory()`) and whether it is the refresh's first.
     """
     running: asyncio.Task[dict[str, Any]] | None = None
+    counted: asyncio.Task[dict[str, Any]] | None = None  # the refresh whose cut was counted
 
     async def refresh() -> dict[str, Any]:
-        nonlocal running
+        nonlocal running, counted
         if running is None or running.done():
             running = asyncio.ensure_future(fetch())
             # Read the outcome even when every waiter was cancelled (no "never retrieved").
             running.add_done_callback(lambda t: t.cancelled() or t.exception())
+        task = running
         try:
-            return await asyncio.shield(running)
+            return await asyncio.shield(task)
         except asyncio.CancelledError:
             # The attempt ran out waiting for credentials, not for the provider (CL-8).
             if (cut := _refresh_cut.get()) is not None:
-                cut.append(True)
+                urgent = mandatory()
+                first = urgent and counted is not task
+                if first:
+                    counted = task
+                cut.append((urgent, first))
             raise
 
     return refresh
@@ -190,9 +212,23 @@ def _refreshing(metadata: dict[str, Any], refresh: Any, method: str) -> AioSessi
     from aiobotocore.credentials import AioRefreshableCredentials
     from aiobotocore.session import AioSession
 
+    box: list[Any] = []
+
+    def mandatory() -> bool:
+        """True when the current keys expire within `REFRESH_MANDATORY_SECS` (FC-2).
+
+        aiobotocore also refreshes inline in the advisory window, while the keys are still good
+        for minutes: a timer cut there is a plain timeout, not a credentials failure.
+        """
+        try:
+            return bool(box[0]._seconds_remaining() < REFRESH_MANDATORY_SECS)
+        except Exception:  # an older botocore without the helper: the old behaviour
+            return True
+
     credentials = AioRefreshableCredentials.create_from_metadata(
-        metadata=metadata, refresh_using=_single_flight(refresh), method=method
+        metadata=metadata, refresh_using=_single_flight(refresh, mandatory), method=method
     )
+    box.append(credentials)
     # Set after creation: older botocore has no advisory/mandatory arguments here.
     credentials._advisory_refresh_timeout = REFRESH_BEFORE_SECS  # type: ignore[attr-defined]  # botocore class attribute, not in the stubs
     credentials._mandatory_refresh_timeout = REFRESH_MANDATORY_SECS  # type: ignore[attr-defined]  # as above
@@ -307,22 +343,24 @@ class ClientPool:
     async def borrow_bedrock(self, route: Route) -> AsyncIterator[BedrockClient]:
         """The route's Bedrock client, counted as in use until the block ends (CL-3).
 
-        An attempt timer that fired while the call waited for a credentials refresh (a slow
-        STS or `credentials=` lookup) raises `CredentialsUnavailable`, not `AttemptTimeout`: the
-        region did nothing wrong (CL-8). A call still queued on botocore's refresh lock (not
-        yet in the refresh) reads as `AttemptTimeout`.
+        An attempt timer that fired while the call waited for a refresh of expiring keys (a
+        slow STS or `credentials=` lookup) raises `CredentialsRefreshSlow`, not
+        `AttemptTimeout`: the region did nothing wrong (CL-8). While the keys are still valid
+        (aiobotocore's advisory window) the cut stays an `AttemptTimeout` (FC-2). A call still
+        queued on botocore's refresh lock (not yet in the refresh) reads as `AttemptTimeout`.
         """
         lease = await self._bedrock_lease(route)
         lease.enter()
-        cut: list[bool] = []
+        cut: list[tuple[bool, bool]] = []
         token = _refresh_cut.set(cut)
         try:
             yield cast("BedrockClient", lease.client)
         except AttemptTimeout as exc:
-            if not cut:
+            if not any(urgent for urgent, _ in cut):
                 raise
-            raise CredentialsUnavailable(
-                f"account {route.account.name}: credentials refresh not done in time ({exc})"
+            raise CredentialsRefreshSlow(
+                f"account {route.account.name}: credentials refresh not done in time ({exc})",
+                first=any(first for _, first in cut),
             ) from exc
         finally:
             _refresh_cut.reset(token)
