@@ -465,6 +465,9 @@ if sticky_dep and results[sticky_dep] then
   end
 end
 
+-- Rotation counters of the weighted pick, written only with a grant (FL-17: a pick that the
+-- fallback headroom check then refused had already moved the rotation).
+local rot_writes = {}
 local function pick(list)
   if #list == 0 then return nil end
   local strategy = req.strategy
@@ -482,11 +485,11 @@ local function pick(list)
     for _, cand in ipairs(list) do
       local w = num(rows[cand.key].weight, 1)
       local cw = hnum(rot, 'cw|' .. cand.key, 0) + w
-      redis.call('HSET', rot, 'cw|' .. cand.key, tostring(cw))
+      rot_writes['cw|' .. cand.key] = tostring(cw)
       total = total + w
       if best_cw == nil or cw > best_cw then best, best_cw = cand, cw end
     end
-    redis.call('HSET', rot, 'cw|' .. best.key, tostring(best_cw - total))
+    rot_writes['cw|' .. best.key] = tostring(best_cw - total)
     return best
   elseif strategy == 'headroom' then
     local mode = req.pick or 'percent'
@@ -586,6 +589,7 @@ if req.strategy == 'round_robin' then
   local rot = mk(alias, 'rot')
   redis.call('HSET', rot, 'rr|' .. chosen.key, redis.call('HINCRBY', rot, 'rr_seq', 1))
 end
+for field, value in pairs(rot_writes) do redis.call('HSET', mk(alias, 'rot'), field, value) end
 local granted = {r = 'granted', dep = chosen.key, minute = minute, limit = res.limit,
   tier = chosen.tier}
 -- A stream's call: how far its chunk stream got (another worker may have begun it, R19); an

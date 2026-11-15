@@ -553,6 +553,30 @@ async def test_fl13_reregister_restores_the_claim_and_the_grant_budgets(
     assert await r.admission.reregister([item]) == 0  # cancelled: not put back
 
 
+async def test_fl17_a_refused_weighted_pick_leaves_the_rotation_alone(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-17: the weighted pick wrote its rotation counters before the fallback headroom
+    check refused the grant, so calls that were never granted moved the rotation.
+    """
+    r = await rig(store, prefix)
+    other = [Candidate("aws-a/r1")]
+    refused = await r.ask(
+        "f1",
+        alias="other",
+        candidates=other,
+        foreign_from="m",
+        strategy="weighted",
+        require_pct=101,
+    )
+    assert (refused.kind, refused.reason) == ("busy", "headroom")
+    assert not await store.exists(f"{prefix}:{{m:other}}:rot")  # written before the fix
+    assert (await r.ask("g1", alias="other", candidates=other, strategy="weighted")).kind == (
+        "granted"
+    )
+    assert await store.exists(f"{prefix}:{{m:other}}:rot")
+
+
 async def test_fl1_release_claims_of_calls_held_without_a_grant(
     store: redis.asyncio.Redis, prefix: str
 ) -> None:
