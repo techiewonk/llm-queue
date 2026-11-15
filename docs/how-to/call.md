@@ -53,7 +53,7 @@ request = {"messages": [{"role": "user", "content": [
 reply = await llmq.converse("claude-sonnet", request)
 ```
 
-- Bytes travel through the queue encoded (`{"__b64__": ...}`) and reach the provider as bytes.
+- Bytes travel through the queue encoded (`{"__llmq_b64__": ...}`) and reach the provider as bytes.
 - The whole message, bytes included, may be at most the model's `max_message_bytes` (default
   4 MB). A larger one fails `CallFailed("invalid_request")` at once, before it is queued. For
   larger files, use a smaller image or an S3 location the model can read.

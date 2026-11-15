@@ -106,3 +106,21 @@ async def test_q5_cancel_bounds_its_ids() -> None:
     tool = cli.Cli(InfraSettings(store_url="redis://x"), MagicMock(), "ann")
     with pytest.raises(ConfigError, match="request ids"):
         await tool._cancel(args)
+
+
+def test_fo25_caller_data_shaped_like_the_bytes_marker_survives() -> None:
+    """FO-25: a caller's own `{"__b64__": "..."}` was decoded, and bad base64 failed parse."""
+    from llm_queue.engine import envelope
+
+    params = {
+        "messages": [{"content": [{"image": {"source": {"bytes": b"\x89PNG"}}}]}],
+        "data": {"__b64__": "not base64 !!"},
+        "odd": {envelope.B64: "%%%"},
+    }
+    sent = envelope.Envelope(
+        request_id="r", op="converse", model="m", params=params, caller="c", timeout_secs=5
+    )
+    got = envelope.parse(sent.dumps()).params
+    assert got["messages"][0]["content"][0]["image"]["source"]["bytes"] == b"\x89PNG"
+    assert got["data"] == {"__b64__": "not base64 !!"}
+    assert got["odd"] == {envelope.B64: "%%%"}
