@@ -193,6 +193,22 @@ class InfraSettings:
         mode = str(get("MODE", "both"))
         if mode not in ("both", "caller", "worker"):
             problems.append("LLMQ_MODE must be both, caller or worker")
+        key_prefix = get("KEY_PREFIX")
+        if strict and not key_prefix:
+            # Owner decision Q26 (R3SE-9): two environments on one store that both left the
+            # default `llmq` shared queues and registry (staging workers ran prod prompts).
+            problems.append(
+                f"LLMQ_KEY_PREFIX is required outside dev ({environment}): name it per app and "
+                "environment, e.g. myapp-prod"
+            )
+        endpoints: dict[str, Any] = {"BEDROCK_ENDPOINT_URL": None, "STS_ENDPOINT_URL": None}
+        for name in endpoints:
+            value = get(name)
+            endpoints[name] = value
+            if strict and value and not str(value).lower().startswith("https://"):
+                # Owner decision Q30 (R3SE-6): plain http sent prompts, SigV4 headers and the
+                # session token (and STS role keys) in clear. Any host is allowed.
+                problems.append(f"LLMQ_{name} must use https outside dev ({environment})")
 
         def number(name: str, default: float, kind: type = float, *, zero: bool = False) -> Any:
             raw = get(name, default)
@@ -223,7 +239,7 @@ class InfraSettings:
             store_url=urls["STORE_URL"] or str(store or ""),
             queue_store_url=urls["QUEUE_STORE_URL"],
             store_max_connections=number("STORE_MAX_CONNECTIONS", 200, int),
-            key_prefix=str(get("KEY_PREFIX", "llmq")),
+            key_prefix=str(key_prefix or "llmq"),
             queue_prefix=str(get("QUEUE_PREFIX", "")),
             registry=registry,
             registry_file=registry_file,
@@ -240,8 +256,8 @@ class InfraSettings:
             local_limit_cap=number("LOCAL_LIMIT_CAP", 10, int),
             metrics_sink=sink,
             mode=mode,
-            bedrock_endpoint_url=get("BEDROCK_ENDPOINT_URL"),
-            sts_endpoint_url=get("STS_ENDPOINT_URL"),
+            bedrock_endpoint_url=endpoints["BEDROCK_ENDPOINT_URL"],
+            sts_endpoint_url=endpoints["STS_ENDPOINT_URL"],
             id_hash_salt=salt,
             environment=environment,
             queue_failover_secs=number("QUEUE_FAILOVER_SECS", 5.0, zero=True),

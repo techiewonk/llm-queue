@@ -15,7 +15,8 @@ import pytest
 from llm_queue import ConfigError, Tuning
 from llm_queue.engine.settings import InfraSettings
 
-SALT = {"LLMQ_ID_HASH_SALT": "s"}
+# What strict mode needs besides TLS: the id salt and an explicit key prefix (Q26).
+SALT = {"LLMQ_ID_HASH_SALT": "s", "LLMQ_KEY_PREFIX": "app-prod"}
 TLS = "rediss://cache.example.com:6379/0"
 
 
