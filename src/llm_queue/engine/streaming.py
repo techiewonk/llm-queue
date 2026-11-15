@@ -73,6 +73,11 @@ class ChunkWriter:
         self._lock = asyncio.Lock()
         self._timer: asyncio.Task[None] | None = None
         self._failed: Exception | None = None
+        # A write whose outcome is unknown (a store error or a cancel mid-XADD): sent again, with
+        # the same seq, before anything else. The reader skips the copy if the first landed.
+        self._doubt: tuple[int, str, bytes, int | None] | None = None
+        self._content = False  # an event with answer content (text, tool, reasoning) was sent
+        self.closed = False  # `end` or `error` was written
         self.partial: list[str] = []
 
     @property
@@ -86,20 +91,25 @@ class ChunkWriter:
         return "".join(self.partial)
 
     async def add(self, event: Any) -> None:
-        """One provider event: written now if it is the first or the flush window has passed."""
+        """One provider event: written now if it is early or the flush window has passed.
+
+        Every event up to the first with answer content is written at once: the first text
+        delta waited up to `stream_flush_ms` behind `messageStart`, and time to first token is
+        the number users see (R3ST-12).
+        """
         if self._failed is not None:
             raise self._failed
         # `exclude_unset`, not `exclude_none`: the wire shape, with the nulls the server sent;
         # `chunk["choices"][0]["finish_reason"]` raised KeyError on most chunks (R3ST-10).
         data = event.model_dump(exclude_unset=True) if hasattr(event, "model_dump") else event
         self._buffer.append(data)
-        if text := text_of(data):
+        text = text_of(data)
+        if text:
             self.partial.append(text)
-        if (
-            self._seq == 0
-            or self._flush_secs == 0
-            or time.monotonic() - self._last >= self._flush_secs
-        ):
+        early = not self._content
+        if early:
+            self._content = bool(text) or _has_content(data)
+        if early or self._flush_secs == 0 or time.monotonic() - self._last >= self._flush_secs:
             await self._flush()
         elif self._timer is None or self._timer.done():
             self._timer = asyncio.create_task(self._flush_later())
@@ -114,61 +124,116 @@ class ChunkWriter:
             # so the failure went unseen (EN-19).
             logger.warning("chunk_flush_failed", key=self.key, error_type=type(exc).__name__)
 
-    async def _write(self, kind: str, data: Any, *, ttl_secs: int | None = None) -> None:
+    async def _write(
+        self, kind: str, data: Any, *, ttl_secs: int | None = None, capped: bool = True
+    ) -> None:
+        """Write one entry under the next seq; the lock is held.
+
+        The seq is taken before the write (R3ST-7, FE-3): a write cut by a cancel or a store
+        error may have reached the store, and the next entry under the same seq was dropped by
+        the reader as a re-read, so the caller never saw the `end` or `error` entry. The entry
+        is kept in doubt and sent again, same seq, before the next one.
+        """
         payload = orjson.dumps(data, default=_chunk_default)
-        size = self._bytes + len(payload)  # counted only once written, like the sequence
-        if size > self._max_bytes:
+        size = self._bytes + len(payload)
+        # `end` is not capped (R3ST-13): an answer delivered in full failed on its last entry.
+        if capped and size > self._max_bytes:
             raise StreamTooLarge(f"the stream is above {self._max_bytes} bytes")
-        seq = self._seq + 1  # counted only once written: a failed write leaves no gap
+        self._seq += 1
+        self._bytes = size
+        self._doubt = (self._seq, kind, payload, ttl_secs)
+        await self._send()
+
+    async def _send(self) -> None:
+        """Send the entry in doubt; it stays in doubt until the store confirmed it."""
+        assert self._doubt is not None
+        seq, kind, payload, ttl_secs = self._doubt
         async with self._client.pipeline(transaction=False) as pipe:
             pipe.xadd(self.key, {"seq": seq, "att": self.attempt_id, "t": kind, "d": payload})
             pipe.expire(
                 self.key, ttl_secs or self._ttl_secs
             )  # every write: the first may have failed
             await pipe.execute()
-        self._seq = seq
-        self._bytes = size
+        self._doubt = None
         self._last = time.monotonic()
 
     async def _flush(self) -> None:
         async with self._lock:
-            if self._buffer:
-                events, self._buffer = self._buffer, []
-                try:
-                    await self._write("chunk", events)
-                except Exception:
-                    # Kept for the next flush: dropped, the stream ended "ok" with chunks
-                    # missing (RESCAN S1).
-                    self._buffer = events + self._buffer
-                    raise
+            await self._flush_locked()
 
-    async def end(self, usage: Mapping[str, Any]) -> None:
+    async def _flush_locked(self) -> None:
+        if self._doubt is not None:
+            await self._send()
+        if self._buffer:
+            events, self._buffer = self._buffer, []
+            try:
+                await self._write("chunk", events)
+            except StreamTooLarge:
+                # Kept: `error` still carries their text (RESCAN S1). Any other failure left
+                # them in doubt, to be sent again (R3ST-7).
+                self._buffer = events + self._buffer
+                raise
+
+    async def end(self, usage: Mapping[str, Any], meta: Mapping[str, Any] | None = None) -> None:
         """Write what is left, then the `end` entry; a background flush's failure raises here.
 
         After `end` the stream lives `END_TTL_SECS` more: a read stream (up to 8 MB) stayed
-        for the result TTL plus the timeout (RESCAN S3).
+        for the result TTL plus the timeout (RESCAN S3). `meta` (served model, deployment,
+        fallback, attempts) is for stream callers, who never see the call's `Reply` (R3ST-9).
         """
         await self._stop_timer()
         if self._failed is not None:
             raise self._failed
-        await self._flush()
+        data: dict[str, Any] = {"usage": dict(usage)}
+        if meta is not None:
+            data["meta"] = dict(meta)
         async with self._lock:
-            await self._write("end", {"usage": dict(usage)}, ttl_secs=END_TTL_SECS)
+            await self._flush_locked()
+            await self._write("end", data, ttl_secs=END_TTL_SECS, capped=False)
+            self.closed = True
 
     async def error(self, kind: str, message: str) -> None:
-        """End the stream with an error that carries the partial text (best effort)."""
+        """End the stream with an error that carries the partial text (best effort).
+
+        A no-op once the stream ended: a cancel that came after `end` wrote an error entry
+        nobody reads.
+        """
+        if self.closed:
+            return
         await self._stop_timer()
-        with contextlib.suppress(StreamTooLarge):
-            await self._flush()
         async with self._lock:
-            self._bytes = 0  # the error entry is always written
+            with contextlib.suppress(StreamTooLarge):
+                await self._flush_locked()
             await self._write(
-                "error", {"kind": kind, "message": message, "partial": self.partial_text}
+                "error",
+                {"kind": kind, "message": message, "partial": self.partial_text},
+                capped=False,  # the error entry is always written
             )
+            self.closed = True
 
     async def _stop_timer(self) -> None:
-        if self._timer is not None and not self._timer.done():
-            await _cancel_and_wait([self._timer])
+        """Stop the flush timer; a flush it has in flight finishes first.
+
+        Cancelled inside its write, the timer lost the batch or left the seq behind, and the
+        `end` written next under the same seq was dropped by the reader (FE-3).
+        """
+        timer = self._timer
+        if timer is None or timer.done():
+            return
+        async with self._lock:  # the timer is asleep or waiting for the lock once this is held
+            timer.cancel()
+        await _cancel_and_wait([timer])
+
+
+def _has_content(event: Mapping[str, Any]) -> bool:
+    """True for an event that carries answer content: a text, tool or reasoning delta."""
+    if "contentBlockDelta" in event:
+        return True
+    choices = event.get("choices") or []
+    if choices and isinstance(choices[0], Mapping):
+        delta = choices[0].get("delta") or {}
+        return any(key != "role" and value for key, value in delta.items())
+    return False
 
 
 class ChunkReader:
@@ -194,7 +259,13 @@ class ChunkReader:
         self._rings: set[asyncio.Task[None]] = set()
 
     def open(self, key: str) -> asyncio.Queue[dict[str, Any]]:
-        """Start reading a chunk stream from its beginning; entries arrive on the queue."""
+        """Start reading a chunk stream from its beginning; entries arrive on the queue.
+
+        `ValueError` when this process already reads it: a second open replaced the first's
+        queue and the first's close then removed the second's, so both starved (R3ST-8).
+        """
+        if key in self._open:
+            raise ValueError(f"the chunk stream {key} is already open in this process")
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._open[key] = (queue, ["0"])
         if self._task is None or self._task.done():
