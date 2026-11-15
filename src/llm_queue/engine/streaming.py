@@ -236,6 +236,91 @@ def _has_content(event: Mapping[str, Any]) -> bool:
     return False
 
 
+def replay_events(response: Mapping[str, Any] | None) -> list[dict[str, Any]] | None:
+    """Stream events rebuilt from a call's kept reply; None for a shape this cannot rebuild.
+
+    For an app id streamed again once its chunks expired (`END_TTL_SECS`) while its result is
+    still kept: the stream ended with no event and no error (R3ST-6). Bedrock gets the
+    ConverseStream events of the body, OpenAI-compatible one chunk plus a usage chunk.
+    """
+    if not isinstance(response, Mapping):
+        return None
+    if isinstance(response.get("output"), Mapping):
+        return _converse_events(response)
+    if isinstance(response.get("choices"), list):
+        return _chat_events(response)
+    return None
+
+
+def _converse_events(body: Mapping[str, Any]) -> list[dict[str, Any]]:
+    message = body["output"].get("message") or {}
+    events: list[dict[str, Any]] = [{"messageStart": {"role": message.get("role", "assistant")}}]
+    for index, block in enumerate(message.get("content") or []):
+        deltas: list[dict[str, Any]] = []
+        if "text" in block:
+            deltas.append({"text": block["text"]})
+        elif "toolUse" in block:
+            tool = block["toolUse"]
+            start = {k: tool[k] for k in ("toolUseId", "name") if k in tool}
+            events.append(
+                {"contentBlockStart": {"start": {"toolUse": start}, "contentBlockIndex": index}}
+            )
+            raw = tool.get("input", {})
+            text = raw if isinstance(raw, str) else orjson.dumps(raw).decode()
+            deltas.append({"toolUse": {"input": text}})
+        elif "reasoningContent" in block:
+            reasoning = block["reasoningContent"]
+            if "redactedContent" in reasoning:
+                deltas.append(
+                    {"reasoningContent": {"redactedContent": reasoning["redactedContent"]}}
+                )
+            part = reasoning.get("reasoningText") or {}
+            if "text" in part:
+                deltas.append({"reasoningContent": {"text": part["text"]}})
+            if "signature" in part:
+                deltas.append({"reasoningContent": {"signature": part["signature"]}})
+        elif "citationsContent" in block:
+            cited = block["citationsContent"]
+            text = "".join(str(c.get("text", "")) for c in cited.get("content") or [])
+            deltas.append({"text": text})
+            deltas.extend({"citation": c} for c in cited.get("citations") or [])
+        events.extend(
+            {"contentBlockDelta": {"delta": delta, "contentBlockIndex": index}} for delta in deltas
+        )
+        events.append({"contentBlockStop": {"contentBlockIndex": index}})
+    stop: dict[str, Any] = {"stopReason": body.get("stopReason")}
+    if "additionalModelResponseFields" in body:
+        stop["additionalModelResponseFields"] = body["additionalModelResponseFields"]
+    events.append({"messageStop": stop})
+    metadata = {k: body[k] for k in ("usage", "metrics", "trace") if k in body}
+    if metadata:
+        events.append({"metadata": metadata})
+    return events
+
+
+def _chat_events(body: Mapping[str, Any]) -> list[dict[str, Any]]:
+    head = {k: body[k] for k in ("id", "created", "model", "system_fingerprint") if k in body}
+    head["object"] = "chat.completion.chunk"
+    choices = []
+    for choice in body["choices"]:
+        delta = dict(choice.get("message") or {})
+        if delta.get("tool_calls"):
+            delta["tool_calls"] = [
+                {"index": i, **call} for i, call in enumerate(delta["tool_calls"])
+            ]
+        choices.append(
+            {
+                "index": choice.get("index", 0),
+                "delta": delta,
+                "finish_reason": choice.get("finish_reason"),
+            }
+        )
+    events: list[dict[str, Any]] = [{**head, "choices": choices}]
+    if body.get("usage") is not None:
+        events.append({**head, "choices": [], "usage": body["usage"]})
+    return events
+
+
 class ChunkReader:
     """One per caller process: one blocking read over every open chunk stream."""
 

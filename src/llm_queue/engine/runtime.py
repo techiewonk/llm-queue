@@ -75,7 +75,13 @@ from llm_queue.engine.store_checks import UNKNOWN as UNKNOWN_POLICY
 from llm_queue.engine.store_checks import check_store, eviction_policy, eviction_warning
 from llm_queue.engine.store_client import StorePoolBusy
 from llm_queue.engine.store_guard import WAIT_SCOPES, ReplicaWait
-from llm_queue.engine.streaming import ChunkReader, ChunkWriter, StreamTooLarge
+from llm_queue.engine.streaming import (
+    ChunkReader,
+    ChunkWriter,
+    StreamTooLarge,
+    replay_events,
+    text_of,
+)
 from llm_queue.errors import ErrorKind, UnsupportedEnvelopeError
 from llm_queue.ids import new_id
 from llm_queue.providers.classify import (
@@ -261,6 +267,42 @@ def _api_kwargs(provider: Any, view: ResolvedRegistry, alias: str) -> dict[str, 
             )
         _ACCEPTS_API[kind] = accepts
     return {"converse_api": str(view.value(alias, "converse_api"))} if accepts else {}
+
+
+# The marker `stream()` puts on its chunk queue when the call task ends (R3PF-11).
+_CALL_DONE: dict[str, Any] = {"t": "call_done"}
+# How long `stream()` waits for a failed call's error entry once the call task ended (R3ST-3).
+_STREAM_GRACE_SECS = 1.0
+
+
+def _call_failed(task: asyncio.Task[Reply]) -> bool:
+    """True when a finished call task raised."""
+    return task.done() and not task.cancelled() and task.exception() is not None
+
+
+def _raise_call_failure(task: asyncio.Task[Reply], partial_text: str | None) -> None:
+    """Raise a finished call task's failure, with the stream's text so far; else return."""
+    if not _call_failed(task):
+        return
+    exc = task.exception()
+    if isinstance(exc, CallFailed):
+        message = str(exc).removeprefix(exc.kind).removeprefix(": ")
+        raise CallFailed(
+            exc.kind,
+            message,
+            retry_after_secs=exc.retry_after_secs,
+            partial_text=exc.partial_text or partial_text,
+            request_id=exc.request_id,
+        ) from exc
+    assert exc is not None
+    raise exc
+
+
+def _meta_event(meta: Mapping[str, Any], usage: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The library's last stream event (`meta_event=True`): usage and how it was served."""
+    if usage is None:
+        usage = {"inputTokens": meta.get("tokens_in"), "outputTokens": meta.get("tokens_out")}
+    return {"llmq": {"usage": dict(usage), "meta": dict(meta)}}
 
 
 def _seen(task: asyncio.Future[Any]) -> None:
@@ -1019,13 +1061,15 @@ class Engine:
             raise
 
     async def stream(
-        self, model: str, params: Mapping[str, Any], **call: Any
+        self, model: str, params: Mapping[str, Any], *, meta_event: bool = False, **call: Any
     ) -> AsyncIterator[dict[str, Any]]:
         """Run a chat call and yield the provider's events as they arrive (plan §3.13, F6).
 
         Takes `call`'s options. The events are ConverseStream events (Bedrock) or chat
         completion chunks (OpenAI-compatible). A failure after events were yielded raises
         `CallFailed` with `partial_text`; no switch to another deployment happens then.
+        `meta_event=True` ends a complete stream with one library event, `{"llmq": {"usage":
+        ..., "meta": ...}}`: tokens, served model, deployment, fallback, attempts (R3ST-9).
         """
         view = self.registry.current
         alias = view.registry.alias_of(model)
@@ -1039,10 +1083,22 @@ class Engine:
                 request_id=call.get("request_id"),
             )
         idle = float(view.value(alias, "stream_idle_secs"))
+        flush_secs = int(view.value(alias, "stream_flush_ms")) / 1000
+        # The worker gives up a stalled provider after `idle` and then writes its error entry
+        # (2+ round trips): waiting the same `idle` here raced it, and the caller got a bare
+        # `deadline_exceeded` with no `partial_text` about half the time (R3ST-1).
+        idle_wait = idle + flush_secs + self.settings.caller_margin_secs
         app_id = call.pop("request_id", None)  # an app id keeps its app-id behaviour (S11)
         rid = app_id or new_id()
         key = self.keys.request(rid, "chunks")
-        queue = self.chunks.open(key)
+        try:
+            queue = self.chunks.open(key)
+        except ValueError:  # both starved before (R3ST-8)
+            raise CallFailed(
+                "invalid_request",
+                "a stream with this request id is already being read in this process",
+                request_id=rid,
+            ) from None
         # The call's own deadline, as `call` computes it: the idle wait between chunks
         # (stream_idle_secs, 30) once let a stream whose worker died answer after it (scenario
         # L2 at 300 %: 38.8 s for a 15 s deadline).
@@ -1052,87 +1108,104 @@ class Engine:
         task = asyncio.create_task(
             self.call(model, params, stream=True, stream_id=rid, request_id=app_id, **call)
         )
-        expected, started, attempt_id, ended = 1, False, "", False
+        # The call's end is a marker on the queue: one plain `get` per entry, where a Task and
+        # an `asyncio.wait` per entry cost 42 us each (R3PF-11).
+        task.add_done_callback(lambda _: queue.put_nowait(_CALL_DONE))
+        expected, attempt_id, ended, finished = 1, "", False, False
+        texts: list[str] = []  # what was yielded: `partial_text` of the failures raised here
+
+        def failed(kind: str, message: str) -> CallFailed:
+            return CallFailed(kind, message, partial_text="".join(texts) or None, request_id=rid)
+
         try:
             while True:
-                if not queue.empty():  # already read: a slow consumer gets it (RESCAN S2)
-                    entry = queue.get_nowait()
-                else:
+                try:
+                    entry = queue.get_nowait()  # already read: a slow consumer gets it (S2)
+                except asyncio.QueueEmpty:
                     left = deadline - loop.time()
                     if left <= 0:
-                        raise CallFailed("deadline_exceeded", "no reply in time", request_id=rid)
-                    getter = asyncio.ensure_future(queue.get())
-                    finished = task.done()
+                        raise failed("deadline_exceeded", "no reply in time") from None
+                    if finished and _call_failed(task):
+                        # Its error entry, if any, is on the way: a short grace, not the idle
+                        # time (a cancel waited 30 s, R3ST-3).
+                        wait = _STREAM_GRACE_SECS + flush_secs
+                    elif finished or expected > 1:
+                        wait = idle_wait
+                    else:
+                        wait = left
                     try:
-                        done, _ = await asyncio.wait(
-                            {getter} if finished else {getter, task},
-                            timeout=min(idle, left) if started or finished else left,
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-                    finally:
-                        # Also when the consumer is cancelled mid-wait: the getter stayed
-                        # pending on the chunk queue, one leaked task per stream (audit RT-25).
-                        if not getter.done():
-                            getter.cancel()
-                    if getter not in done:
-                        if not done and deadline - loop.time() <= 0:  # the deadline, not idleness
-                            raise CallFailed(
-                                "deadline_exceeded", "no reply in time", request_id=rid
-                            )
-                        if task in done:
-                            if not started:
-                                # The store may be down too: then nothing can be replayed, and
-                                # the call's own failure is the answer (scenario L2: this read
-                                # raised redis-py's ConnectionError to the app).
-                                try:
-                                    pending = await self.state.xlen(key)
-                                except STORE_ERRORS:
-                                    task.result()  # the call's failure, if it failed
-                                    raise CallFailed(
-                                        "queue_unavailable",
-                                        "the store is unreachable; the stream cannot be read",
-                                        request_id=rid,
-                                    ) from None
-                                if not pending:
-                                    task.result()  # raises the call's failure (nothing streamed)
-                                    return  # a finished call whose chunks expired
-                            continue  # its last entries are still on the way
+                        async with asyncio.timeout(min(wait, left)):
+                            entry = await queue.get()
+                    except TimeoutError:
+                        if deadline - loop.time() <= 0:
+                            raise failed("deadline_exceeded", "no reply in time") from None
                         if finished:
-                            task.result()
+                            _raise_call_failure(task, "".join(texts) or None)
+                            raise failed(
+                                "worker_lost", "the stream ended without its end entry"
+                            ) from None
+                        raise failed(
+                            "deadline_exceeded", f"no chunk for {idle:g} s (stream_idle_secs)"
+                        ) from None
+                if entry is _CALL_DONE:
+                    finished = True
+                    if expected == 1:  # nothing read yet
+                        # The store may be down too: then nothing can be replayed, and the
+                        # call's own failure is the answer (scenario L2: this read raised
+                        # redis-py's ConnectionError to the app).
+                        try:
+                            pending = await self.state.xlen(key)
+                        except STORE_ERRORS:
+                            task.result()  # the call's failure, if it failed
                             raise CallFailed(
-                                "worker_lost",
-                                "the stream ended without its end entry",
+                                "queue_unavailable",
+                                "the store is unreachable; the stream cannot be read",
                                 request_id=rid,
-                            )
-                        raise CallFailed(
-                            "deadline_exceeded",
-                            f"no chunk for {idle:g} s (stream_idle_secs)",
-                            request_id=rid,
-                        )
-                    entry = getter.result()
+                            ) from None
+                        if not pending:
+                            reply = task.result()  # raises the call's failure (nothing streamed)
+                            # A finished call whose chunks expired: an app id streamed again
+                            # after `END_TTL_SECS` ended with no event and no error (R3ST-6).
+                            events = replay_events(reply.response)
+                            if events is None:
+                                raise CallFailed(
+                                    "result_expired",
+                                    "the stream's chunks expired",
+                                    request_id=rid,
+                                )
+                            ended = True
+                            for event in events:
+                                yield event
+                            if meta_event:
+                                yield _meta_event(reply.meta.model_dump(), None)
+                            return
+                    continue  # its last entries are still on the way
                 if entry["seq"] < expected and entry["att"] == attempt_id:
                     continue  # the same entry read twice (a re-read): not a gap (S11)
                 if entry["seq"] != expected:
-                    raise CallFailed(
-                        "worker_lost", f"gap in the stream at {expected}", request_id=rid
-                    )
+                    raise failed("worker_lost", f"gap in the stream at {expected}")
                 expected += 1
-                started, attempt_id = True, entry["att"]
+                attempt_id = entry["att"]
                 if entry["t"] == "chunk":
                     for event in entry["d"]:
+                        if text := text_of(event):
+                            texts.append(text)
                         yield event
                 elif entry["t"] == "end":
                     # Delivered in full: the caller goes on now; the call task (its result read
                     # and cleanup, ~80 ms more) finishes in the background, and a failure after
                     # `end` (the re-run found the stream taken) is logged, never raised (S11).
                     ended = True
+                    if meta_event:
+                        data = entry["d"]
+                        yield _meta_event(data.get("meta") or {}, data.get("usage"))
                     return
                 else:
                     data = entry["d"]
                     raise CallFailed(
                         data.get("kind", "provider_error"),
                         data.get("message", ""),
-                        partial_text=data.get("partial") or None,
+                        partial_text=data.get("partial") or "".join(texts) or None,
                         request_id=rid,
                     )
         finally:
@@ -2965,10 +3038,15 @@ class Engine:
                 return
             if not held.cancelled:
                 raise
-            # Cancelled by a caller: give the grant back, reply `cancelled`.
+            # Cancelled by a caller: give the grant back, reply `cancelled`. A stream that sent
+            # chunks ends with an error entry first: its caller waited out its idle timer with
+            # no `partial_text`, and the flush timer wrote one more batch (R3ST-3).
             try:
+                partial = await self._end_stream(held, "cancelled", "the call was cancelled")
                 await self._give_back(held)
-                await self._finish_call(held, "cancelled", "cancelled", final="cancelled")
+                await self._finish_call(
+                    held, "cancelled", "cancelled", final="cancelled", partial=partial
+                )
             except Exception as exc:
                 logger.warning("cancel_failed", request_id=held.envelope.request_id, error=str(exc))
                 await self._release(held)
@@ -3215,11 +3293,26 @@ class Engine:
                     **_api_kwargs(provider, view, alias),
                 )
             if writer is not None:
+                # Usage and how the call was served, for `stream(meta_event=True)`: a stream
+                # caller never sees the call's `Reply` (R3ST-9).
                 await writer.end(
                     {
                         "inputTokens": result.usage.input_tokens,
                         "outputTokens": result.usage.output_tokens,
-                    }
+                        "cacheReadInputTokens": result.usage.cache_read_tokens,
+                        "cacheWriteInputTokens": result.usage.cache_write_tokens,
+                    },
+                    {
+                        "served_model": alias,
+                        "deployment": dep_key,
+                        "fallback": "model"
+                        if alias != env.model
+                        else ("region" if deployment.group == "fallback" else None),
+                        "attempts": attempt,
+                        "tokens_in": result.usage.input_tokens,
+                        "tokens_out": result.usage.output_tokens,
+                        "worker": self.worker_id,
+                    },
                 )
         except Exception as exc:
             latency = (time.monotonic() - started) * 1000
@@ -3229,24 +3322,37 @@ class Engine:
             ours = isinstance(exc, StreamTooLarge | RedisError)
             if writer is not None and writer.sent:
                 # Chunks reached the caller: end the stream with the partial text (plan §3.13).
-                refund = tokens.refund(estimate, "cut")
+                # The call's own deadline is not the deployment's fault: it charged the breaker
+                # and reached the caller as `provider_error` with an empty message (R3ST-2).
+                late = outer.expired()
+                # Input plus the output written so far stay charged; the rest of the output
+                # reservation goes back. `cut` kept all of it, for our own failures too (R3ST-13).
+                written = math.ceil(
+                    tokens.input_tokens("converse", {"t": writer.partial_text})
+                    * float(view.value(alias, "tpm_output_weight", dep_key))
+                )
                 await settle(
-                    refund_r=refund.requests,
-                    refund_t=refund.tokens,
-                    outcome="none" if ours else "fail",
-                    latency_ms=latency,
+                    refund_r=0,
+                    refund_t=max(0, estimate.output - written),
+                    outcome="none" if ours or late else "fail",
+                    latency_ms=-1 if late else latency,
                 )
                 # The store under the chunk writer is the store's kind, as a caller meets it:
                 # `provider_error` here failed scenario L2 (a store block cut streams).
-                if isinstance(exc, RedisError):
+                if late:
+                    kind = "deadline_exceeded"
+                elif isinstance(exc, RedisError):
                     kind = "queue_unavailable"
                 elif info.kind is ErrorKind.THROTTLE:
                     kind = "rate_limited"
                 else:
                     kind = "provider_error"
-                message = (
-                    "stream above stream_max_bytes" if isinstance(exc, StreamTooLarge) else str(exc)
-                )
+                if late:
+                    message = "the call's deadline passed mid-stream"
+                elif isinstance(exc, StreamTooLarge):
+                    message = "stream above stream_max_bytes"
+                else:
+                    message = str(exc)
                 try:
                     await writer.error(kind, message)
                 except Exception as end_exc:  # the caller's idle timer ends its stream (RT-24)
@@ -3821,6 +3927,21 @@ class Engine:
                     "give_back_failed", request_id=held.envelope.request_id, error=str(exc)
                 )
         held.grants.clear()
+
+    async def _end_stream(self, held: _Held, kind: str, message: str) -> str | None:
+        """End a stream that sent chunks with an `error` entry; its partial text, else None.
+
+        Best effort and bounded by the probe timer: the call's reply tells the caller too.
+        """
+        writer = held.writer
+        if writer is None or not writer.sent:
+            return None
+        try:
+            async with asyncio.timeout(self.settings.timings.health_probe_secs):
+                await writer.error(kind, message)
+        except Exception as exc:
+            logger.warning("stream_end_failed", request_id=held.envelope.request_id, error=str(exc))
+        return writer.partial_text or None
 
     async def _shutdown_call(self, held: _Held) -> None:
         """The drain ran out mid-call (plan C3): give it back; no failure is counted.
