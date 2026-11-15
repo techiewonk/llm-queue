@@ -339,9 +339,9 @@ async def test_rt6_shutdown_give_back_is_awaited_by_stop(make: Make) -> None:
 
     async def return_(message: Any, delay_secs: float = 0.0) -> bool:
         returned.append(message.id)
-        return await real_return(message, delay_secs)
+        return bool(await real_return(message, delay_secs))
 
-    engine.queues.return_ = return_  # type: ignore[method-assign]  # record the give-back
+    engine.queues.return_ = return_  # record the give-back
     await engine.stop(drain_secs=0)
     assert not engine._settling
     assert not engine._held

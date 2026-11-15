@@ -180,7 +180,8 @@ async def test_paused_calls_share_one_store_probe(
         pings["n"] += 1
         if time.monotonic() < outage["until"]:
             return {"state": "down", "queue": "down"}
-        return await real_probe()
+        found: dict[str, str] = await real_probe()
+        return found
 
     monkeypatch.setattr(engine.requests, "register_send", send)
     monkeypatch.setattr(engine, "_probe_stores", probe)

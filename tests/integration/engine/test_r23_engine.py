@@ -54,7 +54,7 @@ async def _until_async(check: Any, secs: float = 3.0, what: str = "condition") -
 
 async def _confirmed(engine: Any, rid: str) -> bool:
     """True once the call's record says its send landed."""
-    return (await engine.requests.job(rid)).get("confirmed") == "1"
+    return bool((await engine.requests.job(rid)).get("confirmed") == "1")
 
 
 async def _cancel(*tasks: asyncio.Task[Any]) -> None:
@@ -104,7 +104,7 @@ async def test_fe2_a_call_received_during_stop_is_returned(
 
     async def return_(message: Any, delay_secs: float = 0.0) -> bool:
         returned.append(message.id)
-        return await real_return(message, delay_secs)
+        return bool(await real_return(message, delay_secs))
 
     async def decide(*args: Any, **kwargs: Any) -> Decision:
         return Decision("wait", wait_secs=0.05)
@@ -139,7 +139,7 @@ async def test_fe6_stop_with_no_drain_still_returns_waiting_calls(
     real_return = engine.queues.return_
 
     async def return_(message: Any, delay_secs: float = 0.0) -> bool:
-        ok = await real_return(message, delay_secs)
+        ok = bool(await real_return(message, delay_secs))
         returned.append(ok)
         return ok
 
@@ -230,7 +230,7 @@ async def test_fe14_a_stale_ack_is_logged(make: Make, caplog: pytest.LogCaptureF
     async def ack(message: Any) -> bool:
         return False
 
-    engine.queues.ack = ack  # type: ignore[method-assign]  # a stale receipt
+    engine.queues.ack = ack  # a stale receipt
     await engine._ack(held)
     assert "ack_stale_receipt" in caplog.text
 
@@ -636,7 +636,7 @@ async def test_fe20_ring_again_error_does_not_end_the_model_loop(
         return None  # no free slot: a doorbell token taken goes back
 
     async def wait_bell(*args: Any, **kwargs: Any) -> str:
-        return name
+        return str(name)
 
     async def ring_again(queue: str) -> None:
         raise ResponseError("UNBLOCKED force unblock from blocking operation")
