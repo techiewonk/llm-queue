@@ -126,8 +126,9 @@ def _check_model(
             errors.append(f"{where}.inference.max_tokens: above `inference_limits.max_tokens`")
 
     # Rules that depend on the model type.
-    if entry.type == "chat" and "embed_batch_size" in entry.settings:
-        errors.append(f"{path}.embed_batch_size: only for embedding models")
+    for name in ("embed_batch_size", "embed_max_chars"):
+        if entry.type == "chat" and name in entry.settings:
+            errors.append(f"{path}.{name}: only for embedding models")
     rule = view.value(alias, "model_fallback")
     if rule and entry.type == "embedding":
         errors.append(f"{path}.model_fallback: an embedding model cannot change model")

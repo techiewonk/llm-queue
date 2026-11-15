@@ -48,7 +48,10 @@ _TOP_KEYS = frozenset((*_TOP, "accounts", "models"))
 _ACCOUNT_FIELDS = frozenset(
     {"kind", "enabled", "role_arn", "external_id_ref", "base_url", "api_key_ref", "settings"}
 )
-_MODEL_FIELDS = frozenset({"type", "provider", "model_id", "deployments", "residency"})
+_MODEL_FIELDS = frozenset({"type", "provider", "model_id", "deployments", "residency", "family"})
+# Request-body shapes of Bedrock embedding models. `family` names one when the model id does not
+# (an application inference profile ARN); without it the id is guessed from (R3JE-21, Q22).
+EMBED_FAMILIES = ("titan", "cohere")
 _DEPLOYMENT_FIELDS = frozenset({"confirmed", "fallback", "overrides"})
 _ROUTING_FIELDS = frozenset({"kill_switch", "allow_users", "blocked_regions", "blocked_accounts"})
 _PROFILE_FIELDS = frozenset({"name", "region", "profile_id", "routes_to"})
@@ -183,6 +186,7 @@ class ModelEntry:
     settings: Mapping[str, Any]
     deployments: Mapping[str, tuple[RegionEntry, ...]]
     residency: tuple[str, ...] | None = None
+    family: str | None = None  # Bedrock embedding body shape (`EMBED_FAMILIES`); None: guessed
 
 
 @dataclass(frozen=True, slots=True)
@@ -534,6 +538,12 @@ def _model(
     if not any(e.group == "confirmed" for entries in deployments.values() for e in entries):
         out.error(f"{path}.deployments", "needs at least one confirmed region")
     residency = _residency(out, f"{path}.residency", body.get("residency"))
+    family = body.get("family")
+    if family is not None:
+        if family not in EMBED_FAMILIES:
+            out.error(f"{path}.family", f"must be one of {', '.join(EMBED_FAMILIES)}")
+        elif kind != "embedding" or provider != "bedrock":
+            out.error(f"{path}.family", "only for Bedrock embedding models")
     if kind not in MODEL_TYPES or not isinstance(provider, str) or not isinstance(model_id, str):
         return None
     return ModelEntry(
@@ -544,6 +554,7 @@ def _model(
         settings=_frozen(settings),
         deployments=MappingProxyType(deployments),
         residency=residency,
+        family=family if family in EMBED_FAMILIES else None,
     )
 
 

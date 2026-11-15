@@ -84,6 +84,7 @@ from llm_queue.providers.classify import (
     is_target_error,
     request_error_kind,
 )
+from llm_queue.providers.embeddings import is_cohere
 from llm_queue.registry.validate import tpm_refuses
 from llm_queue.tuning import EngineTimings
 
@@ -121,7 +122,7 @@ def _probe_params(provider: str, kind: str, model_id: str) -> dict[str, Any]:
     if kind == "embedding":
         if provider == "openai":
             return {"input": "ping"}
-        if "cohere" in model_id:
+        if is_cohere(model_id):  # one rule with the calls: the case of the id ignored (R3JE-21)
             return {"body": {"texts": ["ping"], "input_type": "search_query"}}
         return {"body": {"inputText": "ping"}}
     if provider == "openai":
@@ -608,6 +609,7 @@ class Engine:
                     self._eviction["queue"] = await check_store(self._queue_store, "queue")
                 await self.state.set(self.keys.epoch, str(self.clock.now()), nx=True)
                 self._epoch = text(await self.state.get(self.keys.epoch))
+                await self.requests.check_offload()  # `ConfigError` without it (Q24)
         except (*STORE_ERRORS, RedisError) as exc:  # the timeout is a TimeoutError (OSError)
             # Start anyway (plan §3.18): calls follow each model's `store_down` rule and
             # the background loops keep retrying until the store answers.
@@ -629,6 +631,7 @@ class Engine:
             self._loop(self._warm_clients(), "warm_clients")
         self._loop(self._heartbeat(), "heartbeat")
         self._loop(self._store_prober(), "store_prober")
+        self._loop(self.requests.check_lifecycle(), "offload_lifecycle")  # Q23
         self._loop(self.registry.run(self.settings.cfg_reload_secs), "registry_reload")
         self.ready = True
 

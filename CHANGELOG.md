@@ -14,6 +14,28 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 
 ### Changed (behaviour)
 
+- **Jobs retry for about an hour** (Q14): a failed job waited a fixed 5 s and was dead-lettered
+  after 5 tries (about 20 s into any outage). Now 5 s doubling to 5 min until about an hour has
+  passed, at least the failing call's `retry_after_secs`; dead jobs are kept 7 days, not 1
+  (Q15). A job returned at shutdown 5 times is dead-lettered (Q17). Job LLM calls run at normal
+  priority with the sender's user and tenant ids, not the context of `start()` (Q18).
+- **`register_job` refuses** a function that is not async (it ran, then failed five times:
+  R3JE-5), a call after `start()` or in `caller` mode (the jobs waited unseen: R3JE-6), and a
+  name that is not 1-64 letters, digits, `_` or `-` (R3JE-12).
+- **`send_job(job_id=X)` is deduplicated for 24 h** and returns `X` (Q13, R3JE-2); a payload
+  above 1 MB fails `request_too_large` and one that is not JSON `invalid_request` (it raised a
+  bare `TypeError`: R3JE-10, Q16). Jobs run 4 per name and 32 per process at most (Q16).
+- **`embed` checks its input first**: a `str` instead of a list was sent letter by letter and a
+  `None` raised `AttributeError` (R3JE-19); a text over the model's length limit (Q20) and an
+  unknown Cohere `input_type` (R3JE-24) fail `invalid_request` with the text's index. A batch
+  the provider refuses for its content is split until only the bad text fails (Q19, R3JE-17).
+  Vectors of different lengths in one call fail `provider_error` (R3JE-23).
+- **Registry: `inference.embedding_types` takes only `["float"]`** (`["int8"]` was paid for,
+  then unreadable; with `["float", "int8"]` the int8 vectors were dropped: R3JE-22).
+- **`S3Offload` and `offload_bytes` go together** (`ConfigError` otherwise; one alone turned
+  nothing on: R3JE-27). A process without the offload refuses to start when the store says the
+  fleet offloads (Q24). Object names are a random id under the prefix (they held a hash of the
+  request id: R3JE-33); `prefix` / `key_prefix` are normalised to one trailing `/` (R3JE-31).
 - **A request id runs again after a failed end** (owner decision Q2): REGISTER and REGISTER_SEND
   answered `done` with the old failure for an id whose run ended failed, expired or cancelled.
   Only a success is replayed now; such an id registers as new and its old result, status, cancel
@@ -160,6 +182,19 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 
 ### Added
 
+- Jobs: `current_job()` (`JobContext`: name, `job_id`, attempt, `max_attempts`) inside a job
+  (Q13, R3JE-1); `LLMQueue.job_dead_letters(name)` and `redrive_jobs(name)`, `llm-queue dlq
+  list|show|redrive|purge --job NAME`, job queues in `llm-queue queues list`, a `jobs` entry in
+  `status()` and the `job_dead_letters` alert (Q15, R3JE-4); `llmq_jobs_total{job,outcome}`;
+  `register_job(..., concurrency=N)`; the `LLMQ_JOB_*` settings and `JobSettings` (see
+  docs/reference/configuration.md). New pages: docs/how-to/jobs.md (guarantees and limits,
+  R3JE-14, -16) and docs/how-to/large-results.md (IAM per process, lifecycle rule, R3JE-34).
+- Embeddings: `EmbedResult.meta.tokens_in`, `EmbedResult.batches` and `EmbedResult.request_ids`
+  (Q21, R3JE-18); the registry's `embed_max_chars` (Q20) and a Bedrock embedding model's
+  `family: titan | cohere` for ids that do not name it, such as ARNs (Q22, R3JE-21).
+- `S3Offload(sse=None)` leaves the encryption header out, `bucket_key=True` sets
+  `BucketKeyEnabled`, `aws:kms` without a key id warns (R3JE-32); `start()` warns
+  `offload_no_lifecycle_rule` when the bucket has no expiry rule for the prefix (Q23).
 - `Provider`, `Route`, `JobFn`, `Secrets` and `PublishResult` are importable from `llm_queue`
   (Q35). `PublishResult.carried` lists the live routing blocks and kill switch a publish or
   rollback kept (Q41).
@@ -250,6 +285,19 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   `store_clock_jump` (R3RC-7, R3FM-10); a subscriber is pinged and reset when silent, or when
   the sweep keeps finding results it never announced, `llmq_pubsub_resubscribes_total`
   (R3RC-6, R3FM-12); a duplicate goes back when the claim lapses, if the script says (R3RC-8).
+- A job delivered again while it still ran in the same process ran twice (R3JE-9); a failed job
+  was logged without its traceback or id (R3JE-11) and any `TimeoutError` as the job's own
+  limit (now `job_timeout` only when `timeout_secs` ran out: R3JE-13).
+- The health probe of an embedding model tested `"cohere"` case-sensitively and sent the Titan
+  body to a mixed-case Cohere id (R3JE-21). An OpenAI reply with a missing or repeated `index`
+  put vectors on the wrong texts; one with base64 vectors became lists of characters (R3JE-22).
+- A process without the offload read an offloaded result as JSON, raised a raw error and
+  deleted the result; it now fails `result_expired`, logs `offload_missing` and keeps it
+  (R3JE-26). A failed offload read (access denied, throttling) read as `result_expired` with no
+  log; it is logged with its S3 code, tried twice more, then fails `queue_unavailable` with the
+  result kept (R3JE-28). An object uploaded for a result already stored is deleted (R3JE-29).
+  The S3 client used botocore's 60 s timeouts: now 3 s connect, 10 s read, 2 attempts, and an
+  upload over 15 s falls back inline (R3JE-30).
 - Lua audit (FL-*): UNDO now releases the call's claim, so another pod runs a given-back call at
   once instead of answering `duplicate` for a lease (FL-1; `undo(keep_claim=True)` keeps it,
   `Admission.release_claims` does it for calls given back without a grant). RESULT_TAKE no longer
@@ -505,6 +553,10 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 
 ### Performance
 
+- OpenAI embeddings are asked for as base64 float32 and decoded once by the reader (R3PF-10).
+  A 96 x 1024 reply, Python 3.12.13, Windows, 2026-11-15, micro-benchmark of `Reply.dumps` and
+  of `orjson.loads` + validate + `vectors_of`: stored value 1.95 MB -> 0.53 MB, worker write
+  8.6 ms -> 0.6 ms, caller read and decode 22.5 ms -> 10.5 ms.
 - Lua audit, measured on the local Valkey 8.1, Python 3.12.13, 2026-11-15, pipelines of 50 script
   calls, 20 rounds A/B against af2fec1 (per call, median): a receive of one message behind 1000
   returned ones 32,957 us -> 1,705 us (the oldest few due ids are picked in one pass instead of

@@ -105,7 +105,10 @@ class _EmbedEngine:
         entry = SimpleNamespace(provider="openai", model_id="e")
         registry = SimpleNamespace(alias_of=lambda m: m, models={"e": entry})
         self.registry = SimpleNamespace(
-            current=SimpleNamespace(registry=registry, value=lambda alias, name: 2)
+            current=SimpleNamespace(
+                registry=registry,
+                value=lambda alias, name: 2 if name == "embed_batch_size" else None,
+            )
         )
         self.fail = fail or set()
         self.ids: list[str | None] = []
@@ -235,7 +238,9 @@ class _FakeEngine:
         self.registry = SimpleNamespace(current=current)
         self.queues = None
         self.metrics = None
-        self.settings = SimpleNamespace(queue_prefix="", drain_secs=0)
+        self.settings = SimpleNamespace(
+            queue_prefix="", drain_secs=0, queue_wait_replicas=0, queue_wait_ms=100
+        )
         self.loops: list[asyncio.AbstractEventLoop] = []
 
     async def start(self, **kw: Any) -> None:

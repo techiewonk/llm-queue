@@ -830,6 +830,16 @@ class StreamQueues:
         keys = [self.keys.queue(queue, "dlq") for queue in queues]
         return int(await self._trim_dead_many(keys, [int(keep_secs) * 1000]))
 
+    @property
+    def client(self) -> redis.asyncio.Redis:
+        """The queue store's client (jobs keep their dedupe and return records next to it)."""
+        return self._client
+
+    async def failures(self, queue: str, message_id: str) -> int:
+        """Failures counted so far for one message (a lapsed hold counts one)."""
+        raw = await self._client.hget(self.keys.queue(queue, "fails"), message_id)
+        return int(_text(raw)) if raw is not None else 0
+
     async def mark_consumer(self, queue: str, ttl_secs: int) -> None:
         """Say a process consumes this queue; the mark lapses `ttl_secs` after the last one."""
         await self._client.set(self.keys.queue(queue, "consumer"), b"1", ex=ttl_secs)

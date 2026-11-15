@@ -4,38 +4,63 @@
 provider accepts: Titan 1, Cohere 96, OpenAI 2048), sends each batch as one call (one request
 against RPM; tokens only when token limiting is on for the model), runs them concurrently and
 returns one vector per text in the input order. Inference defaults (dimensions, input_type,
-...) are added by the worker from the registry.
+...) are added by the worker from the registry. A batch the provider refuses is split and sent
+again until only the bad text fails; texts over the model's length limit fail before any call.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+import base64
+import sys
+from array import array
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from llm_queue.clients.providers import decode_invoke_body
 from llm_queue.engine.errors import CallFailed
-from llm_queue.providers.embeddings import batches, max_batch_size, parse_embeddings
+from llm_queue.providers.embeddings import (
+    COHERE_INPUT_TYPES,
+    MAX_CHARS,
+    batches,
+    family_of,
+    is_cohere,
+    max_batch_size,
+    parse_embeddings,
+)
 
 if TYPE_CHECKING:
     from llm_queue.engine.runtime import Engine
 
 
-def batch_size(provider: str, model_id: str, setting: int) -> int:
+# A refusal of the batch's content: the batch is split in two and each half sent again, so
+# one bad text no longer failed (and hid among) up to 2,047 good ones (R3JE-17, Q19).
+SPLIT_KINDS = frozenset({"invalid_request", "context_length_exceeded", "request_too_large"})
+
+
+def batch_size(provider: str, model_id: str, setting: int, family: str | None = None) -> int:
     """Texts per call: the model's `embed_batch_size`, never above the provider's limit."""
-    return max(1, min(int(setting), max_batch_size(provider, model_id)))
+    return max(1, min(int(setting), max_batch_size(provider, model_id, family=family)))
 
 
 def request_for(
-    provider: str, model_id: str, texts: Sequence[str], input_type: str | None = None
+    provider: str,
+    model_id: str,
+    texts: Sequence[str],
+    input_type: str | None = None,
+    family: str | None = None,
 ) -> dict[str, Any]:
     """The provider-native request of one batch (defaults are merged by the worker).
 
     `input_type` (Cohere: `search_query` / `search_document`) wins over the registry default.
     """
     if provider == "openai":
-        return {"input": list(texts)}
-    if "cohere" in model_id.lower():
+        # base64 float32 on the way back: the reply is about 3x smaller in the store and far
+        # cheaper to write and read than a JSON list of floats (R3PF-10). The SDK asks for
+        # base64 anyway and decodes it itself; asked explicitly, it hands the string through.
+        return {"input": list(texts), "encoding_format": "base64"}
+    if is_cohere(model_id, family):
         body: dict[str, Any] = {"texts": list(texts)}
         if input_type:
             body["input_type"] = input_type
@@ -43,12 +68,89 @@ def request_for(
     return {"body": {"inputText": texts[0]}}
 
 
+def _vector(value: Any) -> list[float]:
+    """One vector as floats: a JSON list of numbers, or base64 of little-endian float32.
+
+    Anything else raises: a base64 string read as a list gave a "vector" of single
+    characters (R3JE-22), and `array` refuses a list holding anything but numbers.
+    """
+    if isinstance(value, str):
+        raw = base64.b64decode(value, validate=True)
+        if not raw or len(raw) % 4:
+            raise ValueError("a base64 embedding is not float32")
+        floats = array("f")
+        floats.frombytes(raw)
+        if sys.byteorder == "big":
+            floats.byteswap()
+        return floats.tolist()
+    if not isinstance(value, list) or not value:
+        raise TypeError("an embedding is not a list of numbers")
+    return array("d", value).tolist()
+
+
 def vectors_of(provider: str, response: dict[str, Any]) -> list[list[float]]:
-    """The vectors of one reply, in the order of its texts."""
+    """The vectors of one reply, in the order of its texts.
+
+    OpenAI's `index` fields must be exactly 0..n-1: a missing or repeated index put a vector
+    on the wrong text without an error.
+    """
     if provider == "openai":
         data = sorted(response.get("data", []), key=lambda item: item.get("index", 0))
-        return [list(item["embedding"]) for item in data]
-    return parse_embeddings(decode_invoke_body(response))
+        if [item.get("index", 0) for item in data] != list(range(len(data))):
+            raise ValueError("embedding indices are not 0..n-1")
+        return [_vector(item["embedding"]) for item in data]
+    return [_vector(v) for v in parse_embeddings(decode_invoke_body(response))]
+
+
+def check_texts(texts: object, request_id: str | None = None) -> None:
+    """Refuse what is not a list of non-empty strings, before any call (`invalid_request`).
+
+    A single `str` was iterated letter by letter (ten one-letter calls for "helloworld"), and
+    a `None` in the list raised a bare `AttributeError` (R3JE-19).
+    """
+    if isinstance(texts, str | bytes | bytearray) or not isinstance(texts, Sequence):
+        raise CallFailed(
+            "invalid_request", "texts must be a list of strings", request_id=request_id
+        )
+    for index, text in enumerate(texts):
+        if not isinstance(text, str):
+            message = f"text {index} is {type(text).__name__}, not a string"
+            raise CallFailed("invalid_request", message, request_id=request_id)
+        if not text.strip():
+            raise CallFailed("invalid_request", f"text {index} is empty", request_id=request_id)
+
+
+@dataclass(slots=True)
+class EmbedOutcome:
+    """What one `embed` produced: vectors in order, errors by text index, and the usage.
+
+    `tokens_in` sums the input tokens the replies reported (None when none did), `batches`
+    counts provider calls (splits included) and `request_ids` lists the answered ones (Q21).
+    """
+
+    vectors: list[list[float]]
+    errors: dict[int, CallFailed] = field(default_factory=dict)
+    tokens_in: int | None = None
+    batches: int = 0
+    request_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class _Part:
+    """The results of one batch (and its splits): a vector or an error per text."""
+
+    items: list[list[float] | CallFailed]
+    tokens_in: int | None = None
+    batches: int = 0
+    request_ids: list[str] = field(default_factory=list)
+
+    def add(self, other: _Part) -> None:
+        """Append another part's results and usage."""
+        self.items += other.items
+        self.batches += other.batches
+        self.request_ids += other.request_ids
+        if other.tokens_in is not None:
+            self.tokens_in = (self.tokens_in or 0) + other.tokens_in
 
 
 async def embed(
@@ -67,7 +169,7 @@ async def embed(
     All or nothing: the first failed batch cancels the rest and raises (`embed_partial` keeps
     what succeeded).
     """
-    vectors, _ = await embed_partial(
+    outcome = await embed_detailed(
         engine,
         model,
         texts,
@@ -78,10 +180,31 @@ async def embed(
         partial=False,
         **call,
     )
-    return vectors
+    return outcome.vectors
 
 
 async def embed_partial(
+    engine: Engine,
+    model: str,
+    texts: Sequence[str],
+    *,
+    partial: bool = True,
+    **kwargs: Any,
+) -> tuple[list[list[float]], dict[int, CallFailed]]:
+    """Vectors in order, and the error of each text that failed (its vector is `[]`)."""
+    outcome = await embed_detailed(engine, model, texts, partial=partial, **kwargs)
+    return outcome.vectors, outcome.errors
+
+
+def _max_chars(view: Any, alias: str, family: str) -> int:
+    """The model's `embed_max_chars`, else its family's limit; 0 when there is none."""
+    setting = view.value(alias, "embed_max_chars")
+    if setting is not None:
+        return int(setting)
+    return MAX_CHARS.get(family, 0)
+
+
+async def embed_detailed(
     engine: Engine,
     model: str,
     texts: Sequence[str],
@@ -93,32 +216,46 @@ async def embed_partial(
     partial: bool = True,
     request_id: str | None = None,
     **call: Any,
-) -> tuple[list[list[float]], dict[int, CallFailed]]:
-    """Vectors in order, and the error of each text whose batch failed (its vector is `[]`).
+) -> EmbedOutcome:
+    """Vectors in order, the error of each text that failed (its vector is `[]`), and usage.
 
-    Empty texts fail the whole call first (`invalid_request`); at most `concurrency` batches
-    exist at once (100,000 texts no longer made every task up front). With `request_id`, batch
-    n is `<request_id>:<n>`: one id for every batch had each later batch rejected as a
-    duplicate (A1). `partial=False` raises the first failure instead.
+    Before any call (`invalid_request`, naming the text's index): empty, non-string or too
+    long texts and an unknown Cohere `input_type`. At most `concurrency` batches exist at once.
+    With `request_id`, batch n is `<request_id>:<n>` (one id for all was refused as a
+    duplicate: A1), its halves `<n>.0` / `<n>.1`. A batch refused for its content is split
+    until the bad text alone fails, with its index in the message. `partial=False` raises the
+    first failure instead. Vectors of different lengths fail the call (`provider_error`).
     """
-    for index, text in enumerate(texts):
-        if not text.strip():
-            raise CallFailed("invalid_request", f"text {index} is empty", request_id=request_id)
+    check_texts(texts, request_id)
     if not texts:
-        return [], {}
+        return EmbedOutcome([])
     view = engine.registry.current
     alias = view.registry.alias_of(model)
     entry = view.registry.models[alias]
-    size = batch_size(entry.provider, entry.model_id, int(view.value(alias, "embed_batch_size")))
+    family = getattr(entry, "family", None)
+    kind = family_of(entry.provider, entry.model_id, family)
+    if input_type is not None and kind == "cohere" and input_type not in COHERE_INPUT_TYPES:
+        # A typo cost one provider request per batch, each refused (R3JE-24).
+        message = f"input_type {input_type!r}: use one of {sorted(COHERE_INPUT_TYPES)}"
+        raise CallFailed("invalid_request", message, request_id=request_id)
+    if limit := _max_chars(view, alias, kind):
+        for index, text in enumerate(texts):
+            if len(text) > limit:
+                # Refused before the call: the provider refused the whole batch, and each
+                # such batch spent a request of the budget (R3JE-20, Q20).
+                message = f"text {index} has {len(text)} characters, above {limit} for {alias}"
+                raise CallFailed("invalid_request", message, request_id=request_id)
+    setting = int(view.value(alias, "embed_batch_size"))
+    size = batch_size(entry.provider, entry.model_id, setting, family)
     groups = list(batches(list(texts), size))
 
-    async def one(n: int, group: list[str]) -> list[list[float]]:
+    async def send(label: str, group: list[str]) -> tuple[list[list[float]], Any]:
         reply = await engine.call(
             alias,
-            request_for(entry.provider, entry.model_id, group, input_type),
+            request_for(entry.provider, entry.model_id, group, input_type, family),
             priority=priority,
             timeout_secs=timeout_secs,
-            request_id=f"{request_id}:{n}" if request_id else None,
+            request_id=f"{request_id}:{label}" if request_id else None,
             **call,
         )
         if reply.response is None:
@@ -136,41 +273,75 @@ async def embed_partial(
         if len(vectors) != len(group):
             message = f"{alias}: {len(group)} texts gave {len(vectors)} vectors"
             raise CallFailed("provider_error", message, request_id=reply.request_id)
-        return vectors
+        return vectors, reply
 
-    results: list[list[list[float]] | CallFailed | None] = [None] * len(groups)
-    running: dict[asyncio.Task[list[list[float]]], int] = {}
-    pending = iter(enumerate(groups))
+    async def one(label: str, start: int, group: list[str]) -> _Part:
+        try:
+            vectors, reply = await send(label, group)
+        except CallFailed as exc:
+            if exc.kind in SPLIT_KINDS and len(group) > 1:
+                half = len(group) // 2  # halves in turn: a split is rare, the window stays
+                part = await one(f"{label}.0", start, group[:half])
+                part.add(await one(f"{label}.1", start + half, group[half:]))
+                part.batches += 1
+                return part
+            failed = exc
+            if exc.kind in SPLIT_KINDS:  # one text: say which
+                failed = CallFailed(
+                    exc.kind, f"text {start}: {exc}", request_id=exc.request_id or request_id
+                )
+            if not partial:
+                raise failed from exc
+            return _Part([failed] * len(group), batches=1)
+        tokens = getattr(reply.meta, "tokens_in", None)
+        return _Part(list(vectors), tokens, 1, [reply.request_id])
+
+    jobs = [(str(n), n * size, group) for n, group in enumerate(groups)]
+    total = _Part([])
+    for part in await _windowed(jobs, one, concurrency):
+        total.add(part)
+    outcome = EmbedOutcome([], {}, total.tokens_in, total.batches, total.request_ids)
+    for index, item in enumerate(total.items):
+        if isinstance(item, CallFailed):
+            outcome.errors[index] = item
+            outcome.vectors.append([])
+        else:
+            outcome.vectors.append(item)
+    sizes = {len(vector) for vector in outcome.vectors if vector}
+    if len(sizes) > 1:
+        # A live edit of `dimensions` between two batches of one call mixed lengths (R3JE-23).
+        message = f"{alias}: vectors of different lengths {sorted(sizes)} in one call"
+        raise CallFailed("provider_error", message, request_id=request_id)
+    return outcome
+
+
+async def _windowed(
+    jobs: list[tuple[str, int, list[str]]],
+    one: Callable[[str, int, list[str]], Awaitable[_Part]],
+    concurrency: int,
+) -> list[_Part]:
+    """Run `one(*job)` for every job, at most `concurrency` at once; results in job order.
+
+    The first exception cancels the rest (they would only spend budget on a lost result).
+    """
+    results: list[_Part | None] = [None] * len(jobs)
+    running: dict[asyncio.Future[_Part], int] = {}
+    pending = iter(enumerate(jobs))
     try:
         while True:
             while len(running) < max(1, concurrency):  # a window, not every batch up front
                 if (item := next(pending, None)) is None:
                     break
-                running[asyncio.ensure_future(one(*item))] = item[0]
+                running[asyncio.ensure_future(one(*item[1]))] = item[0]
             if not running:
                 break
             done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 n = running.pop(task)
-                exc = task.exception()
-                if exc is None:
-                    results[n] = task.result()
-                elif partial and isinstance(exc, CallFailed):
-                    results[n] = exc
-                else:
-                    raise exc
+                results[n] = task.result()  # raises the batch's failure
     except BaseException:
-        # One batch failed: stop the rest, which would only spend budget on a lost result.
         for task in running:
             task.cancel()
         await asyncio.gather(*running, return_exceptions=True)
         raise
-    vectors: list[list[float]] = []
-    errors: dict[int, CallFailed] = {}
-    for group, result in zip(groups, results, strict=True):
-        if isinstance(result, CallFailed):
-            errors.update({len(vectors) + i: result for i in range(len(group))})
-            vectors.extend([] for _ in group)
-        else:
-            vectors.extend(result or [])
-    return vectors, errors
+    return [part for part in results if part is not None]

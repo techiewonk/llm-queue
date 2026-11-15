@@ -26,7 +26,7 @@ from redis.exceptions import RedisError
 from llm_queue.engine._codec import text as _text
 from llm_queue.engine.http import redacted
 from llm_queue.engine.keys import Keys
-from llm_queue.engine.queue import StreamQueues
+from llm_queue.engine.queue import RETENTION_SECS, StreamQueues
 from llm_queue.engine.settings import InfraSettings
 from llm_queue.engine.status import StatusReader
 from llm_queue.engine.store_client import secret_store_client
@@ -115,7 +115,9 @@ def _parser() -> argparse.ArgumentParser:
     dlq = sub.add_parser("dlq").add_subparsers(dest="action", required=True)
     for name in ("list", "show", "redrive", "purge"):
         p = dlq.add_parser(name)
-        p.add_argument("--model", required=True)
+        which = p.add_mutually_exclusive_group(required=True)
+        which.add_argument("--model")
+        which.add_argument("--job", help="a job name: its dead jobs (Q15)")
         p.add_argument("--priority", action="store_true")
         p.add_argument("--count", type=int, default=10)
         if name == "show":
@@ -313,8 +315,12 @@ class Cli:
         return {"model": alias, "enabled": False, "drained": False}
 
     async def _dlq(self, args: argparse.Namespace) -> Any:
-        view = await self.loaded()
-        queue = self._queue(view, args.model, args.priority)
+        if args.job:
+            queue = f"{self.settings.queue_prefix}jobs-{args.job}"
+            view = None
+        else:
+            view = await self.loaded()
+            queue = self._queue(view, args.model, args.priority)
         if args.action == "list":
             letters = await self.queues.dead_letters(queue, args.count)
             return [{k: v for k, v in letter.items() if k != "body"} for letter in letters]
@@ -330,8 +336,12 @@ class Cli:
                 _, _, dead = await self.queues.depth(queue)
                 return {"would_redrive": min(dead, args.count), "queue": queue}
             # The model's own stream retention: the redrive trims like a send (EN-12), and the
-            # 4-day default cut a queue that keeps more.
-            keep = int(view.value(view.registry.alias_of(args.model), "queue")["retention_secs"])
+            # 4-day default cut a queue that keeps more. Jobs keep the queue default.
+            keep = (
+                RETENTION_SECS
+                if view is None
+                else int(view.value(view.registry.alias_of(args.model), "queue")["retention_secs"])
+            )
             return {"redriven": await self.queues.redrive(queue, args.count, keep)}
         if not _confirmed(args, "dlq purge deletes every dead letter"):
             _, _, dead = await self.queues.depth(queue)
@@ -347,6 +357,12 @@ class Cli:
                 name = self._queue(view, alias, priority)
                 total, held, dead = await self.queues.depth(name)
                 out[name] = {"messages": total, "held": held, "dead": dead}
+        # Job queues too: dead jobs had no CLI at all (R3JE-4, Q15).
+        key = f"{self.queues.keys.prefix}:jobs:{self.settings.queue_prefix}"
+        for job in sorted(_text(n) for n in await self.queues.client.smembers(key)):
+            name = f"{self.settings.queue_prefix}jobs-{job}"
+            total, held, dead = await self.queues.depth(name)
+            out[name] = {"messages": total, "held": held, "dead": dead}
         return out
 
 

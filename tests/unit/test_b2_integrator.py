@@ -87,11 +87,13 @@ def test_dedupe_refuses_an_offload_that_deletes_on_read() -> None:
     """16: with result_dedupe_secs, the second reader of an offloaded result found it deleted."""
     client = MagicMock()
     with pytest.raises(ConfigError, match="delete_after_read=False"):
-        RequestStore(client, Keys("p"), result_dedupe_secs=60, offload=S3Offload("b"))
-    RequestStore(
-        client, Keys("p"), result_dedupe_secs=60, offload=S3Offload("b", delete_after_read=False)
-    )
-    RequestStore(client, Keys("p"), offload=S3Offload("b"))  # no dedupe: deleting is right
+        RequestStore(
+            client, Keys("p"), result_dedupe_secs=60, offload=S3Offload("b"), offload_bytes=1
+        )
+    keep = S3Offload("b", delete_after_read=False)
+    RequestStore(client, Keys("p"), result_dedupe_secs=60, offload=keep, offload_bytes=1)
+    # No dedupe: deleting on read is right.
+    RequestStore(client, Keys("p"), offload=S3Offload("b"), offload_bytes=1)
 
 
 async def test_liveness_route_reports_dead_loops() -> None:
@@ -109,7 +111,9 @@ async def test_liveness_route_reports_dead_loops() -> None:
 def test_register_job_takes_a_timeout() -> None:
     """17: `LLMQueue.register_job` could not pass the job runner's `timeout_secs`."""
     engine = SimpleNamespace(
-        queues=None, settings=SimpleNamespace(queue_prefix=""), metrics=MagicMock()
+        queues=None,
+        settings=SimpleNamespace(queue_prefix="", queue_wait_replicas=0, queue_wait_ms=100),
+        metrics=MagicMock(),
     )
     queue = LLMQueue(engine)  # type: ignore[arg-type]
 
@@ -134,7 +138,11 @@ async def test_send_job_at_the_limit_is_queue_full(monkeypatch: pytest.MonkeyPat
     """send_job raised the queue's internal `QueueFull` (not an LLMQueueError) at the limit."""
     from llm_queue.engine.queue import QueueFull
 
-    engine = SimpleNamespace(queues=None, settings=SimpleNamespace(queue_prefix=""), metrics=None)
+    engine = SimpleNamespace(
+        queues=None,
+        settings=SimpleNamespace(queue_prefix="", queue_wait_replicas=0, queue_wait_ms=100),
+        metrics=None,
+    )
     queue = LLMQueue(engine)  # type: ignore[arg-type]
 
     async def full(*args: Any, **kwargs: Any) -> str:

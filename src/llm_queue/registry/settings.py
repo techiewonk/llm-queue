@@ -87,6 +87,15 @@ def text_list(value: Any) -> str | None:
     return "must be a list of non-empty strings"
 
 
+def float_embeddings(value: Any) -> str | None:
+    """Cohere `embedding_types`: `["float"]` only, the one type the reply parser reads.
+
+    `["int8"]` made every call get paid for, then fail as unreadable; `["float", "int8"]`
+    dropped the int8 vectors silently (R3JE-22).
+    """
+    return None if value == ["float"] else 'must be ["float"] (the only type returned)'
+
+
 def any_object(value: Any) -> str | None:
     """Any JSON object (passed through unchecked)."""
     return None if isinstance(value, dict) else "must be an object"
@@ -202,7 +211,7 @@ EMBED_INFERENCE: Mapping[str, Check] = {
     "normalize": boolean,
     "input_type": text,
     "truncate": text,
-    "embedding_types": text_list,
+    "embedding_types": float_embeddings,
 }
 INFERENCE_NAMES = frozenset(CHAT_INFERENCE) | frozenset(EMBED_INFERENCE)
 
@@ -357,6 +366,9 @@ SETTINGS: Mapping[str, Spec] = {
         merge=True,
     ),
     "embed_batch_size": _spec("M", number(1, integer=True), 1),
+    # Longest text, in characters, an embed call sends; 0 turns the check off. None: the
+    # family's own limit (Titan 50,000, Cohere 2,048; OpenAI counts tokens, not checked).
+    "embed_max_chars": _spec("M", number(0, integer=True)),
     "inference": _spec("D,A,M,R", obj({**CHAT_INFERENCE, **EMBED_INFERENCE}), merge=True),
     "inference_limits": _spec(
         "D,A,M,R",

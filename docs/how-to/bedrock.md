@@ -78,8 +78,8 @@ registry:
   profiles need both the profile ARN and the foundation models it routes to.
 - For accounts with `role_arn`, the pods' own role needs `sts:AssumeRole` on that role (with the
   `external_id_ref` value as external id when set), and the assumed role needs the policy above.
-- Large results in S3 (`S3Offload`) need `s3:PutObject`, `s3:GetObject` and `s3:DeleteObject`
-  on the bucket prefix, and `kms:GenerateDataKey` / `kms:Decrypt` when it uses a KMS key.
+- Large results in S3 (`S3Offload`) need S3 and KMS permissions that differ for workers and
+  callers: see [Keep large results in S3](large-results.md#iam-and-kms).
 
 ## Errors from IAM and credentials
 
