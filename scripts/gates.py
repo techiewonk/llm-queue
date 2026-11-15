@@ -817,7 +817,9 @@ async def b34() -> bool:
 
     Pass: with no backlog the queue path adds <= 20 ms at p95 over a direct call; against
     the stored baseline (`scripts/baselines/perf.json`, `--record-baseline` writes it), the
-    queued p95 is within 25 % + 10 ms and the ceiling at least 80 %.
+    queued p95 is within 25 % + 10 ms and the ceiling at least 80 %. The ceiling is the median
+    of three ramps (owner decision, 2026-11-15): on a machine whose store sits behind Docker
+    Desktop's port forwarding one ramp swung between 200 and 490 calls/s.
     """
     fixed = {"defaults": {"latency_ms": {"p50": 100, "p95": 100}}}
     doc = registry({"chat": {"rpm": 10_000_000, "worker_slots": 200}}, accounts=1, regions=1)
@@ -835,14 +837,19 @@ async def b34() -> bool:
             await direct.call(queues[i % 2], "chat", chat(), force_direct=True)
 
         await paced(5, 30, pair)
-        ceiling = 0.0
-        for rate in (50, 100, 200, 400, 800):
-            ramp = Run()
-            await paced(rate, 8, functools.partial(_ramp_call, ramp, queues))
-            ok = [r for r in ramp.results if r.ok]
-            if len(ok) < len(ramp.results) or p95([r.wait_secs for r in ok]) > 1.0:
-                break
-            ceiling = len(ok) / 8
+        ceilings: list[float] = []
+        for _ in range(3):
+            ceiling = 0.0
+            for rate in (50, 100, 200, 400, 800):
+                ramp = Run()
+                await paced(rate, 8, functools.partial(_ramp_call, ramp, queues))
+                ok = [r for r in ramp.results if r.ok]
+                if len(ok) < len(ramp.results) or p95([r.wait_secs for r in ok]) > 1.0:
+                    break
+                ceiling = len(ok) / 8
+            ceilings.append(ceiling)
+            await asyncio.sleep(5)  # the last ramp's backlog drains before the next
+        ceiling = statistics.median(ceilings)
         memory = gate.store.memory_mb()
     queued_ms = p95([r.total_secs for r in queued.results]) * 1000
     added = queued_ms / 1000 - p95([r.total_secs for r in direct.results])
@@ -866,7 +873,8 @@ async def b34() -> bool:
         checks,
         [f"queued p95 {p95([r.total_secs for r in queued.results]) * 1000:.0f} ms, direct p95 "
          f"{p95([r.total_secs for r in direct.results]) * 1000:.0f} ms (+{added * 1000:.0f} ms)",
-         f"ceiling on this machine: {ceiling:.0f} calls/s with queue wait p95 <= 1 s "
+         f"ceiling on this machine: {ceiling:.0f} calls/s (median of {ceilings}) with queue "
+         f"wait p95 <= 1 s "
          f"(4 workers); store memory {memory:.0f} MB"],
     )  # fmt: skip
 
