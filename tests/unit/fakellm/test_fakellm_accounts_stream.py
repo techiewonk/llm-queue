@@ -129,7 +129,8 @@ async def test_speed_paces_output(start_fake: StartFake, stack: AsyncExitStack) 
             first_chunk = time.monotonic() - started
     total = time.monotonic() - started
     assert first_chunk is not None
-    assert first_chunk < 0.3  # the first chunk does not wait for the whole answer
+    # Below the whole answer (0.4 s): the first chunk does not wait for it (0.3 was flaky, FT-21).
+    assert first_chunk < 0.38
     assert total >= 0.35  # 40 tokens at 100 tokens / s
 
 
