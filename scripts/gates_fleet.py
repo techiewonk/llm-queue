@@ -259,7 +259,11 @@ class Worker:
     async def ready(self) -> None:
         """Until the worker printed `ready <worker id>`."""
         assert self.proc.stdout is not None
-        line = await asyncio.to_thread(self.proc.stdout.readline)
+        try:  # FT-7: a worker stuck at start used to hang the whole run for ever
+            line = await asyncio.wait_for(asyncio.to_thread(self.proc.stdout.readline), 60)
+        except TimeoutError:
+            await self.kill()
+            raise RuntimeError("worker did not print ready within 60 s; killed") from None
         if not line.startswith(b"ready"):
             raise RuntimeError(f"worker did not start: {line!r}")
         self.worker_id = line.decode().split()[1] if len(line.split()) > 1 else ""
