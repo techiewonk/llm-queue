@@ -7,7 +7,7 @@ public API (see STABILITY.md).
 
 ## [Unreleased]
 
-## [0.1.0b2] - unreleased
+## [0.1.0b2] - 2026-11-15
 
 Fixes from three code reviews and a six-part rescan of 0.1.0b1, a process-level client hub, and
 behaviour decisions for production. No backward compatibility is kept with 0.1.0b1 (beta).
@@ -330,7 +330,11 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
   heartbeat, through `ClientPool.plan` (Q43).
 - `converse_api` is passed only to providers whose `call` accepts it (Q33).
 - A call's send carries its queue's own `retention_secs` (Q27).
-- Performance: <!-- filled at release -->
+- Performance: no back-to-back 0.1.0b1 / 0.1.0b2 benchmark was run for this release (owner
+  decision); each change's own before / after numbers are in its entry under Performance. The
+  final checks on one Windows machine (store behind Docker Desktop): every scenario, failover
+  drill and gate passed; B34's ceiling was about 300-400 calls/s with the queue path adding
+  under 20 ms at p95.
 - **Embedding families come from one codec table.** Each family (`titan`, `cohere`, `openai`)
   is an `EmbeddingCodec` holding its batch limit, longest text, request body, reply parser and
   health-probe options; a model's codec is its registry `family`, else its provider (`openai`),

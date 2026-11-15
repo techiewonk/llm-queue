@@ -58,4 +58,5 @@ for the 0.1.0b2 client hub, warm connections and round-trip folding
     Other test processes may have been running on the host; compare only runs made back to
     back on the same machine.
 
-<!-- filled at release: the 0.1.0b2 column from `python scripts/bench.py`, run back to back with the baseline on one machine (PLAN B, E6). -->
+0.1.0b2 was released without a back-to-back benchmark against 0.1.0b1; the measured
+before / after numbers of each change are in the CHANGELOG's Performance section.
