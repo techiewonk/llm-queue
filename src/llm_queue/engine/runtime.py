@@ -208,22 +208,6 @@ end
 return {out, gone}
 """
 
-# ARGV: prefix, then (request id, job owner) pairs. Let go of the claims this process held: a
-# claim whose owner is still the given `worker@tag` gets heartbeat 0, so another pod's PICK_TAKE
-# takes the returned message at once. The claim kept a fresh heartbeat, and every other pod
-# answered `duplicate` until it was a lease old: 30-60 s per given-back call (FE-1).
-_RELEASE_CLAIMS = """
-local released = 0
-for i = 2, #ARGV - 1, 2 do
-  local job = ARGV[1] .. ':{r:' .. ARGV[i] .. '}:job'
-  if redis.call('HGET', job, 'owner') == ARGV[i + 1] then
-    redis.call('HSET', job, 'hb', 0)
-    released = released + 1
-  end
-end
-return released
-"""
-
 
 async def _close_all(steps: Sequence[tuple[str, Callable[[], Awaitable[object]]]]) -> None:
     """Run every close step, each whatever the others did; log each failure, raise the first."""
@@ -554,7 +538,6 @@ class Engine:
         # Per model: the claim (key, nonce) of a receive whose reply was lost (S11).
         self._unclaimed: dict[str, tuple[str, str]] = {}
         self._results_exist = state.register_script(_RESULTS_EXIST)
-        self._release_claims_script = state.register_script(_RELEASE_CLAIMS)
         self.ready = False
         self._direct_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.health = Health(state, self.keys)
@@ -1246,7 +1229,7 @@ class Engine:
             if not combined:
                 return (await self.requests.register(rid, **record)).outcome, False
             name = self._queue_name(view, alias, priority)
-            settings = QueueSettings(max_waiting=int(view.value(alias, "max_waiting")))
+            settings = self._queue_settings(view, alias)  # its own retention (Q27)
             try:
                 found = await self.requests.register_send(
                     rid,
@@ -1332,7 +1315,7 @@ class Engine:
         a minute and counted. It ran direct in the caller before, its copy bouncing on the
         queue as a duplicate every 30 s.
         """
-        settings = QueueSettings(max_waiting=int(view.value(alias, "max_waiting")))
+        settings = self._queue_settings(view, alias)  # its own retention_secs (Q27)
         loop = asyncio.get_running_loop()
         give_up = loop.time() + self.settings.queue_failover_secs
         body = envelope.dumps()
@@ -1449,14 +1432,11 @@ class Engine:
         for rid in rids:
             logger.info("call_cancel", request_id=rid, source=source, by=self.worker_id)
         for start in range(0, len(rids), 500):
-            part = rids[start : start + 500]
-            async with self.state.pipeline(transaction=False) as pipe:
-                for rid in part:
-                    pipe.set(
-                        self.keys.request(rid, "cancel"), "1", ex=self.settings.status_ttl_secs
-                    )
-                    pipe.publish(self.keys.cancel_channel, rid)
-                await pipe.execute()
+            await self.requests.cancel(
+                rids[start : start + 500],
+                ttl_secs=self.settings.status_ttl_secs,
+                channel=self.keys.cancel_channel,
+            )
 
     async def _cancel_reader(self) -> None:
         """Stop running attempts whose call was cancelled (by any process)."""
@@ -3861,21 +3841,20 @@ class Engine:
         Without it a given-back call ran elsewhere only once its claim was a lease old (FE-1):
         a 30 s call missed its deadline on every graceful restart, drain timeout or failed run.
         """
-        pairs = [
-            part
+        jobs = [
+            (held.envelope.request_id, f"{self.worker_id}@{held.tag}")
             for held in helds
             if held.message is not None
-            for part in (held.envelope.request_id, f"{self.worker_id}@{held.tag}")
         ]
-        if not pairs:
+        if not jobs:
             return
         try:
             async with asyncio.timeout(self.settings.timings.health_probe_secs):
-                await self._release_claims_script([], [self.keys.prefix, *pairs])
+                await self.admission.release_claims(jobs)  # owner-checked (FL-1)
         except Exception as exc:  # the claim then ages out after a lease, as before
             logger.warning(
                 "release_claims_failed",
-                calls=len(pairs) // 2,
+                calls=len(jobs),
                 error=str(exc),
                 error_type=type(exc).__name__,
             )
@@ -3973,7 +3952,6 @@ class Engine:
                 logger.warning("heartbeat_failed", step="loops", error=str(exc))
             renewed = False
             try:
-                await self.state.set(self.keys.caller(self.worker_id), "1", ex=self.caller_ttl_secs)
                 held_now = list(self._held.values())
                 items = [
                     (alias, owner, held.envelope.request_id)
@@ -3987,7 +3965,10 @@ class Engine:
                     for held in held_now
                     if not held.grants
                 ]
-                _, lost = await self.admission.renew_all(items, jobs)
+                # The caller key and the epoch ride on the same script (FL-21: two round trips).
+                _, lost = await self.admission.renew_all(
+                    items, jobs, caller=(self.keys.caller(self.worker_id), self.caller_ttl_secs)
+                )
                 now = time.monotonic()
                 if now - self._beat_ok_mono > 2 * beat + 1:  # a gap: the store was out of reach
                     self._store_trouble_mono = now
@@ -4043,7 +4024,7 @@ class Engine:
                     # moved with it; callers count as alive for a while (R3FM-10).
                     logger.error("store_clock_jump")
                     self._store_trouble("clock")
-                await self._check_epoch()
+                await self._check_epoch(read=not renewed)
             except Exception as exc:
                 logger.warning("heartbeat_failed", step="clock", error=str(exc))
             try:
@@ -4070,14 +4051,14 @@ class Engine:
             logger.warning("hold_lost", request_id=held.envelope.request_id)
             self._drop(held)  # its hold ends at its next round (not cancelled: FE-4)
 
-    async def _check_epoch(self) -> None:
+    async def _check_epoch(self, *, read: bool = True) -> None:
         """The store lost its data (restart, failover): re-register running calls (T10).
 
         Each process remembers the epoch it saw and re-registers when it is missing or changed
         (RESCAN A2): only the first process to notice re-registered before; the others found
-        the new epoch and did nothing.
+        the new epoch and did nothing. `read` False: this beat's RENEW read it (FL-21).
         """
-        value = await self.state.get(self.keys.epoch)
+        value = await self.state.get(self.keys.epoch) if read else self.admission.last_epoch
         missing = value is None
         if missing:
             logger.error("state_store_reset_detected")

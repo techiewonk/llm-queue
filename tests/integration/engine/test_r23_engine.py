@@ -7,6 +7,7 @@ engine's store helpers; no real LLM is called.
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import math
 from typing import Any
@@ -17,10 +18,12 @@ from redis.exceptions import ConnectionError as StoreConnectionError
 from redis.exceptions import OutOfMemoryError, ReadOnlyError, ResponseError
 from redis.exceptions import TimeoutError as StoreTimeoutError
 
+from llm_queue.engine import runtime
 from llm_queue.engine.admission import Decision
 from llm_queue.engine.envelope import Reply, params_hash
 from llm_queue.engine.errors import CallFailed
-from llm_queue.engine.queue import Message
+from llm_queue.engine.inference import InferenceRejected
+from llm_queue.engine.queue import Message, NotReplicated
 from llm_queue.engine.runtime import Engine, _store_refused
 
 pytestmark = pytest.mark.integration
@@ -578,3 +581,235 @@ async def test_r3fm4_a_call_whose_record_the_store_lost_is_sent_again(make: Make
     await make()  # a worker
     reply = await asyncio.wait_for(task, 8)
     assert reply.ok  # deadline_exceeded before
+
+
+# ---------------------------------------------------------------- FE-13, FE-20, RV-N6
+
+
+async def test_fe13_a_retry_admits_against_the_current_view(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FE-13: a retry asked admission with the view read before the failed attempt.
+
+    A deployment a reload removed meanwhile was still offered.
+    """
+    engine, _ = await make()
+    from test_audit_runtime import _a_held
+
+    held = _a_held(engine, "fe13")
+    engine._held["fe13"] = held
+    newer = copy.copy(engine.registry.current)
+    seen: list[Any] = []
+
+    async def attempt(*args: Any, **kwargs: Any) -> Any:
+        engine.registry._current = newer  # a reload during the attempt
+        return runtime._AttemptResult("retry", "provider_error", None, RuntimeError("5xx"))
+
+    async def decide(view: Any, *args: Any, **kwargs: Any) -> None:
+        seen.append(view)
+
+    async def allowed(*args: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(engine, "_attempt", attempt)
+    monkeypatch.setattr(engine, "_decide", decide)
+    monkeypatch.setattr(engine, "_retry_allowed", allowed)
+    monkeypatch.setattr(engine, "_backoff", lambda *args: 0.0)
+    await engine._attempts(held, Decision("granted", deployment="aws-a/r1"), 1, "small")
+    assert seen
+    assert seen[0] is newer  # the view from before the attempt
+
+
+async def test_fe20_ring_again_error_does_not_end_the_model_loop(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FE-20: `ring_again` meeting an error reply (UNBLOCKED in a failover) ended the loop.
+
+    The model took no calls until the next heartbeat restarted it.
+    """
+    engine, _ = await make()
+    view = engine.registry.current
+    name = engine._queue_name(view, "small", False)
+
+    async def receive_once(alias: str) -> None:
+        return None  # no free slot: a doorbell token taken goes back
+
+    async def wait_bell(*args: Any, **kwargs: Any) -> str:
+        return name
+
+    async def ring_again(queue: str) -> None:
+        raise ResponseError("UNBLOCKED force unblock from blocking operation")
+
+    monkeypatch.setattr(engine, "_receive_once", receive_once)
+    monkeypatch.setattr(engine.queues, "wait_bell", wait_bell)
+    monkeypatch.setattr(engine.queues, "ring_again", ring_again)
+    engine._held_class.add(("small", "n"))  # so a held class sends it to the doorbell path
+    loop = asyncio.create_task(engine._model_loop("small"))
+    await asyncio.sleep(0.6)
+    assert not loop.done()  # ended with the ResponseError before
+    await _cancel(loop)
+
+
+async def test_rvn6_the_probe_lock_goes_back_to_its_spacing(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RV-N6: a probe stretched the lock to 35 s and nobody probed again for that long."""
+    engine, _ = await make()
+    monkeypatch.setattr(runtime, "PROBE_EVERY_SECS", 1.0)
+    key = f"{engine.keys.prefix}:lock:probe"
+    probed: list[str] = []
+
+    async def probe_due(alias: str, *, lock_key: str | None = None) -> dict[str, str]:
+        await engine.state.expire(key, 35)  # as a real probe does
+        probed.append(alias)
+        return {}
+
+    monkeypatch.setattr(engine, "probe_due", probe_due)
+    task = asyncio.create_task(engine._prober())
+    await _until(lambda: len(probed) >= 4, secs=4, what="one probe pass")
+    await asyncio.sleep(0.2)
+    assert await engine.state.ttl(key) <= 1  # 35 s before
+    await _cancel(task)
+
+
+# ---------------------------------------------------------------- WIP commit: Q9, Q10, R3FM-8...
+
+
+async def test_q9_a_short_send_stays_on_the_queue(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner Q9: a send short of replicas ran the call direct in the caller (its copy bounced).
+
+    It is now sent anyway (warned, counted) and run by a worker.
+    """
+    engine, _ = await make()
+    engine.replica_wait.replicas = 1
+    real = engine.queues.send
+    direct: list[Any] = []
+
+    async def send(*args: Any, **kwargs: Any) -> str:
+        await real(*args, **{**kwargs, "wait_replicas": 0})
+        raise NotReplicated("0 of 1 replicas")
+
+    monkeypatch.setattr(engine.queues, "send", send)
+    monkeypatch.setattr(engine, "_start_direct", lambda env: direct.append(env))
+    assert (await engine.call("small", CHAT, timeout_secs=5)).ok
+    assert not direct
+
+
+async def test_q10_strict_mode_with_an_evicting_store_is_not_ready(make: Make) -> None:
+    """Owner Q10: an evicting store policy in strict mode was only a warning at start."""
+    engine, _ = await make()
+    engine.settings = dataclasses.replace(engine.settings, strict=True)
+    engine._eviction["state"] = "allkeys-lru"
+    health = await engine.health_check()
+    assert health["ready"] is False
+    assert "allkeys-lru" in health["not_ready_reason"]
+
+
+async def test_r3fm8_a_promotion_reregisters_and_rechecks(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3FM-8: a promotion that lost writes kept the old epoch: nothing was re-checked."""
+    engine, _ = await make()
+    ids = iter(["a" * 40, "b" * 40])
+    reregistered: list[int] = []
+
+    async def info(section: str) -> dict[str, Any]:
+        return {"connected_slaves": 0, "master_replid": next(ids)}
+
+    async def reregister(owners: Any = None) -> None:
+        reregistered.append(1)
+
+    monkeypatch.setattr(engine.state, "info", info)
+    monkeypatch.setattr(engine, "_reregister", reregister)
+    await engine._check_replication()
+    await engine._check_replication()
+    assert reregistered == [1]
+    assert engine._sweep_now.is_set()
+    assert engine.replica_wait.connected == 0
+
+
+async def test_r3rc6_a_silent_subscriber_is_reset(make: Make) -> None:
+    """R3RC-6 / R3FM-12: a half-open or cut-off subscriber was never noticed (about 15 min)."""
+    engine, _ = await make()
+    alive = runtime._Alive("result_reader")
+    alive.seen_mono -= 100
+    with pytest.raises(runtime._StaleSubscription):
+        await engine._keep_alive(engine._pubsub, alive)
+    alive.reset()
+    engine._reader_stale("result_reader")  # the sweep found unannounced results
+    with pytest.raises(runtime._StaleSubscription):
+        await engine._keep_alive(engine._pubsub, alive)
+
+
+async def test_r3rc8_a_duplicate_goes_back_when_the_claim_lapses(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3RC-8: a duplicate always went back for half a lease, whatever the claim's age."""
+    engine, _ = await make()
+    from test_audit_runtime import _a_held
+
+    held = _a_held(engine, "rc8")
+    held.message = Message(queue="q", id="1-0", generation=1, body=b"")
+    delays: list[float] = []
+
+    async def pick_take(*args: Any, **kwargs: Any) -> Decision:
+        return Decision("duplicate", wait_secs=0.7)
+
+    async def return_(message: Any, delay_secs: float = 0.0) -> bool:
+        delays.append(delay_secs)
+        return True
+
+    monkeypatch.setattr(engine.admission, "pick_take", pick_take)
+    monkeypatch.setattr(engine.queues, "return_", return_)
+    await engine._decide(engine.registry.current, "small", held, 1, frozenset())
+    assert delays == [0.7]
+
+
+async def test_rven14_a_rejected_request_on_static_cap_is_a_call_failure(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RV-EN14: `InferenceRejected` reached the app raw on the `static_cap` path."""
+    engine, _ = await make({"small": {"store_down": "static_cap"}})
+
+    async def down(*args: Any, **kwargs: Any) -> Any:
+        raise StoreConnectionError("connection refused")
+
+    def rejected(*args: Any, **kwargs: Any) -> Any:
+        raise InferenceRejected("max_tokens above the cap")
+
+    monkeypatch.setattr(engine, "_call_routed", down)
+    monkeypatch.setattr(engine, "_params", rejected)
+    with pytest.raises(CallFailed) as info:
+        await engine.call("small", CHAT, timeout_secs=5)
+    assert info.value.kind == "invalid_request"
+
+
+# ---------------------------------------------------------------- FL-21, Q27
+
+
+async def test_fl21_the_heartbeat_keeps_the_caller_key_in_its_renew(make: Make) -> None:
+    """FL-21: the caller key was a SET of its own each beat; it rides on RENEW now."""
+    engine, _ = await make()
+    key = engine.keys.caller(engine.worker_id)
+    await engine.state.delete(key)
+    await _until_async(lambda: engine.state.exists(key), secs=3, what="the key renewed")
+    assert await engine.state.ttl(key) >= math.ceil(2 * engine.settings.lease_secs / 3)
+
+
+async def test_q27_a_send_uses_its_queues_retention(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner Q27: a call's send used the library's retention, not its queue's own."""
+    engine, _ = await make({"small": {"queue": {"retention_secs": 7200}}})
+    seen: list[int] = []
+    real = engine.requests.register_send
+
+    async def register_send(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs["retention_secs"])
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(engine.requests, "register_send", register_send)
+    assert (await engine.call("small", CHAT, timeout_secs=5)).ok
+    assert seen == [7200]
