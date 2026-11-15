@@ -59,6 +59,71 @@ def _usable(view: ResolvedRegistry, alias: str, dep: Deployment) -> bool:
     )
 
 
+# Fairness settings each mode reads; any other one set is a warning (it does nothing).
+_FAIRNESS_READS = {
+    "share": {"weights", "default_weight", "active_secs"},
+    "quota": {"rpm", "tpm", "quotas", "active_secs"},
+    "fair_queue": {"active_secs"},
+}
+
+
+def _check_fairness(
+    view: ResolvedRegistry, alias: str, errors: list[str], warnings: list[str]
+) -> None:
+    """Cross-field checks of `fairness` (owner Q28, Q29, Q50): what the chosen mode needs.
+
+    `quota` needs a cap (`rpm`, `tpm` or `quotas`). A cap above the model's whole budget never
+    binds, and a `tpm` cap below one call's output reservation lets a tenant one call at a
+    time (an oversized call is admitted only on an idle clock): both warnings.
+    """
+    path = f"models.{alias}.fairness"
+    value = view.value(alias, "fairness")
+    mode = value.get("mode", "off")
+    if mode == "off":
+        return
+    entry = view.registry.models[alias]
+    reads = _FAIRNESS_READS[mode]
+    # The library defaults (`default_weight`, `active_secs`) are always there: only the
+    # tenant settings a document sets are worth a warning.
+    for name in sorted(k for k in ("weights", "rpm", "tpm", "quotas") if k in value):
+        if name in reads:
+            continue
+        warnings.append(f"{path}.{name}: not used in `{mode}` mode")
+    if mode != "quota":
+        return
+    caps = [value.get("rpm"), value.get("tpm")]
+    quotas = value.get("quotas") or {}
+    if all(c is None for c in caps) and not any(quotas.values()):
+        errors.append(f"{path}: `quota` mode needs `rpm`, `tpm` or `quotas`")
+        return
+    confirmed = view.deployments(alias, "confirmed")
+    totals: dict[str, int | None] = {}
+    for name in ("rpm", "tpm"):
+        numbers = [view.value(alias, name, d.key) for d in confirmed]
+        totals[name] = None if any(n is None for n in numbers) else sum(numbers)
+    output = (view.value(alias, "inference") or {}).get("max_tokens")
+    output = output or view.value(alias, "default_output_tokens")
+    reserve = math.ceil(output * view.value(alias, "tpm_output_weight"))
+    every: list[tuple[str, Mapping[str, Any]]] = [
+        ("", {"rpm": value.get("rpm"), "tpm": value.get("tpm")})
+    ]
+    every += [(f".quotas.{tenant}", caps_of) for tenant, caps_of in quotas.items()]
+    for where, cap in every:
+        for name in ("rpm", "tpm"):
+            limit, total = cap.get(name), totals[name]
+            if limit is not None and total is not None and limit > total:
+                warnings.append(
+                    f"{path}{where}.{name}: {limit} is above the model's {name} {total}; "
+                    "it never binds"
+                )
+        tpm = cap.get("tpm")
+        if entry.type == "chat" and tpm is not None and tpm < reserve:
+            warnings.append(
+                f"{path}{where}.tpm: {tpm} is below one call's output reservation ({reserve}); "
+                "the tenant runs one call at a time"
+            )
+
+
 def _check_model(
     view: ResolvedRegistry, alias: str, errors: list[str], warnings: list[str]
 ) -> None:
@@ -389,6 +454,7 @@ def _check_registry(view: ResolvedRegistry) -> tuple[list[str], list[str]]:
         if alias in ids and ids[alias] != alias:
             errors.append(f"models.{alias}: the alias equals the model id of `{ids[alias]}`")
         _check_model(view, alias, errors, warnings)
+        _check_fairness(view, alias, errors, warnings)
     errors += _fallback_cycles(view)
     for account in registry.routing.blocked_accounts:
         if account not in registry.accounts:

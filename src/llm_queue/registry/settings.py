@@ -317,6 +317,45 @@ _PCT = number(0, 100, integer=True)
 _POS = number(0, lo_open=True)
 _SECS = number(0, DAY_SECS, lo_open=True)  # timeouts and waits: at most one day (Q42)
 
+# Per-tenant fairness (owner Q28, Q29, Q50), off by default. `weights` and `quotas` name raw
+# tenant ids: they stay in the registry document and the worker's memory; the store and the
+# metrics only ever see the keyed hash of a tenant (`Engine.hash_id`).
+FAIRNESS_MODES = ("off", "share", "quota", "fair_queue")
+FAIRNESS_DEFAULTS = {"mode": "off", "default_weight": 1, "active_secs": 60}
+MAX_TENANT_ID_CHARS = 256
+MAX_WEIGHT = 1_000_000
+
+
+def _tenant_map(item: Check) -> Check:
+    """An object of tenant id -> `item`; ids are non-empty and at most 256 characters."""
+
+    def check(value: Any) -> str | None:
+        if not isinstance(value, dict):
+            return "must be an object of tenant id -> value"
+        for key, sub in value.items():
+            if not key or len(key) > MAX_TENANT_ID_CHARS:
+                return f"tenant ids must be 1-{MAX_TENANT_ID_CHARS} characters"
+            problem = item(sub)
+            if problem:
+                return f"`{key}` {problem}"
+        return None
+
+    return check
+
+
+_TENANT_CAPS = obj({"rpm": number(1, integer=True), "tpm": number(1, integer=True)})
+_FAIRNESS = obj(
+    {
+        "mode": one_of(*FAIRNESS_MODES),
+        "weights": _tenant_map(number(0, MAX_WEIGHT, lo_open=True)),
+        "default_weight": number(0, MAX_WEIGHT, lo_open=True),
+        "rpm": number(1, integer=True),
+        "tpm": number(1, integer=True),
+        "quotas": _tenant_map(_TENANT_CAPS),
+        "active_secs": number(1, DAY_SECS),
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class Spec:
@@ -491,6 +530,7 @@ SETTINGS: Mapping[str, Spec] = {
     "token_estimator": _spec("D,M", hook_name),
     "probe": _spec("D,M", hook_name),
     "debug_capture": _spec("M", boolean, False, protected=True),
+    "fairness": _spec("D,M", _FAIRNESS, FAIRNESS_DEFAULTS, merge=True),
 }
 
 # Defaults of the optional fields inside the two fallback rules.
