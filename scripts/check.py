@@ -305,7 +305,7 @@ def stack_up() -> str | None:
     if str(ROOT / "scripts") not in sys.path:
         sys.path.insert(0, str(ROOT / "scripts"))
     stack: Any = importlib.import_module("stack")
-    for line in stack.repair_memory_limit():
+    for line in [*stack.repair_memory_limit(), *stack.sweep_stale_drill_keys()]:
         say(f"  REPAIRED  {line}")
     return None
 

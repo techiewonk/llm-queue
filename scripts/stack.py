@@ -56,6 +56,45 @@ def repair_memory_limit() -> list[str]:
     return repaired
 
 
+# Key patterns that only drills and tests write (never an app's keys).
+DRILL_PATTERNS = (
+    "llmqgate:*",
+    "llmqload:*",
+    "llmqfo:*",
+    "llmqbench:*",
+    "llmqsample:*",
+    "llmqsoak*",
+    "llmqtest:*",
+)
+
+
+def sweep_stale_drill_keys(idle_secs: int = 3600) -> list[str]:
+    """Delete drill and test keys untouched for `idle_secs`; one line per store that had some.
+
+    A killed or crashed drill leaves its keys behind (FT-18: a gate stream key outlived its
+    cleanup). Only keys idle for an hour go, so a drill running at the same time keeps its own.
+    """
+    import redis
+
+    swept = []
+    for name, port in STORES.items():
+        if not answers(port):
+            continue
+        client = redis.Redis(host="127.0.0.1", port=port, password=PASSWORD)
+        try:
+            gone = 0
+            for pattern in DRILL_PATTERNS:
+                for key in client.scan_iter(match=pattern, count=1000):
+                    idle = client.object("idletime", key)
+                    if idle is not None and int(idle) >= idle_secs:
+                        gone += int(client.unlink(key))
+            if gone:
+                swept.append(f"{name}: {gone} stale drill/test keys removed (idle {idle_secs} s+)")
+        finally:
+            client.close()
+    return swept
+
+
 def status() -> int:
     """Print one line per service; exit 1 when any is down."""
     down = 0
@@ -63,7 +102,7 @@ def status() -> int:
         ok = answers(port)
         down += not ok
         print(f"  {'up  ' if ok else 'DOWN'}  {name} (:{port})")
-    for line in repair_memory_limit():
+    for line in [*repair_memory_limit(), *sweep_stale_drill_keys()]:
         print(f"  REPAIRED  {line}")
     return 1 if down else 0
 
