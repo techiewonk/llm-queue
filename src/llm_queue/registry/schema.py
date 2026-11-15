@@ -20,6 +20,7 @@ from urllib.parse import parse_qsl, urlparse
 
 from llm_queue._version import __version__
 from llm_queue.errors import ConfigError, UnknownModel
+from llm_queue.providers.embeddings import codec_for, embedding_families
 from llm_queue.registry.settings import (
     MAX_NUMBER,
     SETTINGS,
@@ -61,9 +62,6 @@ _ACCOUNT_FIELDS = frozenset(
     {"kind", "enabled", "role_arn", "external_id_ref", "base_url", "api_key_ref", "settings"}
 )
 _MODEL_FIELDS = frozenset({"type", "provider", "model_id", "deployments", "residency", "family"})
-# Request-body shapes of Bedrock embedding models. `family` names one when the model id does not
-# (an application inference profile ARN); without it the id is guessed from (R3JE-21, Q22).
-EMBED_FAMILIES = ("titan", "cohere")
 _DEPLOYMENT_FIELDS = frozenset({"confirmed", "fallback", "overrides"})
 _ROUTING_FIELDS = frozenset({"kill_switch", "allow_users", "blocked_regions", "blocked_accounts"})
 _PROFILE_FIELDS = frozenset({"name", "region", "profile_id", "routes_to"})
@@ -198,7 +196,9 @@ class ModelEntry:
     settings: Mapping[str, Any]
     deployments: Mapping[str, tuple[RegionEntry, ...]]
     residency: tuple[str, ...] | None = None
-    family: str | None = None  # Bedrock embedding body shape (`EMBED_FAMILIES`); None: guessed
+    # Embedding family (`providers.embeddings`), when the model id does not name it (an
+    # application inference profile ARN, R3JE-21, Q22); None: from the provider or the id.
+    family: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -586,12 +586,7 @@ def _model(
     if not any(e.group == "confirmed" for entries in deployments.values() for e in entries):
         out.error(f"{path}.deployments", "needs at least one confirmed region")
     residency = _residency(out, f"{path}.residency", body.get("residency"))
-    family = body.get("family")
-    if family is not None:
-        if family not in EMBED_FAMILIES:
-            out.error(f"{path}.family", f"must be one of {', '.join(EMBED_FAMILIES)}")
-        elif kind != "embedding" or provider != "bedrock":
-            out.error(f"{path}.family", "only for Bedrock embedding models")
+    family = _family(out, path, body.get("family"), kind, provider, model_id)
     if kind not in MODEL_TYPES or not isinstance(provider, str) or not isinstance(model_id, str):
         return None
     return ModelEntry(
@@ -602,8 +597,33 @@ def _model(
         settings=_frozen(settings),
         deployments=MappingProxyType(deployments),
         residency=residency,
-        family=family if family in EMBED_FAMILIES else None,
+        family=family,
     )
+
+
+def _family(
+    out: _Collector, path: str, family: Any, kind: Any, provider: Any, model_id: Any
+) -> str | None:
+    """The model's embedding family, checked; an embedding model must have one we can tell.
+
+    A Bedrock id no codec matched was sent Titan's body (one text per call) and every call was
+    refused; now it is a load error naming `family`. Registered families count.
+    """
+    if family is not None:
+        names = embedding_families()
+        if family not in names:
+            out.error(f"{path}.family", f"must be one of {', '.join(names)}")
+            return None
+        if kind != "embedding":
+            out.error(f"{path}.family", "only for embedding models")
+            return None
+        return str(family)
+    if kind == "embedding" and isinstance(provider, str) and isinstance(model_id, str):
+        try:
+            codec_for(provider, model_id)
+        except ConfigError as exc:
+            out.error(f"{path}.family", str(exc))
+    return None
 
 
 def _routing(out: _Collector, raw: Any) -> Routing:
