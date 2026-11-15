@@ -589,20 +589,38 @@ class LLMQueue:
     async def call(
         self, model: str, params: Mapping[str, Any], *, priority: bool | None = None, **kw: Any
     ) -> Reply:
-        """Any operation of a model (`converse`, `chat`, `invoke_model`, `embeddings`)."""
+        """Any operation of a model (`converse`, `chat`, `invoke_model`, `embeddings`).
+
+        `converse`, `chat` and `call` run the same code: the model's provider, not the method
+        name, decides the request shape (Converse for Bedrock, chat completions for
+        OpenAI-compatible). Use `call` for code that handles every model alike.
+
+        Per-call options (keyword only; R3AP-10): `timeout_secs` (default the model's
+        `timeout_secs`, capped by `timeout_max_secs`), `max_wait_secs` (longest wait for
+        budget), `request_id` (your id; a repeat attaches to the same call), `session_id`,
+        `user_id`, `tenant_id` (default from `request_context`), `allow_fallback` (`"all"`:
+        fallback regions and models, `"regions"`: regions only, `"none"`), `allowed_regions`
+        and `allowed_accounts` (limit the deployments). An unknown option raises `TypeError`.
+        """
         self._check(work=True)
         return await self._engine.call(model, params, **self._call_kwargs(priority, **kw))
 
     async def converse(
         self, model: str, request: Mapping[str, Any], *, priority: bool | None = None, **kw: Any
     ) -> Reply:
-        """One Bedrock Converse call (the reply's `response` is the Converse body)."""
+        """One chat call, named for Bedrock: send a Converse request to a Bedrock model.
+
+        Same options and code as `call`; the reply's `response` is the Converse body.
+        """
         return await self.call(model, request, priority=priority, **kw)
 
     async def chat(
         self, model: str, request: Mapping[str, Any], *, priority: bool | None = None, **kw: Any
     ) -> Reply:
-        """One OpenAI-compatible chat completion."""
+        """One chat call, named for OpenAI: send a chat completion to an OpenAI-compatible model.
+
+        Same options and code as `call`; the reply's `response` is the completion body.
+        """
         return await self.call(model, request, priority=priority, **kw)
 
     async def converse_stream(
@@ -624,7 +642,20 @@ class LLMQueue:
             async for event in events:
                 yield event
 
-    chat_stream = converse_stream
+    async def chat_stream(
+        self, model: str, request: Mapping[str, Any], *, priority: bool | None = None, **kw: Any
+    ) -> AsyncIterator[dict[str, Any]]:
+        """`converse_stream` under the OpenAI name: chat completion chunks from such a model.
+
+        Was an alias, so `help()` and tracebacks showed `converse_stream` (R3AP-15).
+        """
+        inner = cast(
+            "AsyncGenerator[dict[str, Any], None]",
+            self.converse_stream(model, request, priority=priority, **kw),
+        )
+        async with contextlib.aclosing(inner) as events:
+            async for event in events:
+                yield event
 
     async def embed(
         self,

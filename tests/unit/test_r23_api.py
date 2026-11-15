@@ -61,6 +61,16 @@ def test_q38_kind_is_a_literal_of_every_kind() -> None:
     assert CallFailed("rejected", "x").kind == "rejected"
 
 
+def test_q36_chat_stream_has_its_own_name_and_docs() -> None:
+    """Q36 / Q37 / R3AP-15: `chat_stream` was an alias, so help() named it converse_stream."""
+    from llm_queue.core import LLMQueue
+
+    assert LLMQueue.chat_stream.__name__ == "chat_stream"
+    for name in ("call", "converse", "chat", "chat_stream"):
+        assert getattr(LLMQueue, name).__doc__
+    assert "allow_fallback" in (LLMQueue.call.__doc__ or "")  # R3AP-10: options documented
+
+
 def test_r3ap13_queued_chat_openai_stays_off_the_responses_api() -> None:
     """R3AP-13: the Responses API posted to /responses, which the queue answered with 404."""
     import pytest

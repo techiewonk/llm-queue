@@ -24,17 +24,29 @@ reply.meta.deployment   # "aws-main/ap-south-1"
 reply.meta.served_model # the alias that served it (another one after a model fallback)
 ```
 
-`converse` is a Bedrock Converse call; `chat` is an OpenAI-compatible chat completion. `call`
-runs any operation of a model. Each takes these keyword arguments:
+`converse`, `chat` and `call` are one call under three names, all supported:
+
+| Method | Use it for |
+|---|---|
+| `converse` | Bedrock models, with a Converse request (`messages`, `inferenceConfig`, `toolConfig`) |
+| `chat` | OpenAI-compatible models (vLLM, OpenAI), with a chat completions request (`messages`, `max_tokens`, `tools`) |
+| `call` | Code that handles any model alike, and the other operations (`invoke_model`, `embeddings`) |
+
+The model's provider decides the request shape, not the method name: `chat` on a Bedrock model
+sends a Converse request. Pick the name that matches the model so the code reads right. The
+streaming pair is `converse_stream` / `chat_stream`, the sync pair `converse_sync` /
+`chat_sync`.
+
+Each takes these keyword arguments (keyword only; an unknown name raises `TypeError`):
 
 | Argument | Meaning |
 |---|---|
-| `priority` | Priority calls are read before normal ones (default from `request_context`, else normal) |
+| `priority` | Priority calls are read before normal ones (default from `request_context`, else normal). Only trusted code should set it |
 | `timeout_secs` | The call's time budget (default the model's `timeout_secs`, 120; capped by `timeout_max_secs`, 900) |
 | `max_wait_secs` | The longest the call may wait for budget before it fails `rate_limited` |
-| `request_id` | Your own id; a repeated id runs once and returns the same answer |
+| `request_id` | Your own id; a repeat while it runs attaches to the same call, and a repeat after a success returns the same answer |
 | `session_id`, `user_id`, `tenant_id` | Ids of the caller (default from `request_context`); user and session ids are stored only as a keyed hash (`LLMQ_ID_HASH_SALT`) |
-| `allow_fallback` | `"all"` (default) lets a disabled model fall back to its `model_fallback` model |
+| `allow_fallback` | `"all"` (default): fallback regions and fallback models (also when the model is disabled); `"regions"`: fallback regions only; `"none"`: neither |
 | `allowed_regions`, `allowed_accounts` | Limit the deployments this call may use |
 
 ### Images and documents
@@ -77,7 +89,7 @@ async for event in llmq.converse_stream("gpt20b", request):
 ```
 
 Bedrock models yield ConverseStream events, OpenAI-compatible ones chat completion chunks
-(`chat_stream` is the same method). A failure after events were sent raises `CallFailed` with
+(`chat_stream` is the same call under the OpenAI name). A failure after events were sent raises `CallFailed` with
 `partial_text`; the call never switches to another deployment half-way. See
 [Streaming](../explanation/streaming.md).
 

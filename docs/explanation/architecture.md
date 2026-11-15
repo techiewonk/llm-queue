@@ -75,7 +75,7 @@ flowchart LR
 
 | Module | Role |
 |---|---|
-| `core.py` | Front door `LLMQueue`: `from_env`, `start`, `pause_receiving`, `stop`, `converse` / `chat` / `call`, `converse_stream` (= `chat_stream`), `embed`, `*_sync` (direct path on a private loop and engine), `register_job` / `send_job`, `cancel`, `status`, `request_status`, `health`, `registry`, `http_router` |
+| `core.py` | Front door `LLMQueue`: `from_env`, `start`, `pause_receiving`, `stop`, `converse` / `chat` / `call`, `converse_stream` / `chat_stream`, `embed`, `*_sync` (direct path on a private loop and engine), `register_job` / `send_job`, `cancel`, `status`, `request_status`, `health`, `registry`, `http_router` |
 | `engine/runtime.py` | `Engine`: caller (register, send, wait), worker loops, held calls, attempts, retries, fallback, direct path, `store_down`, cancel, every background task |
 | `engine/_admission_lua.py`, `engine/admission.py` | Lua `PICK_TAKE`, `FINISH`, `UNDO`, `RENEW`, `SWEEP`, `REREGISTER` and their Python wrapper |
 | `engine/queue.py` | `StreamQueues`: a queue on a stream with visibility, generation, failures and dead letters (`SEND`, `RECEIVE`, `RETURN`, `EXTEND`, `FAIL`, `ACK`, `DEPTH`, `REDRIVE`), doorbells |
