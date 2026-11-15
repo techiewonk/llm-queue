@@ -65,7 +65,7 @@ flowchart LR
 |---|---|---|
 | `LLMQ_ENVIRONMENT` | unset (strict) | See above |
 | `LLMQ_ID_HASH_SALT` | | Key of the user / session id hash (HMAC); required when strict. Use the same value in every service that shares the store |
-| `LLMQ_KEY_PREFIX` | `llmq` | Prefix of this environment's store keys |
+| `LLMQ_KEY_PREFIX` | `llmq` in dev and test; **required** in strict mode | Prefix of this environment's store keys: name it per app and environment (`myapp-prod`) |
 | `LLMQ_QUEUE_PREFIX` | empty | Prefix of this environment's queue names |
 | `LLMQ_MODE` | `both` | `both` (caller and worker), `caller` or `worker` |
 | `LLMQ_METRICS_SINK` | `emf` | `emf` (CloudWatch embedded metrics), `prometheus` (extra `metrics`) or `none`. One sink per process |
@@ -104,4 +104,4 @@ flowchart LR
 
 | Variable | Meaning |
 |---|---|
-| `LLMQ_BEDROCK_ENDPOINT_URL`, `LLMQ_STS_ENDPOINT_URL` | Point Bedrock / STS at fakes (fakellm, moto) |
+| `LLMQ_BEDROCK_ENDPOINT_URL`, `LLMQ_STS_ENDPOINT_URL` | Point Bedrock / STS at fakes (fakellm, moto); `https` only in strict mode |

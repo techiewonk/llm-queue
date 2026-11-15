@@ -141,7 +141,7 @@ async def test_sync_calls_run_direct(llmq: LLMQueue, store: redis.asyncio.Redis)
 
 async def _messages_sent(llmq: LLMQueue, store: redis.asyncio.Redis, alias: str) -> int:
     """Messages ever added to a model's normal and priority streams (XINFO entries-added)."""
-    engine = llmq.engine
+    engine = llmq._engine
     total = 0
     for priority in (False, True):
         name = engine._queue_name(engine.registry.current, alias, priority)

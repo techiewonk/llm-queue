@@ -63,3 +63,19 @@ def test_queued_lines_are_written_before_the_process_exits() -> None:
         [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=60
     ).stdout
     assert len(out.splitlines()) == 500
+
+
+def test_a_writer_whose_thread_died_starts_a_new_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FC-9: after a fork `_thread` was set but dead; the child's lines piled up, then dropped."""
+    import threading
+
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    writer = _StdoutWriter()
+    dead = threading.Thread(target=lambda: None)
+    dead.start()
+    dead.join()
+    writer._thread = dead  # what a forked child inherits
+    writer("line")
+    assert writer.flush(timeout_secs=5)
+    assert out.getvalue() == "line\n"

@@ -847,7 +847,7 @@ async def _worker_main() -> None:
             await sink.flush(client)
 
     task = asyncio.create_task(flusher())
-    print(f"ready {llmq.engine.worker_id}", flush=True)
+    print(f"ready {llmq._engine.worker_id}", flush=True)
     while True:  # "stats" (the soak's debug hook) until "stop", or EOF when the driver exits
         line = await asyncio.to_thread(sys.stdin.readline)
         if line.strip() != "stats":
@@ -926,7 +926,7 @@ async def _client_main(spec: dict[str, Any]) -> None:
     await llmq.start()
     view = llmq.registry.current
     model = str(spec["model"])
-    print(json.dumps({"ready": True, "worker_id": llmq.engine.worker_id,
+    print(json.dumps({"ready": True, "worker_id": llmq._engine.worker_id,
                       "version": int(view.registry.version)}), flush=True)  # fmt: skip
     await asyncio.to_thread(sys.stdin.readline)  # "go"
     t0 = time.monotonic()

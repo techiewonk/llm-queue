@@ -105,10 +105,15 @@ Path = tuple[str, ...]
 
 @dataclass(frozen=True, slots=True)
 class PublishResult:
-    """What a publish did: `published`, `kept`, `not_bumped` or `ignored`, and the version live."""
+    """What a publish did: `published`, `kept`, `not_bumped` or `ignored`, and the version live.
+
+    `carried` lists the live routing switches kept from the stored document (blocked regions
+    and accounts, the kill switch), e.g. after a rollback (Q41).
+    """
 
     action: str
     version: int
+    carried: tuple[str, ...] = ()
 
 
 def content_hash(doc: Mapping[str, Any]) -> str:
@@ -234,6 +239,47 @@ def refused_edits(before: Mapping[str, Any], after: Mapping[str, Any], mode: str
         if why:
             reasons.append(f"{'.'.join(path)}: {why}")
     return reasons
+
+
+def protected_mismatches(
+    config: Mapping[str, Any], stored: Mapping[str, Any]
+) -> list[tuple[str, str]]:
+    """(path, why) of every protected or deploy-only field where `stored` differs from `config`.
+
+    The same rules as a live edit under `registry_live_edit=safe` (`_deploy_only`,
+    `_protected`, models and accounts added or removed), plus `live_edit` itself. The version
+    fields and the live routing switches are not compared.
+    """
+    out: list[tuple[str, str]] = []
+    for path, _, _ in diff(dict(config), dict(stored)):
+        if path[:1] in (("registry_version",), ("min_lib_version",)):
+            continue
+        why = _deploy_only(path) or _protected(path)
+        if why is None and path[:1] in (("models",), ("accounts",)) and len(path) == 2:
+            why = "adding or removing a model or an account changes only with a deploy"
+        if why is not None:
+            out.append((".".join(path), why))
+    return out
+
+
+def carried_routing(doc: Mapping[str, Any], merged: Mapping[str, Any]) -> tuple[str, ...]:
+    """The live routing switches `merged` keeps that `doc` did not have (Q41), as text.
+
+    `routing.blocked_regions: r1`, `routing.kill_switch`: what a publish or rollback kept
+    from the stored document.
+    """
+    raw_given, raw_routing = doc.get("routing"), merged.get("routing")
+    given: Mapping[str, Any] = raw_given if isinstance(raw_given, Mapping) else {}
+    routing: Mapping[str, Any] = raw_routing if isinstance(raw_routing, Mapping) else {}
+    out = [
+        f"routing.{name}: {value}"
+        for name in _CARRIED_LISTS
+        for value in routing.get(name) or ()
+        if value not in (given.get(name) or ())
+    ]
+    if routing.get("kill_switch") is True and given.get("kill_switch") is not True:
+        out.append("routing.kill_switch")
+    return tuple(out)
 
 
 def check_actor(actor: str) -> str:
@@ -474,7 +520,13 @@ class RegistryStore:
         return doc, meta_text
 
     def _readable(self, doc: Mapping[str, Any]) -> Registry | None:
-        """The stored document as a registry, or None (logged once) when this pod refuses it."""
+        """The stored document as a registry, or None (logged once) when this pod refuses it.
+
+        A pod that holds its own config also refuses a stored document whose protected fields
+        (accounts and their roles, model ids, residency, region lists, `live_edit`, ...) differ
+        from it (owner decision Q25, R3SE-3): anyone who could write the key could send prompts
+        to another AWS account or model after a schema check only.
+        """
         registry, errors, _ = check(doc, strict=False, allowed_hosts=self._hosts)
         if registry is not None and needs_newer_lib(registry.min_lib_version):
             errors = [
@@ -482,6 +534,17 @@ class RegistryStore:
                 f"(this is {__version__}); this pod keeps its registry and never publishes"
             ]
             registry = None
+        mismatched = (
+            protected_mismatches(self.config, doc)
+            if registry is not None and self.config is not None
+            else []
+        )
+        if mismatched:
+            errors = [
+                f"{path}: differs from this pod's deploy config ({why})" for path, why in mismatched
+            ]
+            registry = None
+            self._count("llmq_registry_refused_total", reason="protected_mismatch")
         if registry is None:
             key = "|".join(errors)
             if key not in self._warned:
@@ -610,7 +673,7 @@ class RegistryStore:
                 logger.info("registry_published", version=version, actor=actor)
                 logger.info("llmq_registry_audit", actor=actor, op="publish", diff=changes)
             await self._load()  # a fresh read, never one that started before the write
-            return PublishResult(action, version)
+            return PublishResult(action, version, carried_routing(doc, merged))
         raise RegistryConflict(
             f"the registry kept changing during a publish ({tries} tries); try again"
         )
@@ -819,7 +882,13 @@ class RegistryStore:
 
         The new version is the stored one plus one; when a deploy publishes in between (the
         rollback comes back `ignored` or `not_bumped`), it is read and tried again, up to
-        `Tuning.registry.edit_retries` tries, then `RegistryConflict`.
+        `Tuning.registry.edit_retries` tries, then `RegistryConflict`. Each try is a whole
+        `publish`, which itself retries `edit_retries + 2` times on a lost race: at most
+        `edit_retries * (edit_retries + 2)` publishes in all (3 x 5 by default; 10 x 12, about
+        135 s of backoff, at the maximum), not the 12.5 s bound of one publish (FC-16).
+
+        The live routing blocks and kill switch are kept, as for any publish, and the result's
+        `carried` lists them (Q41): a rollback never lifts an emergency block.
         """
         check_actor(actor)
         raw = await self._client.hget(self.history_key, str(version))
@@ -928,10 +997,14 @@ class RegistryStore:
 
     def _count_reload_error(self, exc: BaseException) -> None:
         """Count a failed reload by error type; a failing sink never stops the loop."""
+        self._count("llmq_registry_reload_errors_total", error=type(exc).__name__)
+
+    def _count(self, name: str, **labels: str) -> None:
+        """Count one event on the engine's sink, if any; a failing sink is only logged."""
         if self.metrics is None:
             return
         try:
-            self.metrics.count("llmq_registry_reload_errors_total", error=type(exc).__name__)
+            self.metrics.count(name, 1.0, **labels)
         except Exception as sink_exc:
             logger.debug("registry_metric_failed", error=str(sink_exc))
 

@@ -44,7 +44,8 @@ from llm_queue.tuning import (
 
 if TYPE_CHECKING:
     from llm_queue.clients.hub import run
-    from llm_queue.clients.providers import register_provider
+    from llm_queue.clients.pool import Route
+    from llm_queue.clients.providers import Provider, register_provider
     from llm_queue.core import (
         EmbedResult,
         Health,
@@ -54,11 +55,18 @@ if TYPE_CHECKING:
         StatusReport,
     )
     from llm_queue.engine.envelope import Meta, Reply
+    from llm_queue.engine.jobs import JobFn
     from llm_queue.engine.metrics import EmfSink, Metrics, NullSink, PrometheusSink
     from llm_queue.engine.offload import ResultOffload, S3Offload
+    from llm_queue.engine.store_client import Secrets
     from llm_queue.engine.tokens import register_token_estimator
     from llm_queue.registry import RegistryError, register_account_kind
-    from llm_queue.registry.store import LiveEditRefused, RegistryConflict, RegistryStore
+    from llm_queue.registry.store import (
+        LiveEditRefused,
+        PublishResult,
+        RegistryConflict,
+        RegistryStore,
+    )
 
 # Loaded on first access: these pull in redis, pydantic models or the SDK layer.
 _LAZY = {
@@ -84,6 +92,13 @@ _LAZY = {
     "register_provider": "llm_queue.clients.providers",
     "run": "llm_queue.clients.hub",
     "register_token_estimator": "llm_queue.engine.tokens",
+    # Types an app writes against (owner decision Q35): a custom provider, its route, a job
+    # function, a secrets lookup, and what a publish or rollback did.
+    "Provider": "llm_queue.clients.providers",
+    "Route": "llm_queue.clients.pool",
+    "JobFn": "llm_queue.engine.jobs",
+    "Secrets": "llm_queue.engine.store_client",
+    "PublishResult": "llm_queue.registry.store",
 }
 
 __all__ = [
@@ -97,6 +112,7 @@ __all__ = [
     "EmfSink",
     "EngineTimings",
     "Health",
+    "JobFn",
     "LLMQueue",
     "LLMQueueError",
     "LiveEditRefused",
@@ -107,6 +123,8 @@ __all__ = [
     "NullSink",
     "OpenAIOptions",
     "PrometheusSink",
+    "Provider",
+    "PublishResult",
     "RegistryConflict",
     "RegistryError",
     "RegistryOptions",
@@ -116,7 +134,9 @@ __all__ = [
     "RequestContext",
     "RequestStatus",
     "ResultOffload",
+    "Route",
     "S3Offload",
+    "Secrets",
     "StatusReport",
     "StoreOptions",
     "StoreUnavailable",

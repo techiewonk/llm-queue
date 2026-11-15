@@ -34,13 +34,15 @@ class StreamTooLarge(Exception):
 
 def text_of(event: Mapping[str, Any]) -> str:
     """The answer text an event adds: a Bedrock `contentBlockDelta` or an OpenAI chunk delta."""
-    delta = event.get("contentBlockDelta", {}).get("delta", {})
+    # `delta: null` raised TypeError (`"text" in None`, R3ST-14); with `n` > 1 the text of
+    # every choice was mixed into `partial_text` (R3ST-10): only choice 0 counts.
+    delta = (event.get("contentBlockDelta") or {}).get("delta") or {}
     if "text" in delta:
         return str(delta["text"])
-    choices = event.get("choices") or []
-    if choices and isinstance(choices[0], Mapping):
-        content = (choices[0].get("delta") or {}).get("content")
-        return str(content) if content else ""
+    for choice in event.get("choices") or ():
+        if isinstance(choice, Mapping) and choice.get("index", 0) == 0:
+            content = (choice.get("delta") or {}).get("content")
+            return str(content) if content else ""
     return ""
 
 
@@ -87,7 +89,9 @@ class ChunkWriter:
         """One provider event: written now if it is the first or the flush window has passed."""
         if self._failed is not None:
             raise self._failed
-        data = event.model_dump(exclude_none=True) if hasattr(event, "model_dump") else event
+        # `exclude_unset`, not `exclude_none`: the wire shape, with the nulls the server sent;
+        # `chunk["choices"][0]["finish_reason"]` raised KeyError on most chunks (R3ST-10).
+        data = event.model_dump(exclude_unset=True) if hasattr(event, "model_dump") else event
         self._buffer.append(data)
         if text := text_of(data):
             self.partial.append(text)

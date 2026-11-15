@@ -13,8 +13,10 @@ Used by `LLMQueue.from_env` and the `llm-queue` CLI.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import redis.asyncio
 from redis.asyncio.retry import Retry
@@ -23,7 +25,10 @@ from redis.credentials import CredentialProvider
 from redis.exceptions import ConnectionError as StoreConnectionError
 from redis.exceptions import ReadOnlyError
 
+from llm_queue._logging import get_logger
 from llm_queue.tuning import StoreOptions
+
+logger = get_logger(__name__)
 
 Secrets = Callable[[str], "str | None"]  # a secret's value by name
 
@@ -73,10 +78,61 @@ def store_client(
     }
     if credential_provider is not None:
         kwargs["credential_provider"] = credential_provider
-    pool = redis.asyncio.BlockingConnectionPool.from_url(
+    pool = BusyPool.from_url(
         url, max_connections=max_connections, timeout=opts.pool_wait_secs, **kwargs
     )
+    # A connection in use frees within one read timeout (its command answers or times out).
+    pool.busy_secs = opts.read_timeout_secs
     return redis.asyncio.Redis.from_pool(pool)  # owns the pool: aclose() closes it
+
+
+class StorePoolBusy(StoreConnectionError):
+    """Every pooled connection stayed in use past the wait: the pool is too small for the load.
+
+    Still a `ConnectionError` for the callers that handle one, but named so a saturated pool
+    (a slow store, too few `LLMQ_STORE_MAX_CONNECTIONS`) is not read as a store that is down
+    (R3PF-6). The message names the pool size.
+    """
+
+
+class BusyPool(redis.asyncio.BlockingConnectionPool):
+    """A blocking pool that waits again, up to `busy_secs` more, while every connection is busy.
+
+    redis-py raised `ConnectionError("No connection available.")` after `timeout`: under a
+    300 ms store latency 3,612 of 10,000 concurrent commands failed that way and took the
+    `store_down` path (R3PF-6). In-use connections free within one read timeout, so the wait is
+    bounded; after it `StorePoolBusy` says what happened.
+    """
+
+    busy_secs: float = 0.0
+
+    async def get_connection(self, *args: Any, **kwargs: Any) -> Any:  # noqa: D102  # as redis-py
+        deadline = time.monotonic() + self.busy_secs
+        while True:
+            try:
+                return await super().get_connection(*args, **kwargs)  # type: ignore[no-untyped-call]  # redis-py has no annotation here
+            except StoreConnectionError as exc:
+                if not isinstance(exc.__cause__, TimeoutError):
+                    raise  # a real connection failure
+                if time.monotonic() < deadline:
+                    _log_busy(self.max_connections)
+                    continue
+                raise StorePoolBusy(
+                    f"all {self.max_connections} store connections stayed in use; raise "
+                    "LLMQ_STORE_MAX_CONNECTIONS or lower worker_slots"
+                ) from exc
+
+
+_busy_logged = 0.0
+
+
+def _log_busy(size: int) -> None:
+    """Warn at most once a minute per process that the store pool is saturated."""
+    global _busy_logged
+    now = time.monotonic()
+    if now - _busy_logged >= 60:
+        _busy_logged = now
+        logger.warning("store_pool_busy", max_connections=size)
 
 
 class FreshPassword(CredentialProvider):
@@ -107,7 +163,22 @@ def secret_store_client(
 ) -> redis.asyncio.Redis:
     """`store_client` for a URL whose password secret `name`, when set, wins (read fresh).
 
-    Used by `LLMQueue.from_env` and the CLI.
+    Used by `LLMQueue.from_env` and the CLI. The URL's user (an ACL user limited to the app's
+    key prefix) is kept and its password dropped: redis-py refuses a URL user or password
+    together with a credential provider, so every connection failed (R3SE-2).
     """
-    provider = FreshPassword(secrets, name) if secrets is not None and secrets(name) else None
-    return store_client(url, provider, max_connections=max_connections, options=options)
+    if secrets is None or not secrets(name):
+        return store_client(url, None, max_connections=max_connections, options=options)
+    bare, username = split_user(url)
+    provider = FreshPassword(secrets, name, username)
+    return store_client(bare, provider, max_connections=max_connections, options=options)
+
+
+def split_user(url: str) -> tuple[str, str | None]:
+    """`url` without its user and password, and the user name (None when it has none)."""
+    parts = urlsplit(url)
+    if "@" not in parts.netloc:
+        return url, None
+    userinfo, host = parts.netloc.rsplit("@", 1)
+    user = unquote(userinfo.split(":", 1)[0]) or None
+    return urlunsplit(parts._replace(netloc=host)), user

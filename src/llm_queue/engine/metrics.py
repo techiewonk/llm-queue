@@ -72,15 +72,21 @@ class _StdoutWriter:
 
     def __call__(self, line: str) -> None:
         """Queue one line; drop it (counted, warned once) when the queue is full."""
-        if self._thread is None:
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            # Not only the first line: after a fork the child has `_thread` set but no thread,
+            # and its lines piled up to the cap, then were dropped (FC-9).
             with self._lock:
-                if self._thread is None:
+                if self._thread is None or not self._thread.is_alive():
+                    if self._thread is None:
+                        # Lines still queued at exit would be lost with the daemon thread.
+                        atexit.register(self.flush)
+                    else:  # the parent's queue may hold its lines and a held lock: start over
+                        self._lines = queue.Queue(self.MAX_LINES)
                     self._thread = threading.Thread(
                         target=self._run, name="llmq-emf-writer", daemon=True
                     )
                     self._thread.start()
-                    # Lines still queued at exit would be lost with the daemon thread.
-                    atexit.register(self.flush)
         try:
             self._lines.put_nowait(line)
         except queue.Full:

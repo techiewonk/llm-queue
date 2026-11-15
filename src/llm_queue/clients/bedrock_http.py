@@ -38,6 +38,7 @@ from botocore.exceptions import (
     ParamValidationError,
 )
 from botocore.httpsession import ProxyConfiguration, create_urllib3_context, get_cert_path
+from botocore.utils import get_environ_proxies
 from yarl import URL
 
 from llm_queue._version import __version__
@@ -72,6 +73,8 @@ _INVOKE_REPLY_HEADERS = {
     "serviceTier": "x-amzn-bedrock-service-tier",
 }
 _MEDIA = ("image", "document", "video", "audio")
+# Block keys that can hold a blob member (`_blob_paths`); a block with none of them has none.
+_BLOB_KEYS = frozenset({*_MEDIA, "guardContent", "reasoningContent", "toolResult"})
 
 
 def default_endpoint(region: str) -> str:
@@ -94,6 +97,10 @@ def _blob_paths(block: Mapping[str, Any]) -> list[tuple[Mapping[str, Any], str]]
     content and `guardContent.image`, and `reasoningContent.redactedContent`.
     """
     found: list[tuple[Mapping[str, Any], str]] = []
+    if type(block) is dict and _BLOB_KEYS.isdisjoint(block):
+        # A plain text block or delta (nearly all of them): the walk below costs 8 ABC checks,
+        # 5.9 us a block, more than the JSON it guards (FC-5).
+        return found
     for media in _MEDIA:
         source = (block.get(media) or {}).get("source")
         if isinstance(source, Mapping) and "bytes" in source:
@@ -217,11 +224,16 @@ def _event(message: EventStreamMessage) -> dict[str, Any] | None:
         if event_type not in _EVENTS:
             return None
         payload = _loads(message.payload, "stream event")
+        if not isinstance(payload, dict):
+            # A proxy's `"text"` or `[...]` frame raised AttributeError below: FATAL (R3ST-14).
+            raise StreamTruncated("a Bedrock stream event is not a JSON object")
         if event_type == "contentBlockDelta":
             _decode_blobs((payload.get("delta"),))
         return {event_type: payload}
     if kind == "exception":
         body = _loads(message.payload, "stream exception")
+        if not isinstance(body, dict):  # R3ST-14, as for an event
+            raise StreamTruncated("a Bedrock stream exception is not a JSON object")
         error = {
             "Code": headers.get(":exception-type", ""),
             "Message": body.get("Message", body.get("message", "")),
@@ -314,7 +326,7 @@ class BedrockHTTP:
     ) -> BedrockHTTP:
         """A client with a pool of `pool_size` connections and botocore's TLS and proxy setup."""
         url = (endpoint_url or default_endpoint(region)).rstrip("/")
-        proxy = ProxyConfiguration().proxy_url_for(url)
+        proxy = proxy_for(url)
         tls: ssl.SSLContext | bool = False
         if url.startswith("https:"):
             tls = await asyncio.to_thread(_tls_context)  # loads the CA bundle from disk
@@ -438,9 +450,30 @@ class BedrockHTTP:
         return reply
 
 
+def proxy_for(url: str) -> str | None:
+    """The proxy botocore would use for `url`: `HTTPS_PROXY` / `HTTP_PROXY`, minus `NO_PROXY`.
+
+    `ProxyConfiguration()` with no proxies always answered None, so a pod that reaches Bedrock
+    only through an egress proxy timed out on every call over aiohttp (FC-1).
+    """
+    return ProxyConfiguration(proxies=get_environ_proxies(url)).proxy_url_for(url)
+
+
+def ca_bundle() -> str:
+    """The CA bundle botocore trusts: `AWS_CA_BUNDLE`, then `REQUESTS_CA_BUNDLE`, then certifi.
+
+    `REQUESTS_CA_BUNDLE` was ignored, so behind a TLS-inspecting egress STS worked and every
+    Bedrock call failed its certificate check (FC-1, R3SE-12).
+    """
+    for name in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
+        if value := os.environ.get(name):
+            return value
+    return str(get_cert_path(True))
+
+
 def _tls_context() -> ssl.SSLContext:
-    """The verifying TLS context of botocore, with `AWS_CA_BUNDLE` or certifi's CA bundle."""
+    """The verifying TLS context of botocore, with the CA bundle of `ca_bundle()`."""
     context: ssl.SSLContext = create_urllib3_context()
     context.check_hostname = True
-    context.load_verify_locations(os.environ.get("AWS_CA_BUNDLE") or get_cert_path(True))
+    context.load_verify_locations(ca_bundle())
     return context

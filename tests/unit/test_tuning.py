@@ -107,7 +107,7 @@ def test_values_reach_their_clients() -> None:
         registry=RegistryOptions(history_size=5, edit_retries=7),
     )
     queue = LLMQueue.from_env(ENV, tuning=tuning)
-    engine: Any = queue.engine
+    engine: Any = queue._engine
     pool = engine.state.connection_pool
     assert pool.connection_kwargs["socket_timeout"] == 20
     assert pool.connection_kwargs["socket_connect_timeout"] == 2
