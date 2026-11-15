@@ -14,6 +14,16 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 
 ### Changed (behaviour)
 
+- **A request id runs again after a failed end** (owner decision Q2): REGISTER and REGISTER_SEND
+  answered `done` with the old failure for an id whose run ended failed, expired or cancelled.
+  Only a success is replayed now; such an id registers as new and its old result, status, cancel
+  mark and chunk stream are dropped in the same script.
+- **Queue retention defaults to 1 day** (Q27): `QueueSettings.retention_secs` and the redrive
+  default were 4 days. (The registry's `queue.retention_secs` default and the runtime's send
+  paths are changed separately.)
+- `StreamQueues.depth` counts as held every message whose visibility deadline is ahead, which
+  includes one returned with a delay still to run (FL-15).
+
 - **Bedrock calls go over aiohttp by default** (`BedrockOptions(transport=...)`: `"aiohttp"`, or
   `"botocore"` for the aiobotocore client). The body is built and the reply parsed with orjson
   and sent on one aiohttp session per client; botocore still resolves and refreshes
@@ -135,6 +145,27 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   workflow, pytest-timeout and a coverage floor of 89 %.
 
 ### Fixed
+
+- Lua audit (FL-*): UNDO now releases the call's claim, so another pod runs a given-back call at
+  once instead of answering `duplicate` for a lease (FL-1; `undo(keep_claim=True)` keeps it,
+  `Admission.release_claims` does it for calls given back without a grant). RESULT_TAKE no longer
+  deletes a library id's result in the read: a replay after a dropped reply found nothing and
+  the caller waited to its deadline; the result now expires 10 s after the read (FL-2). A
+  receive's claim keeps its dead letters, so a replayed receive still reports them (FL-4).
+  RETURN (no delay) and RECLAIM ring the queue's doorbell (FL-5). A held grant is judged alive by
+  its own lease, not only by the job record's heartbeat (a missing record let a live call run
+  twice, FL-6). Lease, in-progress, waiter, limiter, breaker, health and rotation keys get a
+  sliding expiry, and publishing without a model deletes its state keys (FL-7). Fractional costs
+  and refunds are rounded before HINCRBY, which raised after earlier writes stayed (FL-9). RENEW
+  extends the claim's TTL and writes only its own claim's heartbeat (FL-12). REREGISTER restores
+  the claim, the grant's budgets, window and account, and skips a cancelled call (FL-13). The
+  weighted rotation moves only with a grant (FL-17). A class share of 0 never fits instead of
+  having no cap (FL-18). REDRIVE stops at an optional `max_waiting` (FL-23). SWEEP waits half a
+  lease before removing a lapsed grant, so a slightly late heartbeat still renews it (FL-24).
+  REGISTER_SEND keeps the record when a takeover's send finds the queue full (FL-25).
+- `RequestStore.cancel` marks and announces a batch of calls in one script, skipping calls
+  already final: cancel wins for a shared id (Q3, R3RC-1; the runtime's read-then-write of the
+  callers set never cancelled a shared id).
 
 - Clients audit (CL-*): the aiohttp Bedrock transport followed redirects and re-sent the signed
   body and session token to the new host (it never follows now; aiobotocore still does); TLS,
@@ -337,6 +368,18 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   routes are checked for missing secrets at start (CL-6).
 
 ### Performance
+
+- Lua audit, measured on the local Valkey 8.1, Python 3.12.13, 2026-11-15, pipelines of 50 script
+  calls, 20 rounds A/B against af2fec1 (per call, median): a receive of one message behind 1000
+  returned ones 32,957 us -> 1,705 us (the oldest few due ids are picked in one pass instead of
+  sorting the window with two string matches per comparison, FL-8); a refused PICK_TAKE behind
+  400 waiters 4,050 us -> 3,413 us (one HMGET, FL-10); a granted PICK_TAKE over 6 candidates with
+  rpm, tpm and account budgets 888 us -> 784 us (each budget hash read once, FL-11); the
+  sweeper's two dead-letter trims per model 3,956 us -> 1,932 us (one call, 300 sequential runs,
+  FL-20). The receive claim is one JSON string (one SET, one GET) instead of a list (FL-16):
+  157-199 us -> 175-212 us a receive of one, no gain at batch 1 (fewer commands replicated).
+  RENEW can set the caller key and return the epoch (FL-21); the heartbeat does not use it yet.
+- PUBLISH and EDIT test the registry document with EXISTS instead of reading it into Lua (FL-19).
 
 - The CloudWatch (EMF) sink writes its lines from a background thread instead of on the event
   loop: with a stdout that takes 5 ms per line (a backed-up log pipe), a metric point held the
