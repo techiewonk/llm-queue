@@ -176,6 +176,31 @@ async def test_langchain_bedrock_chat_and_tools(llmq: LLMQueue) -> None:
     assert str(sync_reply.content).startswith("fakellm")
 
 
+async def test_langchain_queue_streaming(llmq: LLMQueue) -> None:
+    """Q49: `queue_streaming=True` streams tokens; the joined chunks equal `ainvoke`; Q1 kept."""
+    import functools
+    import operator
+
+    from llm_queue import LLMQueueError
+    from llm_queue.langchain import QueuedChatBedrockConverse, QueuedChatOpenAI
+
+    bedrock = QueuedChatBedrockConverse(model_alias="big", llmq=llmq, queue_streaming=True)  # type: ignore[call-arg]
+    openai_chat = QueuedChatOpenAI(model="local", llmq=llmq, queue_streaming=True)
+    for model in (bedrock, openai_chat):
+        chunks = [chunk async for chunk in model.astream("hello")]
+        assert len(chunks) > 2  # the provider's events, not one whole message
+        assert [n for n, c in enumerate(chunks) if c.usage_metadata] == [len(chunks) - 1]
+        whole = functools.reduce(operator.add, chunks)
+        assert whole.text.startswith("fakellm")
+        assert whole.response_metadata["finish_reason"] == "stop"
+        assert whole.response_metadata["served_model"] in ("big", "local")
+        assert whole.usage_metadata is not None
+        assert whole.usage_metadata["output_tokens"] > 0
+        with pytest.raises(LLMQueueError) as refused:  # a sync call on the queue's own loop
+            model.invoke("hello")
+        assert "would deadlock" in str(refused.value)
+
+
 async def test_langchain_bedrock_embeddings(llmq: LLMQueue) -> None:
     from llm_queue.langchain import QueuedBedrockEmbeddings
 
