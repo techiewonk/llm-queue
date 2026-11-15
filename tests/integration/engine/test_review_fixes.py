@@ -153,7 +153,10 @@ def test_role_session_name_is_valid_for_aws() -> None:
     ],
 )
 def test_settings_refuse_unsafe_values(env: dict[str, str], problem: str) -> None:
-    base = {"LLMQ_STORE_URL": "redis://cache.example.com:6379/0", "LLMQ_ID_HASH_SALT": "test-salt-0123456789"}
+    base = {
+        "LLMQ_STORE_URL": "redis://cache.example.com:6379/0",
+        "LLMQ_ID_HASH_SALT": "test-salt-0123456789",
+    }
     if env.get("LLMQ_ENVIRONMENT") == "uat":
         base.pop("LLMQ_ID_HASH_SALT")
         base["LLMQ_STORE_URL"] = "rediss://cache.example.com:6379/0"
