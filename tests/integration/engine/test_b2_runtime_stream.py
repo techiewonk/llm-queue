@@ -105,14 +105,18 @@ class FlakyOffload:
 async def test_offloaded_result_survives_a_failed_read(
     store: redis.asyncio.Redis, prefix: str
 ) -> None:
-    """S4: the result was deleted before its offload read; a blip there lost it for good."""
-    offload = FlakyOffload(fail=1)
+    """S4: the result was deleted before its offload read; a blip there lost it for good.
+
+    Since R3JE-28 a failed read is tried twice more, then answers the retryable
+    `queue_unavailable`; the result survives either way and a later read gets it.
+    """
+    offload = FlakyOffload(fail=3)  # more failures than one read's retries
     requests = RequestStore(store, Keys(prefix), offload=offload, offload_bytes=10)
     reply = Reply(request_id="big", ok=True, response={"x": "y" * 50}, meta=Meta())
     assert await requests.put_result(reply, final_state="done")
     with pytest.raises(CallFailed) as info:
         await requests.take_result("big")
-    assert info.value.kind == "result_expired"
+    assert info.value.kind == "queue_unavailable"
     again = await requests.take_result("big")
     assert again is not None
     assert again.response == {"x": "y" * 50}
