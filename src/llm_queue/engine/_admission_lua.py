@@ -278,9 +278,14 @@ end
 local reserved = {}
 local function reserve_from(list, into)
   into = into or reserved
-  for _, id in ipairs(list) do
-    if id ~= rid then
-      local raw = redis.call('HGET', info_key, id)
+  -- One HMGET for every waiter read (FL-10: an HGET each, up to 400 a call).
+  local ids = {}
+  for _, id in ipairs(list) do if id ~= rid then table.insert(ids, id) end end
+  if #ids == 0 then return end
+  local raws = redis.call('HMGET', info_key, unpack(ids))
+  for k = 1, #ids do
+    do
+      local raw = raws[k]
       if raw then
         local w = cjson.decode(raw)
         if num(w.exp, 0) >= now then
