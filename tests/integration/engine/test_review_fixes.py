@@ -398,10 +398,11 @@ async def test_store_down_pause_keeps_the_call_deadline(make: Make) -> None:
 
     engine, _ = await make({"big": {"store_down": "pause"}})
 
-    async def down() -> None:
-        raise StoreConnectionError("down")
+    async def down() -> dict[str, str]:
+        # The pause asks the write probe whether the store is back (FE-7), not PING.
+        return {"state": "down", "queue": "down"}
 
-    engine.state.ping = down
+    engine._probe_stores = down  # the store stays down for the probe
     env = Envelope(
         request_id="p", op="converse", model="big", params=CHAT, caller="c", timeout_secs=30
     )
