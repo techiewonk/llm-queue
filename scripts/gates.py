@@ -840,7 +840,7 @@ async def b34() -> bool:
         ceilings: list[float] = []
         for _ in range(3):
             ceiling = 0.0
-            for rate in (50, 100, 200, 400, 800):
+            for rate in (50, 100, 150, 200, 250, 300, 350, 400, 500, 600, 800):
                 ramp = Run()
                 await paced(rate, 8, functools.partial(_ramp_call, ramp, queues))
                 ok = [r for r in ramp.results if r.ok]
