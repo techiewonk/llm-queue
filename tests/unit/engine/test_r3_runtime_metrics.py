@@ -290,3 +290,22 @@ def test_every_emitted_metric_is_in_the_table() -> None:
     assert "llmq_calls_total" in names
     assert sorted(n for n in names if spec_of(n) is None) == []
     assert "llmq_provider_latency_ms" not in METRICS  # renamed to _seconds
+
+
+async def test_http_live_names_the_reason_and_metrics_are_served() -> None:
+    """R3OB-20 / R3OB-14: /health/live said only false; no /metrics route existed."""
+    from llm_queue.engine.http import Handlers
+
+    registry = CollectorRegistry()
+    sink = PrometheusSink(registry)
+    engine = _engine(sink)
+
+    async def boom() -> None:
+        raise RuntimeError("bug")
+
+    engine._loop(boom(), "alerts")
+    await asyncio.sleep(0.01)
+    handlers = Handlers(engine)
+    assert await handlers.live() == (503, {"live": False, "reason": "loop died: alerts"})
+    body, _ = handlers.metrics()
+    assert b'llmq_loop_died_total{loop="alerts"} 1.0' in body

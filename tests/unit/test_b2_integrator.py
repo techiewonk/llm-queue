@@ -102,9 +102,10 @@ async def test_liveness_route_reports_dead_loops() -> None:
     Liveness reads the engine's `_live()` only, never the store-probing health check (FO-9).
     """
     for live, code in ((True, 200), (False, 503)):
-        engine = SimpleNamespace(_live=lambda live=live: live)
+        engine = SimpleNamespace(_live=lambda live=live: live, _not_live_reason=lambda: "why")
         status, body = await Handlers(engine).live()  # type: ignore[arg-type]
-        assert (status, body) == (code, {"live": live})
+        expected = {"live": True} if live else {"live": False, "reason": "why"}  # (R3OB-20)
+        assert (status, body) == (code, expected)
 
 
 def test_register_job_takes_a_timeout() -> None:

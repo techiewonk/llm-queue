@@ -34,6 +34,7 @@ from typing import Any, NotRequired, TypedDict, TypeVar, cast, overload
 import orjson
 
 from llm_queue._logging import get_logger
+from llm_queue._version import __version__
 from llm_queue.clients import ClientPool, Providers
 from llm_queue.context import current_context
 from llm_queue.engine.envelope import Meta, Reply
@@ -289,7 +290,13 @@ class LLMQueue:
         tuning = tuning or Tuning()
         if problems := tuning.problems(queue_wait_ms=settings.queue_wait_ms):
             raise ConfigError("invalid tuning:\n  " + "\n  ".join(problems))
-        sink = metrics or sink_for(settings.metrics_sink)  # one sink for both engines (O5)
+        # One sink for both engines (O5). EMF: the environment is a dimension, so two
+        # environments in one account are not summed; pod and version are plain fields (R3OB-12).
+        sink = metrics or sink_for(
+            settings.metrics_sink,
+            static={"environment": settings.environment},
+            properties={"pod": worker_id or socket.gethostname(), "version": __version__},
+        )
 
         def build(cap: int = settings.store_max_connections) -> Engine:
             state = secret_store_client(
