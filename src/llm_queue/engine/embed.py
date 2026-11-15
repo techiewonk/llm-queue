@@ -1,7 +1,7 @@
 """Embeddings over the queue (plan step A13): batching, provider bodies, vectors in order.
 
-`embed()` splits texts into batches of the model's `embed_batch_size` (capped by what the
-provider accepts: Titan 1, Cohere 96, OpenAI 2048), sends each batch as one call (one request
+`embed()` splits texts into batches of the model's `embed_batch_size` (capped by its family's
+`EmbeddingCodec`: Titan 1, Cohere 96, OpenAI 2048), sends each batch as one call (one request
 against RPM; tokens only when token limiting is on for the model), runs them concurrently and
 returns one vector per text in the input order. Inference defaults (dimensions, input_type,
 ...) are added by the worker from the registry. A batch the provider refuses is split and sent
@@ -11,24 +11,14 @@ again until only the bad text fails; texts over the model's length limit fail be
 from __future__ import annotations
 
 import asyncio
-import base64
-import sys
-from array import array
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from llm_queue.clients.providers import decode_invoke_body
 from llm_queue.engine.errors import CallFailed
-from llm_queue.providers.embeddings import (
-    COHERE_INPUT_TYPES,
-    MAX_CHARS,
-    batches,
-    family_of,
-    is_cohere,
-    max_batch_size,
-    parse_embeddings,
-)
+from llm_queue.errors import ConfigError
+from llm_queue.providers.embeddings import EmbeddingCodec, batches, codec_for, request_body
 
 if TYPE_CHECKING:
     from llm_queue.engine.runtime import Engine
@@ -39,67 +29,26 @@ if TYPE_CHECKING:
 SPLIT_KINDS = frozenset({"invalid_request", "context_length_exceeded", "request_too_large"})
 
 
-def batch_size(provider: str, model_id: str, setting: int, family: str | None = None) -> int:
-    """Texts per call: the model's `embed_batch_size`, never above the provider's limit."""
-    return max(1, min(int(setting), max_batch_size(provider, model_id, family=family)))
+def batch_size(codec: EmbeddingCodec, setting: int) -> int:
+    """Texts per call: the model's `embed_batch_size`, never above its family's limit."""
+    return max(1, min(int(setting), codec.max_batch))
 
 
 def request_for(
-    provider: str,
-    model_id: str,
-    texts: Sequence[str],
-    input_type: str | None = None,
-    family: str | None = None,
+    provider: str, codec: EmbeddingCodec, texts: Sequence[str], input_type: str | None = None
 ) -> dict[str, Any]:
     """The provider-native request of one batch (defaults are merged by the worker).
 
     `input_type` (Cohere: `search_query` / `search_document`) wins over the registry default.
     """
-    if provider == "openai":
-        # base64 float32 on the way back: the reply is about 3x smaller in the store and far
-        # cheaper to write and read than a JSON list of floats (R3PF-10). The SDK asks for
-        # base64 anyway and decodes it itself; asked explicitly, it hands the string through.
-        return {"input": list(texts), "encoding_format": "base64"}
-    if is_cohere(model_id, family):
-        body: dict[str, Any] = {"texts": list(texts)}
-        if input_type:
-            body["input_type"] = input_type
-        return {"body": body}
-    return {"body": {"inputText": texts[0]}}
+    options: Mapping[str, Any] = {"input_type": input_type} if input_type else {}
+    return request_body(provider, codec, texts, options)
 
 
-def _vector(value: Any) -> list[float]:
-    """One vector as floats: a JSON list of numbers, or base64 of little-endian float32.
-
-    Anything else raises: a base64 string read as a list gave a "vector" of single
-    characters (R3JE-22), and `array` refuses a list holding anything but numbers.
-    """
-    if isinstance(value, str):
-        raw = base64.b64decode(value, validate=True)
-        if not raw or len(raw) % 4:
-            raise ValueError("a base64 embedding is not float32")
-        floats = array("f")
-        floats.frombytes(raw)
-        if sys.byteorder == "big":
-            floats.byteswap()
-        return floats.tolist()
-    if not isinstance(value, list) or not value:
-        raise TypeError("an embedding is not a list of numbers")
-    return array("d", value).tolist()
-
-
-def vectors_of(provider: str, response: dict[str, Any]) -> list[list[float]]:
-    """The vectors of one reply, in the order of its texts.
-
-    OpenAI's `index` fields must be exactly 0..n-1: a missing or repeated index put a vector
-    on the wrong text without an error.
-    """
-    if provider == "openai":
-        data = sorted(response.get("data", []), key=lambda item: item.get("index", 0))
-        if [item.get("index", 0) for item in data] != list(range(len(data))):
-            raise ValueError("embedding indices are not 0..n-1")
-        return [_vector(item["embedding"]) for item in data]
-    return [_vector(v) for v in parse_embeddings(decode_invoke_body(response))]
+def vectors_of(provider: str, codec: EmbeddingCodec, response: dict[str, Any]) -> list[list[float]]:
+    """The vectors of one reply in the order of its texts (an InvokeModel body decoded first)."""
+    body = response if provider == "openai" else decode_invoke_body(response)
+    return codec.parse_reply(body)
 
 
 def check_texts(texts: object, request_id: str | None = None) -> None:
@@ -196,12 +145,12 @@ async def embed_partial(
     return outcome.vectors, outcome.errors
 
 
-def _max_chars(view: Any, alias: str, family: str) -> int:
+def _max_chars(view: Any, alias: str, codec: EmbeddingCodec) -> int:
     """The model's `embed_max_chars`, else its family's limit; 0 when there is none."""
     setting = view.value(alias, "embed_max_chars")
     if setting is not None:
         return int(setting)
-    return MAX_CHARS.get(family, 0)
+    return codec.max_chars or 0
 
 
 async def embed_detailed(
@@ -220,11 +169,12 @@ async def embed_detailed(
     """Vectors in order, the error of each text that failed (its vector is `[]`), and usage.
 
     Before any call (`invalid_request`, naming the text's index): empty, non-string or too
-    long texts and an unknown Cohere `input_type`. At most `concurrency` batches exist at once.
-    With `request_id`, batch n is `<request_id>:<n>` (one id for all was refused as a
-    duplicate: A1), its halves `<n>.0` / `<n>.1`. A batch refused for its content is split
-    until the bad text alone fails, with its index in the message. `partial=False` raises the
-    first failure instead. Vectors of different lengths fail the call (`provider_error`).
+    long texts, an `input_type` the family does not take, and a model with no family. At most
+    `concurrency` batches exist at once. With `request_id`, batch n is `<request_id>:<n>` (one
+    id for all was refused as a duplicate: A1), its halves `<n>.0` / `<n>.1`. A batch refused
+    for its content is split until the bad text alone fails, with its index in the message.
+    `partial=False` raises the first failure instead. Vectors of different lengths fail the
+    call (`provider_error`).
     """
     check_texts(texts, request_id)
     if not texts:
@@ -232,13 +182,16 @@ async def embed_detailed(
     view = engine.registry.current
     alias = view.registry.alias_of(model)
     entry = view.registry.models[alias]
-    family = getattr(entry, "family", None)
-    kind = family_of(entry.provider, entry.model_id, family)
-    if input_type is not None and kind == "cohere" and input_type not in COHERE_INPUT_TYPES:
+    try:
+        codec = codec_for(entry.provider, entry.model_id, getattr(entry, "family", None))
+    except ConfigError as exc:  # the registry refuses this at load; a family not registered here
+        raise CallFailed("invalid_request", f"{alias}: {exc}", request_id=request_id) from exc
+    allowed = codec.input_types
+    if input_type is not None and allowed is not None and input_type not in allowed:
         # A typo cost one provider request per batch, each refused (R3JE-24).
-        message = f"input_type {input_type!r}: use one of {sorted(COHERE_INPUT_TYPES)}"
+        message = f"input_type {input_type!r}: use one of {sorted(allowed)}"
         raise CallFailed("invalid_request", message, request_id=request_id)
-    if limit := _max_chars(view, alias, kind):
+    if limit := _max_chars(view, alias, codec):
         for index, text in enumerate(texts):
             if len(text) > limit:
                 # Refused before the call: the provider refused the whole batch, and each
@@ -246,13 +199,13 @@ async def embed_detailed(
                 message = f"text {index} has {len(text)} characters, above {limit} for {alias}"
                 raise CallFailed("invalid_request", message, request_id=request_id)
     setting = int(view.value(alias, "embed_batch_size"))
-    size = batch_size(entry.provider, entry.model_id, setting, family)
+    size = batch_size(codec, setting)
     groups = list(batches(list(texts), size))
 
     async def send(label: str, group: list[str]) -> tuple[list[list[float]], Any]:
         reply = await engine.call(
             alias,
-            request_for(entry.provider, entry.model_id, group, input_type, family),
+            request_for(entry.provider, codec, group, input_type),
             priority=priority,
             timeout_secs=timeout_secs,
             request_id=f"{request_id}:{label}" if request_id else None,
@@ -263,7 +216,7 @@ async def embed_detailed(
                 "provider_error", f"{alias}: no embedding body", request_id=reply.request_id
             )
         try:
-            vectors = vectors_of(entry.provider, reply.response)
+            vectors = vectors_of(entry.provider, codec, reply.response)
         except (KeyError, ValueError, TypeError, IndexError, AttributeError) as exc:
             # A raw parse error is not a `CallFailed`: with `partial` it aborted every batch,
             # and the app got an exception outside `LLMQueueError` (EN-6).
