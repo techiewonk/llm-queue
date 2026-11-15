@@ -45,7 +45,9 @@ async def prefix(store: redis.asyncio.Redis) -> AsyncIterator[str]:
     """Unique key prefix; every key under it is deleted at teardown."""
     value = f"llmqtest:eng:{uuid7().hex[-12:]}"
     yield value
-    keys = [k async for k in store.scan_iter(match=f"{value}:*", count=500)]
+    # Every key that starts with the prefix: some rigs build sibling prefixes such as
+    # f"{prefix}s" or f"{prefix}w", which f"{value}:*" missed (FT-5: 612 keys leaked per store).
+    keys = [k async for k in store.scan_iter(match=f"{value}*", count=500)]
     if keys:
         await store.delete(*keys)
 

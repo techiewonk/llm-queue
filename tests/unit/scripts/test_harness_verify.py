@@ -251,7 +251,7 @@ async def test_worker_kill_waits_off_the_loop() -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await task
     assert worker.proc.killed
-    assert max(gaps) < 0.25
+    assert max(gaps) < 1.0  # FT-21: a blocking wait would stall about 10 s
 
 
 async def test_caller_dies_kills_and_reaps_a_caller_that_never_got_ready(

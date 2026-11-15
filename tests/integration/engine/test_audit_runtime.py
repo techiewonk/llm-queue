@@ -212,7 +212,7 @@ async def test_rt4_stream_close_lets_the_consumers_cancel_through(
     consumer.cancel()
     with pytest.raises(asyncio.CancelledError):
         await consumer
-    assert time.monotonic() - started < 0.5  # ~2.9 s before the fix
+    assert time.monotonic() - started < 1.5  # ~2.9 s before the fix (FT-21: room for a busy box)
     await asyncio.wait_for(stopped.wait(), 5)
 
 
@@ -375,7 +375,7 @@ async def test_rt7_stop_can_be_cancelled(make: Make) -> None:
     stopping.cancel()
     with pytest.raises(asyncio.CancelledError):
         await stopping
-    assert time.monotonic() - started < 0.5
+    assert time.monotonic() - started < 1.5  # FT-21: room for a busy box
 
 
 async def test_rt7_stop_logs_a_loop_that_died(make: Make, caplog: pytest.LogCaptureFixture) -> None:

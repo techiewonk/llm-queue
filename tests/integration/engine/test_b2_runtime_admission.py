@@ -146,7 +146,7 @@ async def test_throttle_keeps_a_deployment_out_for_every_pod(
     alone = await r.ask("b", candidates=R1, worker="w2")
     assert alone.kind == "wait"
     assert alone.reason == "throttled"
-    assert 4.0 <= alone.wait_secs <= 5.1
+    assert 3.0 <= alone.wait_secs <= 5.1  # FT-21: time passes between throttle and ask
     other = await r.ask("c", candidates=CONFIRMED, worker="w3")
     assert (other.kind, other.deployment) == ("granted", "aws-a/r2")
     cb = _m(prefix, "cb:aws-a/r2")
