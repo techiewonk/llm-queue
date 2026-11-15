@@ -1,8 +1,9 @@
 """Queued OpenAI-compatible adapters: `ChatOpenAI` / `OpenAIEmbeddings` over `QueuedHTTPTransport`.
 
 Both SDK clients get an httpx client whose transport answers from the LLM queue (D88), so every
-LangChain/SDK code path is queued and parsed unchanged. Streaming and SDK retries are forced off:
-the queue's workers own retry and fallback. Chat replies get how the queue served
+LangChain/SDK code path is queued and parsed unchanged. SDK streaming and retries are forced off:
+the queue's workers own retry and fallback (`queue_streaming=True` streams through
+`LLMQueue.chat_stream` instead of the SDK). Chat replies get how the queue served
 them (served model, deployment, attempts, queue wait) in `response_metadata`.
 """
 
