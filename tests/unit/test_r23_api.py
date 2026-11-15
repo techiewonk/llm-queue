@@ -39,7 +39,8 @@ def test_r3ap3_deployment_status_declares_every_key() -> None:
     view = load_registry(json.loads(FIXTURE.read_text(encoding="utf-8")))
     reader = StatusReader(MagicMock(), MagicMock(), MagicMock(), "")
     dep = view.deployments("gpt20b")[0]
-    row = reader._deployment(view, "gpt20b", dep, [[], b"", 0, b"closed", 0], {}, 0)
+    # flat rate, raw limit, in use, breaker, throttles this and last minute (R3OB-6)
+    row = reader._deployment(view, "gpt20b", dep, [[], b"", 0, b"closed", 0, 0], {}, 0)
     assert set(row) == set(get_type_hints(DeploymentStatus))
     assert set(row["concurrency"]) == set(get_type_hints(ConcurrencyStatus))
     for name in ("DeploymentStatus", "RateStatus", "ConcurrencyStatus", "Kind"):
