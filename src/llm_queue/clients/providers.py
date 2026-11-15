@@ -13,7 +13,7 @@ import base64
 import contextlib
 import inspect
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -114,70 +114,121 @@ async def _reset_retry(
 # ------------------------------------------------------------------------------- Bedrock
 
 
-def _converse_body(events: list[Mapping[str, Any]]) -> dict[str, Any]:
+class _ConverseAssembler:
+    """Folds ConverseStream events, one at a time, into the body `converse` returns.
+
+    Every event used to be kept in a list until the stream ended (2.7 MB for a 4,000-delta
+    answer of 60 KB, R3PF-4), and text was joined with `+` per delta, quadratic in the answer
+    (R3PF-1). Text, reasoning, redacted bytes and tool input are now parts joined once.
+    """
+
+    __slots__ = ("blocks", "body", "citations", "parts", "redacted", "role", "stopped", "tools")
+
+    def __init__(self) -> None:
+        self.role = "assistant"
+        self.blocks: dict[int, dict[str, Any]] = {}
+        self.parts: dict[tuple[int, str], list[str]] = {}  # (index, "text" | "reasoning")
+        self.redacted: dict[int, list[bytes]] = {}
+        self.tools: dict[int, list[str]] = {}
+        self.citations: dict[int, list[Any]] = {}
+        self.body: dict[str, Any] = {}
+        self.stopped = False
+
+    def add(self, event: Mapping[str, Any]) -> None:
+        """Fold one event in."""
+        if "contentBlockDelta" in event:
+            index = event["contentBlockDelta"].get("contentBlockIndex", 0)
+            delta = event["contentBlockDelta"].get("delta") or {}
+            if "text" in delta:
+                self.blocks.setdefault(index, {"text": ""})
+                self.parts.setdefault((index, "text"), []).append(delta["text"])
+            elif "toolUse" in delta:
+                self.blocks.setdefault(index, {"toolUse": {}})
+                piece = (delta["toolUse"] or {}).get("input") or ""
+                self.tools.setdefault(index, []).append(piece)
+            elif "reasoningContent" in delta:
+                block = self.blocks.setdefault(index, {"reasoningContent": {}})
+                reasoning = block.setdefault("reasoningContent", {})
+                part = delta["reasoningContent"] or {}
+                if "redactedContent" in part:
+                    self.redacted.setdefault(index, []).append(part["redactedContent"])
+                if "text" in part or "signature" in part:
+                    text = reasoning.setdefault("reasoningText", {})
+                    if "text" in part:
+                        text.setdefault("text", "")
+                        self.parts.setdefault((index, "reasoning"), []).append(part["text"])
+                    if "signature" in part:
+                        text["signature"] = part["signature"]
+            elif "citation" in delta:
+                self.citations.setdefault(index, []).append(delta["citation"])
+        elif "messageStart" in event:
+            self.role = event["messageStart"].get("role", self.role)
+        elif "contentBlockStart" in event:
+            index = event["contentBlockStart"].get("contentBlockIndex", 0)
+            start = event["contentBlockStart"].get("start") or {}
+            if "toolUse" in start:
+                self.blocks[index] = {"toolUse": dict(start["toolUse"])}
+                self.tools[index] = []
+        elif "messageStop" in event:
+            self.stopped = True
+            self.body["stopReason"] = event["messageStop"].get("stopReason")
+            extra = event["messageStop"].get("additionalModelResponseFields")
+            if extra is not None:
+                self.body["additionalModelResponseFields"] = extra
+        elif "metadata" in event:
+            for key in ("usage", "metrics", "trace"):
+                if key in event["metadata"]:
+                    self.body[key] = event["metadata"][key]
+
+    def result(self) -> dict[str, Any]:
+        """The assembled body; `StreamTruncated` when the stream ended before `messageStop`."""
+        if not self.stopped:
+            raise StreamTruncated("the Bedrock stream ended before messageStop")
+        blocks = self.blocks
+        for (index, kind), parts in self.parts.items():
+            if kind == "text":
+                blocks[index]["text"] = "".join(parts)
+            else:
+                blocks[index]["reasoningContent"]["reasoningText"]["text"] = "".join(parts)
+        for index, chunks in self.redacted.items():
+            blocks[index]["reasoningContent"]["redactedContent"] = b"".join(chunks)
+        for index, pieces in self.tools.items():
+            # A text block at a tool's index (a broken server) takes the tool too: the
+            # KeyError here failed a call whose whole stream had reached the caller (R3ST-4).
+            blocks[index].setdefault("toolUse", {})["input"] = _tool_input("".join(pieces))
+        for index, cited in self.citations.items():  # the non-streamed shape of a cited answer
+            text = blocks.get(index, {}).get("text", "")
+            blocks[index] = {"citationsContent": {"content": [{"text": text}], "citations": cited}}
+        content = [blocks[i] for i in sorted(blocks)]
+        return {"output": {"message": {"role": self.role, "content": content}}, **self.body}
+
+
+def _tool_input(text: str) -> Any:
+    """A streamed tool input as JSON; the raw text when it is not JSON.
+
+    A tool call cut by `stopReason: max_tokens` ends with partial JSON. `orjson.loads` raised,
+    classified FATAL, after the whole stream had reached the caller: the caller got
+    `provider_error`, the usage was not charged and the breaker was (R3ST-4). Converse takes
+    any JSON document as `input`, so the text is kept as a string.
+    """
+    if not text:
+        return {}
+    try:
+        return orjson.loads(text)
+    except orjson.JSONDecodeError:
+        return text
+
+
+def _converse_body(events: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     """Assemble ConverseStream events into the body `converse` returns.
 
     Keeps reasoning (text, signature, redacted bytes) and citations; raises `StreamTruncated`
     when the stream ended without `messageStop`.
     """
-    role = "assistant"
-    blocks: dict[int, dict[str, Any]] = {}
-    tool_input: dict[int, str] = {}
-    citations: dict[int, list[Any]] = {}
-    body: dict[str, Any] = {}
-    stopped = False
+    assembler = _ConverseAssembler()
     for event in events:
-        if "messageStart" in event:
-            role = event["messageStart"].get("role", role)
-        elif "contentBlockStart" in event:
-            index = event["contentBlockStart"].get("contentBlockIndex", 0)
-            start = event["contentBlockStart"].get("start", {})
-            if "toolUse" in start:
-                blocks[index] = {"toolUse": dict(start["toolUse"])}
-                tool_input[index] = ""
-        elif "contentBlockDelta" in event:
-            index = event["contentBlockDelta"].get("contentBlockIndex", 0)
-            delta = event["contentBlockDelta"].get("delta", {})
-            if "text" in delta:
-                block = blocks.setdefault(index, {"text": ""})
-                block["text"] = block.get("text", "") + delta["text"]
-            elif "toolUse" in delta:
-                tool_input[index] = tool_input.get(index, "") + delta["toolUse"].get("input", "")
-                blocks.setdefault(index, {"toolUse": {}})
-            elif "reasoningContent" in delta:
-                content = blocks.setdefault(index, {"reasoningContent": {}})["reasoningContent"]
-                part = delta["reasoningContent"]
-                if "redactedContent" in part:
-                    content["redactedContent"] = (
-                        content.get("redactedContent", b"") + part["redactedContent"]
-                    )
-                if "text" in part or "signature" in part:
-                    reasoning = content.setdefault("reasoningText", {})
-                    if "text" in part:
-                        reasoning["text"] = reasoning.get("text", "") + part["text"]
-                    if "signature" in part:
-                        reasoning["signature"] = part["signature"]
-            elif "citation" in delta:
-                citations.setdefault(index, []).append(delta["citation"])
-        elif "messageStop" in event:
-            stopped = True
-            body["stopReason"] = event["messageStop"].get("stopReason")
-            extra = event["messageStop"].get("additionalModelResponseFields")
-            if extra is not None:
-                body["additionalModelResponseFields"] = extra
-        elif "metadata" in event:
-            for key in ("usage", "metrics", "trace"):
-                if key in event["metadata"]:
-                    body[key] = event["metadata"][key]
-    if not stopped:
-        raise StreamTruncated("the Bedrock stream ended before messageStop")
-    for index, text in tool_input.items():
-        blocks[index]["toolUse"]["input"] = orjson.loads(text) if text else {}
-    for index, cited in citations.items():  # the non-streamed Converse shape of a cited answer
-        text = blocks.get(index, {}).get("text", "")
-        blocks[index] = {"citationsContent": {"content": [{"text": text}], "citations": cited}}
-    content = [blocks[i] for i in sorted(blocks)]
-    return {"output": {"message": {"role": role, "content": content}}, **body}
+        assembler.add(event)
+    return assembler.result()
 
 
 def _bedrock_usage(usage: Mapping[str, Any] | None) -> Usage:
@@ -260,15 +311,15 @@ class BedrockProvider:
     async def _converse_stream(
         self, params: Mapping[str, Any], route: Route, timing: Timing, sink: Sink | None
     ) -> Result:
-        events = []
+        assembler = _ConverseAssembler()  # folded as they come, no list of events (R3PF-4)
         # aclosing: a sink that raised (or a cancel during it) left the generator suspended and
         # its connection held until the asyncgen finalizer ran (CL-10).
         async with contextlib.aclosing(self.stream(params, route, timing)) as stream:
             async for event in stream:
-                events.append(event)
+                assembler.add(event)
                 if sink is not None:
                     await sink(event)
-        body = _converse_body(events)
+        body = assembler.result()
         return Result(body, _bedrock_usage(body.get("usage")))
 
     async def _invoke(self, params: Mapping[str, Any], route: Route, timing: Timing) -> Result:
@@ -335,7 +386,13 @@ def _choice_body(slot: dict[str, Any]) -> dict[str, Any]:
     if slot["refusal"]:
         message["refusal"] = "".join(slot["refusal"])
     if slot["calls"]:
-        message["tool_calls"] = [slot["calls"][i] for i in sorted(slot["calls"])]
+        calls = []
+        for key in sorted(slot["calls"]):
+            call = slot["calls"][key]
+            name, arguments = call.pop("parts")
+            call["function"] = {"name": "".join(name), "arguments": "".join(arguments)}
+            calls.append(call)
+        message["tool_calls"] = calls
     return {
         "index": slot["index"],
         "message": message,
@@ -344,69 +401,115 @@ def _choice_body(slot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _chat_body(chunks: list[Any]) -> dict[str, Any]:
-    """Assemble chat.completion.chunk objects into one chat.completion body.
+# Tool calls a server sent without `index` sort after the indexed ones, in arrival order.
+_NO_INDEX = 1 << 30
 
-    Every choice (`n` > 1) separately, with reasoning, refusal and logprobs; raises
-    `StreamTruncated` when a choice never got its `finish_reason` (the stream was cut).
+
+class _ChatAssembler:
+    """Folds chat.completion.chunk objects, one at a time, into one chat.completion body.
+
+    Every choice (`n` > 1) separately, with reasoning, refusal and logprobs. Every chunk used
+    to be kept until the stream ended (2.4 KB each, 9.6 MB for a 4,000-chunk answer, R3PF-4);
+    each one is now folded in as it arrives and only the text parts are kept.
     """
-    slots: dict[int, dict[str, Any]] = {}
-    usage = None
-    ident, model, created = "", "", int(time.time())
-    for chunk in chunks:
-        ident, model, created = chunk.id or ident, chunk.model or model, chunk.created or created
+
+    __slots__ = ("created", "ident", "model", "slots", "usage")
+
+    def __init__(self) -> None:
+        self.slots: dict[int, dict[str, Any]] = {}
+        self.usage: dict[str, Any] | None = None
+        self.ident, self.model, self.created = "", "", int(time.time())
+
+    def add(self, chunk: Any) -> None:
+        """Fold one chunk in."""
+        self.ident = chunk.id or self.ident
+        self.model = chunk.model or self.model
+        self.created = chunk.created or self.created
         if chunk.usage is not None:
-            usage = chunk.usage.model_dump(mode="json", exclude_none=True)
+            self.usage = chunk.usage.model_dump(mode="json", exclude_none=True)
         for choice in chunk.choices or []:
-            slot = slots.get(choice.index)
+            slot = self.slots.get(choice.index)
             if slot is None:
-                slot = slots[choice.index] = {
+                slot = self.slots[choice.index] = {
                     "index": choice.index,
                     "text": [],
                     "reasoning": [],
                     "refusal": [],
                     "calls": {},
+                    "last_call": None,
                     "logprobs": None,
                     "finish": None,
                 }
-            delta = choice.delta
-            if delta.content:
-                slot["text"].append(delta.content)
-            extra = getattr(delta, "model_extra", None) or {}
-            reasoning = extra.get("reasoning_content") or extra.get("reasoning")
-            if reasoning:  # vLLM / DeepSeek-style servers: not an SDK field
-                slot["reasoning"].append(reasoning)
-            if getattr(delta, "refusal", None):
-                slot["refusal"].append(delta.refusal)
-            for call in delta.tool_calls or []:
-                tool = slot["calls"].setdefault(
-                    call.index,
-                    {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
-                )
-                if call.id:
-                    tool["id"] = call.id
-                if call.function is not None:
-                    tool["function"]["name"] += call.function.name or ""
-                    tool["function"]["arguments"] += call.function.arguments or ""
+            # Azure's asynchronous content-filter chunks have no `delta` (or `delta: null`):
+            # reading `.content` raised AttributeError, FATAL, after the whole stream (R3ST-5).
+            delta = getattr(choice, "delta", None)
+            if delta is not None:
+                self._delta(slot, delta)
             if getattr(choice, "logprobs", None) is not None:
                 part = choice.logprobs.model_dump(mode="json", exclude_none=True)
                 merged = slot["logprobs"] = slot["logprobs"] or {}
                 for key, items in part.items():
                     merged.setdefault(key, []).extend(items or [])
-            if choice.finish_reason:
+            if getattr(choice, "finish_reason", None):
                 slot["finish"] = choice.finish_reason
-    if not slots or any(slot["finish"] is None for slot in slots.values()):
-        raise StreamTruncated("the chat stream ended before finish_reason")
-    body: dict[str, Any] = {
-        "id": ident,
-        "object": "chat.completion",
-        "created": created,
-        "model": model,
-        "choices": [_choice_body(slots[i]) for i in sorted(slots)],
-    }
-    if usage is not None:
-        body["usage"] = usage
-    return body
+
+    @staticmethod
+    def _delta(slot: dict[str, Any], delta: Any) -> None:
+        content = getattr(delta, "content", None)
+        if content:
+            slot["text"].append(content)
+        extra = getattr(delta, "model_extra", None) or {}
+        reasoning = extra.get("reasoning_content") or extra.get("reasoning")
+        if reasoning:  # vLLM / DeepSeek-style servers: not an SDK field
+            slot["reasoning"].append(reasoning)
+        if getattr(delta, "refusal", None):
+            slot["refusal"].append(delta.refusal)
+        calls = slot["calls"]
+        for call in getattr(delta, "tool_calls", None) or []:
+            key = call.index
+            if key is None:
+                # Some gateways send tool calls without `index`: every call merged into one
+                # (name `f1f2`, arguments `{}{}`, R3ST-11). A new id starts a new call.
+                key = slot["last_call"]
+                if key is None or (call.id and calls[key]["id"] and call.id != calls[key]["id"]):
+                    key = _NO_INDEX + len(calls)
+            slot["last_call"] = key
+            tool = calls.get(key)
+            if tool is None:
+                tool = calls[key] = {"id": "", "type": "function", "parts": ([], [])}
+            if call.id:
+                tool["id"] = call.id
+            if call.function is not None:
+                tool["parts"][0].append(call.function.name or "")
+                tool["parts"][1].append(call.function.arguments or "")
+
+    def result(self) -> dict[str, Any]:
+        """The chat.completion body; `StreamTruncated` when a choice never got `finish_reason`."""
+        slots = self.slots
+        if not slots or any(slot["finish"] is None for slot in slots.values()):
+            raise StreamTruncated("the chat stream ended before finish_reason")
+        body: dict[str, Any] = {
+            "id": self.ident,
+            "object": "chat.completion",
+            "created": self.created,
+            "model": self.model,
+            "choices": [_choice_body(slots[i]) for i in sorted(slots)],
+        }
+        if self.usage is not None:
+            body["usage"] = self.usage
+        return body
+
+
+def _chat_body(chunks: Iterable[Any]) -> dict[str, Any]:
+    """Assemble chat.completion.chunk objects into one chat.completion body.
+
+    Every choice (`n` > 1) separately, with reasoning, refusal and logprobs; raises
+    `StreamTruncated` when a choice never got its `finish_reason` (the stream was cut).
+    """
+    assembler = _ChatAssembler()
+    for chunk in chunks:
+        assembler.add(chunk)
+    return assembler.result()
 
 
 def _openai_usage(usage: Mapping[str, Any] | None) -> Usage:
@@ -476,13 +579,13 @@ class OpenAIProvider:
     async def _chat(
         self, params: Mapping[str, Any], route: Route, timing: Timing, sink: Sink | None
     ) -> Result:
-        chunks = []
+        assembler = _ChatAssembler()  # folded as they come, no list of chunks (R3PF-4)
         async with contextlib.aclosing(self.stream(params, route, timing)) as stream:  # CL-10
             async for chunk in stream:
-                chunks.append(chunk)
+                assembler.add(chunk)
                 if sink is not None:
                     await sink(chunk)
-        body = _chat_body(chunks)
+        body = assembler.result()
         return Result(body, _openai_usage(body.get("usage")))
 
     async def _embeddings(self, params: Mapping[str, Any], route: Route, timing: Timing) -> Result:

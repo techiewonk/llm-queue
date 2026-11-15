@@ -217,11 +217,16 @@ def _event(message: EventStreamMessage) -> dict[str, Any] | None:
         if event_type not in _EVENTS:
             return None
         payload = _loads(message.payload, "stream event")
+        if not isinstance(payload, dict):
+            # A proxy's `"text"` or `[...]` frame raised AttributeError below: FATAL (R3ST-14).
+            raise StreamTruncated("a Bedrock stream event is not a JSON object")
         if event_type == "contentBlockDelta":
             _decode_blobs((payload.get("delta"),))
         return {event_type: payload}
     if kind == "exception":
         body = _loads(message.payload, "stream exception")
+        if not isinstance(body, dict):  # R3ST-14, as for an event
+            raise StreamTruncated("a Bedrock stream exception is not a JSON object")
         error = {
             "Code": headers.get(":exception-type", ""),
             "Message": body.get("Message", body.get("message", "")),
