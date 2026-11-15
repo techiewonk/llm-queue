@@ -2,6 +2,10 @@
 
 - **Public API** = the names in `llm_queue.__all__`, the registry document's setting
   names and the `llm-queue` commands. Anything else may change without notice.
+- **`llm_queue.run`** is part of that API under this generic name: it runs a coroutine like
+  `asyncio.run`, on uvloop when the `uvloop` extra is installed (`use_uvloop=` forces it on or
+  off). It is kept as `run`, not renamed (FO-23); import it as `llm_queue.run` or
+  `from llm_queue import run as run_main` if the bare name clashes in your module.
 - **0.x releases:** a minor release may break the public API; every break is in CHANGELOG.md.
 - **Message format:** queue messages carry a format version `v`. A worker returns a message newer
   than it understands to the queue instead of dropping it. Workers of two releases share a queue
