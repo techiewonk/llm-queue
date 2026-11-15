@@ -13,8 +13,9 @@ import pytest
 
 from llm_queue.engine.jobs import JobRunner
 from llm_queue.engine.queue import NotReplicated
-from llm_queue.engine.runtime import StoreClock, _api_kwargs
+from llm_queue.engine.runtime import StoreClock, _api_kwargs, _by_deployment, _call_timeout_secs
 from llm_queue.engine.store_guard import ReplicaWait, parse_scopes
+from llm_queue.registry import load_registry
 
 
 class _Clock:
@@ -130,3 +131,32 @@ async def test_r3fm5_a_job_send_waits_for_replicas_and_sends_anyway() -> None:
     ident = await runner.send("j", {})
     assert ident
     assert queues.waits == [2]
+
+
+def test_q39_account_level_timeout_and_output_tokens_are_honoured() -> None:
+    """Owner Q39: `timeout_secs` / `default_output_tokens` on an account were never read.
+
+    Both were looked up for the model alone; the most specific level now wins (the largest
+    over the model's deployments, as the deployment is not known yet).
+    """
+    doc: dict[str, Any] = {
+        "registry_version": 1,
+        "defaults": {"timeout_secs": 30},
+        "accounts": {
+            "aws-a": {
+                "kind": "aws",
+                "settings": {"timeout_secs": 90, "default_output_tokens": 4000},
+            }
+        },
+        "models": {
+            "m": {
+                "type": "chat",
+                "provider": "bedrock",
+                "model_id": "openai.gpt-oss-20b-1:0",
+                "deployments": {"aws-a": {"confirmed": ["us-east-1"]}},
+            }
+        },
+    }
+    view = load_registry(doc)
+    assert _call_timeout_secs(view, "m", None) == 90  # 30 (the defaults) before
+    assert _by_deployment(view, "m", "default_output_tokens") == 4000

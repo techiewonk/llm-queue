@@ -25,6 +25,7 @@ from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.inference import InferenceRejected
 from llm_queue.engine.queue import Message, NotReplicated
 from llm_queue.engine.runtime import Engine, _store_refused
+from llm_queue.engine.store_client import StorePoolBusy
 
 pytestmark = pytest.mark.integration
 
@@ -813,3 +814,42 @@ async def test_q27_a_send_uses_its_queues_retention(
     monkeypatch.setattr(engine.requests, "register_send", register_send)
     assert (await engine.call("small", CHAT, timeout_secs=5)).ok
     assert seen == [7200]
+
+
+# ---------------------------------------------------------------- R3PF-6, Q43
+
+
+async def test_r3pf6_a_busy_store_pool_is_not_a_store_outage(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3PF-6: a saturated connection pool was read as the store down.
+
+    Calls paused or ran outside their budgets (`store_down`), and the outage memo told every
+    other call the store was down. It is now `rate_limited`, retry in a second.
+    """
+    engine, _ = await make({"small": {"store_down": "fail_fast"}})
+
+    async def busy(*args: Any, **kwargs: Any) -> Any:
+        raise StorePoolBusy("all 10 store connections stayed in use")
+
+    monkeypatch.setattr(engine, "_call_routed", busy)
+    with pytest.raises(CallFailed) as info:
+        await engine.call("small", CHAT, timeout_secs=5)
+    assert info.value.kind == "rate_limited"
+    assert not engine._outage_remembered()
+
+
+async def test_q43_a_live_edit_replans_the_bedrock_pools(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner Q43: a live `max_concurrency` / `worker_slots` edit resized nothing until restart."""
+    engine, _ = await make({"small": {"max_concurrency": 2}})
+    await _until(lambda: engine._planned is not None, what="the first plan")
+    planned: list[Any] = []
+    monkeypatch.setattr(engine.providers.pool, "plan", planned.append)
+    engine._replan_pools()
+    assert not planned  # nothing changed
+    engine._planned = {}  # as after an edit
+    engine._replan_pools()
+    assert planned == [engine._pool_slots(engine.registry.current)]
+    assert planned[0][("aws-a", "r1")] >= 2

@@ -72,6 +72,7 @@ from llm_queue.engine.requests import RequestStore
 from llm_queue.engine.status import AlertEvaluator, StatusReader
 from llm_queue.engine.store_checks import UNKNOWN as UNKNOWN_POLICY
 from llm_queue.engine.store_checks import check_store, eviction_policy, eviction_warning
+from llm_queue.engine.store_client import StorePoolBusy
 from llm_queue.engine.store_guard import WAIT_SCOPES, ReplicaWait
 from llm_queue.engine.streaming import ChunkReader, ChunkWriter, StreamTooLarge
 from llm_queue.errors import ErrorKind, UnsupportedEnvelopeError
@@ -141,9 +142,21 @@ def _op_of(view: ResolvedRegistry, alias: str) -> str:
     return OPS.get((entry.provider, entry.type), "chat" if entry.type == "chat" else "embeddings")
 
 
+def _by_deployment(view: ResolvedRegistry, alias: str, name: str) -> float:
+    """A setting at its most specific level, the largest over the model's deployments.
+
+    Owner Q39: `timeout_secs` and `default_output_tokens` set on an account (or deployment)
+    were never read, as both were looked up for the model alone. The deployment is not known
+    when they are needed (the call's deadline, the estimate charged at admission), so the
+    largest of the deployments' values is used: no deployment gets less than its own.
+    """
+    values = [float(view.value(alias, name, d.key)) for d in view.deployments(alias)]
+    return max(values) if values else float(view.value(alias, name))
+
+
 def _call_timeout_secs(view: ResolvedRegistry, alias: str, asked: float | None) -> float:
-    """A call's timeout: the one asked for (else the model's), capped at `timeout_max_secs`."""
-    timeout = float(asked or view.value(alias, "timeout_secs"))
+    """A call's timeout: the one asked for (else its levels'), capped at `timeout_max_secs`."""
+    timeout = float(asked or _by_deployment(view, alias, "timeout_secs"))
     return min(timeout, float(view.value(alias, "timeout_max_secs")))
 
 
@@ -481,6 +494,7 @@ class Engine:
             wait_ms=self.settings.queue_wait_ms,
             scopes=self.settings.queue_wait_scopes,
         )
+        self._planned: dict[tuple[str, str], int] | None = None  # Bedrock pool sizes (Q43)
         self._replid: str | None = None  # the state store's `master_replid` last seen (R3FM-8)
         self.requests = RequestStore(
             state,
@@ -629,6 +643,10 @@ class Engine:
         """
         if not self._worker or self._stopping:
             return
+        try:
+            self._replan_pools()
+        except Exception as exc:  # the pools keep their size; calls go on
+            logger.warning("pool_replan_failed", error=str(exc), error_type=type(exc).__name__)
         view = self.registry.current
         for alias in view.registry.models:
             wanted = int(view.value(alias, "worker_slots"))
@@ -947,6 +965,14 @@ class Engine:
                     return await self._call_routed(
                         view, alias, envelope, params, priority, call_secs, request_id, direct
                     )
+                except StorePoolBusy as exc:
+                    # Every pooled connection was in use: the process is busy, the store is
+                    # up. Read as store_down it paused or ran calls outside their budgets and
+                    # set the outage memo for everyone (R3PF-6).
+                    self.metrics.count("llmq_store_pool_busy_total", model=alias)
+                    raise CallFailed(
+                        "rate_limited", str(exc), retry_after_secs=1.0, request_id=rid
+                    ) from exc
                 except STORE_ERRORS as exc:
                     self._remember_outage()
                     if stream:  # chunks travel through the state store
@@ -1940,21 +1966,52 @@ class Engine:
         warned about at start, not first met by a call (CL-6).
         """
         view = self.registry.current
-        routes = []
-        slots: dict[tuple[str, str], int] = {}
-        for alias, entry in view.registry.models.items():
-            places = set()
-            for deployment in view.deployments(alias):
-                routes.append(route_for(view, deployment))
-                places.add((deployment.account, deployment.region))
-            if entry.provider != "bedrock":
-                continue
-            for place in places:
-                slots[place] = slots.get(place, 0) + int(view.value(alias, "worker_slots"))
+        routes = [
+            route_for(view, deployment)
+            for alias in view.registry.models
+            for deployment in view.deployments(alias)
+        ]
+        slots = self._pool_slots(view)
+        self._planned = slots
         try:
             await self.providers.pool.warm(routes, slots=slots)
         except Exception as exc:  # a call meets the problem again; start goes on (RT-24)
             logger.warning("warm_clients_failed", error=str(exc), error_type=type(exc).__name__)
+
+    @staticmethod
+    def _pool_slots(view: ResolvedRegistry) -> dict[tuple[str, str], int]:
+        """Concurrent Bedrock calls this process may make per (account, region).
+
+        Per model, its worker slots, or a deployment's `max_concurrency` when that is lower
+        (no more connections than calls the deployment admits).
+        """
+        slots: dict[tuple[str, str], int] = {}
+        for alias, entry in view.registry.models.items():
+            if entry.provider != "bedrock":
+                continue
+            workers = int(view.value(alias, "worker_slots"))
+            places: dict[tuple[str, str], int] = {}
+            for deployment in view.deployments(alias):
+                cap = view.value(alias, "max_concurrency", deployment.key)
+                want = min(workers, int(cap)) if cap else workers
+                place = (deployment.account, deployment.region)
+                places[place] = max(places.get(place, 0), want)
+            for place, want in places.items():
+                slots[place] = slots.get(place, 0) + want
+        return slots
+
+    def _replan_pools(self) -> None:
+        """Resize the Bedrock pools when a reload changed their sizes (owner Q43).
+
+        A live `max_concurrency` or `worker_slots` edit changed nothing until a restart: the
+        pool retires a client whose size changed (closed once idle) and builds the new one.
+        """
+        if not self._worker or self._planned is None:
+            return  # not warmed yet: `_warm_clients` plans the first sizes
+        slots = self._pool_slots(self.registry.current)
+        if slots != self._planned:
+            self._planned = slots
+            self.providers.pool.plan(slots)
 
     async def _result_sweep(self) -> None:
         """Every `poll_secs`, one store call finds results of this process's waiting callers.
@@ -2501,7 +2558,7 @@ class Engine:
             env.op,
             params,
             embedding=entry.type == "embedding",
-            default_output_tokens=int(view.value(alias, "default_output_tokens")),
+            default_output_tokens=int(_by_deployment(view, alias, "default_output_tokens")),
             output_weight=float(view.value(alias, "tpm_output_weight")),
             estimator=view.value(alias, "token_estimator"),
         )
