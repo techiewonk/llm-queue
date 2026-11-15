@@ -64,6 +64,12 @@ def test_fo20_prefixes_are_plain(name: str, value: str) -> None:
         InfraSettings.from_env({**STRICT, name: value})
 
 
+def test_fo20_a_key_prefix_may_hold_colons() -> None:
+    """FO-20 follow-up: `llmq:prod:v3` (the documented, deployed form) was refused at start."""
+    settings = InfraSettings.from_env({**STRICT, "LLMQ_KEY_PREFIX": "llmq:prod:v3"})
+    assert settings.key_prefix == "llmq:prod:v3"
+
+
 def test_r3cf13_allowed_hosts_are_bare_names() -> None:
     """R3CF-13: `https://api.openai.com` never matched, and the error did not name the entry."""
     with pytest.raises(ConfigError, match=r"`https://api.openai.com` must be a bare host"):

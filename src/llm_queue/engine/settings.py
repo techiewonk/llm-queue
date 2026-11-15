@@ -39,8 +39,11 @@ _SCHEMES_TEXT = "a redis://, rediss://, valkey:// or valkeys:// URL"
 # salt does not (and the hash is cut to 64 bits), so strict mode wants at least this (FO-13).
 MIN_SALT_CHARS = 16
 # Key and queue prefixes become part of every store key; `registry gc` splits keys on `{m:` /
-# `{q:`, so braces, colons and glob characters in a prefix mis-attributed keys (FO-20).
+# `{q:`, so braces and glob characters in a prefix mis-attributed keys (FO-20). A colon is
+# fine in the key prefix (`llmq:prod:v3` is the documented and deployed form: every key is
+# `<prefix>:...`); the queue prefix, which goes inside `{q:...}` hash tags, stays plain.
 _PREFIX_RE = re.compile(r"^[A-Za-z0-9_.-]{0,64}\Z")
+_KEY_PREFIX_RE = re.compile(r"^[A-Za-z0-9_.:-]{0,64}\Z")
 INT32_MAX = 2**31 - 1  # the longest TTL `EXPIRE` takes on every store engine (R3CF-14)
 
 
@@ -234,14 +237,14 @@ class InfraSettings:
                 "environment, e.g. myapp-prod"
             )
         queue_prefix = str(get("QUEUE_PREFIX", ""))
-        for name, value, need in (
-            ("KEY_PREFIX", str(key_prefix or "llmq"), True),
-            ("QUEUE_PREFIX", queue_prefix, False),
+        for name, value, need, rule, allowed in (
+            ("KEY_PREFIX", str(key_prefix or "llmq"), True, _KEY_PREFIX_RE, "`_`, `.`, `:`"),
+            ("QUEUE_PREFIX", queue_prefix, False, _PREFIX_RE, "`_`, `.`"),
         ):
-            if not _PREFIX_RE.match(value) or (need and not value):
+            if not rule.match(value) or (need and not value):
                 problems.append(
-                    f"LLMQ_{name} must be {'1' if need else '0'}-64 letters, digits, `_`, `.` "
-                    "or `-` (no braces, colons or glob characters: it is part of every key)"
+                    f"LLMQ_{name} must be {'1' if need else '0'}-64 letters, digits, {allowed} "
+                    "or `-` (no braces or glob characters: it is part of every key)"
                 )
         endpoints: dict[str, Any] = {"BEDROCK_ENDPOINT_URL": None, "STS_ENDPOINT_URL": None}
         for name in endpoints:
