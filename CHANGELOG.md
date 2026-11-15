@@ -123,7 +123,10 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
   `LLMQ_BASE_URL_ALLOWED_HOSTS` with a scheme, port or path are refused by name (R3CF-13).
 - **Registry checks added** (R3CF-10, R3CF-12): a fallback `after_secs` that could never fire
   inside `timeout_secs` is an error; the weight-0 check covers `balance_priority` and counts
-  usable deployments only. Cross-field messages show values and levels and use the dotted
+  usable deployments only. `LLMQ_RESULT_TTL_SECS` below `Tuning.engine.result_recheck_secs`
+  is a `ConfigError` (a caller that missed its wake-up never read its result), and `start()`
+  warns (`config_cross_check`) when a model's `attempt_timeout_secs` is above its client's
+  read timeout in `Tuning` or its call timeout above `LLMQ_STATUS_TTL_SECS`. Cross-field messages show values and levels and use the dotted
   override path `settings set` takes (R3CF-17).
 - **A fallback model of another provider is allowed** (owner Q40, R3CF-6): the changelog and
   docs said it was refused; it never was. The request is not converted between shapes yet, so

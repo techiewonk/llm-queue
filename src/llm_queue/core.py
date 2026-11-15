@@ -37,6 +37,7 @@ from llm_queue._logging import get_logger
 from llm_queue._version import __version__
 from llm_queue.clients import ClientPool, Providers
 from llm_queue.context import current_context
+from llm_queue.engine.cross_checks import start_warnings
 from llm_queue.engine.envelope import Meta, Reply
 from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.jobs import JobFn, JobRunner, JobSettings
@@ -219,14 +220,18 @@ class LLMQueue:
         builder: Callable[[], Engine] | None = None,
         offload: ResultOffload | None = None,
         job_settings: JobSettings | None = None,
+        tuning: Tuning | None = None,
     ) -> None:
         """Wrap a built `Engine`; `builder` makes a caller-only engine for sync calls.
 
         That engine is used only while this queue is not started (sync-only processes).
-        `job_settings` (default: `LLMQ_JOB_*` read by `from_env`) bounds jobs.
+        `job_settings` (default: `LLMQ_JOB_*` read by `from_env`) bounds jobs. `tuning` is
+        the one the engine was built with (`from_env` passes it): `start()` compares its
+        client timeouts with the registry (R3CF-10).
         """
         self._engine = engine
         self.settings = settings
+        self._tuning = tuning or Tuning()
         self._jobs = JobRunner(
             engine.queues,
             queue_prefix=engine.settings.queue_prefix,
@@ -298,7 +303,9 @@ class LLMQueue:
         settings = InfraSettings.from_env(environ, secrets=secrets)
         jobs = JobSettings.from_env(os.environ if environ is None else environ)
         tuning = tuning or Tuning()
-        if problems := tuning.problems(queue_wait_ms=settings.queue_wait_ms):
+        if problems := tuning.problems(
+            queue_wait_ms=settings.queue_wait_ms, result_ttl_secs=settings.result_ttl_secs
+        ):
             raise ConfigError("invalid tuning:\n  " + "\n  ".join(problems))
         # One sink for both engines (O5). EMF: the environment is a dimension, so two
         # environments in one account are not summed; pod and version are plain fields (R3OB-12).
@@ -383,6 +390,7 @@ class LLMQueue:
             builder=lambda: build(sync_cap),
             offload=offload,
             job_settings=jobs,
+            tuning=tuning,
         )
 
     # ---------------------------------------------------------------- guards (C2)
@@ -482,6 +490,7 @@ class LLMQueue:
         await self._engine.start(
             worker=mode in ("both", "worker"), caller=mode in ("both", "caller")
         )
+        self._cross_check()
         if mode in ("both", "worker"):
             self._check_store_pool()
             await self._jobs.start()
@@ -510,6 +519,29 @@ class LLMQueue:
                 return
         async with lock:
             pass
+
+    def _cross_check(self) -> None:
+        """Warn at start about registry values this process's settings cannot honour (R3CF-10).
+
+        An attempt timeout above the client's read timeout (the client cuts the call first), a
+        call timeout above `LLMQ_STATUS_TTL_SECS`. Never raises: a check that cannot run is
+        skipped (logged at debug).
+        """
+        try:
+            view = self._engine.registry.current
+            lines = start_warnings(
+                view,
+                read_timeouts={
+                    "bedrock": self._tuning.bedrock.read_timeout_secs,
+                    "openai": self._tuning.openai.read_timeout_secs,
+                },
+                status_ttl_secs=float(self._engine.settings.status_ttl_secs),
+            )
+        except Exception as exc:
+            logger.debug("config_cross_check_skipped", error=repr(exc))
+            return
+        for line in lines:
+            logger.warning("config_cross_check", warning=line)
 
     def _check_store_pool(self) -> None:
         """Warn at start when the store pool is smaller than the worker slots it serves (R3PF-8).

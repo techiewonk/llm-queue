@@ -132,11 +132,12 @@ class Tuning:
     openai: OpenAIOptions = field(default_factory=OpenAIOptions)
     warm: WarmOptions = field(default_factory=WarmOptions)
 
-    def problems(self, *, queue_wait_ms: int = 0) -> list[str]:
+    def problems(self, *, queue_wait_ms: int = 0, result_ttl_secs: int | None = None) -> list[str]:
         """Every bad value and bad combination, one line each (empty when all is well).
 
         `queue_wait_ms` is `LLMQ_QUEUE_WAIT_MS`: WAIT blocks a connection that long, so the
-        store read timeout must be above it.
+        store read timeout must be above it. `result_ttl_secs` is `LLMQ_RESULT_TTL_SECS`: a
+        result must outlive a waiting caller's last-resort read (R3CF-10).
         """
         out: list[str] = []
         parts = {
@@ -173,6 +174,19 @@ class Tuning:
                     f"store.read_timeout_secs ({store.read_timeout_secs:g}) must be at least 1 s "
                     f"above {name} ({command}, {secs:g} s), or that command times out"
                 )
+        recheck = engine.result_recheck_secs
+        if (
+            result_ttl_secs is not None
+            and "engine.result_recheck_secs" not in bad
+            and result_ttl_secs < recheck
+        ):
+            # A caller whose wake-up was lost reads its result only every `recheck`: a result
+            # that expires sooner is never read, and the call ends `deadline_exceeded`.
+            out.append(
+                f"LLMQ_RESULT_TTL_SECS ({result_ttl_secs}) must be at least "
+                f"engine.result_recheck_secs ({recheck:g}), or a caller that missed its wake-up "
+                "never reads its result"
+            )
         if "engine.limiter_cut_factor" not in bad and engine.limiter_cut_factor >= 1:
             out.append("engine.limiter_cut_factor must be below 1 (a cut makes the limit smaller)")
         if "engine.budget_key_ms" not in bad and engine.budget_key_ms < 130_000:
