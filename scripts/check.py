@@ -7,11 +7,20 @@ use fakellm (`python scripts/samples.py --live` runs the samples on real Bedrock
 
     python scripts/check.py a1          # one step
     python scripts/check.py a1 a2       # several
-    python scripts/check.py all         # every step built so far
-    python scripts/check.py all --quick # the same, drills shortened (gates subset)
+    python scripts/check.py all --quick # dev run (~30 min): lint once, tests once, scenarios
+                                        # `at` 3 at a time, gates without the slow three
+    python scripts/check.py all         # before a push (~45 min): adds the burst scenarios
+                                        # and every gate
+    python scripts/check.py all --release  # before a release: every scenario x every load
     python scripts/check.py soak3       # soaks (not in `all`): 3 min smoke, soak10, soak20
     python scripts/check.py soak20      # before a release
     python scripts/check.py --list      # what each step runs
+
+`all` lints and type-checks the union of every step's paths once, runs the union of the unit
+tests and of the stack tests once each (a test file named by several steps ran up to five
+times), then each step's extra script (FT-1). A named step keeps its own lint, types and tests.
+Every check has a time limit (`Step.timeout_secs`, `LINT_SECS`, `TEST_SECS`): a hung drill
+fails its check instead of holding the run for ever (FT-7).
 
 Every check writes its whole output, as it runs, to `reports/check-<time>/<step>.<check>.log`
 (git-ignored); the console shows one PASS / FAIL line per check with its log, and
@@ -29,12 +38,15 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 _VENV_PY = ROOT / ".venv" / ("Scripts" if os.name == "nt" else "bin") / "python"
 # The project venv, else the interpreter running this script.
 _FOUND = _VENV_PY.with_suffix(".exe" if os.name == "nt" else "").exists()
 PY = str(_VENV_PY) if _FOUND else sys.executable
+LINT_SECS = 900.0  # one ruff or mypy run (a cold mypy over everything: ~1 min)
+TEST_SECS = 2400.0  # one pytest run (the stack tests: ~7 min measured)
 
 
 @dataclass(frozen=True)
@@ -47,8 +59,11 @@ class Step:
     needs_stack: bool = False
     extra: tuple[tuple[str, ...], ...] = field(default=())
     quick: tuple[str, ...] = ()  # arguments added to `extra` commands with --quick
+    full: tuple[str, ...] = ()  # arguments added to `extra` commands without --quick
+    release: tuple[str, ...] | None = None  # with --release instead of `full` (None: `full`)
     in_all: bool = True
     gating: bool = True  # False: the step reports its numbers but never fails the run
+    timeout_secs: float = 1800  # per extra command; a hung drill fails instead of hanging (FT-7)
 
 
 STEPS: dict[str, Step] = {
@@ -214,14 +229,21 @@ STEPS: dict[str, Step] = {
         needs_stack=True,
         extra=(("scripts/gates.py",),),
         quick=("--quick",),
+        timeout_secs=3600,  # ~20 min measured
     ),
     "scenarios": Step(
         "Fault scenarios (store, worker, provider, registry, caller, pairs) x loads, by calls",
         sources=("scripts/scenarios.py",),
         tests=(),
         needs_stack=True,
-        extra=(("scripts/scenarios.py", "all", "--jobs", "1"),),  # one at a time
-        quick=("--load", "under"),  # one load per scenario
+        # The Docker failover drills (S6 / S7 / S11) run once, in step `store` (FT-14).
+        # `under` and `at` run 3 at a time (each unit is its own process, its own fakellm and
+        # store proxy); `burst` runs one at a time inside scenarios.py (FT-2).
+        extra=(("scripts/scenarios.py", "all", "--jobs", "3", "--exclude", "S6", "S7", "S11"),),
+        quick=("--load", "at"),  # dev: every scenario at 100 % of the budget
+        full=("--matrix", "default"),  # every scenario `at`, plus `burst` where load matters
+        release=("--matrix", "full"),  # every scenario x every load
+        timeout_secs=5400,
     ),
     "samples": Step(
         "Usage samples (samples/*.py) run as app code against fakellm",
@@ -237,6 +259,7 @@ STEPS: dict[str, Step] = {
         needs_stack=True,
         extra=(("scripts/bench.py",),),
         quick=("--reps", "2", "--idle", "10"),
+        in_all=False,  # numbers only (104 s); run on purpose (FT-14)
         gating=False,
     ),
     **{
@@ -248,6 +271,7 @@ STEPS: dict[str, Step] = {
             needs_stack=True,
             extra=(("scripts/soak.py", "--minutes", str(minutes)),),
             in_all=False,  # long; run on purpose
+            timeout_secs=minutes * 60 * 2 + 900,
         )
         for minutes, use in ((3, "smoke"), (10, "after an engine change"), (20, "release"))
     },
@@ -265,7 +289,11 @@ def say(line: str) -> None:
 
 
 def stack_up() -> str | None:
-    """None when the Docker stack answers (Valkey, Redis, fakellm); otherwise why not."""
+    """None when the Docker stack answers (Valkey, Redis, fakellm); otherwise why not.
+
+    Also resets a store memory limit a killed S9 drill left behind (FT-19), and says so.
+    """
+    import importlib
     import socket
 
     for name, port in (("Valkey", 6379), ("Redis", 6380), ("fakellm", 8080)):
@@ -274,11 +302,20 @@ def stack_up() -> str | None:
                 pass
         except OSError as exc:
             return f"{name} on 127.0.0.1:{port} is not reachable ({exc}); run `make up`"
+    if str(ROOT / "scripts") not in sys.path:
+        sys.path.insert(0, str(ROOT / "scripts"))
+    stack: Any = importlib.import_module("stack")
+    for line in stack.repair_memory_limit():
+        say(f"  REPAIRED  {line}")
     return None
 
 
-def _run(step: str, label: str, cmd: list[str]) -> bool:
-    """Run one check with its output written live to its own log; print PASS / FAIL."""
+def _run(step: str, label: str, cmd: list[str], *, timeout_secs: float = LINT_SECS) -> bool:
+    """Run one check with its output written live to its own log; print PASS / FAIL.
+
+    A check still running after `timeout_secs` is killed and fails (FT-7); its worker
+    processes end on their stdin closing.
+    """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log = LOG_DIR / f"{step}.{re.sub(r'[^A-Za-z0-9_.-]+', '_', label).strip('_')}.log"
     env = {
@@ -287,15 +324,27 @@ def _run(step: str, label: str, cmd: list[str]) -> bool:
         "LLMQ_DRILL_LOG_DIR": str(LOG_DIR / f"{step}-processes"),  # workers' own logs
     }
     started = time.monotonic()
+    timed_out = False
     with log.open("w", encoding="utf-8") as out_file:
         out_file.write(f"$ {' '.join(cmd)}\n\n")
         out_file.flush()
-        proc = subprocess.run(
-            cmd, cwd=ROOT, stdout=out_file, stderr=subprocess.STDOUT, env=env, check=False
-        )
-    ok = proc.returncode == 0
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=ROOT,
+                stdout=out_file,
+                stderr=subprocess.STDOUT,
+                env=env,
+                check=False,
+                timeout=timeout_secs,
+            )
+            ok = proc.returncode == 0
+        except subprocess.TimeoutExpired:
+            timed_out, ok = True, False
+            out_file.write(f"\nFAIL  timed out after {timeout_secs:.0f}s (killed)\n")
     secs = time.monotonic() - started
-    say(f"  {'PASS' if ok else 'FAIL'}  {label} ({secs:.1f}s)  {log.relative_to(ROOT)}")
+    note = " TIMED OUT" if timed_out else ""
+    say(f"  {'PASS' if ok else 'FAIL'}  {label} ({secs:.1f}s){note}  {log.relative_to(ROOT)}")
     if not ok:
         out = log.read_text(encoding="utf-8", errors="replace").rstrip()
         # Verdict lines first (a drill's log noise must not push them out of the tail).
@@ -311,53 +360,151 @@ def _run(step: str, label: str, cmd: list[str]) -> bool:
     return ok
 
 
-def run_step(name: str, step: Step, *, quick: bool = False) -> bool:
+def _lint(name: str, paths: list[str]) -> list[bool]:
+    """Ruff, ruff format and mypy over `paths` (mypy incremental: its cache is per checkout)."""
+    return [
+        _run(name, "ruff check", [PY, "-m", "ruff", "check", *paths]),
+        _run(name, "ruff format --check", [PY, "-m", "ruff", "format", "--check", *paths]),
+        _run(name, "mypy", [PY, "-m", "mypy", *paths]),
+    ]
+
+
+def _pytest(name: str, tests: list[str], *, cov: str = "") -> bool:
+    """One pytest run; `cov` "new" starts a coverage data file, "append" adds to it."""
+    # -rA: a line per test with its outcome, so the log shows what ran, not only failures.
+    cmd = [PY, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rA"]
+    if cov:
+        cmd += ["--cov", "--cov-report="] + (["--cov-append"] if cov == "append" else [])
+    return _run(name, "pytest", [*cmd, *tests], timeout_secs=TEST_SECS)
+
+
+def _extras(name: str, step: Step, mode: str) -> list[bool]:
+    """The step's extra scripts with the arguments of `mode` (quick, full or release)."""
+    added = {
+        "quick": step.quick,
+        "full": step.full,
+        "release": step.full if step.release is None else step.release,
+    }[mode]
+    results = []
+    for cmd in step.extra:
+        full = [*cmd, *added]
+        results.append(_run(name, " ".join(full), [PY, *full], timeout_secs=step.timeout_secs))
+    return results
+
+
+def run_step(name: str, step: Step, *, mode: str = "full") -> bool:
     """Run every check of one step; print one line per check."""
     say(f"[{name}] {step.title}")
     if step.needs_stack and (why := stack_up()):
         say(f"  FAIL  stack: {why}")
         return False
     paths = list(dict.fromkeys([*step.sources, *(t.split("::")[0] for t in step.tests)]))
-    results = [
-        _run(name, "ruff check", [PY, "-m", "ruff", "check", *paths]),
-        _run(name, "ruff format --check", [PY, "-m", "ruff", "format", "--check", *paths]),
-        _run(name, "mypy", [PY, "-m", "mypy", "--no-incremental", *paths]),
-    ]
+    results = _lint(name, paths)
     if step.tests:
-        # -rA: a line per test with its outcome, so the log shows what ran, not only failures.
-        pytest = [PY, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rA", *step.tests]
-        results.append(_run(name, "pytest", pytest))
-    for cmd in step.extra:
-        full = [*cmd, *(step.quick if quick else ())]
-        results.append(_run(name, " ".join(full), [PY, *full]))
+        results.append(_pytest(name, list(step.tests)))
+    results += _extras(name, step, mode)
     if not step.gating and not all(results):
         say(f"  (not gating: {name} reports numbers; its failure does not fail the run)")
         return True
     return all(results)
 
 
+def union(paths: list[str]) -> list[str]:
+    """Each path once: a path under a chosen folder, or a test id of a chosen file, goes.
+
+    `all` named `test_runtime.py` in five steps and `tests/unit` in six, and each ran every
+    time (FT-1: 641 s of the 1,165 s of pytest was repeated work).
+    """
+    chosen = list(dict.fromkeys(paths))
+    whole = {p for p in chosen if "::" not in p}
+
+    def covered(path: str) -> bool:
+        file = path.split("::")[0]
+        if "::" in path and file in whole:
+            return True
+        return any(file != other and file.startswith(other.rstrip("/") + "/") for other in whole)
+
+    return [p for p in chosen if not covered(p)]
+
+
+def run_all(names: list[str], *, mode: str) -> dict[str, bool]:
+    """`all`: lint and types once, unit tests once, stack tests once, then each extra script.
+
+    Coverage is measured over both test runs and judged against `fail_under` (pyproject.toml)
+    in the full and release modes, as CI does (FT-22); the dev run skips it.
+    """
+    steps = {n: STEPS[n] for n in names}
+    results: dict[str, bool] = {}
+    paths = [p for s in steps.values() for p in (*s.sources, *(t.split("::")[0] for t in s.tests))]
+    say("[lint] ruff, ruff format and mypy over every step's paths, once")
+    results["lint"] = all(_lint("lint", union(paths)))
+    tests = union([t for s in steps.values() for t in s.tests])
+    unit = [t for t in tests if not t.startswith("tests/integration")]
+    stack = [t for t in tests if t.startswith("tests/integration")]
+    cov = mode != "quick"
+    if unit:
+        say(f"[unit] pytest {' '.join(unit)}")
+        results["unit"] = _pytest("unit", unit, cov="new" if cov else "")
+    if stack:
+        say(f"[integration] pytest {' '.join(stack)}")
+        if why := stack_up():
+            say(f"  FAIL  stack: {why}")
+            results["integration"] = False
+        else:
+            started = "append" if unit else "new"
+            results["integration"] = _pytest("integration", stack, cov=started if cov else "")
+    if cov and unit and stack:
+        say("[coverage] unit + integration against fail_under (pyproject.toml)")
+        results["coverage"] = _run("coverage", "coverage report", [PY, "-m", "coverage", "report"])
+    for name, step in steps.items():
+        if not step.extra:
+            continue
+        say(f"[{name}] {step.title}")
+        if step.needs_stack and (why := stack_up()):
+            say(f"  FAIL  stack: {why}")
+            results[name] = False
+            continue
+        ok = all(_extras(name, step, mode))
+        if not step.gating and not ok:
+            say(f"  (not gating: {name} reports numbers; its failure does not fail the run)")
+            ok = True
+        results[name] = ok
+    return results
+
+
 def main() -> int:
     """Parse the step names and run them; exit 1 if any check fails."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("steps", nargs="*", help="step names (a1, a2, ...) or all")
+    parser.add_argument("steps", nargs="*", help="step names (a1, a2, ...), all, or dev")
     parser.add_argument("--list", action="store_true", help="show the steps and exit")
-    parser.add_argument("--quick", action="store_true", help="gates without the slow three")
+    parser.add_argument("--quick", action="store_true", help="dev: scenarios `at`, gates quick")
+    parser.add_argument("--release", action="store_true", help="every scenario x every load")
     args = parser.parse_args()
     if args.list or not args.steps:
         for name, step in STEPS.items():
             note = "" if step.in_all else "  [not in all]"
             print(f"{name:5} {step.title}  ({', '.join(step.tests)}){note}")
         return 0
-    names = [n for n, s in STEPS.items() if s.in_all] if args.steps == ["all"] else args.steps
+    if args.quick and args.release:
+        parser.error("--quick and --release do not go together")
+    mode = "quick" if args.quick else "release" if args.release else "full"
+    if args.steps == ["dev"]:  # the dev run's short name
+        args.steps, mode = ["all"], "quick"
+    whole = args.steps == ["all"]
+    names = [n for n, s in STEPS.items() if s.in_all] if whole else args.steps
     unknown = [n for n in names if n not in STEPS]
     if unknown:
         print(f"unknown step(s): {', '.join(unknown)}; see --list")
         return 2
-    say(f"logs: {LOG_DIR.relative_to(ROOT)}")
-    results = {n: run_step(n, STEPS[n], quick=args.quick) for n in names}  # all, then judge
+    say(f"logs: {LOG_DIR.relative_to(ROOT)}  ({'all, ' if whole else ''}{mode})")
+    started = time.monotonic()
+    if whole:
+        results = run_all(names, mode=mode)
+    else:
+        results = {n: run_step(n, STEPS[n], mode=mode) for n in names}  # all, then judge
     failed = [n for n, ok in results.items() if not ok]
     say("ALL PASS" if not failed else f"FAILED: {', '.join(failed)}")
-    say(f"logs: {LOG_DIR.relative_to(ROOT)}")
+    say(f"logs: {LOG_DIR.relative_to(ROOT)}  ({(time.monotonic() - started) / 60:.1f} min)")
     return 1 if failed else 0
 
 

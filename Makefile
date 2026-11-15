@@ -5,7 +5,7 @@ else
 PY = .venv/bin/python
 endif
 
-.PHONY: up rebuild down status check check-all
+.PHONY: up rebuild down status check check-dev check-all
 
 up:
 	$(PY) scripts/stack.py up
@@ -23,5 +23,10 @@ status:
 check:
 	$(PY) scripts/check.py $(S)
 
+# the dev run (lint and tests once, scenarios at 100 %, gates quick)
+check-dev:
+	$(PY) scripts/check.py dev
+
+# before a push
 check-all:
 	$(PY) scripts/check.py all
