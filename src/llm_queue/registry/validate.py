@@ -247,6 +247,13 @@ def _check_model(
             target = view.registry.models[other]
             if target.type != "chat":
                 errors.append(f"{path}.model_fallback: `{other}` is not a chat model")
+            if target.provider != entry.provider:
+                # Allowed (owner decision); the request is not converted between shapes yet,
+                # so say so where it is configured (R3CF-6a).
+                warnings.append(
+                    f"{path}.model_fallback: `{other}` is an {target.provider} model; this "
+                    f"{entry.provider} model's requests reach it unchanged"
+                )
             allowed = view.residency(alias)
             if allowed is not None:
                 # A fallback must not carry this model's calls where its residency forbids.

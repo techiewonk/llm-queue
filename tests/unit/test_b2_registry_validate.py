@@ -408,3 +408,13 @@ def test_r3cf17_messages_name_values_levels_and_paths(small: dict[str, Any]) -> 
     assert _has(_errors(doc), "models.gpt20b.deployments.aws-main.overrides.ap-south-1")
     text = '{"registry_version": 1, "defaults": {"rpm": 1, "tpm": 5, "rpm": 2}}'
     assert _has(_errors(text), "`rpm` (in the object with tpm)")
+
+
+def test_r3cf6_cross_provider_fallback_loads_with_a_warning() -> None:
+    """R3CF-6a: the docs said a fallback to another provider was refused; it is allowed (Q40).
+
+    The request is not converted between shapes yet, so the validator says so.
+    """
+    doc = json.loads((FIXTURES / "full.json").read_text(encoding="utf-8"))
+    warnings = _warnings(doc)
+    assert _has(warnings, "gpt120b.model_fallback", "`gpt120b-vllm` is an openai model")
