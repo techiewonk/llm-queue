@@ -19,7 +19,9 @@ flowchart LR
 - Writes (live registry edits, region and account blocks) stay off unless `allow_writes=True`.
   Each write is audited under the `actor` you return.
 - A preStop hook calls `pause_receiving()`. Readiness then fails and no new queued work starts,
-  while running calls finish.
+  while running calls finish. `/drain` is the app's own route (the router has none) and answers
+  GET, which is what Kubernetes' `preStop: httpGet` sends; a POST-only route answers it 405 and
+  nothing drains.
 - The sample calls the app in process with httpx's ASGI transport, so no port is opened. In an
   app, uvicorn serves the same router.
 
@@ -39,5 +41,9 @@ GET /requests/{id} -> done
 POST /registry rpm=50 -> [{'path': 'models.gpt20b.rpm', 'before': 60, 'after': 50}]
 after /drain: GET /health/ready -> 503
 ```
+
+Since this run the health body also carries `eviction_policy` (the state store's
+`maxmemory-policy`, `unknown` when unreadable) and, with a separate queue store,
+`queue_eviction_policy`; `/drain` is called with GET.
 
 See also: [CLI and HTTP](../reference/cli-http.md), [Operate](../how-to/operate.md).

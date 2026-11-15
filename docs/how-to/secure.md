@@ -62,6 +62,13 @@ app.include_router(
   admin visits cannot post an edit with the admin's cookies.
 - `actor(request)` returns the authenticated name the audit records; never a client-supplied
   value. Actors are 1-200 characters without control characters.
+- **Guard the read routes too.** With no `dependencies`, `/status`, `/requests/{id}` and
+  `/registry` are open to anyone who reaches the app, and `/registry` lists account names,
+  regions, model ids, `base_url`s and routing blocks (only role ARNs and secret references are
+  redacted). The router logs `admin_routes_unauthenticated` when it is built that way; mount it
+  without `dependencies` only behind the app's own auth or on an internal-only port.
+- Bodies and ids are bounded before any store read: at most 100 paths per edit, ids and names
+  of at most 256 characters.
 
 ```bash
 curl -X POST https://app/llmq/registry/block \

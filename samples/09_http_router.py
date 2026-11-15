@@ -50,7 +50,9 @@ app.include_router(
 )
 
 
-@app.post("/drain")
+# GET for Kubernetes' `preStop: httpGet` (a POST-only route answered it 405 and nothing
+# drained); POST for scripts. The route is the app's own: the router has no `/drain`.
+@app.api_route("/drain", methods=["GET", "POST"])
 async def drain() -> dict[str, bool]:
     """PreStop hook: fail readiness and take no new queued calls; running ones finish."""
     llmq.pause_receiving()
@@ -115,7 +117,7 @@ async def main() -> None:
             print(f"POST /registry/block {region} on={on} -> {block.status_code}")
             assert block.status_code == 200
 
-        await client.post("/drain")
+        await client.get("/drain")  # what the preStop httpGet sends
         after = await client.get("/llm-queue/health/ready")
         print(f"after /drain: GET /health/ready -> {after.status_code}")
         assert after.status_code == 503
