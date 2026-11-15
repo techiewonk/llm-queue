@@ -107,6 +107,14 @@ class DeploymentStatus(TypedDict):
     throttles_1m: int
 
 
+class FairnessStatus(TypedDict):
+    """A model's tenant fairness, as counts only (docs/explanation/fairness.md)."""
+
+    mode: str
+    active_tenants: int
+    waiting_within_share: int
+
+
 class ModelStatus(TypedDict):
     """One model: waiting calls per class, calls in progress, dead letters, deployments."""
 
@@ -116,6 +124,7 @@ class ModelStatus(TypedDict):
     in_progress: int
     dead_letters: int
     deployments: list[DeploymentStatus]
+    fairness: NotRequired[FairnessStatus]  # only when `fairness.mode` is on
 
 
 class JobStatus(TypedDict):
