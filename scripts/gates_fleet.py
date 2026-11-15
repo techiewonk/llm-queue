@@ -188,6 +188,13 @@ class FakeLLM:
 
     def start(self) -> None:
         """Start and wait until it answers."""
+        # FT-17: a listener already on the port (the stack's fakellm, or another drill's) used
+        # to count as "started", and the drill then measured someone else's counters.
+        with (
+            contextlib.suppress(OSError),
+            socket.create_connection(("127.0.0.1", FAKE_PORT), timeout=0.2),
+        ):
+            raise RuntimeError(f"port {FAKE_PORT} is already in use; fakellm cannot start there")
         env = dict(os.environ, PYTHONPATH=str(ROOT / "tools" / "fakellm"))
         cmd = [PY, "-m", "fakellm", "--host", "127.0.0.1", "--port", str(FAKE_PORT)]
         log = log_file("fakellm")
@@ -202,6 +209,8 @@ class FakeLLM:
         )
         log.close()  # the process keeps its own handle
         for _ in range(100):
+            if self.proc.poll() is not None:  # it died (for example, the port was taken)
+                break
             try:
                 with socket.create_connection(("127.0.0.1", FAKE_PORT), timeout=0.2):
                     return
@@ -259,7 +268,11 @@ class Worker:
     async def ready(self) -> None:
         """Until the worker printed `ready <worker id>`."""
         assert self.proc.stdout is not None
-        line = await asyncio.to_thread(self.proc.stdout.readline)
+        try:  # FT-7: a worker stuck at start used to hang the whole run for ever
+            line = await asyncio.wait_for(asyncio.to_thread(self.proc.stdout.readline), 60)
+        except TimeoutError:
+            await self.kill()
+            raise RuntimeError("worker did not print ready within 60 s; killed") from None
         if not line.startswith(b"ready"):
             raise RuntimeError(f"worker did not start: {line!r}")
         self.worker_id = line.decode().split()[1] if len(line.split()) > 1 else ""

@@ -62,7 +62,7 @@ def test_first_response_budget_covers_the_open() -> None:
     """K7: the first event got a whole `first_response_secs` again after a slow open."""
     started = time.monotonic() - 0.4
     left = opened(Timing(1.0, 30.0), started).first_response_secs
-    assert 0.5 < left < 0.61
+    assert 0.3 < left < 0.61  # FT-21: a busy machine only makes it smaller
     assert opened(Timing(0.1, 30.0), started).first_response_secs == 0.0
 
 

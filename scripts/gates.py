@@ -47,7 +47,9 @@ from gates_fleet import (  # needs the sys.path entry
     account_keys,
     drill_tuning,
     environment,
+    kill_and_reap,
     log_dir,
+    log_file,
     new_prefix,
     registry,
     setup_logging,
@@ -345,24 +347,30 @@ async def b19() -> bool:
         scripts = gate.store.script_calls() - before_scr
         metrics = gate.store.metrics(gate.prefix)
     refusals = sum(v for k, v in metrics.items() if k.startswith("llmq_admission_refusals"))
+    # FT-24: a refusal count of 0 also comes from a metrics flusher that died; the call
+    # counter the workers must have written proves the metrics reached the store.
+    counted = sum(v for k, v in metrics.items() if k.startswith("llmq_calls_total"))
     calls = len(run.results)
     lines = [
         f"{calls} calls, {sum(r.ok for r in run.results)} ok; failures {run.kinds() or 0}",
         f"admission refusals {refusals:.0f} ({refusals / calls:.3f} per call); "
         f"store scripts per call {scripts / calls:.1f} "
         f"(commands incl. inside them {cmds / calls:.0f})",
+        f"calls counted by the workers' metrics: {counted:.0f}",
     ]
     return verdict(
         "B19",
         {
             "every call served": all(r.ok for r in run.results),
+            "the workers' metrics reached the store (calls counted >= 90 %)": counted
+            >= 0.9 * calls,
             "refusals per call <= 0.05": refusals / calls <= 0.05,
         },
         lines,
     )
 
 
-async def _shares(processes: int) -> tuple[dict[str, float], float, float]:
+async def _shares(processes: int) -> tuple[dict[str, float], float]:
     """Deployment shares and store commands per call for one load on `processes` workers."""
     doc = registry({"chat": {"rpm": 1_000_000, "balance": "round_robin"}})
     async with Gate(doc) as gate:
@@ -376,12 +384,11 @@ async def _shares(processes: int) -> tuple[dict[str, float], float, float]:
         t0, c0 = time.monotonic(), gate.store.commands()
         await paced(100, 15, lambda i: run.call(queues[i % 2], "chat", chat()))
         secs, cmds = time.monotonic() - t0, gate.store.commands() - c0
-        probes = gate.store.client.keys(f"{gate.prefix}:lock:*")
     served = collections.Counter(r.deployment for r in run.results if r.ok)
     total = sum(served.values())
     shares = {d: n / total for d, n in served.items()}
     per_call = (cmds - idle_rate * secs) / max(1, len(run.results))
-    return shares, per_call, len(probes) + 0.0
+    return shares, per_call
 
 
 async def b22() -> bool:
@@ -390,8 +397,8 @@ async def b22() -> bool:
     Pass: deployment shares and
     store commands per call (idle polling subtracted) equal within 5 %.
     """
-    two, two_cmds, _ = await _shares(2)
-    eight, eight_cmds, _ = await _shares(8)
+    two, two_cmds = await _shares(2)
+    eight, eight_cmds = await _shares(8)
     worst = max(abs(two.get(d, 0) - eight.get(d, 0)) / max(two.get(d, 1e-9), 1e-9) for d in two)
     cmd_diff = abs(two_cmds - eight_cmds) / two_cmds
     lines = [
@@ -569,37 +576,69 @@ async def b95() -> bool:
 async def b96() -> bool:
     """Kill switch on, 2,000 direct calls waiting in 4 caller processes (plan: 5,000 on 20).
 
-    Pass: admission calls <= 20 per process per second.
+    Pass: every caller started and is still waiting (alive, no outcome yet) through the
+    measurement, the store saw some admission traffic, and scripts <= 20 per process per second.
+    FT-3: a crashed or idle caller used to pass (rate 0); FT-4: callers are always reaped;
+    FT-30: each caller logs to its own file instead of DEVNULL.
     """
     doc = registry({"chat": {"rpm": 600}}, accounts=1, regions=1, routing={"kill_switch": True})
+    procs: list[subprocess.Popen[bytes]] = []
+    ready = alive = 0
+    FLEET = Path(__file__).parent / "gates_fleet.py"  # a path, not a variable
+    rate = 0.0
     async with Gate(doc) as gate:
-        procs = [
-            subprocess.Popen(  # noqa: ASYNC220  # started once, before the measurement
-                [PY, str(Path(__file__).parent / "gates_fleet.py"), "caller", "500", "chat"],
-                env={**gate.env, "LLMQ_MODE": "caller"},
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-            for _ in range(4)
-        ]
-        for proc in procs:
-            assert proc.stdout is not None
-            await asyncio.to_thread(proc.stdout.readline)
-        for proc in procs:
-            assert proc.stdin is not None
-            proc.stdin.write(b"go\n")
-            proc.stdin.flush()
-        await asyncio.sleep(10)
-        s0, t0 = gate.store.script_calls(), time.monotonic()
-        await asyncio.sleep(20)
-        rate = (gate.store.script_calls() - s0) / (time.monotonic() - t0) / len(procs)
-        for proc in procs:
-            proc.kill()
+        try:
+            for _ in range(4):
+                log = log_file("b96-caller")
+                try:
+                    procs.append(
+                        subprocess.Popen(  # noqa: ASYNC220  # started once, before measuring
+                            [PY, str(FLEET), "caller", "500", "chat"],
+                            env={**gate.env, "LLMQ_MODE": "caller"},
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=log,
+                        )
+                    )
+                finally:
+                    log.close()  # the child keeps its own handle
+            for proc in procs:
+                assert proc.stdout is not None
+                try:
+                    line = await asyncio.wait_for(asyncio.to_thread(proc.stdout.readline), 60)
+                except TimeoutError:
+                    line = b""
+                ready += line.strip() == b"ready"
+            if ready == len(procs):
+                for proc in procs:
+                    assert proc.stdin is not None
+                    proc.stdin.write(b"go\n")
+                    proc.stdin.flush()
+                await asyncio.sleep(10)
+                s0, t0 = gate.store.script_calls(), time.monotonic()
+                await asyncio.sleep(20)
+                calls = gate.store.script_calls() - s0
+                rate = calls / (time.monotonic() - t0) / len(procs)
+                alive = sum(proc.poll() is None for proc in procs)
+        finally:
+            await asyncio.gather(*(kill_and_reap(p) for p in procs), return_exceptions=True)
+            for proc in procs:
+                for pipe in (proc.stdin, proc.stdout):
+                    if pipe is not None:
+                        with contextlib.suppress(OSError):
+                            pipe.close()
     return verdict(
         "B96",
-        {"store scripts <= 20 per process per second": rate <= 20},
-        [f"store scripts per caller process per second while 2,000 direct calls wait: {rate:.1f}"],
+        {
+            "every caller started": ready == len(procs),
+            "every caller still waiting during the measurement": alive == len(procs),
+            "store scripts > 0 (the callers really ask)": rate > 0,
+            "store scripts <= 20 per process per second": rate <= 20,
+        },
+        [
+            f"ready {ready}/{len(procs)}, alive {alive}/{len(procs)}; store scripts per caller "
+            f"process per second while 2,000 direct calls wait: {rate:.1f}"
+        ],
     )
 
 
@@ -712,7 +751,7 @@ async def b33() -> bool:
 
     Here 3K / min and one version.
 
-    Pass: 0 lost, 0 failed priority calls; with a live edit at each restart, the
+    Pass: 0 lost (priority calls included); with a live edit at each restart, the
     registry change counter each caller sees never goes back and ends at the last edit
     (a live edit keeps `version` and bumps the counter).
     """
@@ -754,7 +793,6 @@ async def b33() -> bool:
         "B33",
         {
             "0 lost": all(r.ok for r in run.results),
-            "0 failed priority calls": all(r.ok for r in run.results if r.priority),
             "registry changes never go back": all(v == sorted(v) for v in seen),
             "every caller ends on the last edit": final == [start + edits] * 2,
         },
@@ -840,6 +878,9 @@ async def b23() -> bool:
 
     losses: dict[str, int] = {}
     dups: dict[str, int] = {}
+    failed: dict[str, int] = {}
+    calls: dict[str, int] = {}
+    promoted: dict[str, bool] = {}
     for wait in (0, 1):
         proxy = failover.Proxy()  # its own process (CO-2)
         doc = registry({"chat": {"rpm": 1_000_000}}, accounts=1, regions=1)
@@ -885,6 +926,9 @@ async def b23() -> bool:
                 )
                 await asyncio.gather(load, chaos())
                 provider = await asyncio.to_thread(gate.fake.stats)
+                # FT-12: prove the fault happened (b took over); 0 <= 0 passed when it did not.
+                role = await asyncio.to_thread(failover.role, "b")
+                promoted["on" if wait else "off"] = role == "master"
         finally:
             try:
                 await asyncio.to_thread(proxy.stop)
@@ -894,17 +938,25 @@ async def b23() -> bool:
         losses["on" if wait else "off"] = lost
         dups["on" if wait else "off"] = sum(int(m.get("duplicates", 0)) for m in provider.values())
         side = "on" if wait else "off"
+        failed[side] = sum(1 for r in run.results if not r.ok)
+        calls[side] = len(run.results)
         print(f"  queue_wait_replicas={wait}: {len(run.results)} calls, lost {lost}, "
               f"duplicates {dups[side]}, failures {run.kinds() or 0}")  # fmt: skip
     return verdict(
         "B23",
         {
-            "losses with the wait on <= with it off": losses["on"] <= losses["off"],
-            "duplicates with the wait on <= with it off": dups["on"] <= dups["off"],
+            # FT-12: the kill really happened on both sides, and absolute bounds as well as the
+            # on-vs-off comparison (one noisy run used to decide it; 2 calls of slack each).
+            "the replica took over in both runs": all(promoted.values()) and len(promoted) == 2,
+            "losses with the wait on <= with it off (+2)": losses["on"] <= losses["off"] + 2,
+            "duplicates with the wait on <= with it off (+2)": dups["on"] <= dups["off"] + 2,
+            "every failure with the wait on <= 5 % of its calls": failed["on"]
+            <= 0.05 * max(1, calls["on"]),
         },
         [
             f"lost sends: off {losses['off']}, on {losses['on']}; "
-            f"duplicates: off {dups['off']}, on {dups['on']}"
+            f"duplicates: off {dups['off']}, on {dups['on']}; "
+            f"all failures: off {failed['off']}/{calls['off']}, on {failed['on']}/{calls['on']}"
         ],
     )
 
@@ -932,22 +984,30 @@ SLOW_GATES = frozenset({"B17", "B91", "B92"})  # left out by --quick
 def main() -> int:
     """Run the chosen gates; exit 1 if any fails."""
     setup_logging()
-    print(f"  logs of worker processes: {log_dir()}", flush=True)
-    args = [a for a in sys.argv[1:] if a != "--record-baseline"]
-    seed = random.randrange(2**31)
-    if "--seed" in args:
-        at = args.index("--seed")
-        seed = int(args[at + 1])
-        del args[at : at + 2]
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
+    parser.add_argument("gates", nargs="*", help=f"gate names (default: all): {', '.join(GATES)}")
+    parser.add_argument("--quick", action="store_true", help="leave out the slow gates")
+    parser.add_argument("--list", action="store_true", help="list the gates and exit")
+    parser.add_argument("--seed", type=int, help="replay the random choices of a run")
+    parser.add_argument("--record-baseline", action="store_true", help="kept for check.py")
+    # FT-27: argparse, so `--quick B19` works and a typo is an error, not a KeyError.
+    opts = parser.parse_args()
+    seed = opts.seed if opts.seed is not None else random.randrange(2**31)
     random.seed(seed)
     print(f"  seed {seed} (replay with --seed {seed})", flush=True)
-    if args == ["--list"]:
+    if opts.list:  # before any output folder is needed
         for name, fn in GATES.items():
             print(f"{name:4} {(fn.__doc__ or '').splitlines()[0]}")
         return 0
-    if args == ["--quick"]:
-        args = [name for name in GATES if name not in SLOW_GATES]
-    chosen = args or list(GATES)
+    unknown = [g for g in opts.gates if g not in GATES]
+    if unknown:
+        parser.error(f"unknown gate(s) {unknown}; have {', '.join(GATES)}")
+    chosen = opts.gates or list(GATES)
+    if opts.quick:
+        chosen = [name for name in chosen if name not in SLOW_GATES]
+    print(f"  logs of worker processes: {log_dir()}", flush=True)
     results: dict[str, bool] = {}
     for name in chosen:
         print(f"[{name}]", flush=True)

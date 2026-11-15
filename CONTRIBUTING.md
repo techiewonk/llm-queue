@@ -36,8 +36,11 @@ Optional features go behind an extra (`openai`, `langchain-aws`, `langchain-open
 python scripts/check.py --list      # the steps and what each one runs
 python scripts/check.py a6          # one step
 python scripts/check.py a6 a8       # several
-python scripts/check.py all         # everything (or: make check-all)
-python scripts/check.py all --quick # drills shortened: gates without B17 / B91 / B92
+python scripts/check.py dev         # dev run (= all --quick): scenarios at 100 % only,
+                                    # gates without B17 / B91 / B92
+python scripts/check.py all         # before a push (or: make check-all): adds the burst
+                                    # scenarios, every gate and coverage
+python scripts/check.py all --release  # before a release: every scenario x every load
 python scripts/check.py soak3       # 3-minute soak: smoke test while fixing
 python scripts/check.py soak10      # 10 minutes: after a change to the engine
 python scripts/check.py soak20      # 20 minutes: before a release
@@ -85,12 +88,14 @@ status expiry and sampling to fit, so even 3 minutes sees every chaos event:
 | `soak20` | ~84,000 | every 120 s, block 20 s | before a release |
 
 Shorter runs catch broken recovery, leftovers and deadline bugs as well as long ones; only
-time shows slow leaks and drift (more calls, more growth above the noise). Run `all` without
-`--quick`, and `soak20`, before a release.
+time shows slow leaks and drift (more calls, more growth above the noise). Run
+`all --release` and `soak20` before a release.
 
 Each step runs `ruff check`, `ruff format --check` and `mypy` on its source paths, then
-`pytest` on its tests, then any extra script. Steps that need the stack fail at once if a
-service does not answer; they never skip silently.
+`pytest` on its tests, then any extra script. `all` instead lints and type-checks the union of
+every step's paths once, runs the unit tests once and the stack tests once, then each step's
+extra script; each check has a time limit, so a hung drill fails instead of hanging. Steps
+that need the stack fail at once if a service does not answer; they never skip silently.
 
 | Steps | What they cover |
 |---|---|
@@ -106,7 +111,7 @@ service does not answer; they never skip silently.
 | `gates` | `scripts/gates.py`: the plan's load and chaos gates on worker processes (~20 min) |
 | `soak3` / `soak10` / `soak20` (not in `all`) | `scripts/soak.py --minutes N`: 8 worker processes, chaos (kill, store block, live edit, restart), leak and drift checks; `soak20` before a release |
 | `samples` | `scripts/samples.py`: every file in `samples/` run as app code on fakellm |
-| `bench` (not gating) | `scripts/bench.py`: prints its numbers; a failure never fails the run |
+| `bench` (not gating, not in `all`) | `scripts/bench.py`: prints its numbers; a failure never fails the run |
 
 **No test calls a real LLM.** Unit tests use fakes, stack tests and drills use fakellm. The
 only path to a real model is `python scripts/samples.py --live` (real Bedrock, AWS keys read

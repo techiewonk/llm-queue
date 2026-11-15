@@ -5,7 +5,7 @@ calls a real LLM.
 
     python scripts/stack.py up        # start (builds fakellm when its image is missing)
     python scripts/stack.py rebuild   # rebuild fakellm after changing tools/fakellm, restart
-    python scripts/stack.py status    # which services answer
+    python scripts/stack.py status    # which services answer; resets a stuck memory limit
     python scripts/stack.py down
 """
 
@@ -20,6 +20,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 COMPOSE = ["docker", "compose", "-f", str(ROOT / "docker" / "compose.yaml")]
 SERVICES = {"valkey": 6379, "redis": 6380, "fakellm": 8080}
+STORES = {"valkey": 6379, "redis": 6380}
+PASSWORD = "localdev"  # docker/compose.yaml
 
 
 def answers(port: int) -> bool:
@@ -31,6 +33,68 @@ def answers(port: int) -> bool:
         return False
 
 
+def repair_memory_limit() -> list[str]:
+    """Reset a store's `maxmemory` left above 0 by a killed S9 drill; one line per repair.
+
+    S9 lowers the stack Valkey's memory limit for 5 s; a driver killed hard in that window
+    left every later check refusing writes, with errors that look like library bugs (FT-19).
+    """
+    import redis
+
+    repaired = []
+    for name, port in STORES.items():
+        if not answers(port):
+            continue
+        client = redis.Redis(host="127.0.0.1", port=port, password=PASSWORD)
+        try:
+            limit = int(client.config_get("maxmemory").get("maxmemory") or 0)
+            if limit:
+                client.config_set("maxmemory", 0)
+                repaired.append(f"{name}: maxmemory was {limit}, reset to 0 (a killed S9?)")
+        finally:
+            client.close()
+    return repaired
+
+
+# Key patterns that only drills and tests write (never an app's keys).
+DRILL_PATTERNS = (
+    "llmqgate:*",
+    "llmqload:*",
+    "llmqfo:*",
+    "llmqbench:*",
+    "llmqsample:*",
+    "llmqsoak*",
+    "llmqtest:*",
+)
+
+
+def sweep_stale_drill_keys(idle_secs: int = 3600) -> list[str]:
+    """Delete drill and test keys untouched for `idle_secs`; one line per store that had some.
+
+    A killed or crashed drill leaves its keys behind (FT-18: a gate stream key outlived its
+    cleanup). Only keys idle for an hour go, so a drill running at the same time keeps its own.
+    """
+    import redis
+
+    swept = []
+    for name, port in STORES.items():
+        if not answers(port):
+            continue
+        client = redis.Redis(host="127.0.0.1", port=port, password=PASSWORD)
+        try:
+            gone = 0
+            for pattern in DRILL_PATTERNS:
+                for key in client.scan_iter(match=pattern, count=1000):
+                    idle = client.object("idletime", key)
+                    if idle is not None and int(idle) >= idle_secs:
+                        gone += int(client.unlink(key))
+            if gone:
+                swept.append(f"{name}: {gone} stale drill/test keys removed (idle {idle_secs} s+)")
+        finally:
+            client.close()
+    return swept
+
+
 def status() -> int:
     """Print one line per service; exit 1 when any is down."""
     down = 0
@@ -38,6 +102,8 @@ def status() -> int:
         ok = answers(port)
         down += not ok
         print(f"  {'up  ' if ok else 'DOWN'}  {name} (:{port})")
+    for line in [*repair_memory_limit(), *sweep_stale_drill_keys()]:
+        print(f"  REPAIRED  {line}")
     return 1 if down else 0
 
 

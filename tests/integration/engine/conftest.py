@@ -6,6 +6,7 @@ Every test gets its own key prefix, deleted at teardown. The stack comes from
 
 from __future__ import annotations
 
+import contextlib
 import os
 from collections.abc import AsyncIterator
 from typing import Any
@@ -45,7 +46,9 @@ async def prefix(store: redis.asyncio.Redis) -> AsyncIterator[str]:
     """Unique key prefix; every key under it is deleted at teardown."""
     value = f"llmqtest:eng:{uuid7().hex[-12:]}"
     yield value
-    keys = [k async for k in store.scan_iter(match=f"{value}:*", count=500)]
+    # Every key that starts with the prefix: some rigs build sibling prefixes such as
+    # f"{prefix}s" or f"{prefix}w", which f"{value}:*" missed (FT-5: 612 keys leaked per store).
+    keys = [k async for k in store.scan_iter(match=f"{value}*", count=500)]
     if keys:
         await store.delete(*keys)
 
@@ -86,8 +89,11 @@ async def make(store: redis.asyncio.Redis, prefix: str) -> AsyncIterator[Make]:
         return engine, fake
 
     yield build
-    for engine in engines:
-        await engine.stop(drain_secs=1)
-        await engine.providers.aclose()
-    for server in servers:
-        await server.close()
+    # Every engine, pool and server is closed even when one close raises (FT-31): the first
+    # error is raised at the end, after everything else was torn down.
+    async with contextlib.AsyncExitStack() as stack:
+        for server in servers:
+            stack.push_async_callback(server.close)
+        for engine in engines:
+            stack.push_async_callback(engine.providers.aclose)
+            stack.push_async_callback(engine.stop, drain_secs=1)

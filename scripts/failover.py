@@ -161,8 +161,12 @@ async def _drill(scenario: str, stack: contextlib.AsyncExitStack) -> bool:
     failed: collections.Counter[int] = collections.Counter()
     errors: collections.Counter[str] = collections.Counter()
     latencies: list[float] = []
+    running = 0  # calls in flight now
+    in_flight_at_event = 0  # calls in flight when the fault began (may run twice: FT-8)
 
     async def one(i: int) -> None:
+        nonlocal running
+        running += 1
         second = int(time.monotonic() - started)
         sent = time.monotonic()
         request = {**REQUEST, "messages": [{"role": "user", "content": [{"text": f"fo {i}"}]}]}
@@ -176,6 +180,8 @@ async def _drill(scenario: str, stack: contextlib.AsyncExitStack) -> bool:
         except Exception as exc:  # the drill reports every kind of failure
             failed[second] += 1
             errors[type(exc).__name__] += 1
+        finally:
+            running -= 1
 
     async def traffic() -> None:
         calls: list[asyncio.Task[None]] = []
@@ -185,7 +191,9 @@ async def _drill(scenario: str, stack: contextlib.AsyncExitStack) -> bool:
         await asyncio.gather(*calls)
 
     async def event() -> None:
+        nonlocal in_flight_at_event
         await asyncio.sleep(EVENT_AT_SECS)
+        in_flight_at_event = running
         at = f"[{time.monotonic() - started:.1f}s]"
         if scenario == "restart":
             await proxy.set(refuse=True)
@@ -199,6 +207,13 @@ async def _drill(scenario: str, stack: contextlib.AsyncExitStack) -> bool:
             return
         # In a thread: a blocking call here stalled the drill's own callers mid-traffic.
         await asyncio.to_thread(docker, "exec", NODES["a"][0], "valkey-cli", "FAILOVER")
+        # FT-34: confirm the switch really happened before moving the name.
+        for _ in range(50):
+            if (await asyncio.to_thread(role, "a")) == "slave":
+                break
+            await asyncio.sleep(0.1)
+        else:
+            raise RuntimeError("FAILOVER did not make node a a replica within 5 s")
         print(f"  {at} FAILOVER: a is now a replica")
         if scenario == "slowdns":
             await asyncio.sleep(OUTAGE_SECS)
@@ -224,12 +239,16 @@ async def _drill(scenario: str, stack: contextlib.AsyncExitStack) -> bool:
         f"  {total_ok} ok, {total_failed} failed {dict(errors) or ''}; {timing}; "
         f"stores after: {health['stores']}"
     )
-    print(f"  provider: {provider_calls} calls, {twice} ran twice")
+    print(
+        f"  provider: {provider_calls} calls, {twice} ran twice "
+        f"(allowed {in_flight_at_event}: calls in flight at the fault, at-least-once)"
+    )
     allowed = 0 if scenario != "slowdns" else (total_ok + total_failed) // 20
     passed = (
         total_failed <= allowed
         and health["stores"] == {"state": "ok", "queue": "ok"}
-        and twice == 0
+        # At-least-once (owner decision D1): only a call in flight at the fault may run twice.
+        and twice <= in_flight_at_event
     )
     print(f"{'PASS' if passed else 'FAIL'}  {scenario}")
     return passed
