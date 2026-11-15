@@ -145,6 +145,7 @@ class Admission:
         # Owners this process settled (FINISH or UNDO sent), oldest first: a heartbeat that
         # found one lost re-registered it, a slot nobody freed until its lease ran out.
         self._settled: dict[str, float] = {}
+        self.last_epoch: str | None = None  # the store's epoch, as the last renew read it
         pace = timings or EngineTimings()
         self._t = {
             "probe_wait_ms": pace.admission_probe_wait_ms,
@@ -301,20 +302,27 @@ class Admission:
         self,
         items: Sequence[tuple[str, str, str]],
         jobs: Sequence[tuple[str, str]] = (),
+        *,
+        caller: tuple[str, int] | None = None,
     ) -> tuple[int, list[str]]:
         """The heartbeat: extend grants, refresh the claims of `jobs` (request id, job owner).
 
         Returns how many grants were renewed and the owners whose entry was gone (lost). An
         owner settled while this beat ran is not lost (its entry went with its FINISH or UNDO).
+        `caller` (key, ttl secs) also sets the process's caller key in the same script, and
+        `last_epoch` keeps the store's epoch it read (FL-21: two round trips of their own).
         """
-        if not items and not jobs:
+        if not items and not jobs and caller is None:
             return 0, []
-        body = {
+        body: dict[str, Any] = {
             "lease_ms": self.lease_ms,
             "items": [{"alias": a, "owner": o, "request_id": r} for a, o, r in items],
             "jobs": [{"request_id": r, "owner": o} for r, o in jobs],
         }
+        if caller is not None:
+            body["caller"] = {"key": caller[0], "ttl": int(caller[1])}
         raw = orjson.loads(await self._call(self._renew, body))
+        self.last_epoch = str(raw.get("epoch") or "") or None
         lost = raw.get("lost") or []
         lost = (
             [str(o) for o in lost if str(o) not in self._settled] if isinstance(lost, list) else []

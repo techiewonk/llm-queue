@@ -639,6 +639,20 @@ async def test_fl7_publishing_without_a_model_deletes_its_state_keys(
     assert not [k for k in left if k.rsplit(b":", 1)[-1] in (b"cfg", b"health", b"inprog")]
 
 
+async def test_fl21_renew_sets_the_caller_key_and_reads_the_epoch(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-21: a heartbeat sent SET caller, RENEW and GET epoch as separate round trips; RENEW
+    now does the first and the last too, when asked.
+    """
+    r = await rig(store, prefix)
+    await store.set(f"{prefix}:epoch", "1700000000")
+    caller = f"{prefix}:caller:pod-a"
+    assert await r.admission.renew_all([], caller=(caller, 30)) == (0, [])
+    assert 0 < await store.ttl(caller) <= 30
+    assert r.admission.last_epoch == "1700000000"
+
+
 async def test_fl1_release_claims_of_calls_held_without_a_grant(
     store: redis.asyncio.Redis, prefix: str
 ) -> None:

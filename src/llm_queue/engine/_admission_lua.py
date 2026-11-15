@@ -802,9 +802,10 @@ return n
 """
 )
 
-# req: {lease_ms, items: [{alias, owner, request_id}], jobs: [{request_id, owner}]}. Heartbeat of
+# req: {lease_ms, items: [{alias, owner, request_id}], jobs: [{request_id, owner}], caller: {key,
+# ttl} (optional)}. Heartbeat of
 # held grants, and of the claim of held calls between grants (`jobs`, owner `worker@tag`).
-# Reply: {n = renewed, lost = owners whose entry was gone}.
+# Reply: {n = renewed, lost = owners whose entry was gone, epoch = the store's epoch or ''}.
 RENEW = (
     _COMMON
     + r"""
@@ -842,7 +843,10 @@ for _, item in ipairs(req.items) do
     table.insert(lost, item.owner)
   end
 end
-return cjson.encode({n = renewed, lost = lost})
+-- Folded in (FL-21), both optional: the process's caller key (a SET of its own before) and the
+-- store's epoch (a GET of its own), so a beat needs fewer round trips.
+if present(req.caller) then redis.call('SET', req.caller.key, '1', 'EX', req.caller.ttl) end
+return cjson.encode({n = renewed, lost = lost, epoch = redis.call('GET', P .. ':epoch') or ''})
 """
 )
 
