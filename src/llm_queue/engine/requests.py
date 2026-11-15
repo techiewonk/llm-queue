@@ -129,7 +129,9 @@ local outcome = register()
 if outcome ~= 'new' and outcome ~= 'takeover' then return {outcome} end
 local sent = send(KEYS[5], ARGV[10], tonumber(ARGV[11]), tonumber(ARGV[12]), ARGV[13])
 if sent[1] == 'full' then
-  if redis.call('HGET', KEYS[1], 'confirmed') == '0'
+  -- Only a record this call just made goes (FL-25): on a takeover the first sender's message
+  -- may be in the stream, and dropping its record left that call running for nobody.
+  if outcome == 'new' and redis.call('HGET', KEYS[1], 'confirmed') == '0'
     and redis.call('HGET', KEYS[1], 'caller') == ARGV[3] then
     redis.call('DEL', KEYS[1], KEYS[2], KEYS[3])
   end

@@ -14,6 +14,7 @@ import redis.asyncio
 
 from llm_queue.engine.envelope import Envelope, Reply, params_hash, parse
 from llm_queue.engine.keys import Keys
+from llm_queue.engine.queue import QueueSettings
 from llm_queue.engine.requests import RequestStore
 from llm_queue.errors import UnsupportedEnvelopeError
 
@@ -199,6 +200,38 @@ async def test_q3_cancel_wins_for_every_caller_of_a_shared_id(
     await store.delete(f"{prefix}:{{r:req-1}}:cancel")
     assert await requests.cancel(["req-1"], ttl_secs=60, channel=keys.cancel_channel) == 0
     assert not await store.exists(f"{prefix}:{{r:req-1}}:cancel")
+
+
+async def test_fl25_a_full_queue_on_takeover_keeps_the_record(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-25: REGISTER_SEND on a takeover with a full queue deleted the job, callers and
+    status, although the first sender's message may be in the stream (run for nobody).
+    """
+    from llm_queue.engine.queue import QueueFull, StreamQueues
+
+    requests = _store(store, prefix)  # takeover grace 0: the next sender takes over at once
+    queues = StreamQueues(store, Keys(prefix))
+    assert await _register(requests, "pod-a") == "new"  # unconfirmed; its send "lost"
+    await queues.send("q", b"first", QueueSettings(max_waiting=0))
+    with pytest.raises(QueueFull):
+        await requests.register_send(
+            "req-1",
+            caller="pod-b",
+            user_hash="u",
+            params_hash="p",
+            model="gpt120b",
+            priority=True,
+            app_id=False,
+            queue="q",
+            queue_keys=queues.queue_keys("q"),
+            bell=queues.bell("q"),
+            body=b"x",
+            max_waiting=1,
+            retention_secs=60,
+            keep_secs=60,
+        )
+    assert await requests.job("req-1")  # {} before the fix
 
 
 async def test_final_status_is_never_replaced(store: redis.asyncio.Redis, prefix: str) -> None:
