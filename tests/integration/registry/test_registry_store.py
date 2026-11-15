@@ -208,7 +208,7 @@ async def test_audit_redacts_secrets(
 ) -> None:
     store = _store(valkey, prefix, full, mode="all")
     await store.boot()
-    await store.set({"accounts.aws-dr.role_arn": "arn:aws:iam::333:role/new"}, actor="op")
+    await store.set({"accounts.aws-dr.role_arn": "arn:aws:iam::333333333333:role/new"}, actor="op")
     change = (await store.log(1))[0]["diff"][0]
     assert change["before"] == "[redacted]"
     assert change["after"] == "[redacted]"
