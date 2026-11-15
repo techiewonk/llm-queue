@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     import redis.asyncio
 
 logger = get_logger(__name__)
-RETENTION_SECS = 345_600  # how long a message may wait (4 days), unless the model sets it
+RETENTION_SECS = 86_400  # how long a message may wait (1 day, owner decision Q27), unless set
 
 _NOW = """
 local t = redis.call('TIME')

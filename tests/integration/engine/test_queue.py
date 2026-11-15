@@ -192,3 +192,15 @@ async def test_s11_a_retried_receive_hands_back_the_same_messages(
     assert [m.body for m in fresh] == [b"m2", b"m3"]
     for message in retry + fresh:
         assert await queues.ack(message)
+
+
+async def test_q27_a_send_keeps_messages_one_day_by_default(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """Owner decision Q27 (R3SE-4): a send with the default settings trimmed the stream at
+    4 days; the default retention applied on every send is now 1 day.
+    """
+    assert QueueSettings().retention_secs == 86_400
+    queues = StreamQueues(store, Keys(prefix))
+    await queues.send("q", b"x", QueueSettings())
+    assert await store.xlen(f"{prefix}:{{q:q}}:s") == 1
