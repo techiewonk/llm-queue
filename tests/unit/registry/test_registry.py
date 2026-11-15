@@ -160,7 +160,7 @@ def test_residency_filters_and_warns(full: dict[str, Any]) -> None:
     outside = [d.key for d in view.deployments("gpt120b") if view.outside_residency(d)]
     assert outside == ["aws-main/us-east-1", "aws-main/us-west-2"]
     assert not view.outside_residency(view.deployments("gpt120b-vllm")[0])  # own list
-    assert _has(warnings, "gpt120b @ aws-main/us-east-1", "residency")
+    assert _has(warnings, "gpt120b.deployments.aws-main.overrides.us-east-1", "residency")
 
 
 def test_profile_without_routes_to_is_outside_residency(full: dict[str, Any]) -> None:
@@ -168,7 +168,7 @@ def test_profile_without_routes_to_is_outside_residency(full: dict[str, Any]) ->
     del doc["models"]["gpt120b"]["deployments"]["aws-main"]["fallback"][2]["routes_to"]
     registry, _, warnings = check(doc)
     assert registry is not None
-    assert _has(warnings, "aws-main/apac", "routes_to is missing")
+    assert _has(warnings, "aws-main.overrides.apac", "routes_to is missing")
 
 
 def test_settings_table_lists_every_setting(full: dict[str, Any]) -> None:
@@ -286,7 +286,7 @@ def test_profile_name_cannot_equal_a_region(full: dict[str, Any]) -> None:
     [
         (
             lambda d: d["models"]["gpt20b"].update(attempt_timeout_secs=200),
-            ["attempt_timeout_secs` must be below `timeout_secs"],
+            ["`attempt_timeout_secs` 200 (model) must be below `timeout_secs`"],
         ),
         (
             lambda d: d["models"]["gpt20b"].update(timeout_secs=1000),
@@ -294,7 +294,7 @@ def test_profile_name_cannot_equal_a_region(full: dict[str, Any]) -> None:
         ),
         (
             lambda d: d["models"]["gpt20b"].update(max_wait_secs=1),
-            ["fallback.after_secs: must be below `max_wait_secs`"],
+            ["fallback.after_secs: 2 must be below `max_wait_secs` 1 (model)"],
         ),
         (
             lambda d: d["models"]["gpt20b"].update(priority_reserve=0.6, normal_min_share=0.5),

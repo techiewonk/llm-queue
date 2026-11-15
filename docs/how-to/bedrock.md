@@ -9,7 +9,7 @@ pods' role needs.
 |---|---|---|
 | `converse` / `converse_sync`, model `converse_api: "converse"` (default) | `Converse` | `bedrock:InvokeModel` |
 | `converse` / `converse_sync`, model `converse_api: "stream"` | `ConverseStream`, assembled into a Converse reply | `bedrock:InvokeModelWithResponseStream` |
-| `converse_stream` (and LangChain streaming) | `ConverseStream` | `bedrock:InvokeModelWithResponseStream` |
+| `converse_stream` | `ConverseStream` | `bedrock:InvokeModelWithResponseStream` |
 | `embed` / `embed_sync` | `InvokeModel` | `bedrock:InvokeModel` |
 
 ```mermaid
@@ -73,7 +73,7 @@ registry:
 ```
 
 - Drop `bedrock:InvokeModelWithResponseStream` only if no model uses `converse_api: "stream"`
-  and no code calls `converse_stream` (LangChain `astream` included).
+  and no code calls `converse_stream` (the LangChain adapters never stream).
 - Narrow `Resource` to the model ids and regions in your registry. Cross-region inference
   profiles need both the profile ARN and the foundation models it routes to.
 - For accounts with `role_arn`, the pods' own role needs `sts:AssumeRole` on that role (with the

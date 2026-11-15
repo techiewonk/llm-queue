@@ -1,7 +1,8 @@
 """LangChain: drop-in chat model and embeddings that go through the queue (chains, agents, RAG).
 
-`QueuedChatBedrockConverse` is a `ChatBedrockConverse` whose calls go through the queue (tools,
-streaming and structured output work as usual); `QueuedBedrockEmbeddings` is a
+`QueuedChatBedrockConverse` is a `ChatBedrockConverse` whose calls go through the queue (tools
+and structured output work as usual; `astream()` yields the whole answer as one chunk, so use
+`LLMQueue.converse_stream` for token streaming); `QueuedBedrockEmbeddings` is a
 `BedrockEmbeddings`. They find the started `LLMQueue` on their own.
 
     python scripts/samples.py 08_langchain [--live]

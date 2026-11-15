@@ -8,6 +8,7 @@ names parameters the call may not change; `inference_limits.max_tokens` caps the
 from __future__ import annotations
 
 import copy
+import math
 from collections.abc import Mapping
 from typing import Any
 
@@ -62,6 +63,47 @@ def _set(params: dict[str, Any], path: tuple[str, str], value: Any) -> None:
     _section(params, path[0])[path[1]] = value
 
 
+def whole_tokens(value: Any, name: str = "max_tokens") -> int:
+    """A token count as an int: ints, whole floats and numeric strings are accepted.
+
+    OpenAI-compatible servers (vLLM) coerce `100000.0` or `"100000"`, so a cap that read only
+    ints let those through (FO-3). Anything else is refused as `invalid_request`.
+    """
+    number: float | int
+    if isinstance(value, bool):
+        raise InferenceRejected(f"{name} must be a whole number, not {value!r}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError:
+            raise InferenceRejected(f"{name} must be a whole number") from None
+    elif isinstance(value, float):
+        number = value
+    else:
+        raise InferenceRejected(f"{name} must be a whole number, not {type(value).__name__}")
+    if not math.isfinite(number) or number != int(number):
+        raise InferenceRejected(f"{name} must be a whole number")
+    return int(number)
+
+
+def _capped(current: Any, cap: int, limits: Mapping[str, Any], name: str) -> int:
+    """`current` checked against `cap`: the cap when absent or above it (`clamp`), else itself.
+
+    A call that sets no value gets the cap, so the provider's own (often larger) default does
+    not apply on a capped model (FO-3).
+    """
+    if current is None:
+        return cap
+    value = whole_tokens(current, name)
+    if value > cap:
+        if limits.get("on_exceed") == "reject":
+            raise InferenceRejected(f"{name} {value} is above the limit {cap}")
+        return cap
+    return value
+
+
 def apply(
     provider: str,
     op: str,
@@ -90,11 +132,9 @@ def apply(
             for key, value in extra.items():
                 fields.setdefault(key, value)
         cap = limits.get("max_tokens")
-        current = _get(out, _CHAT_BEDROCK["max_tokens"])
-        if cap is not None and isinstance(current, int) and current > cap:
-            if limits.get("on_exceed") == "reject":
-                raise InferenceRejected(f"max_tokens {current} is above the limit {cap}")
-            _set(out, _CHAT_BEDROCK["max_tokens"], cap)
+        if cap is not None:
+            current = _get(out, _CHAT_BEDROCK["max_tokens"])
+            _set(out, _CHAT_BEDROCK["max_tokens"], _capped(current, cap, limits, "max_tokens"))
         return out
     if provider == "openai" and op == "chat":
         for name in _CHAT_OPENAI:
@@ -102,12 +142,21 @@ def apply(
                 out[name] = defaults[name]
         for key, value in (defaults.get("extra") or {}).items():
             out.setdefault(key, value)
+        # `max_completion_tokens` is the same limit under its newer OpenAI name: a lock on
+        # `max_tokens` drops it, and the cap applies to it too, or a caller got unlimited
+        # output on a capped model by sending it instead (FO-2).
+        if "max_tokens" in locked:
+            out.pop("max_completion_tokens", None)
         cap = limits.get("max_tokens")
-        current = out.get("max_tokens")
-        if cap is not None and isinstance(current, int) and current > cap:
-            if limits.get("on_exceed") == "reject":
-                raise InferenceRejected(f"max_tokens {current} is above the limit {cap}")
-            out["max_tokens"] = cap
+        if cap is not None:
+            if out.get("max_completion_tokens") is not None:
+                out["max_completion_tokens"] = _capped(
+                    out["max_completion_tokens"], cap, limits, "max_completion_tokens"
+                )
+                if out.get("max_tokens") is not None:
+                    out["max_tokens"] = _capped(out["max_tokens"], cap, limits, "max_tokens")
+            else:
+                out["max_tokens"] = _capped(out.get("max_tokens"), cap, limits, "max_tokens")
         return out
     if op == "embeddings" and "dimensions" in defaults:
         out.setdefault("dimensions", defaults["dimensions"])

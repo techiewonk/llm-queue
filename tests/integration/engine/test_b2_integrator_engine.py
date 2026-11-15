@@ -169,10 +169,10 @@ async def test_message_cap_covers_every_path(make: Make) -> None:
     for direct in (False, True):
         with pytest.raises(CallFailed) as info:
             await engine.call("small", big, timeout_secs=5, force_direct=direct)
-        assert info.value.kind == "invalid_request"
+        assert info.value.kind == "request_too_large"  # one kind for too big (Q38)
     with pytest.raises(CallFailed) as info:
         await engine.embed("titan", ["y" * 4096])
-    assert info.value.kind == "invalid_request"
+    assert info.value.kind == "request_too_large"  # one kind for too big (Q38)
     assert not fake.snapshot()["models"]
 
 

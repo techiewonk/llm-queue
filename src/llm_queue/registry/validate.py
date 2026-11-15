@@ -34,6 +34,31 @@ def _budget_numbers(view: ResolvedRegistry, alias: str, dep: Deployment) -> tupl
     return view.value(alias, "rpm", dep.key), view.value(alias, "tpm", dep.key)
 
 
+def _at(path: str, dep: Deployment) -> str:
+    """The dotted path of a deployment's overrides, as `settings set` takes it (R3CF-17)."""
+    return f"{path}.deployments.{dep.account}.overrides.{dep.name}"
+
+
+def _shown(view: ResolvedRegistry, alias: str, name: str, dep: str | None = None) -> str:
+    """`name` = value (level), so a message says which value and where it came from."""
+    found = view.effective(alias, name, dep)
+    return f"`{name}` {found.value} ({found.level})"
+
+
+def _usable(view: ResolvedRegistry, alias: str, dep: Deployment) -> bool:
+    """A deployment a call can reach: enabled, its account enabled, not blocked, in residency."""
+    routing = view.registry.routing
+    account = view.registry.accounts.get(dep.account)
+    return (
+        bool(view.value(alias, "enabled", dep.key))
+        and account is not None
+        and account.enabled
+        and dep.account not in routing.blocked_accounts
+        and dep.region not in routing.blocked_regions
+        and not view.outside_residency(dep)
+    )
+
+
 def _check_model(
     view: ResolvedRegistry, alias: str, errors: list[str], warnings: list[str]
 ) -> None:
@@ -54,30 +79,76 @@ def _check_model(
     # Timeouts.
     timeout = view.value(alias, "timeout_secs")
     if timeout > view.value(alias, "timeout_max_secs"):
-        errors.append(f"{path}: `timeout_secs` is above `timeout_max_secs`")
+        errors.append(
+            f"{path}: {_shown(view, alias, 'timeout_secs')} is above "
+            f"{_shown(view, alias, 'timeout_max_secs')}"
+        )
     for dep in deployments:
         if view.value(alias, "attempt_timeout_secs", dep.key) >= view.value(
             alias, "timeout_secs", dep.key
         ):
             errors.append(
-                f"{path} @ {dep.key}: `attempt_timeout_secs` must be below `timeout_secs`"
+                f"{_at(path, dep)}: {_shown(view, alias, 'attempt_timeout_secs', dep.key)} must "
+                f"be below {_shown(view, alias, 'timeout_secs', dep.key)}"
             )
         # A probe still running when its slot is freed lets a second probe through.
         if view.value(alias, "breaker_probe_secs", dep.key) < view.value(
             alias, "attempt_timeout_secs", dep.key
         ):
             errors.append(
-                f"{path} @ {dep.key}: `breaker_probe_secs` must be at least `attempt_timeout_secs`"
+                f"{_at(path, dep)}: {_shown(view, alias, 'breaker_probe_secs', dep.key)} must be "
+                f"at least {_shown(view, alias, 'attempt_timeout_secs', dep.key)}"
+            )
+        # The retry wait starts at the base and grows to the cap: a base above the cap is
+        # always the cap (R3CF-10).
+        if view.value(alias, "retry_base_secs", dep.key) > view.value(
+            alias, "retry_max_secs", dep.key
+        ):
+            warnings.append(
+                f"{_at(path, dep)}: {_shown(view, alias, 'retry_base_secs', dep.key)} is above "
+                f"{_shown(view, alias, 'retry_max_secs', dep.key)}; every wait is the cap"
+            )
+        health = view.value(alias, "health", dep.key)
+        if health["probe_after_secs"] > health["probe_max_secs"]:
+            warnings.append(
+                f"{_at(path, dep)}.health: `probe_after_secs` {health['probe_after_secs']} is "
+                f"above `probe_max_secs` {health['probe_max_secs']}"
             )
     max_wait = view.value(alias, "max_wait_secs")
     for rule in ("fallback", "model_fallback"):
         value = view.value(alias, rule)
-        if value and max_wait is not None and value["after_secs"] >= max_wait:
-            errors.append(f"{path}.{rule}.after_secs: must be below `max_wait_secs`")
+        if not value:
+            continue
+        if max_wait is not None and value["after_secs"] >= max_wait:
+            errors.append(
+                f"{path}.{rule}.after_secs: {value['after_secs']} must be below "
+                f"{_shown(view, alias, 'max_wait_secs')}"
+            )
+        elif max_wait is None and value["after_secs"] >= timeout:
+            # With no max_wait the rule can only fire inside the call's deadline (R3CF-10).
+            errors.append(
+                f"{path}.{rule}.after_secs: {value['after_secs']} must be below "
+                f"{_shown(view, alias, 'timeout_secs')}; it could never fire"
+            )
+        causes = value.get("on", [])
+        if len(set(causes)) != len(causes):
+            warnings.append(f"{path}.{rule}.on: lists a cause twice")
+    queue = view.value(alias, "queue")
+    if queue["retention_secs"] < timeout:
+        # A message the queue trims before the call's deadline is lost while it waits (R3CF-10).
+        warnings.append(
+            f"{path}.queue.retention_secs: {queue['retention_secs']} is below "
+            f"{_shown(view, alias, 'timeout_secs')}; a waiting call can be trimmed"
+        )
 
     # Shares.
-    if view.value(alias, "priority_reserve") + view.value(alias, "normal_min_share") >= 1:
-        errors.append(f"{path}: `priority_reserve` + `normal_min_share` must be below 1")
+    reserve = view.value(alias, "priority_reserve")
+    share = view.value(alias, "normal_min_share")
+    if reserve + share >= 1:
+        errors.append(
+            f"{path}: {_shown(view, alias, 'priority_reserve')} + "
+            f"{_shown(view, alias, 'normal_min_share')} must be below 1"
+        )
 
     # Budgets named by rate_limits must have a number.
     for dep in deployments:
@@ -85,9 +156,9 @@ def _check_model(
         rpm, tpm = _budget_numbers(view, alias, dep)
         if limits.level != "library":
             if limits.value == "rpm" and rpm is None:
-                errors.append(f"{path} @ {dep.key}: `rate_limits` is rpm but no `rpm` is set")
+                errors.append(f"{_at(path, dep)}: `rate_limits` is rpm but no `rpm` is set")
             if limits.value == "tpm" and tpm is None:
-                errors.append(f"{path} @ {dep.key}: `rate_limits` is tpm but no `tpm` is set")
+                errors.append(f"{_at(path, dep)}: `rate_limits` is tpm but no `tpm` is set")
         # One call reserves its output tokens x the weight up front: a TPM below that admits
         # nothing, and every call waited until its deadline.
         if entry.type == "chat" and tpm is not None and limits.value in ("both", "tpm"):
@@ -96,7 +167,7 @@ def _check_model(
             reserve = math.ceil(output * view.value(alias, "tpm_output_weight", dep.key))
             if tpm < reserve:
                 errors.append(
-                    f"{path} @ {dep.key}: `tpm` {tpm} is below one call's output reservation "
+                    f"{_at(path, dep)}: `tpm` {tpm} is below one call's output reservation "
                     f"({output} max tokens x tpm_output_weight = {reserve})"
                 )
 
@@ -106,10 +177,22 @@ def _check_model(
             bare = [d.key for d in confirmed if _budget_numbers(view, alias, d) == (None, None)]
             if bare:
                 errors.append(f"{path}.{name}: headroom needs `rpm` or `tpm` on {', '.join(bare)}")
-    if view.value(alias, "balance") == "weighted":
-        weights = [view.value(alias, "weight", d.key) for d in confirmed]
+    # Weight 0 does not keep traffic away when every usable deployment has it: Lua's total is
+    # 0 and the first candidate always wins. Both settings, usable deployments only (R3CF-12).
+    for name in ("balance", "balance_priority"):
+        if view.value(alias, name) != "weighted":
+            continue
+        weights = [view.value(alias, "weight", d.key) for d in confirmed if _usable(view, alias, d)]
         if weights and not any(weights):
-            errors.append(f"{path}: every confirmed deployment has weight 0")
+            errors.append(
+                f"{path}.{name}: every confirmed deployment has weight 0 (counting usable ones)"
+            )
+    # Nothing to call (R3CF-11): a warning, since a planned disable is valid.
+    if confirmed and not any(_usable(view, alias, d) for d in confirmed):
+        warnings.append(
+            f"{path}: no usable confirmed deployment (disabled, account disabled, blocked or "
+            "outside residency); calls wait or fall back"
+        )
 
     # Inference parameters by model type and provider; defaults within their limits.
     wrong = EMBED_INFERENCE if entry.type == "chat" else CHAT_INFERENCE
@@ -123,16 +206,36 @@ def _check_model(
             errors.append(f"{where}.inference.seed: not supported by Bedrock")
         caps = view.value(alias, "inference_limits", dep_key) or {}
         if "max_tokens" in caps and inference.get("max_tokens", 0) > caps["max_tokens"]:
-            errors.append(f"{where}.inference.max_tokens: above `inference_limits.max_tokens`")
+            errors.append(
+                f"{where}.inference.max_tokens: {inference['max_tokens']} is above "
+                f"`inference_limits.max_tokens` {caps['max_tokens']}"
+            )
+        misplaced = [n for n in caps.get("locked", ()) if n in wrong]
+        if misplaced:  # R3CF-16
+            warnings.append(
+                f"{where}.inference_limits.locked: {', '.join(misplaced)} is not a parameter of "
+                f"a {entry.type} model"
+            )
 
     # Rules that depend on the model type.
     for name in ("embed_batch_size", "embed_max_chars"):
         if entry.type == "chat" and name in entry.settings:
             errors.append(f"{path}.{name}: only for embedding models")
+    # Settings the model's type or provider never reads: valid, but they mislead (R3CF-16).
+    unread = []
+    if entry.type == "embedding":
+        unread += ["stream_idle_secs", "converse_api", "supports_tools"]
+    if entry.provider != "bedrock":
+        unread.append("converse_api")
+    for name in sorted({n for n in unread if n in entry.settings}):
+        warnings.append(f"{path}.{name}: not used by a {entry.provider} {entry.type} model")
     rule = view.value(alias, "model_fallback")
     if rule and entry.type == "embedding":
         errors.append(f"{path}.model_fallback: an embedding model cannot change model")
     elif rule:
+        named = [item["model"] for item in rule["models"]]
+        if len(set(named)) != len(named):
+            warnings.append(f"{path}.model_fallback.models: lists a model twice")  # R3CF-16
         for item in rule["models"]:
             other = item["model"]
             if other == alias:
@@ -144,6 +247,13 @@ def _check_model(
             target = view.registry.models[other]
             if target.type != "chat":
                 errors.append(f"{path}.model_fallback: `{other}` is not a chat model")
+            if target.provider != entry.provider:
+                # Allowed (owner decision); the request is not converted between shapes yet,
+                # so say so where it is configured (R3CF-6a).
+                warnings.append(
+                    f"{path}.model_fallback: `{other}` is an {target.provider} model; this "
+                    f"{entry.provider} model's requests reach it unchanged"
+                )
             allowed = view.residency(alias)
             if allowed is not None:
                 # A fallback must not carry this model's calls where its residency forbids.
@@ -184,17 +294,22 @@ def _check_model(
     fallback_deps = [d for d in deployments if d.group == "fallback"]
     if fallback_deps and not view.value(alias, "fallback"):
         warnings.append(f"{path}: fallback regions are listed but there is no `fallback` rule")
+    if view.value(alias, "fallback") and not fallback_deps:
+        warnings.append(f"{path}.fallback: there are no fallback regions to move to")  # R3CF-16
     for dep in deployments:
         if view.outside_residency(dep):
             reason = "routes_to is missing" if dep.profile_id and not dep.routes_to else "region"
-            warnings.append(f"{path} @ {dep.key}: outside the residency list ({reason}); unused")
+            warnings.append(f"{_at(path, dep)}: outside the residency list ({reason}); unused")
     if confirmed and all(view.outside_residency(d) for d in confirmed):
         errors.append(f"{path}: the residency list leaves no confirmed deployment to call")
     for dep in deployments:
         rpm = view.value(alias, "rpm", dep.key)
         shared = view.registry.accounts[dep.account].settings.get("shared_rpm")
         if shared is not None and rpm is not None and shared < rpm:
-            warnings.append(f"accounts.{dep.account}: `shared_rpm` is below {alias} @ {dep.key}")
+            warnings.append(
+                f"accounts.{dep.account}.settings.shared_rpm: {shared} is below the `rpm` {rpm} "
+                f"of {_at(path, dep)}"
+            )
 
 
 def _fallback_cycles(view: ResolvedRegistry) -> list[str]:
@@ -314,16 +429,24 @@ def parse_document(text: str | bytes) -> Any:
         out: dict[str, Any] = {}
         for key, value in items:
             if key in out:
-                repeated.append(key)
+                # The other keys of the object say which one it is (R3CF-17).
+                siblings = sorted({k for k, _ in items if k != key})[:4]
+                beside = f" (in the object with {', '.join(siblings)})" if siblings else ""
+                repeated.append(f"`{key}`{beside}")
             out[key] = value
         return out
 
+    def constant(name: str) -> Any:
+        # `json` reads NaN / Infinity, which pass every range check and are written back as
+        # `null` (orjson), so the stored document then failed on every reader (R3CF-1).
+        raise ValueError(f"{name} is not a JSON number")
+
     try:
-        doc = json.loads(text, object_pairs_hook=pairs)
-    except ValueError as exc:  # JSONDecodeError and bad UTF-8
+        doc = json.loads(text, object_pairs_hook=pairs, parse_constant=constant)
+    except ValueError as exc:  # JSONDecodeError, NaN / Infinity and bad UTF-8
         raise RegistryError([f"registry is not valid JSON: {exc}"]) from exc
     if repeated:
-        names = ", ".join(f"`{k}`" for k in sorted(set(repeated)))
+        names = "; ".join(sorted(set(repeated)))
         raise RegistryError([f"registry repeats keys inside one object: {names}"])
     return doc
 

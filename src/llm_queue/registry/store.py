@@ -140,6 +140,8 @@ def _redact(path: Path, value: Any) -> Any:
         return "[redacted]"
     if isinstance(value, dict):
         return {k: _redact((*path, k), v) for k, v in value.items()}
+    if isinstance(value, list):  # a list of objects was copied unredacted (FO-16)
+        return [_redact(path, v) for v in value]
     return value
 
 

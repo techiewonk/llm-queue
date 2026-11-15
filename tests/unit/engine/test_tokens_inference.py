@@ -155,3 +155,104 @@ def test_hook_failure_falls_back_once() -> None:
     assert hooks.get("balancer", "missing") is None
     with pytest.raises(ConfigError, match="name"):
         hooks.register_balancer("", lambda c, x: [])
+
+
+class _Counts:
+    """A metrics sink that keeps every counter call."""
+
+    def __init__(self) -> None:
+        self.seen: list[tuple[str, dict[str, str]]] = []
+
+    def count(self, name: str, value: float = 1.0, **labels: str) -> None:
+        self.seen.append((name, labels))
+
+    def observe(self, name: str, value: float, **labels: str) -> None:
+        """Unused."""
+
+    def gauge(self, name: str, value: float, **labels: str) -> None:
+        """Unused."""
+
+
+def test_admission_hook_fails_closed_and_counts() -> None:
+    """FO-4: a raising or unregistered admission hook admitted the call, logged once only."""
+    from llm_queue.engine import hooks
+
+    def broken(_: object) -> None:
+        raise RuntimeError("entitlement service down")
+
+    sink = _Counts()
+    ctx = hooks.CallContext("m", "r", False, None, None, "t")
+    for _ in range(2):
+        verdict = hooks.call_safely("admission", "gate", broken, ctx, default=None, metrics=sink)
+        assert isinstance(verdict, hooks.Reject)
+    assert sink.seen == [("llmq_hook_failed_total", {"kind": "admission", "hook": "gate"})] * 2
+    missing = hooks.get("admission", "fo4-not-registered")
+    assert missing is not None
+    verdict = hooks.call_safely("admission", "fo4-not-registered", missing, ctx, default=None)
+    assert isinstance(verdict, hooks.Reject)
+    assert "fo4-not-registered" in verdict.reason
+    # Other kinds still fall back to the built-in behaviour.
+    assert hooks.call_safely("sticky_key", "s", broken, ctx, default=None, metrics=sink) is None
+
+
+def test_max_completion_tokens_is_capped_and_locked() -> None:
+    """FO-2: the OpenAI cap read only `max_tokens`, so `max_completion_tokens` went uncapped."""
+    out = inference.apply(
+        "openai", "chat", {"max_completion_tokens": 10**6}, {}, {"max_tokens": 1000}
+    )
+    assert out["max_completion_tokens"] == 1000
+    assert "max_tokens" not in out
+    both = inference.apply(
+        "openai",
+        "chat",
+        {"max_tokens": 5000, "max_completion_tokens": 50},
+        {},
+        {"max_tokens": 1000},
+    )
+    assert (both["max_tokens"], both["max_completion_tokens"]) == (1000, 50)
+    locked = inference.apply(
+        "openai",
+        "chat",
+        {"max_completion_tokens": 10**6},
+        {"max_tokens": 256},
+        {"locked": ["max_tokens"]},
+    )
+    assert locked["max_tokens"] == 256
+    assert "max_completion_tokens" not in locked
+    with pytest.raises(inference.InferenceRejected, match="max_completion_tokens"):
+        inference.apply(
+            "openai",
+            "chat",
+            {"max_completion_tokens": 5000},
+            {},
+            {"max_tokens": 1000, "on_exceed": "reject"},
+        )
+
+
+@pytest.mark.parametrize("value", [100000.0, "100000", " 100000 "])
+def test_cap_coerces_floats_and_strings(value: object) -> None:
+    """FO-3: a float or numeric string skipped the cap (only ints were compared)."""
+    out = inference.apply("openai", "chat", {"max_tokens": value}, {}, {"max_tokens": 1000})
+    assert out["max_tokens"] == 1000
+    bedrock = inference.apply(
+        "bedrock", "converse", {"inferenceConfig": {"maxTokens": value}}, {}, {"max_tokens": 1000}
+    )
+    assert bedrock["inferenceConfig"]["maxTokens"] == 1000
+    assert tokens.max_tokens_of("chat", {"max_tokens": value}) == 100000
+
+
+@pytest.mark.parametrize("value", ["lots", 1.5, float("nan"), True, [1]])
+def test_cap_refuses_non_numbers(value: object) -> None:
+    """FO-3: a value that is not a whole number is refused (`invalid_request`), not ignored."""
+    with pytest.raises(inference.InferenceRejected, match="whole number"):
+        inference.apply("openai", "chat", {"max_tokens": value}, {}, {"max_tokens": 1000})
+
+
+def test_cap_is_written_when_the_call_sets_none() -> None:
+    """FO-3: a call with no `max_tokens` on a capped model got the provider's own default."""
+    out = inference.apply("openai", "chat", {"messages": []}, {}, {"max_tokens": 1000})
+    assert out["max_tokens"] == 1000
+    bedrock = inference.apply("bedrock", "converse", {"messages": []}, {}, {"max_tokens": 700})
+    assert bedrock["inferenceConfig"]["maxTokens"] == 700
+    below = inference.apply("openai", "chat", {"max_tokens": "10"}, {}, {"max_tokens": 99})
+    assert below["max_tokens"] == 10  # kept, as an int

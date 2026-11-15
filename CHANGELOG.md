@@ -12,7 +12,113 @@ public API (see STABILITY.md).
 Fixes from three code reviews and a six-part rescan of 0.1.0b1, a process-level client hub, and
 behaviour decisions for production. No backward compatibility is kept with 0.1.0b1 (beta).
 
+### Upgrading from 0.1.0b1
+
+Every change an app pinned to 0.1.0b1 may need, as a checklist; each item is described in full
+below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with tables.
+
+1. **Drain every 0.1.0b1 worker before the first 0.1.0b2 pod starts.** Mixed fleets are not
+   supported (owner Q32): a message with bytes is written in a form 0.1.0b1 does not decode.
+2. **Environment:** set `LLMQ_ENVIRONMENT=dev` where checks should be relaxed (unset is strict);
+   in strict mode set `LLMQ_KEY_PREFIX`, an `LLMQ_ID_HASH_SALT` of 16 characters or more, and
+   `https` endpoint overrides; bare host names in `LLMQ_BASE_URL_ALLOWED_HOSTS`; fix any
+   `LLMQ_*` number the start-up error says is out of range.
+3. **Registry:** rename secret references to `LLMQ_ACCOUNT_*`; fix numbers, names and queue
+   names the load error lists (bounds, no trailing newline, no `jobs-` queue names); set
+   `queue.retention_secs` where calls wait longer than a day; delete the four removed alert
+   names (they warn until 0.2); keep `inference.embedding_types` at `["float"]`.
+4. **Code:** await calls on the queue's own loop instead of using `*_sync` there (Q1); catch
+   `request_too_large` for oversize messages and add `invalid_request`,
+   `context_length_exceeded` and `worker_shutdown` to kind tables (`llm_queue.Kind`); register
+   every admission hook the registry names in every process (a missing one now refuses calls);
+   use `dataclasses.replace` on the options classes; stop using `LLMQueue.engine` / `.jobs`.
+5. **Operations:** keep the liveness probe's `failureThreshold` at 3 or more (`/health/live`
+   can now answer 503); set `noeviction` (strict readiness fails otherwise); answer the preStop
+   `/drain` route on GET; add `--yes` to `dlq purge`, `dlq redrive`, `drain`, `registry gc` and
+   `cancel` in scripts and check the new exit codes; retry registry writes on 409.
+6. **OpenAI transport and LangChain:** `retry_budget_exhausted`, `provider_error`,
+   `no_deployment` and `worker_shutdown` are now 5xx (`InternalServerError`, not
+   `RateLimitError` / `BadRequestError`); the adapters refuse the Responses API and do not
+   stream.
+
 ### Changed (behaviour)
+
+- **Mixed 0.1.0b1 / 0.1.0b2 fleets are not supported** (owner Q32, R3AP-8): drain the 0.1.0b1
+  workers before starting 0.1.0b2. Bytes in a message travel as `{"__llmq_b64__": ...}` (was
+  `{"__b64__": ...}`, which also decoded a caller's own dict of that shape and failed the
+  message on bad base64: FO-25); invalid base64 is now left as data. The format version stays 2.
+- **`GET /health/live` can answer 503** (R3AP-7): when a background loop died or the heartbeat
+  stalled for a lease (0.1.0b1 always answered 200), so a Kubernetes liveness probe restarts
+  such a pod; keep its `failureThreshold` at 3 or more. It now reads the process's own state
+  only, never the store (it probed the store inline, up to 3 s: FO-9), and stays 200 once
+  `stop()` begins.
+- **The OpenAI transport's status codes changed** (R3AP-6; was listed under Added):
+  `retry_budget_exhausted` 429 -> 503, `dead_lettered` 500 -> 502, `provider_error` 400 -> 502,
+  `no_deployment` and `worker_shutdown` 400 -> 503, `rejected` 400 -> 403,
+  `request_id_conflict` 400 -> 409, `result_expired` 400 -> 410, a kind with no row 400 -> 500.
+  The OpenAI SDK raises `InternalServerError` for the 5xx ones (was `RateLimitError` /
+  `BadRequestError`), so LangChain `with_retry` and fallbacks keyed on those classes change.
+- **A failing or unregistered admission hook refuses the call** (`rejected`, FO-4): it admitted
+  the call and logged once per process, so a tenant or entitlement gate was silently lost. Every
+  failure counts `llmq_hook_failed_total{kind, hook}`.
+- **`inference_limits.max_tokens` caps `max_completion_tokens` too** (FO-2), reads whole floats
+  and numeric strings (`100000.0`, `"100000"`) and refuses anything else as `invalid_request`
+  (FO-3); a lock on `max_tokens` drops `max_completion_tokens`. A capped call that sets no
+  `max_tokens` now carries the cap, so the provider's own default no longer applies and the call
+  reserves the cap (not `default_output_tokens`) against TPM.
+- **A message above `max_message_bytes` fails `request_too_large`** (owner Q38), like a call
+  above the token budget; it was `invalid_request`. The message says which setting to raise.
+- **Registry numbers are bounded** (owner Q42, R3CF-1, R3CF-2, R3CF-3): `NaN` and infinities
+  are refused (also in JSON text, where they passed every range check and were stored as
+  `null`); every number is at most 2**53 - 1 (`rpm: 2**64` failed boot with a raw `TypeError`),
+  every timeout and wait at most one day, and tighter limits apply per setting
+  (`retry_multiplier` and `retry_spread` at most 100, `max_attempts` 100, `max_concurrency`
+  100000, `max_receives` 1000, `embed_batch_size` 4096, ...); `registry_version` too.
+- **Registry names refuse a trailing newline** (R3CF-4: `$` matched before one, so `"acc\n"`
+  became a store key); aliases and account names are at most 64 characters, hook names 1-64;
+  an explicit `queue.name` is 1-71 letters, digits, `_`, `.`, `-` and may not start with
+  `jobs-` (R3CF-5). A padded `model_id` / `profile_id` and a `role_arn` that is not an IAM role
+  ARN are refused (R3CF-16).
+- **A stored registry is read leniently inside objects too** (R3CF-8): an unknown sub-field
+  (`health.new_field`) from a newer pod made every older pod refuse the whole document; it is
+  now dropped with a warning. The process's own config stays strict.
+- **The removed alert names load with a deprecation warning until 0.2** (owner Q34, R3AP-5): a
+  0.1.0b1 document naming `quota_used_mins`, `spill_pct`, `spill_window_secs` or
+  `waiting_age_secs` stopped the pod from starting.
+- **The registry's `queue.retention_secs` defaults to one day** (owner Q27; was four days).
+- **Process settings have ranges** (R3CF-14): `LLMQ_CFG_RELOAD_SECS` 1-3600,
+  `LLMQ_STORE_MAX_CONNECTIONS` 4-100000, `LLMQ_STATUS_TTL_SECS` at least 60,
+  `LLMQ_QUEUE_WAIT_REPLICAS` at most 16, TTLs within 2147483647 s, and others listed in
+  `docs/reference/environment.md`; an empty value counts as unset; `LLMQ_DRAIN_SECS=0` is valid.
+  Whole-number variables say "must be a whole number" for `200.0` (R3CF-17).
+- **Strict mode wants an `LLMQ_ID_HASH_SALT` of at least 16 characters** (FO-13): a
+  one-character key does not stop brute-forcing hashed phone numbers.
+- **`LLMQ_KEY_PREFIX` and `LLMQ_QUEUE_PREFIX` are plain names** (FO-20): letters, digits, `_`,
+  `.`, `-` (`registry gc` split keys on `{m:` / `{q:` and mis-attributed them). Entries of
+  `LLMQ_BASE_URL_ALLOWED_HOSTS` with a scheme, port or path are refused by name (R3CF-13).
+- **Registry checks added** (R3CF-10, R3CF-12): a fallback `after_secs` that could never fire
+  inside `timeout_secs` is an error; the weight-0 check covers `balance_priority` and counts
+  usable deployments only. Cross-field messages show values and levels and use the dotted
+  override path `settings set` takes (R3CF-17).
+- **A fallback model of another provider is allowed** (owner Q40, R3CF-6): the changelog and
+  docs said it was refused; it never was. The request is not converted between shapes yet, so
+  the validator warns. A disabled fallback target and unknown `blocked_regions` stay warnings.
+- **Admin HTTP status codes** (FO-6, FO-7, FO-17): a write that lost the compare-and-set race
+  answers 409 with `Retry-After` (was 400); a route hit before the registry loaded answers 503
+  (was a 500); only an unknown model is a 404 (any internal `KeyError` was).
+- **CLI exit codes** (FO-8): `llm-queue request ID` exits 1 for an unknown or expired id and
+  `drain --wait` exits 3 when it times out (both exited 0). The OS user is looked up only for
+  writes and falls back to `uid:<n>` (FO-5: it failed every command in a container with no
+  passwd entry).
+- **LangChain adapters** (R3AP-13, R3AP-14): `QueuedChatOpenAI` turns the Responses API off and
+  refuses `use_responses_api=True` (it posted to `/responses`, which answered 404); every adapter
+  checks `llmq=` against `QueueClient` at construction, and `allow_fallback` is a `Literal`.
+- **`RegistryStore.boot()`** audits a boot publish as `boot@<host>:<pid>` when no `actor` is
+  given (was `boot`) (R3AP-17).
+- `Tuning.problems()` has upper bounds and pair checks (R3CF-15): times at most a day,
+  `job_ttl_ms` at least 60000, `registry.history_size` at least 2, `store.retries` at most 100,
+  `warm.refresh_secs` below `warm.keepalive_secs`, `openai.max_keepalive_connections` at most
+  `openai.max_connections`, read timeouts at least 1 s.
 
 - **Jobs retry for about an hour** (Q14): a failed job waited a fixed 5 s and was dead-lettered
   after 5 tries (about 20 s into any outage). Now 5 s doubling to 5 min until about an hour has
@@ -41,8 +147,7 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   Only a success is replayed now; such an id registers as new and its old result, status, cancel
   mark and chunk stream are dropped in the same script.
 - **Queue retention defaults to 1 day** (Q27): `QueueSettings.retention_secs` and the redrive
-  default were 4 days. (The registry's `queue.retention_secs` default and the runtime's send
-  paths are changed separately.)
+  default were 4 days, and so was the registry's `queue.retention_secs`.
 - `StreamQueues.depth` counts as held every message whose visibility deadline is ahead, which
   includes one returned with a delay still to run (FL-15).
 
@@ -80,13 +185,13 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 - Throttles count in the retry budget; the retry budget is a sliding minute.
 - `LLMQ_CALLER_TTL_SECS` must be at least `LLMQ_LEASE_SECS / 3 + max(5, LLMQ_LEASE_SECS / 6)`.
 - Registry: residency that leaves a model with no deployment is an error (was a warning); a TPM
-  below one call's reservation, fallback models across providers, fallback cycles of any length
+  below one call's reservation, fallback cycles of any length
   (unless every step requires headroom), fallback targets outside the source's residency and
   `breaker_probe_secs` below `attempt_timeout_secs` are refused; `queue.retention_secs` and
   `dlq_retention_secs` are capped at 14 days; `inference.extra` takes an allow-listed set of
   names only; `min_lib_version` must be a version.
 - Alert settings `quota_used_mins`, `spill_pct`, `spill_window_secs` and `waiting_age_secs` are
-  removed (they did nothing); `quota_used_pct` is 1-100 and also checks TPM; `dlq_messages` is
+  removed (they did nothing; ignored with a warning until 0.2); `quota_used_pct` is 1-100 and also checks TPM; `dlq_messages` is
   at least 1.
 - CLI: `dlq purge`, `dlq redrive`, `drain` and `registry gc` need `--yes` (or `--dry-run`);
   `registry gc` also removes the queues of removed models.
@@ -182,6 +287,30 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 
 ### Added
 
+- **`llm-queue cancel ID ... --yes|--dry-run`** (owner Q5, R3SE-5): cancels calls for every
+  caller of each id, logs `call_cancel` with `source=cli` and writes an audit entry (`registry
+  log`) with the actor.
+- **`llm_queue.Kind`**, a `Literal` of every `CallFailed` kind (owner Q38); `CallFailed.kind` is
+  typed with it and `KINDS` is built from it.
+- **`DeploymentStatus`, `RateStatus` and `ConcurrencyStatus` are exported** (R3AP-3), and
+  `DeploymentStatus` declares `account_enabled` and `blocked` (returned but not declared, so
+  `mypy` refused reading them); `RequestStatus` declares the `*_at` state times and says every
+  value is text (R3AP-4).
+- **`register_probe` has a typed contract** (`Probe = Callable[[str, str], Mapping | None]`,
+  FO-22, R3AP-12); the docs say hooks run on the event loop and must not block.
+- `chat_stream` is its own method (it was an alias of `converse_stream`) and the `call`,
+  `converse` and `chat` docstrings say when to use each and list every per-call option (owner
+  Q36 / Q37, R3AP-10, R3AP-15).
+- `http_router()` with no `dependencies` logs `admin_routes_unauthenticated` (FO-14): the read
+  routes, `/registry` included, are open then. Ids and edit bodies are bounded (FO-15).
+- Registry warnings (R3CF-11, R3CF-16): a model with no usable confirmed deployment, queue
+  retention below the timeout, a retry base above its cap, `probe_after_secs` above
+  `probe_max_secs`, duplicate fallback causes or models, a `fallback` rule with no fallback
+  regions, settings the model's type or provider never reads, locked parameters of the other
+  model type.
+- The model setting `supports_tools` (default true; false drops a call's tool fields when that
+  model serves it as a fallback) (R3AP-17).
+
 - Jobs: `current_job()` (`JobContext`: name, `job_id`, attempt, `max_attempts`) inside a job
   (Q13, R3JE-1); `LLMQueue.job_dead_letters(name)` and `redrive_jobs(name)`, `llm-queue dlq
   list|show|redrive|purge --job NAME`, job queues in `llm-queue queues list`, a `jobs` entry in
@@ -242,7 +371,8 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
   metric, acks retried apart from the job, a job stopped by shutdown returned instead of failed.
 - **Errors:** kinds `invalid_request`, `context_length_exceeded`, `worker_shutdown`;
   `RegistryConflict` and `LiveEditRefused` exported. The OpenAI HTTP transport maps request
-  faults to 400 and exhausted retries to 502 / 503 with `retry-after`.
+  faults to 400 and exhausted retries to 502 / 503 with `retry-after` (the codes that changed
+  are under Changed).
 - **Health and metrics:** readiness from a cached background store probe (every 5 s; refusals
   are `down`, never a 500); liveness false when a background loop died or the heartbeat stalled;
   typed `health()` / `status()` results; status rows show `account_enabled` and `blocked`;

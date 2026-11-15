@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from llm_queue._version import __version__
 from llm_queue.context import RequestContext, current_context, request_context
-from llm_queue.engine.errors import KINDS, CallFailed
+from llm_queue.engine.errors import KINDS, CallFailed, Kind
 from llm_queue.engine.hooks import (
     CallContext,
     DeploymentView,
@@ -47,10 +47,13 @@ if TYPE_CHECKING:
     from llm_queue.clients.pool import Route
     from llm_queue.clients.providers import Provider, register_provider
     from llm_queue.core import (
+        ConcurrencyStatus,
+        DeploymentStatus,
         EmbedResult,
         Health,
         LLMQueue,
         ModelStatus,
+        RateStatus,
         RequestStatus,
         StatusReport,
     )
@@ -76,6 +79,10 @@ _LAZY = {
     "ModelStatus": "llm_queue.core",
     "RequestStatus": "llm_queue.core",
     "StatusReport": "llm_queue.core",
+    # The rows of a status report, so an app can annotate them (R3AP-3).
+    "DeploymentStatus": "llm_queue.core",
+    "RateStatus": "llm_queue.core",
+    "ConcurrencyStatus": "llm_queue.core",
     "Reply": "llm_queue.engine.envelope",
     "Meta": "llm_queue.engine.envelope",
     "Metrics": "llm_queue.engine.metrics",
@@ -109,7 +116,9 @@ __all__ = [
     "BedrockOptions",
     "CallContext",
     "CallFailed",
+    "ConcurrencyStatus",
     "ConfigError",
+    "DeploymentStatus",
     "DeploymentView",
     "EmbedResult",
     "EmfSink",
@@ -118,6 +127,7 @@ __all__ = [
     "JobContext",
     "JobFn",
     "JobSettings",
+    "Kind",
     "LLMQueue",
     "LLMQueueError",
     "LiveEditRefused",
@@ -130,6 +140,7 @@ __all__ = [
     "PrometheusSink",
     "Provider",
     "PublishResult",
+    "RateStatus",
     "RegistryConflict",
     "RegistryError",
     "RegistryOptions",

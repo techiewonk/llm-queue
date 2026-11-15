@@ -187,3 +187,29 @@ def test_edit_retries_has_an_upper_bound() -> None:
     assert Tuning(registry=RegistryOptions(edit_retries=11)).problems() == [
         "registry.edit_retries must be 10 or less (each try backs off up to 2 s)"
     ]
+
+
+def test_r3cf15_upper_bounds_and_pairs() -> None:
+    """R3CF-15: `problems()` returned [] for a 1 ms job TTL, 10**30 ms keys, history 1 ..."""
+    from llm_queue.tuning import OpenAIOptions, WarmOptions
+
+    tuning = Tuning(
+        engine=EngineTimings(job_ttl_ms=1, budget_key_ms=10**30, result_recheck_secs=1e9),
+        registry=RegistryOptions(history_size=1),
+        store=StoreOptions(retries=10**9),
+        warm=WarmOptions(refresh_secs=100, keepalive_secs=1),
+        openai=OpenAIOptions(max_keepalive_connections=500),
+        bedrock=BedrockOptions(read_timeout_secs=0.001),
+    )
+    text = "\n".join(tuning.problems())
+    for fragment in (
+        "engine.result_recheck_secs must be at most 86400",
+        "engine.budget_key_ms must be at most 86400000",
+        "engine.job_ttl_ms must be at least 60000",
+        "registry.history_size must be at least 2",
+        "store.retries must be at most 100",
+        "warm.refresh_secs must be below warm.keepalive_secs",
+        "openai.max_keepalive_connections must not be above",
+        "bedrock.read_timeout_secs must be at least 1",
+    ):
+        assert fragment in text

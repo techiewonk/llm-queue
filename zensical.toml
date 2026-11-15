@@ -35,6 +35,7 @@ nav = [
     { "Many services, one model" = "how-to/share-models.md" },
     { "Secure a deployment" = "how-to/secure.md" },
     { "Test" = "how-to/test.md" },
+    { "Upgrade from 0.1.0b1" = "how-to/upgrade.md" },
   ] },
   { "Explanation" = [
     { "Architecture overview" = "explanation/architecture.md" },

@@ -18,7 +18,7 @@ from langchain_aws import BedrockEmbeddings, ChatBedrockConverse
 from pydantic import Field, model_validator
 
 from llm_queue.errors import LLMQueueError
-from llm_queue.langchain._client import get_default_queue, resolve_queue
+from llm_queue.langchain._client import checked_values, get_default_queue, resolve_queue
 
 if TYPE_CHECKING:
     from langchain_core.callbacks import (
@@ -128,7 +128,7 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
 
     llmq: Any = Field(default=None, exclude=True)
     model_alias: str | None = None
-    allow_fallback: str = "all"
+    allow_fallback: Literal["all", "regions", "none"] = "all"
     priority: bool | None = None
     # langchain-aws 1.x types it as these values (0.2.x has no such field: ours adds it).
     service_tier: Literal["priority", "default", "flex", "reserved"] | None = None
@@ -138,7 +138,7 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
     @classmethod
     def _queue_defaults(cls, values: Any) -> Any:
         values = _queue_only_values(
-            _alias_values(values), cls.model_fields, "client", "bedrock_client"
+            _alias_values(checked_values(values)), cls.model_fields, "client", "bedrock_client"
         )
         if isinstance(values, dict):
             values["disable_streaming"] = True
@@ -263,7 +263,7 @@ class QueuedBedrockEmbeddings(BedrockEmbeddings):
     @model_validator(mode="before")
     @classmethod
     def _queue_defaults(cls, values: Any) -> Any:
-        return _queue_only_values(values, cls.model_fields, "client")
+        return _queue_only_values(checked_values(values), cls.model_fields, "client")
 
     def _queue(self) -> QueueClient:
         return resolve_queue(self.llmq)

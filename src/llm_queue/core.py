@@ -75,18 +75,31 @@ class RateStatus(TypedDict):
     left: int | None
 
 
+class ConcurrencyStatus(TypedDict):
+    """Calls in flight on one deployment and its (adaptive) limit."""
+
+    limit: float
+    in_use: int
+
+
 class DeploymentStatus(TypedDict):
-    """One deployment of a model: switches, budgets, concurrency, breaker and latency."""
+    """One deployment of a model: switches, budgets, concurrency, breaker and latency.
+
+    `account_enabled` and `blocked` (a routing block on its region or account) were returned
+    but not declared, so a type checker refused reading them (R3AP-3).
+    """
 
     name: str
     group: str
     enabled: bool
+    account_enabled: bool
+    blocked: bool
     healthy: bool
     next_probe: float | None
     outside_residency: bool
     rpm: RateStatus
     tpm: RateStatus
-    concurrency: dict[str, Any]
+    concurrency: ConcurrencyStatus
     breaker: str
     latency_ms: float | None
     samples: int
@@ -124,9 +137,11 @@ class StatusReport(TypedDict):
 
 
 class RequestStatus(TypedDict, total=False):
-    """One call's status record as stored, all values text (empty when the id is unknown).
+    """One call's status record as stored (empty when the id is unknown).
 
-    `<state>_at` timestamps (e.g. `done_at`) are there too, one per state reached.
+    Every value is text, as the store keeps it: convert the numbers with `int()` (`attempts`,
+    `tokens_in`, `tokens_out`) and the `*_at` times (Unix seconds) with `float()`. One `*_at`
+    key is there per state the call reached (R3AP-4).
     """
 
     request_id: str
@@ -134,6 +149,11 @@ class RequestStatus(TypedDict, total=False):
     model: str
     priority: str
     enqueued_at: str
+    in_progress_at: str
+    done_at: str
+    failed_at: str
+    expired_at: str
+    cancelled_at: str
     served_model: str
     deployment: str
     attempts: str
@@ -569,20 +589,38 @@ class LLMQueue:
     async def call(
         self, model: str, params: Mapping[str, Any], *, priority: bool | None = None, **kw: Any
     ) -> Reply:
-        """Any operation of a model (`converse`, `chat`, `invoke_model`, `embeddings`)."""
+        """Any operation of a model (`converse`, `chat`, `invoke_model`, `embeddings`).
+
+        `converse`, `chat` and `call` run the same code: the model's provider, not the method
+        name, decides the request shape (Converse for Bedrock, chat completions for
+        OpenAI-compatible). Use `call` for code that handles every model alike.
+
+        Per-call options (keyword only; R3AP-10): `timeout_secs` (default the model's
+        `timeout_secs`, capped by `timeout_max_secs`), `max_wait_secs` (longest wait for
+        budget), `request_id` (your id; a repeat attaches to the same call), `session_id`,
+        `user_id`, `tenant_id` (default from `request_context`), `allow_fallback` (`"all"`:
+        fallback regions and models, `"regions"`: regions only, `"none"`), `allowed_regions`
+        and `allowed_accounts` (limit the deployments). An unknown option raises `TypeError`.
+        """
         self._check(work=True)
         return await self._engine.call(model, params, **self._call_kwargs(priority, **kw))
 
     async def converse(
         self, model: str, request: Mapping[str, Any], *, priority: bool | None = None, **kw: Any
     ) -> Reply:
-        """One Bedrock Converse call (the reply's `response` is the Converse body)."""
+        """One chat call, named for Bedrock: send a Converse request to a Bedrock model.
+
+        Same options and code as `call`; the reply's `response` is the Converse body.
+        """
         return await self.call(model, request, priority=priority, **kw)
 
     async def chat(
         self, model: str, request: Mapping[str, Any], *, priority: bool | None = None, **kw: Any
     ) -> Reply:
-        """One OpenAI-compatible chat completion."""
+        """One chat call, named for OpenAI: send a chat completion to an OpenAI-compatible model.
+
+        Same options and code as `call`; the reply's `response` is the completion body.
+        """
         return await self.call(model, request, priority=priority, **kw)
 
     async def converse_stream(
@@ -604,7 +642,20 @@ class LLMQueue:
             async for event in events:
                 yield event
 
-    chat_stream = converse_stream
+    async def chat_stream(
+        self, model: str, request: Mapping[str, Any], *, priority: bool | None = None, **kw: Any
+    ) -> AsyncIterator[dict[str, Any]]:
+        """`converse_stream` under the OpenAI name: chat completion chunks from such a model.
+
+        Was an alias, so `help()` and tracebacks showed `converse_stream` (R3AP-15).
+        """
+        inner = cast(
+            "AsyncGenerator[dict[str, Any], None]",
+            self.converse_stream(model, request, priority=priority, **kw),
+        )
+        async with contextlib.aclosing(inner) as events:
+            async for event in events:
+                yield event
 
     async def embed(
         self,

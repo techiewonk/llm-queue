@@ -868,9 +868,10 @@ class Engine:
         # embeddings, jobs and the LangChain adapters (plan C1). One orjson pass over the params.
         size, limit = message_size_bytes(params), int(view.value(alias, "max_message_bytes"))
         if size > limit:
-            raise CallFailed(
-                "invalid_request",
-                f"the message is {size} bytes, above max_message_bytes {limit}",
+            raise CallFailed(  # one kind for every too-big call (owner Q38)
+                "request_too_large",
+                f"the message is {size} bytes, above max_message_bytes {limit} (raise it on the "
+                "model, or send large files by reference)",
                 request_id=rid,
             )
         timeout = _call_timeout_secs(view, alias, timeout_secs)
@@ -896,7 +897,9 @@ class Engine:
         hook = hooks.get("admission", hook_name)
         if hook is not None:
             ctx = hooks.CallContext(alias, rid, priority, session_id, user_id, tenant_id)
-            verdict = hooks.call_safely("admission", hook_name, hook, ctx, default=None)
+            verdict = hooks.call_safely(
+                "admission", hook_name, hook, ctx, default=None, metrics=self.metrics
+            )
             if isinstance(verdict, hooks.Reject):
                 raise CallFailed("rejected", verdict.reason, request_id=rid)
         direct = force_direct or self._direct_route(view, alias, rid, user_id)

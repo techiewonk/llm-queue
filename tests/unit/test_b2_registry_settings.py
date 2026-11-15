@@ -16,7 +16,7 @@ from llm_queue import ConfigError, Tuning
 from llm_queue.engine.settings import InfraSettings
 
 # What strict mode needs besides TLS: the id salt and an explicit key prefix (Q26).
-SALT = {"LLMQ_ID_HASH_SALT": "s", "LLMQ_KEY_PREFIX": "app-prod"}
+SALT = {"LLMQ_ID_HASH_SALT": "test-salt-0123456789", "LLMQ_KEY_PREFIX": "app-prod"}
 TLS = "rediss://cache.example.com:6379/0"
 
 
@@ -93,7 +93,7 @@ def test_debug_capture_refused_outside_dev(environment: str) -> None:
 
 
 def test_salt_is_not_in_repr() -> None:
-    assert "pepper" not in repr(_settings(LLMQ_ID_HASH_SALT="pepper"))
+    assert "pepper-0123456789" not in repr(_settings(LLMQ_ID_HASH_SALT="pepper-0123456789"))
 
 
 def test_caller_ttl_must_outlive_a_heartbeat() -> None:

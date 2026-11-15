@@ -97,13 +97,12 @@ def test_dedupe_refuses_an_offload_that_deletes_on_read() -> None:
 
 
 async def test_liveness_route_reports_dead_loops() -> None:
-    """18: /health/live answered 200 even with a dead background loop."""
+    """18: /health/live answered 200 even with a dead background loop.
 
-    async def health(live: bool) -> dict[str, Any]:
-        return {"live": live, "ready": True, "stores": {}}
-
+    Liveness reads the engine's `_live()` only, never the store-probing health check (FO-9).
+    """
     for live, code in ((True, 200), (False, 503)):
-        engine = SimpleNamespace(health_check=lambda live=live: health(live))
+        engine = SimpleNamespace(_live=lambda live=live: live)
         status, body = await Handlers(engine).live()  # type: ignore[arg-type]
         assert (status, body) == (code, {"live": live})
 

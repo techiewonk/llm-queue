@@ -3,13 +3,14 @@
 A call's deadline is not an absolute pod time: the message carries `timeout_secs` and the
 worker measures it from the queue position (the store's clock), so pod clock skew does not
 matter (plan §3.18). Version 2 only: a newer message is returned to the queue, never dropped.
-Bytes (Converse images, documents, redacted reasoning) travel as `{"__b64__": "..."}` and are
-decoded back to bytes on read, so botocore gets the bytes it expects (plan C1).
+Bytes (Converse images, documents, redacted reasoning) travel as `{"__llmq_b64__": "..."}` and
+are decoded back to bytes on read, so botocore gets the bytes it expects (plan C1).
 """
 
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 from typing import Any, Literal
 
@@ -21,7 +22,9 @@ from llm_queue.errors import UnsupportedEnvelopeError
 VERSION = 2
 Op = Literal["converse", "invoke_model", "chat", "embeddings"]
 AllowFallback = Literal["all", "regions", "none"]
-B64 = "__b64__"
+# A key no request field uses: `{"__b64__": ...}` written by a caller as data was decoded too,
+# and invalid base64 there failed the message on the worker (FO-25).
+B64 = "__llmq_b64__"
 # Set on a dumped message or reply that holds encoded bytes, so readers walk it only then (a
 # walk of every reply would cost a full pass over large embedding responses).
 _HAS_BYTES = "b64"
@@ -31,7 +34,7 @@ MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 
 
 class _Encoder:
-    """orjson `default` that turns bytes into `{"__b64__": ...}` and remembers it did."""
+    """orjson `default` that turns bytes into `{B64: ...}` and remembers it did."""
 
     __slots__ = ("used",)
 
@@ -51,10 +54,13 @@ def json_default(value: Any) -> Any:
 
 
 def decode_bytes(node: Any) -> Any:
-    """`node` with every `{"__b64__": ...}` turned back into bytes."""
+    """`node` with every `{B64: ...}` turned back into bytes (invalid base64 is left as is)."""
     if isinstance(node, dict):
         if len(node) == 1 and isinstance(node.get(B64), str):
-            return base64.b64decode(node[B64])
+            try:
+                return base64.b64decode(node[B64], validate=True)
+            except (binascii.Error, ValueError):
+                return dict(node)
         return {k: decode_bytes(v) for k, v in node.items()}
     if isinstance(node, list):
         return [decode_bytes(v) for v in node]
@@ -72,7 +78,7 @@ def message_size_bytes(params: Any) -> int:
     """The JSON size of a call's params as they travel (bytes base64-encoded): the size cap.
 
     Checked against `max_message_bytes` before a call is sent; above it the call fails with
-    `CallFailed("invalid_request")` instead of reaching the store or Bedrock.
+    `CallFailed("request_too_large")` instead of reaching the store or Bedrock.
     """
     return len(orjson.dumps(params, default=json_default))
 

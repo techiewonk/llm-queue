@@ -11,28 +11,45 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
+from llm_queue._logging import get_logger
 from llm_queue.engine.store_guard import STORE_DOWN
-from llm_queue.errors import ConfigError, MissingExtra
-from llm_queue.registry.store import LiveEditRefused, audit_diff
+from llm_queue.errors import ConfigError, MissingExtra, UnknownModel
+from llm_queue.registry.store import (
+    _SECRET_FIELDS,  # one set for the audit and this view, so a new secret is hidden in both
+    LiveEditRefused,
+    RegistryConflict,
+    audit_diff,
+)
 from llm_queue.registry.validate import RegistryError
 
 if TYPE_CHECKING:
     from llm_queue.engine.runtime import Engine
 
-_REDACT = frozenset({"role_arn", "external_id_ref", "api_key_ref"})
+logger = get_logger(__name__)
 ADMIN_HEADER = "X-LLMQ-Admin"
 Response = tuple[int, dict[str, Any]]
 # A store outage was a 500 with redis-py's traceback; it is a 503 like the readiness probe (EN-10).
 _UNAVAILABLE: Response = (503, {"error": "state store unavailable"})
+# Mounted and hit before `start()` loaded the registry: a 500 with a traceback (FO-7).
+_NOT_LOADED: Response = (503, {"error": "registry not loaded"})
+# A lost compare-and-set is valid and retryable: 409 with `Retry-After`, not 400 (FO-6).
+RETRY_AFTER_SECS = 1
+# Bounds on what a client sends before anything reads the store or diffs the registry (FO-15).
+MAX_ID_CHARS = 256
+MAX_EDIT_PATHS = 100
 
 
 def redacted(doc: Any) -> Any:
-    """The registry with role ARNs and secret references hidden."""
+    """The registry with role ARNs and secret references hidden (lists walked too)."""
     if isinstance(doc, Mapping):
-        return {k: "[redacted]" if k in _REDACT else redacted(v) for k, v in doc.items()}
+        return {k: "[redacted]" if k in _SECRET_FIELDS else redacted(v) for k, v in doc.items()}
     if isinstance(doc, list):
         return [redacted(v) for v in doc]
     return doc
+
+
+def _too_long(*values: str | None) -> bool:
+    return any(v is not None and len(v) > MAX_ID_CHARS for v in values)
 
 
 class Handlers:
@@ -43,9 +60,20 @@ class Handlers:
         self.engine = engine
         self.allow_writes = allow_writes
 
+    def _loaded(self) -> bool:
+        try:
+            self.engine.registry.current  # noqa: B018  # raises ConfigError before the first load
+        except ConfigError:
+            return False
+        return True
+
     async def live(self) -> Response:
-        """200 while the engine's loops run; 503 when one died or the heartbeat stalled (O2)."""
-        live = bool((await self.engine.health_check())["live"])
+        """200 while the engine's loops run; 503 when one died or the heartbeat stalled (O2).
+
+        Read from the engine's own state, never the store: a store outage or a slow probe made
+        liveness wait up to the probe timeout and fail the kubelet's 1 s default (FO-9).
+        """
+        live = self.engine._live()
         return (200 if live else 503), {"live": live}
 
     async def ready(self) -> Response:
@@ -54,16 +82,22 @@ class Handlers:
         return (200 if health["ready"] else 503), health
 
     async def status(self, model: str | None = None) -> Response:
-        """Status of a model or of everything (503 while the store is unreachable)."""
+        """Status of a model or of everything (404 unknown model, 503 store down or not loaded)."""
+        if _too_long(model):
+            return 404, {"error": "unknown model"}
         try:
             return 200, await self.engine.status(model)
-        except KeyError:
+        except UnknownModel:  # only this: another KeyError is a bug, not a client error (FO-17)
             return 404, {"error": f"unknown model {model}"}
+        except ConfigError:
+            return _NOT_LOADED
         except STORE_DOWN:
             return _UNAVAILABLE
 
     async def request(self, request_id: str) -> Response:
         """Status of one call (503 while the store is unreachable)."""
+        if _too_long(request_id):
+            return 404, {"error": "unknown or expired request"}
         try:
             found = await self.engine.request_status(request_id)
         except STORE_DOWN:
@@ -75,10 +109,13 @@ class Handlers:
         store = self.engine.registry
         try:
             live_edits = await store.diff_with_config()
+            raw = dict(store.current.registry.raw)
+        except ConfigError:
+            return _NOT_LOADED
         except STORE_DOWN:
             return _UNAVAILABLE
         return 200, {
-            "registry": redacted(dict(store.current.registry.raw)),
+            "registry": redacted(raw),
             "changes": store.changes,
             "live_edits": redacted(live_edits),
         }
@@ -89,9 +126,15 @@ class Handlers:
         """A live edit of safe fields (only with `allow_writes`); audited with `actor`."""
         if not self.allow_writes:
             return 403, {"error": "writes are off"}
+        if len(values) > MAX_EDIT_PATHS or _too_long(model, *values):
+            return 400, {"error": f"at most {MAX_EDIT_PATHS} paths of {MAX_ID_CHARS} characters"}
+        if not self._loaded():
+            return _NOT_LOADED
         before = dict(self.engine.registry.current.registry.raw)
         try:
             view = await self.engine.registry.set(values, actor=f"http:{actor}", model=model)
+        except RegistryConflict as exc:
+            return 409, {"error": str(exc), "retry_after_secs": RETRY_AFTER_SECS}
         except (LiveEditRefused, RegistryError, ConfigError) as exc:
             return 400, {"error": str(exc)}
         except STORE_DOWN:
@@ -104,10 +147,16 @@ class Handlers:
         """Block or unblock a region or account (only with `allow_writes`)."""
         if not self.allow_writes:
             return 403, {"error": "writes are off"}
+        if _too_long(region, account):
+            return 400, {"error": f"a region or account has at most {MAX_ID_CHARS} characters"}
+        if not self._loaded():
+            return _NOT_LOADED
         try:
             await self.engine.registry.block(
                 region=region, account=account, on=on, actor=f"http:{actor}"
             )
+        except RegistryConflict as exc:
+            return 409, {"error": str(exc), "retry_after_secs": RETRY_AFTER_SECS}
         except ConfigError as exc:
             return 400, {"error": str(exc)}
         except STORE_DOWN:
@@ -133,7 +182,8 @@ def status_router(
     returns the authenticated name the audit records (never a client-supplied value, which
     anyone could spoof). Write routes take JSON bodies and need the `X-LLMQ-Admin` header: a
     browser cannot send either cross-site without a CORS preflight, so a page an admin visits
-    cannot post a block or an edit with the admin's cookies.
+    cannot post a block or an edit with the admin's cookies. With no `dependencies` the read
+    routes (`/status`, `/requests/{id}`, `/registry`) are open; a warning is logged (FO-14).
     """
     try:
         from fastapi import APIRouter, Body, Depends, Request
@@ -148,6 +198,14 @@ def status_router(
         raise ConfigError("allow_writes=True needs actor= (who made the edit, for the audit)")
     if allow_writes and not dependencies:
         raise ConfigError("allow_writes=True needs dependencies= (the app's admin check)")
+    if not dependencies:
+        # `/registry` lists accounts, regions, model ids and base URLs: open to anyone who
+        # reaches the app unless it sits behind its own auth (FO-14).
+        logger.warning(
+            "admin_routes_unauthenticated",
+            routes="/status, /requests/{id}, /registry",
+            fix="pass dependencies= (the app's admin check)",
+        )
 
     handlers = Handlers(engine, allow_writes=allow_writes)
 
@@ -164,7 +222,8 @@ def status_router(
 
     def reply(result: Response) -> Any:
         code, body = result
-        return JSONResponse(body, status_code=code)
+        headers = {"Retry-After": str(RETRY_AFTER_SECS)} if code == 409 else None
+        return JSONResponse(body, status_code=code, headers=headers)
 
     @router.get("/health/live")
     async def live() -> Any:

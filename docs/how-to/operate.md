@@ -22,8 +22,9 @@ Start one queue per process, after any fork (in each gunicorn / uvicorn worker, 
 
 ## Deploys and restarts
 
-1. A **preStop hook** calls `llmq.pause_receiving()` (for example through a `/drain` endpoint, as
-   in `samples/09_http_router.py`). Readiness fails, and the process takes no new calls or jobs;
+1. A **preStop hook** calls `llmq.pause_receiving()` through a `/drain` endpoint of the app (the
+   library's router has none), as in `samples/09_http_router.py`. It must answer **GET**:
+   `preStop: httpGet` sends a GET, and a POST-only route answers 405 and nothing drains. Readiness fails, and the process takes no new calls or jobs;
    running work goes on.
 2. **Shutdown** is `await llmq.stop(drain_secs=...)`. Held messages go back to the queue at once;
    running calls and this pod's waiting callers get up to `drain_secs` (default
@@ -76,11 +77,17 @@ Measured: 4 rolling restarts, 0 calls lost (gate B33).
 
 | Route / call | Answers |
 |---|---|
-| `GET /health/live` | 200 while the process runs |
+| `GET /health/live` | 200 while the library's background loops run and the heartbeat makes progress; **503** when a loop died or the heartbeat stalled for a lease. Once `stop()` begins it stays 200, so a draining pod is not restarted. It reads the process's own state only, never the store |
 | `GET /health/ready` | 200 when the registry is loaded and the process is not draining, else 503 |
-| `await llmq.health()` | `{"live", "ready", "stores": {"state", "queue"}}` |
+| `await llmq.health()` | `{"live", "ready", "stores": {"state", "queue"}, "eviction_policy"}`, plus `queue_eviction_policy` with a separate queue store |
 
-Readiness never depends on the stores or the providers, and answers at once from cached state:
+A liveness probe on `/health/live` restarts a pod whose loops died (0.1.0b1 always answered
+200): keep its `failureThreshold` at 3 or more so one slow beat does not restart a healthy pod.
+
+Readiness never depends on the stores' reachability or the providers, and answers at once from
+cached state (one exception: in strict mode a store whose `maxmemory-policy` may evict keys makes
+the process not ready, with `not_ready_reason` in the body; the policy is read again every
+minute):
 a background task probes each store every 5 s with a short write bounded by
 `EngineTimings.health_probe_secs` (3 s) and reports it `ok`, `read_only` (a failover left it a
 replica) or `down` (unreachable, or refusing writes, such as out of memory). A store error never
@@ -88,7 +95,8 @@ turns the readiness route into a 500. Liveness is false when one of the library'
 loops died or the heartbeat made no progress for a lease (`LLMQ_LEASE_SECS`).
 
 At `start()` the store's own setup is checked: a cluster-mode store is refused (`ConfigError`),
-and a `maxmemory-policy` other than `noeviction` logs `store_eviction_policy` with a warning (see
+and a `maxmemory-policy` other than `noeviction` logs `store_eviction_policy` with a warning and,
+when strict, fails readiness (see
 [Store requirements](../explanation/storage.md#store-requirements)).
 
 ## Status
@@ -197,8 +205,10 @@ Metrics go to `LLMQ_METRICS_SINK`: `emf` (CloudWatch embedded metrics, default),
 (needs the `metrics` extra) or `none`; one sink per process. Names include `llmq_calls_total`,
 `llmq_wait_seconds`, `llmq_tokens_input_total`, `llmq_tokens_output_total`,
 `llmq_fallback_total`, `llmq_admission_refusals_total` (counted once per call),
-`llmq_retries_total`, `llmq_grants_lost_total`, `llmq_store_errors_total` and
-`llmq_jobs_no_consumer_total`. Every 30 s the alert loop also sets gauges per model and
+`llmq_retries_total`, `llmq_grants_lost_total`, `llmq_store_errors_total`,
+`llmq_jobs_no_consumer_total` and `llmq_hook_failed_total` (a failing or unregistered
+admission hook, which refuses the call; labels `kind`, `hook`). Every 30 s the alert loop also
+sets gauges per model and
 deployment: `llmq_queue_waiting`, `llmq_in_progress`, `llmq_dead_letters`, `llmq_breaker_open`,
 `llmq_rpm_used`, `llmq_tpm_used`, `llmq_concurrency_in_use`, `llmq_throttles_1m`,
 `llmq_provider_latency_ms` and `llmq_alert_<name>`.

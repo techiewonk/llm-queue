@@ -3,8 +3,11 @@
 Every command reads `LLMQ_*` from the environment (`InfraSettings.from_env`) and talks to the
 stores directly; writes go through the registry store (validated, protected fields, audited
 with `--actor`, default the OS user). Output is JSON, one document per command. Commands that
-delete or move data (`dlq purge`, `dlq redrive`, `registry gc`, `drain`) need `--yes`;
-`--dry-run` shows what they would do.
+delete or move data (`dlq purge`, `dlq redrive`, `registry gc`, `drain`, `cancel`) need
+`--yes`; `--dry-run` shows what they would do.
+
+Exit codes: 0 done, 1 an error (bad input, unknown or expired request, store outage), 3 a
+`drain --wait` that timed out with calls still waiting (FO-8).
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import getpass
 import json
 import os
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -23,18 +27,40 @@ import orjson
 import redis.asyncio
 from redis.exceptions import RedisError
 
+from llm_queue._logging import get_logger
 from llm_queue.engine._codec import text as _text
 from llm_queue.engine.http import redacted
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import RETENTION_SECS, StreamQueues
+from llm_queue.engine.requests import RequestStore
 from llm_queue.engine.settings import InfraSettings
 from llm_queue.engine.status import StatusReader
 from llm_queue.engine.store_client import secret_store_client
 from llm_queue.errors import ConfigError, LLMQueueError
+from llm_queue.registry._lua import AUDIT_MAX_ENTRIES
 from llm_queue.registry.store import RegistryStore
 from llm_queue.tuning import Tuning
 
+logger = get_logger(__name__)
 _GC_BATCH = 500  # keys per UNLINK pipeline in `registry gc`
+EXIT_DRAIN_TIMEOUT = 3  # `drain --wait` ran out of time with calls still waiting (FO-8)
+MAX_CANCEL_IDS = 1000  # one `cancel` command at most
+
+
+def default_actor() -> str:
+    """The OS user for the audit, or `uid:<n>` when the user has no passwd entry (FO-5).
+
+    `getpass.getuser()` raises in a container running under a UID with no passwd entry and no
+    `USER` / `LOGNAME` (`KeyError` on 3.11 / 3.12, `OSError` on 3.13), which failed every
+    command, read-only ones included.
+    """
+    try:
+        return getpass.getuser()
+    except (KeyError, OSError):
+        getuid = getattr(os, "getuid", None)
+        if getuid is not None:
+            return f"uid:{getuid()}"
+        raise ConfigError("cannot tell who you are: pass --actor NAME") from None
 
 
 def _glob_escape(text: str) -> str:
@@ -106,7 +132,15 @@ def _parser() -> argparse.ArgumentParser:
         p.add_argument("--region")
         p.add_argument("--account")
 
-    drain = sub.add_parser("drain", help="disable a model for new calls; serve waiting ones")
+    cancel = sub.add_parser("cancel", help="cancel calls by request id (audited)")
+    cancel.add_argument("request_ids", nargs="+")
+    _confirm(cancel)
+
+    drain = sub.add_parser(
+        "drain",
+        help="disable a model for new calls; serve waiting ones "
+        "(undo: registry set --model M enabled=true)",
+    )
     drain.add_argument("model")
     drain.add_argument("--wait", action="store_true")
     drain.add_argument("--timeout", type=float, default=600.0)
@@ -137,14 +171,17 @@ class Cli:
         self,
         settings: InfraSettings,
         client: redis.asyncio.Redis,
-        actor: str,
+        actor: str | None,
         queue_client: redis.asyncio.Redis | None = None,
     ) -> None:
-        """Wire the stores: queues live on `queue_client` when `LLMQ_QUEUE_STORE_URL` is set."""
+        """Wire the stores: queues live on `queue_client` when `LLMQ_QUEUE_STORE_URL` is set.
+
+        `actor` None means the OS user, looked up only when a command writes (FO-5).
+        """
         self.settings = settings
         self.client = client
         self.queue_client = queue_client
-        self.actor = actor
+        self._actor = actor
         self.keys = Keys(settings.key_prefix)
         config = None
         if settings.registry or settings.registry_file:
@@ -158,6 +195,13 @@ class Cli:
             audit_retention_days=settings.audit_retention_days,
         )
         self.queues = StreamQueues(queue_client or client, self.keys)
+
+    @property
+    def actor(self) -> str:
+        """Who makes a change, for the audit: `--actor`, else the OS user."""
+        if self._actor is None:
+            self._actor = default_actor()
+        return self._actor
 
     async def loaded(self) -> Any:
         """The stored registry; `ConfigError` when none is published."""
@@ -296,6 +340,39 @@ class Cli:
     async def _unblock(self, args: argparse.Namespace) -> Any:
         return await self._block(args, on=False)
 
+    async def _cancel(self, args: argparse.Namespace) -> Any:
+        """Cancel calls for every caller of each id, audited like a registry edit (owner Q5).
+
+        Anyone may cancel any id; the audit stream (`registry log`) records who, and each
+        cancel is logged as `call_cancel` with `source=cli`.
+        """
+        ids = list(dict.fromkeys(args.request_ids))
+        if len(ids) > MAX_CANCEL_IDS or any(not rid or len(rid) > 256 for rid in ids):
+            raise ConfigError(f"give 1-{MAX_CANCEL_IDS} request ids of at most 256 characters")
+        if not _confirmed(args, "cancel stops these calls for every caller"):
+            return {"would_cancel": ids}
+        actor = self.actor
+        store = RequestStore(self.client, self.keys, status_ttl_secs=self.settings.status_ttl_secs)
+        cancelled = await store.cancel(
+            ids, ttl_secs=self.settings.status_ttl_secs, channel=self.keys.cancel_channel
+        )
+        for rid in ids:
+            logger.info("call_cancel", request_id=rid, source="cli", by=actor)
+        diff = [{"path": f"requests.{rid}", "before": None, "after": "cancelled"} for rid in ids]
+        await self.client.xadd(
+            self.registry.audit_key,
+            {
+                "actor": actor,
+                "op": "cancel",
+                "version": "",
+                "diff": orjson.dumps(diff),
+                "ts": f"{time.time():.6f}",  # wall time, like the Lua audit entries
+            },
+            maxlen=AUDIT_MAX_ENTRIES,
+            approximate=True,
+        )
+        return {"cancelled": cancelled, "requested": len(ids), "actor": actor}
+
     async def _drain(self, args: argparse.Namespace) -> Any:
         view = await self.loaded()
         alias = view.registry.alias_of(args.model)
@@ -366,6 +443,20 @@ class Cli:
         return out
 
 
+def exit_code(result: Any) -> int:
+    """The exit code of a printed result: 1 for an error document, 3 for a drain timeout.
+
+    `request ID` printed `{"error": ...}` and `drain --wait` printed `"drained": false`, both
+    with exit 0, so a script waiting on them carried on (FO-8).
+    """
+    if isinstance(result, Mapping):
+        if "error" in result:
+            return 1
+        if result.get("drained") is False:
+            return EXIT_DRAIN_TIMEOUT
+    return 0
+
+
 async def amain(argv: Sequence[str], environ: Mapping[str, str] | None = None) -> Any:
     """Parse and run one command; returns its JSON-able result."""
     args = _parser().parse_args(list(argv))
@@ -387,7 +478,7 @@ async def amain(argv: Sequence[str], environ: Mapping[str, str] | None = None) -
         if queue_client is not None:
             stack.push_async_callback(queue_client.aclose)
         stack.push_async_callback(client.aclose)
-        cli = Cli(settings, client, args.actor or getpass.getuser(), queue_client)
+        cli = Cli(settings, client, args.actor, queue_client)
         return await cli.run(args)
 
 
@@ -401,5 +492,8 @@ def main(argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = 
     except RedisError as exc:  # an outage printed redis-py's traceback (EN-30)
         print(f"state store error ({type(exc).__name__}): {exc}", file=sys.stderr)
         return 1
+    except OSError as exc:  # a file or user lookup (3.13 raises OSError for getuser), FO-5
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     print(json.dumps(result, indent=2, default=str))
-    return 0
+    return exit_code(result)

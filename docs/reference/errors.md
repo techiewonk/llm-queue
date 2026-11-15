@@ -25,7 +25,7 @@ sync call on the queue's own event-loop thread, or `start()` on a stopped queue.
 
 ```python
 class CallFailed(LLMQueueError):
-    kind: str                      # one of llm_queue.KINDS
+    kind: Kind                     # llm_queue.Kind, a Literal of every kind (KINDS as a set)
     retry_after_secs: float | None # set where a later retry can work
     partial_text: str | None       # a stream cut mid-answer
     request_id: str | None
@@ -36,9 +36,9 @@ class CallFailed(LLMQueueError):
 | `rate_limited` | No budget before `max_wait_secs` or the deadline, the provider kept throttling past `throttle_retry_attempts` (or the retry budget ran out with no untried deployment left), or a fallback model was busy | Retry after `retry_after_secs`, or tell the user to wait |
 | `queue_full` | The model's queue already holds `max_waiting` (50,000) calls, or `send_job` found 10,000 jobs of that name waiting; `retry_after_secs` is 5 | Retry later; shed load |
 | `deadline_exceeded` | No reply within the call's timeout (also: the store did not answer in time, or retries ran out of time) | Retry once, or raise `timeout_secs` for long answers |
-| `invalid_request` | The request itself is wrong: the message is above `max_message_bytes` (4 MB), an embedding text is empty, the provider refused the request as invalid, or `on_exceed: reject` refused its inference values | Fix the request; retrying will not help |
+| `invalid_request` | The request itself is wrong: an embedding text is empty, the provider refused the request as invalid, a `max_tokens` / `max_completion_tokens` is not a whole number on a model with a cap, or `on_exceed: reject` refused its inference values | Fix the request; retrying will not help |
 | `context_length_exceeded` | The input does not fit the model's context window | Shorten the input |
-| `request_too_large` | The input estimate is above every candidate deployment's `tpm` | Shorten the input or split it; retrying will not help |
+| `request_too_large` | The call is too big: its input estimate is above every candidate deployment's `tpm`, or its message is above the model's `max_message_bytes` (4 MB) | Shorten the input or split it, or raise `max_message_bytes`; retrying will not help |
 | `no_deployment` | The call's own filters (`allowed_regions`, `allowed_accounts`) leave no deployment | Fix the filters or the registry |
 | `model_unavailable` | No usable deployment: all disabled, blocked, unhealthy or outside residency; `retry_after_secs` is the time to the next probe | Use another feature or model, or retry after `retry_after_secs` |
 | `model_disabled` | The model is disabled and has no fallback model to use | Use another model; an operator turned it off |
@@ -52,7 +52,7 @@ class CallFailed(LLMQueueError):
 | `worker_lost` | A stream ended without its end entry or had a gap (its worker was lost) | Retry; `partial_text` holds the text so far |
 | `worker_shutdown` | A stream had already sent chunks when its worker's drain ran out (a call that has sent nothing is given back to the queue instead and does not fail) | Retry; `partial_text` holds the text so far |
 | `cancelled` | The call was cancelled (`cancel()`, or its caller process was gone) | Nothing, unless you did not cancel it |
-| `rejected` | The app's `admission` hook rejected the call before it was sent | Handle as your hook intends |
+| `rejected` | The app's `admission` hook rejected the call before it was sent, or the hook raised, or the registry names one this process has not registered (fails closed) | Handle as your hook intends; for a failing hook, check `llmq_hook_failed_total` |
 
 The set of kinds is `llm_queue.KINDS`. Over the OpenAI-compatible HTTP transport the LangChain
 OpenAI adapters use, kinds map to status codes. Only the request's own faults are 4xx; failures

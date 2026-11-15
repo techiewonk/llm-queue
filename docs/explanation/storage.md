@@ -53,7 +53,7 @@ model's `queue.name`) and `...-priority`; jobs use `jobs-<name>`. Hash tags grou
 | `P:{m:A}:health`, `:terr:DEP`, `:thr:DEP:MIN` | hash, zset, counter | fields `DEP\|until`, `DEP\|wait`, `DEP\|since`, `DEP\|lat` (latency EWMA, ms), `DEP\|n`; target errors by request id; throttles this minute | window; 180 s |
 | `P:{m:A}:rot`, `:sticky:HASH`, `:retries:MIN` | hash, string, hash | Rotation; a session's deployment; retries and first attempts this minute (first attempts counted by `PICK_TAKE` at grant) | none; `sticky.idle_ttl_secs` (1800); 180 s |
 | `P:{r:ID}:job`, `:callers`, `:status`, `:res`, `:cancel`, `:chunks`, `:debug` | hash, set, hash, string, string, stream, string | Claim; calling processes; status (`state`, `model`, `priority`, `<state>_at`, ...); result; cancel flag; stream; `debug_capture` text | job and callers: deadline + status TTL; status: `LLMQ_STATUS_TTL_SECS` (1800); res: `LLMQ_RESULT_TTL_SECS` (300), deleted on first read for a library id; cancel: status TTL; chunks: result TTL + timeout; debug: 1 h |
-| `P:{q:NAME}:s`, `:vis`, `:gen`, `:fails`, `:st`, `:dlq`, `:meta` | stream, zset, hashes, stream, hash | Messages; hidden until; generation; failures; held / returned; dead letters (`body, src, fails`); the receive cursor | stream `MINID` 4 days (`retention_secs`); DLQ 1 day |
+| `P:{q:NAME}:s`, `:vis`, `:gen`, `:fails`, `:st`, `:dlq`, `:meta` | stream, zset, hashes, stream, hash | Messages; hidden until; generation; failures; held / returned; dead letters (`body, src, fails`); the receive cursor | stream `MINID` 1 day (`retention_secs`); DLQ 1 day |
 | `P:bell:NAME` | list | Doorbell tokens (at most 64) | 60 s |
 | `P:caller:WORKER`, `P:done:WORKER`, `P:cancel`, `P:chunkwake:WORKER` | string, channel, channel, stream | Process liveness; result wake-ups; cancels; wakes the process's shared chunk reader when a new stream opens | `LLMQ_CALLER_TTL_SECS` (30); chunkwake trimmed |
 | `P:epoch`, `P:reset_minute`, `P:lock:{sweep,alerts,probe}`, `P:alert:*`, `P:health:WORKER` | strings | Store-reset detector; locks for one-process tasks; alert state; readiness probe | locks 5-25 s; alerts 1 day; probe 5 s |
@@ -99,10 +99,16 @@ model's `queue.name`) and `...-priority`; jobs use `jobs-<name>`. Hash tags grou
 
 | Requirement | Why | What the library does |
 |---|---|---|
-| `maxmemory-policy noeviction` (recommended) | Any evicting policy lets a full store drop queue messages, budgets and results: lost calls and overspent budgets | Reads the policy at `start()` (`CONFIG GET`, else `INFO memory` where `CONFIG` is disabled, as on ElastiCache); logs `store_eviction_policy` with a warning when it is not `noeviction`, and reports it in `health()`: `eviction_policy` for the state store (`unknown` when unreadable), `queue_eviction_policy` only when the queue store is a separate one |
+| `maxmemory-policy noeviction` (recommended) | Any evicting policy lets a full store drop queue messages, budgets and results: lost calls and overspent budgets | Reads the policy at `start()` and every minute after (`CONFIG GET`, else `INFO memory` where `CONFIG` is disabled, as on ElastiCache); logs `store_eviction_policy` with a warning when it is not `noeviction` and, in strict mode, fails readiness with `not_ready_reason`; reports it in `health()`: `eviction_policy` for the state store (`unknown` when unreadable), `queue_eviction_policy` only when the queue store is a separate one |
 | One primary (with replicas), **not cluster mode** | One admission script touches keys of several hash tags | `start()` refuses a cluster-mode store with a `ConfigError` (`INFO cluster`) instead of failing at the first call |
 | Lua scripts, pub/sub, blocking list reads (`BLPOP`) | Admission, result wake-ups and the queue doorbell | ElastiCache for Valkey / Redis OSS allows all three |
 | A store that is out of memory | `noeviction` refuses writes when full | Calls fail `queue_unavailable` ("out of memory"), admin operations `StoreUnavailable`; nothing is lost silently |
+| `min-replicas-to-write 1` (recommended with replicas) | Without it a primary that lost its replicas keeps accepting writes, and a failover then drops what only it held | A write the store refuses for it (`NOREPLICAS`), like `OOM`, `MISCONF` (a failed save), `BUSY` (a long script) and `READONLY`, is treated as the store being down: `store_down` decides (pause, static cap, fail fast); a result already written stays readable |
+
+Set `min-replicas-to-write` with `min-replicas-max-lag` (for example 1 and 10 s) on a replicated
+self-managed Valkey or Redis; on a managed service, check whether its parameter group exposes
+them (unverified for ElastiCache). `LLMQ_QUEUE_WAIT_REPLICAS` adds a `WAIT` after each
+send for the same guarantee per message.
 
 Tested versions: Valkey 8.1 and Redis 7.4 (the `docker/compose.yaml` stack every integration
 test, scenario and gate runs on); Valkey 8 and Redis 7.2+ are supported. The client is redis-py
