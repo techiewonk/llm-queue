@@ -155,3 +155,66 @@ def test_hook_failure_falls_back_once() -> None:
     assert hooks.get("balancer", "missing") is None
     with pytest.raises(ConfigError, match="name"):
         hooks.register_balancer("", lambda c, x: [])
+
+
+def test_max_completion_tokens_is_capped_and_locked() -> None:
+    """FO-2: the OpenAI cap read only `max_tokens`, so `max_completion_tokens` went uncapped."""
+    out = inference.apply(
+        "openai", "chat", {"max_completion_tokens": 10**6}, {}, {"max_tokens": 1000}
+    )
+    assert out["max_completion_tokens"] == 1000
+    assert "max_tokens" not in out
+    both = inference.apply(
+        "openai",
+        "chat",
+        {"max_tokens": 5000, "max_completion_tokens": 50},
+        {},
+        {"max_tokens": 1000},
+    )
+    assert (both["max_tokens"], both["max_completion_tokens"]) == (1000, 50)
+    locked = inference.apply(
+        "openai",
+        "chat",
+        {"max_completion_tokens": 10**6},
+        {"max_tokens": 256},
+        {"locked": ["max_tokens"]},
+    )
+    assert locked["max_tokens"] == 256
+    assert "max_completion_tokens" not in locked
+    with pytest.raises(inference.InferenceRejected, match="max_completion_tokens"):
+        inference.apply(
+            "openai",
+            "chat",
+            {"max_completion_tokens": 5000},
+            {},
+            {"max_tokens": 1000, "on_exceed": "reject"},
+        )
+
+
+@pytest.mark.parametrize("value", [100000.0, "100000", " 100000 "])
+def test_cap_coerces_floats_and_strings(value: object) -> None:
+    """FO-3: a float or numeric string skipped the cap (only ints were compared)."""
+    out = inference.apply("openai", "chat", {"max_tokens": value}, {}, {"max_tokens": 1000})
+    assert out["max_tokens"] == 1000
+    bedrock = inference.apply(
+        "bedrock", "converse", {"inferenceConfig": {"maxTokens": value}}, {}, {"max_tokens": 1000}
+    )
+    assert bedrock["inferenceConfig"]["maxTokens"] == 1000
+    assert tokens.max_tokens_of("chat", {"max_tokens": value}) == 100000
+
+
+@pytest.mark.parametrize("value", ["lots", 1.5, float("nan"), True, [1]])
+def test_cap_refuses_non_numbers(value: object) -> None:
+    """FO-3: a value that is not a whole number is refused (`invalid_request`), not ignored."""
+    with pytest.raises(inference.InferenceRejected, match="whole number"):
+        inference.apply("openai", "chat", {"max_tokens": value}, {}, {"max_tokens": 1000})
+
+
+def test_cap_is_written_when_the_call_sets_none() -> None:
+    """FO-3: a call with no `max_tokens` on a capped model got the provider's own default."""
+    out = inference.apply("openai", "chat", {"messages": []}, {}, {"max_tokens": 1000})
+    assert out["max_tokens"] == 1000
+    bedrock = inference.apply("bedrock", "converse", {"messages": []}, {}, {"max_tokens": 700})
+    assert bedrock["inferenceConfig"]["maxTokens"] == 700
+    below = inference.apply("openai", "chat", {"max_tokens": "10"}, {}, {"max_tokens": 99})
+    assert below["max_tokens"] == 10  # kept, as an int

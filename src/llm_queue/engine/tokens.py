@@ -26,7 +26,17 @@ if TYPE_CHECKING:  # an annotation only: importing it pulled the provider stack 
 Estimator = Callable[[str, Mapping[str, Any]], int]
 _ESTIMATORS: dict[str, Estimator] = {}
 # Request fields that carry numbers or switches, not text the model reads.
-_SKIP = frozenset({"inferenceConfig", "modelId", "max_tokens", "temperature", "top_p", "seed"})
+_SKIP = frozenset(
+    {
+        "inferenceConfig",
+        "modelId",
+        "max_tokens",
+        "max_completion_tokens",
+        "temperature",
+        "top_p",
+        "seed",
+    }
+)
 # Content blocks that carry binary data (Converse) or a data URL (OpenAI): their base64 text is
 # not tokens. Unverified starting value: a ~1 MP image is about 1,300 tokens on Claude.
 _BINARY = frozenset({"image", "document", "video", "audio", "image_url", "input_audio", "file"})
@@ -87,10 +97,26 @@ def max_tokens_of(op: str, params: Mapping[str, Any]) -> int | None:
     """The `max_tokens` a request carries, if any (Converse or OpenAI shape)."""
     if op == "converse":
         config = params.get("inferenceConfig")
-        value = config.get("maxTokens") if isinstance(config, Mapping) else None
+        values = [config.get("maxTokens") if isinstance(config, Mapping) else None]
     else:
-        value = params.get("max_tokens") or params.get("max_completion_tokens")
-    return int(value) if isinstance(value, int) else None
+        values = [params.get("max_tokens"), params.get("max_completion_tokens")]
+    # A whole float or a numeric string counts too (vLLM coerces them), and the larger of the
+    # two OpenAI names is reserved (FO-2, FO-3). Anything else reads as not set.
+    found = [n for n in map(_whole, values) if n is not None and n > 0]
+    return max(found) if found else None
+
+
+def _whole(value: Any) -> int | None:
+    """`value` as a whole number of tokens, or None when it is not one."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        number = float(value.strip()) if isinstance(value, str) else float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(number) if math.isfinite(number) and number == int(number) else None
 
 
 @dataclass(frozen=True, slots=True)
