@@ -119,6 +119,10 @@ def test_fo16_redaction_shares_the_store_set_and_walks_lists() -> None:
 
     doc = {"accounts": [dict.fromkeys(_SECRET_FIELDS, "secret")]}
     assert all(v == "[redacted]" for v in redacted(doc)["accounts"][0].values())
+    from llm_queue.registry.store import audit_diff
+
+    (entry,) = audit_diff({"a": []}, {"a": [{"api_key_ref": "LLMQ_ACCOUNT_K"}]})
+    assert entry["after"] == [{"api_key_ref": "[redacted]"}]  # the audit walks lists too
 
 
 async def test_fo17_only_an_unknown_model_is_404() -> None:
