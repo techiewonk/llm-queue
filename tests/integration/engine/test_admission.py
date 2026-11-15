@@ -602,6 +602,43 @@ async def test_fl24_a_slightly_late_beat_still_renews_after_a_sweep(
     assert await r.admission.renew([("m", owner_token("c1", "w1", 1), "c1")]) == 1
 
 
+async def test_fl7_every_admission_key_expires(store: redis.asyncio.Redis, prefix: str) -> None:
+    """FL-7: limiter, breaker, health, rotation, lease, in-progress and waiter keys had no
+    expiry, so a removed model's or deployment's keys stayed in the store for good.
+    """
+    r = await rig(store, prefix, model={"max_concurrency": 1, "priority_reserve": 0})
+    one = [Candidate("aws-a/r1")]
+    assert (await r.ask("a", candidates=one, strategy="round_robin")).kind == "granted"
+    assert (await r.ask("b", candidates=one)).kind == "wait"  # a waiter
+    await r.admission.finish(
+        "m", owner_token("a", "w1", 1), "a", refund_r=0, refund_t=0, outcome="fail", latency_ms=5
+    )
+    assert (await r.ask("b", pos=2, candidates=one, strategy="weighted")).kind == "granted"
+    await r.admission.renew([("m", owner_token("b", "w1", 1), "b")])
+    forever = []
+    async for key in store.scan_iter(match=f"{prefix}:{{m:*", count=500):
+        if await store.pttl(key) == -1 and not key.endswith(b":cfg"):
+            forever.append(key)
+    assert forever == []
+
+
+async def test_fl7_publishing_without_a_model_deletes_its_state_keys(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-7: PUBLISH deleted only a removed model's `cfg`; its waiters, in-progress set,
+    health and rotation stayed for good, since the sweep visits only registry models.
+    """
+    r = await rig(store, prefix)
+    assert (await r.ask("a", alias="other", candidates=[Candidate("aws-a/r1")])).kind == "granted"
+    await store.hset(f"{prefix}:{{m:other}}:health", "x", 1)
+    doc = copy.deepcopy(BASE)
+    doc["registry_version"] = 2
+    del doc["models"]["other"]
+    await RegistryStore(store, prefix, config=doc).boot()
+    left = [k async for k in store.scan_iter(match=f"{prefix}:{{m:other}}:*")]
+    assert not [k for k in left if k.rsplit(b":", 1)[-1] in (b"cfg", b"health", b"inprog")]
+
+
 async def test_fl1_release_claims_of_calls_held_without_a_grant(
     store: redis.asyncio.Redis, prefix: str
 ) -> None:

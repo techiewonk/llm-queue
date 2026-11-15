@@ -28,6 +28,11 @@ local function present(v) return v ~= nil and v ~= false and v ~= cjson.null end
 -- Costs and refunds go to HINCRBY, which raises on a fraction after earlier writes stayed (FL-9).
 local function whole(v) return math.floor(v + 0.5) end
 KEY_MS = num(T.budget_key_ms, 180000)  -- budget and limiter keys live this long (> 2 minutes)
+-- Every key a script writes has an expiry, sliding on each write (FL-7): a removed model's or
+-- deployment's breaker, limiter, health, rotation, leases and waiters stayed in the store for good.
+local DAY_MS = 86400000
+local function slide(key, ms) redis.call('PEXPIRE', key, ms) end
+local function held_ms() return math.max(KEY_MS, 2 * num(req.lease_ms, 60000)) end
 
 -- One budget: field prefix f, limit L per minute, burst fraction bf, window mode.
 local function avail(key, f, L, bf, mode)
@@ -150,6 +155,7 @@ local function limit_of(alias, row)
     -- A new deployment takes its full share at once (plan E74).
     limit = cap
     redis.call('HSET', key, 'limit', tostring(limit))
+    slide(key, DAY_MS)
   end
   return math.max(1, math.floor(math.min(limit, cap))), cap
 end
@@ -536,6 +542,8 @@ if not chosen then
   local exp = now + num(req.waiter_ms, 2000)
   redis.call('ZADD', wait_keys[cls], pos, rid)
   redis.call('HSET', info_key, rid, cjson.encode({r = cost_r, t = cost_t, deps = deps, exp = exp}))
+  slide(wait_keys[cls], held_ms())
+  slide(info_key, held_ms())
   redis.call('ZADD', exp_key, exp, cls .. '|' .. rid)
   redis.call('PEXPIRE', exp_key, KEY_MS)
   return cjson.encode({r = 'wait', ms = math.max(1, math.floor(best_wait or num(T.wait_ms, 100))),
@@ -558,6 +566,8 @@ local lp, ln = lease_keys(alias, chosen.key)
 local lease_ms = num(req.lease_ms, 60000)
 redis.call('ZADD', (cls == 'p') and lp or ln, now + lease_ms, req.owner)
 redis.call('ZADD', mk(alias, 'inprog'), now + lease_ms, req.owner)
+slide((cls == 'p') and lp or ln, held_ms())
+slide(mk(alias, 'inprog'), held_ms())
 redis.call('HSET', entry_key, 'owner', req.owner, 'worker', req.worker, 'dep', chosen.key,
   'cls', cls, 'minute', minute, 'cost_r', cost_r, 'cost_t', cost_t, 'account', row.account,
   'started', now, 'request', rid, 'served', alias, 'mode', row.rate_window or 'smooth',
@@ -566,6 +576,7 @@ redis.call('PEXPIRE', entry_key, lease_ms * 2)
 if res.probe then
   local cb = mk(alias, 'cb:' .. chosen.key)
   redis.call('HSET', cb, 'probe', req.owner, 'probe_at', now)
+  slide(cb, DAY_MS)
 end
 -- Running, by this worker: a fallback grant too, so a redelivery of the call is refused
 -- while it runs on the other model (it was granted again and ran twice).
@@ -597,6 +608,7 @@ if req.strategy == 'round_robin' then
   redis.call('HSET', rot, 'rr|' .. chosen.key, redis.call('HINCRBY', rot, 'rr_seq', 1))
 end
 for field, value in pairs(rot_writes) do redis.call('HSET', mk(alias, 'rot'), field, value) end
+if req.strategy == 'round_robin' or next(rot_writes) then slide(mk(alias, 'rot'), DAY_MS) end
 local granted = {r = 'granted', dep = chosen.key, minute = minute, limit = res.limit,
   tier = chosen.tier}
 -- A stream's call: how far its chunk stream got (another worker may have begun it, R19); an
@@ -700,7 +712,10 @@ local function settle(alias, owner, rid, refund_r, refund_t, learn, outcome, lat
       if hnum(health, dep .. '|lat_at', 0) < now - num(T.slow_stale_ms, 300000) then old = latency end
       redis.call('HSET', health, dep .. '|lat', tostring(old * 0.8 + latency * 0.2), dep .. '|lat_at', now)
       redis.call('HINCRBY', health, dep .. '|n', 1)
+      slide(health, DAY_MS)
     end
+    if redis.call('EXISTS', ac) == 1 then slide(ac, DAY_MS) end
+    if redis.call('EXISTS', cb) == 1 then slide(cb, DAY_MS) end
   end
   return 1
 end
@@ -797,6 +812,8 @@ for _, item in ipairs(req.items) do
     -- guards it), so a still-running call holds its slot again.
     redis.call('ZADD', mk(item.alias, 'lease:' .. dep .. ':' .. cls), until_, item.owner)
     redis.call('ZADD', mk(item.alias, 'inprog'), 'XX', until_, item.owner)
+    slide(mk(item.alias, 'lease:' .. dep .. ':' .. cls), held_ms())
+    slide(mk(item.alias, 'inprog'), held_ms())
     redis.call('PEXPIRE', entry_key, num(req.lease_ms, 60000) * 2)
     beat(item.request_id, redis.call('HGET', entry_key, 'job_owner')
       or string.match(item.owner, '^.*|([^|]*)|[^|]*$'))
@@ -829,6 +846,8 @@ for _, item in ipairs(req.items) do
     local until_ = now + num(req.lease_ms, 60000)
     redis.call('ZADD', mk(item.alias, 'lease:' .. item.dep .. ':' .. item.cls), until_, item.owner)
     redis.call('ZADD', mk(item.alias, 'inprog'), until_, item.owner)
+    slide(mk(item.alias, 'lease:' .. item.dep .. ':' .. item.cls), held_ms())
+    slide(mk(item.alias, 'inprog'), held_ms())
     local entry_key = mk(item.alias, 'inprog:' .. item.request_id)
     local worker = string.match(item.owner, '^.*|([^|]*)|[^|]*$') or ''
     redis.call('HSET', entry_key, 'owner', item.owner, 'worker', worker, 'dep', item.dep,
