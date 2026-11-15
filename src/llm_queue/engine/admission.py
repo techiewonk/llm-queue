@@ -361,5 +361,5 @@ class Admission:
         `deployments`: the model's deployment keys, whose leases past their end are removed
         even when their in-progress entry is already gone (scenario L4 left such leases).
         """
-        body = {"alias": alias, "deps": list(deployments)}
+        body = {"alias": alias, "deps": list(deployments), "lease_ms": self.lease_ms}
         return int(await self._call(self._sweep, body))

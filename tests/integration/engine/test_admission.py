@@ -589,6 +589,19 @@ async def test_fl18_a_class_share_of_zero_never_fits(
     assert (await r.ask("p1", cls="p")).kind == "granted"
 
 
+async def test_fl24_a_slightly_late_beat_still_renews_after_a_sweep(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-24: SWEEP removed an entry the moment its lease ended, so a heartbeat late by any
+    amount found its grant `lost` (then a REREGISTER without its budgets).
+    """
+    r = await rig(store, prefix, lease_secs=1)
+    assert (await r.ask("c1")).kind == "granted"
+    await asyncio.sleep(1.1)  # time is what is under test: just past the lease
+    assert await r.admission.sweep("m") == 0  # removed (1) before the fix
+    assert await r.admission.renew([("m", owner_token("c1", "w1", 1), "c1")]) == 1
+
+
 async def test_fl1_release_claims_of_calls_held_without_a_grant(
     store: redis.asyncio.Redis, prefix: str
 ) -> None:

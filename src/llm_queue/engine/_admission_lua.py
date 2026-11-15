@@ -872,7 +872,10 @@ SWEEP = (
     + r"""
 local removed = 0
 local inprog = mk(req.alias, 'inprog')
-for _, owner in ipairs(redis.call('ZRANGEBYSCORE', inprog, '-inf', now, 'LIMIT', 0, 200)) do
+-- Half a lease of grace (FL-24): RENEW brings back a lapsed lease, but a beat late by any amount
+-- after a sweep found the entry gone (`lost`, then a REREGISTER).
+local dead_by = now - math.floor(num(req.lease_ms, 0) / 2)
+for _, owner in ipairs(redis.call('ZRANGEBYSCORE', inprog, '-inf', dead_by, 'LIMIT', 0, 200)) do
   redis.call('ZREM', inprog, owner)
   local rid = string.match(owner, '^(.*)|[^|]*|[^|]*$')
   if rid then
