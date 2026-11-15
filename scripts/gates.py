@@ -347,17 +347,23 @@ async def b19() -> bool:
         scripts = gate.store.script_calls() - before_scr
         metrics = gate.store.metrics(gate.prefix)
     refusals = sum(v for k, v in metrics.items() if k.startswith("llmq_admission_refusals"))
+    # FT-24: a refusal count of 0 also comes from a metrics flusher that died; the call
+    # counter the workers must have written proves the metrics reached the store.
+    counted = sum(v for k, v in metrics.items() if k.startswith("llmq_calls_total"))
     calls = len(run.results)
     lines = [
         f"{calls} calls, {sum(r.ok for r in run.results)} ok; failures {run.kinds() or 0}",
         f"admission refusals {refusals:.0f} ({refusals / calls:.3f} per call); "
         f"store scripts per call {scripts / calls:.1f} "
         f"(commands incl. inside them {cmds / calls:.0f})",
+        f"calls counted by the workers' metrics: {counted:.0f}",
     ]
     return verdict(
         "B19",
         {
             "every call served": all(r.ok for r in run.results),
+            "the workers' metrics reached the store (calls counted >= 90 %)": counted
+            >= 0.9 * calls,
             "refusals per call <= 0.05": refusals / calls <= 0.05,
         },
         lines,
