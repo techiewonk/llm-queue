@@ -155,16 +155,35 @@ class StatusReader:
             "throttles_1m": int(_num(throttles)),
         }
 
+    async def jobs(self) -> list[dict[str, Any]]:
+        """Every job name a worker consumed lately: waiting jobs and dead letters (Q15).
+
+        Names come from the set the job loops keep (`JobRunner.names_key`); dead jobs had no
+        place in `status()` and no alert before.
+        """
+        key = f"{self.queues.keys.prefix}:jobs:{self.queue_prefix}"
+        names = sorted(_text(n) for n in await self.queues.client.smembers(key))
+        depths = await asyncio.gather(
+            *(self.queues.depth(f"{self.queue_prefix}jobs-{name}") for name in names)
+        )
+        return [
+            {"job": name, "waiting": max(0, total - held), "dead_letters": dead}
+            for name, (total, held, dead) in zip(names, depths, strict=True)
+        ]
+
     async def report(self, view: ResolvedRegistry) -> dict[str, Any]:
-        """Every model, the registry version and the routing switches."""
-        models = list(await asyncio.gather(*(self.model(view, a) for a in view.registry.models)))
+        """Every model and job, the registry version and the routing switches."""
+        models, jobs = await asyncio.gather(
+            asyncio.gather(*(self.model(view, a) for a in view.registry.models)), self.jobs()
+        )
         routing = view.registry.routing
         return {
             "registry_version": view.registry.version,
             "kill_switch": routing.kill_switch,
             "blocked_regions": list(routing.blocked_regions),
             "blocked_accounts": list(routing.blocked_accounts),
-            "models": models,
+            "models": list(models),
+            "jobs": jobs,
         }
 
     async def request(self, request_id: str) -> dict[str, Any]:
@@ -276,6 +295,16 @@ class AlertEvaluator:
                     "dead_letters",
                     model["dead_letters"] >= thresholds["dlq_messages"],
                     {"model": alias},
+                )
+            )
+        for job in report.get("jobs", ()):
+            # Any dead job is worth a look: it ran out of retries (Q15).
+            alerts.append(
+                Alert(
+                    "job_dead_letters",
+                    job["dead_letters"] > 0,
+                    {"job": job["job"]},
+                    f"{job['dead_letters']} dead",
                 )
             )
         return alerts

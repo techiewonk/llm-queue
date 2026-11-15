@@ -38,7 +38,7 @@ from llm_queue.clients import ClientPool, Providers
 from llm_queue.context import current_context
 from llm_queue.engine.envelope import Meta, Reply
 from llm_queue.engine.errors import CallFailed
-from llm_queue.engine.jobs import JobFn, JobRunner
+from llm_queue.engine.jobs import JobFn, JobRunner, JobSettings
 from llm_queue.engine.metrics import Metrics, sink_for
 from llm_queue.engine.offload import ResultOffload
 from llm_queue.engine.queue import QueueFull
@@ -104,14 +104,23 @@ class ModelStatus(TypedDict):
     deployments: list[DeploymentStatus]
 
 
+class JobStatus(TypedDict):
+    """One job name a worker consumed lately: waiting jobs and dead letters."""
+
+    job: str
+    waiting: int
+    dead_letters: int
+
+
 class StatusReport(TypedDict):
-    """Every model, the registry version and the routing switches."""
+    """Every model and job, the registry version and the routing switches."""
 
     registry_version: int
     kill_switch: bool
     blocked_regions: list[str]
     blocked_accounts: list[str]
     models: list[ModelStatus]
+    jobs: NotRequired[list[JobStatus]]
 
 
 class RequestStatus(TypedDict, total=False):
@@ -178,10 +187,12 @@ class LLMQueue:
         settings: InfraSettings | None = None,
         builder: Callable[[], Engine] | None = None,
         offload: ResultOffload | None = None,
+        job_settings: JobSettings | None = None,
     ) -> None:
         """Wrap a built `Engine`; `builder` makes a caller-only engine for sync calls.
 
         That engine is used only while this queue is not started (sync-only processes).
+        `job_settings` (default: `LLMQ_JOB_*` read by `from_env`) bounds jobs.
         """
         self._engine = engine
         self.settings = settings
@@ -190,6 +201,7 @@ class LLMQueue:
             queue_prefix=engine.settings.queue_prefix,
             metrics=engine.metrics,
             replica_wait=getattr(engine, "replica_wait", None),  # one per process (R3FM-5, Q8)
+            job_settings=job_settings,
         )
         self._builder = builder
         self._offload = offload
@@ -253,6 +265,7 @@ class LLMQueue:
         defaults); a bad value or combination raises `ConfigError` listing every problem.
         """
         settings = InfraSettings.from_env(environ, secrets=secrets)
+        jobs = JobSettings.from_env(os.environ if environ is None else environ)
         tuning = tuning or Tuning()
         if problems := tuning.problems(queue_wait_ms=settings.queue_wait_ms):
             raise ConfigError("invalid tuning:\n  " + "\n  ".join(problems))
@@ -327,7 +340,13 @@ class LLMQueue:
             )
 
         sync_cap = min(SYNC_STORE_CONNECTIONS, settings.store_max_connections)
-        return cls(build(), settings=settings, builder=lambda: build(sync_cap), offload=offload)
+        return cls(
+            build(),
+            settings=settings,
+            builder=lambda: build(sync_cap),
+            offload=offload,
+            job_settings=jobs,
+        )
 
     # ---------------------------------------------------------------- guards (C2)
 
@@ -692,8 +711,17 @@ class LLMQueue:
 
     # ---------------------------------------------------------------- jobs and admin
 
-    def register_job(self, name: str, fn: JobFn, *, timeout_secs: float | None = None) -> None:
+    def register_job(
+        self,
+        name: str,
+        fn: JobFn,
+        *,
+        timeout_secs: float | None = None,
+        concurrency: int | None = None,
+    ) -> None:
         """Allow this process to run job `name` (call before `start`).
+
+        `concurrency` caps its runs in this process (default `LLMQ_JOB_CONCURRENCY`, 4).
 
         A run longer than `timeout_secs` is cancelled and counts as a failure (retried, then
         dead-lettered); None (the default) lets it run as long as it takes. `ConfigError` in
@@ -701,7 +729,7 @@ class LLMQueue:
         """
         if self.settings is not None and self.settings.mode == "caller":
             raise ConfigError(f"job {name}: a process in caller mode runs no jobs")
-        self._jobs.register(name, fn, timeout_secs=timeout_secs)
+        self._jobs.register(name, fn, timeout_secs=timeout_secs, concurrency=concurrency)
 
     @store_op
     async def send_job(
@@ -709,14 +737,28 @@ class LLMQueue:
     ) -> str:
         """Queue a job; returns its id (jobs run at least once).
 
-        `CallFailed("queue_full")` when 10,000 jobs of this name already wait (it raised the
-        queue's internal `QueueFull` before).
+        A second send with the same `job_id` within `LLMQ_JOB_DEDUPE_SECS` (24 h) queues
+        nothing and returns the id. `CallFailed("queue_full")` when 10,000 jobs of this name
+        already wait; `request_too_large` above `LLMQ_JOB_MAX_PAYLOAD_BYTES` (1 MB);
+        `invalid_request` for a payload that is not JSON.
         """
         self._check(work=True)
         try:
             return await self._jobs.send(name, payload, job_id=job_id)
         except QueueFull as exc:
             raise CallFailed("queue_full", str(exc), retry_after_secs=5) from exc
+
+    @store_op
+    async def job_dead_letters(self, name: str, count: int = 10) -> list[dict[str, Any]]:
+        """Dead jobs of one name, oldest first: entry id, job id, failures, payload (Q15)."""
+        self._check()
+        return await self._jobs.dead_letters(name, count)
+
+    @store_op
+    async def redrive_jobs(self, name: str, count: int = 1000) -> int:
+        """Send up to `count` dead jobs of one name back to run again; returns how many."""
+        self._check()
+        return await self._jobs.redrive(name, count)
 
     @store_op
     async def cancel(self, request_id: str) -> None:

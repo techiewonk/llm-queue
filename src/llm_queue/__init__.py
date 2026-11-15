@@ -55,7 +55,7 @@ if TYPE_CHECKING:
         StatusReport,
     )
     from llm_queue.engine.envelope import Meta, Reply
-    from llm_queue.engine.jobs import JobFn
+    from llm_queue.engine.jobs import JobContext, JobFn, JobSettings, current_job
     from llm_queue.engine.metrics import EmfSink, Metrics, NullSink, PrometheusSink
     from llm_queue.engine.offload import ResultOffload, S3Offload
     from llm_queue.engine.store_client import Secrets
@@ -97,6 +97,9 @@ _LAZY = {
     "Provider": "llm_queue.clients.providers",
     "Route": "llm_queue.clients.pool",
     "JobFn": "llm_queue.engine.jobs",
+    "JobContext": "llm_queue.engine.jobs",
+    "JobSettings": "llm_queue.engine.jobs",
+    "current_job": "llm_queue.engine.jobs",
     "Secrets": "llm_queue.engine.store_client",
     "PublishResult": "llm_queue.registry.store",
 }
@@ -112,7 +115,9 @@ __all__ = [
     "EmfSink",
     "EngineTimings",
     "Health",
+    "JobContext",
     "JobFn",
+    "JobSettings",
     "LLMQueue",
     "LLMQueueError",
     "LiveEditRefused",
@@ -145,6 +150,7 @@ __all__ = [
     "WarmOptions",
     "__version__",
     "current_context",
+    "current_job",
     "register_account_kind",
     "register_admission",
     "register_balancer",
