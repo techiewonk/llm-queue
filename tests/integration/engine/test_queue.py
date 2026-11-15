@@ -192,3 +192,135 @@ async def test_s11_a_retried_receive_hands_back_the_same_messages(
     assert [m.body for m in fresh] == [b"m2", b"m3"]
     for message in retry + fresh:
         assert await queues.ack(message)
+
+
+async def test_fl4_a_replayed_receive_hands_back_its_dead_letters(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-4: dead letters were not in the claim; a receive replayed after a lost reply (or one
+    that took nothing but dead-lettered) returned no dead letter, so the caller was never told.
+    """
+    once = QueueSettings(visibility_secs=0.05, max_receives=1, max_waiting=0)
+    queues = await _filled(store, prefix, 1)
+    await queues.receive("q", 1, once)  # held; its hold lapses: the next receive counts a failure
+    await asyncio.sleep(0.1)  # time is what is under test: past the visibility
+    key = queues.claim_key("w1:model")
+    taken, dead = await queues.receive_first(["q"], 1, once, claim=(key, "n1"))
+    assert (taken, [d.body for d in dead]) == ([], [b"m0"])
+    taken, dead = await queues.receive_first(["q"], 1, once, claim=(key, "n1"))  # the replay
+    assert (taken, [d.body for d in dead]) == ([], [b"m0"])  # ([], []) before the fix
+    assert await store.type(key) == b"string"  # FL-16: one SET, not a list of RPUSHes
+
+
+async def test_fl5_a_returned_or_reclaimed_message_rings_the_doorbell(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-5: RETURN and RECLAIM made a message visible without a doorbell token, so idle
+    workers of other pods slept in BLPOP for their poll pause before they took it.
+    """
+    queues = await _filled(store, prefix, 2)
+    await store.delete(queues.bell("q"))  # the sends' tokens are taken
+    (held,), _ = await queues.receive("q", 1, SLOW_VIS)
+    await queues.return_(held, delay_secs=5)
+    assert await store.llen(queues.bell("q")) == 0  # visible later: no token yet
+    (held,), _ = await queues.receive("q", 1, SLOW_VIS)
+    await queues.return_(held)
+    assert await queues.wait_bell(["q"], 0.5) == "q"
+    key = queues.claim_key("w1:model")
+    await queues.receive_first(["q"], 1, SLOW_VIS, claim=(key, "n1"))
+    assert await queues.reclaim(key, "n1") == 1
+    assert await queues.wait_bell(["q"], 0.5) == "q"
+
+
+async def test_rv_t1_a_reclaim_leaves_a_re_received_message_alone(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """RV-T1 (S11): a message another receiver took after the lost receive's hold lapsed is
+    left alone by the reclaim: its receipt stays good and it is not made visible again.
+    """
+    short = QueueSettings(visibility_secs=0.05, max_receives=0, max_waiting=0)
+    queues = await _filled(store, prefix, 1)
+    key = queues.claim_key("w1:model")
+    (lost,), _ = await queues.receive_first(["q"], 1, short, claim=(key, "n1"))
+    await asyncio.sleep(0.1)  # time is what is under test: the lost hold lapses
+    (other,), _ = await queues.receive_first(["q"], 1, SLOW_VIS, claim=(key + "2", "m1"))
+    assert other.id == lost.id
+    assert await queues.reclaim(key, "n1") == 0
+    assert await queues.receive("q", 1, SLOW_VIS) == ([], [])  # still hidden under `other`
+    assert await queues.ack(other)
+
+
+async def test_fl8_a_small_receive_behind_many_returned_takes_the_oldest(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-8: a receive read and sorted up to 1000 due ids even for one message (30 ms of store
+    time a receive after a mass return, measured). It now reads max(4 x want, 32); a receive
+    still takes the oldest returned messages first, before newer ones.
+    """
+    queues = await _filled(store, prefix, 100)
+    batch, _ = await queues.receive("q", 100, SLOW_VIS)
+    for message in reversed(batch):  # returned newest first: deadlines do not follow ids
+        await queues.return_(message)
+    await queues.send("q", b"new", SLOW_VIS)
+    first, _ = await queues.receive("q", 3, SLOW_VIS)
+    assert [m.body for m in first] == [b"m0", b"m1", b"m2"]
+
+
+async def test_fl15_depth_counts_holds_by_deadline(store: redis.asyncio.Redis, prefix: str) -> None:
+    """FL-15: DEPTH copied every hold and return into Lua (HVALS) to count holds; it now counts
+    visibility deadlines still ahead: holds, and returns whose delay has not run out.
+    """
+    queues = await _filled(store, prefix, 3)
+    batch, _ = await queues.receive("q", 2, SLOW_VIS)
+    await queues.return_(batch[0], delay_secs=30)
+    await queues.return_(batch[1])
+    assert await queues.depth("q") == (3, 1, 0)  # (3, 0, 0) before: a delayed return
+
+
+async def test_fl20_trim_dead_many_trims_every_queue_in_one_call(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-20: the sweeper trimmed a model's two dead-letter streams one round trip each."""
+    queues = StreamQueues(store, Keys(prefix))
+    for name in ("p", "n"):
+        await store.xadd(queues.keys.queue(name, "dlq"), {"body": "x"}, id="1-1")
+    assert await queues.trim_dead_many(["p", "n"], 60) == 2
+    assert await queues.trim_dead_many([], 60) == 0
+
+
+async def test_fl23_redrive_stops_at_max_waiting(store: redis.asyncio.Redis, prefix: str) -> None:
+    """FL-23: REDRIVE ignored max_waiting and filled the queue past it."""
+    queues = await _filled(store, prefix, 1)
+    for i in range(3):
+        await store.xadd(queues.keys.queue("q", "dlq"), {"body": f"d{i}"})
+    assert await queues.redrive("q", max_waiting=2) == 1  # 3 before the fix
+    assert await queues.depth("q") == (2, 0, 2)
+
+
+async def test_cg4_scripts_reload_after_a_script_flush(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """CG-4: no test covered NOSCRIPT after SCRIPT FLUSH (a failover to a node without the
+    scripts): the raw EVALSHA of a send with a replica wait, and redis-py's own reload.
+    """
+    from llm_queue.engine.queue import NotReplicated
+
+    queues = await _filled(store, prefix, 1)
+    await store.script_flush()
+    with pytest.raises(NotReplicated):  # no replicas here: sent, then refused by WAIT
+        await queues.send("q", b"m1", FAST, wait_replicas=1, wait_ms=10)
+    await store.script_flush()
+    taken, _ = await queues.receive("q", 5, FAST)
+    assert [m.body for m in taken] == [b"m0", b"m1"]
+
+
+async def test_q27_a_send_keeps_messages_one_day_by_default(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """Owner decision Q27 (R3SE-4): a send with the default settings trimmed the stream at
+    4 days; the default retention applied on every send is now 1 day.
+    """
+    assert QueueSettings().retention_secs == 86_400
+    queues = StreamQueues(store, Keys(prefix))
+    await queues.send("q", b"x", QueueSettings())
+    assert await store.xlen(f"{prefix}:{{q:q}}:s") == 1

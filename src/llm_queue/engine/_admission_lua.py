@@ -3,6 +3,11 @@
 Each script takes the key prefix and one JSON argument and builds its key names itself, which
 needs the single-primary store 0.3 supports. Times are the store's clock in ms. Budgets are GCRA
 clocks (`smooth`) or minute counters (`fixed`); class clocks enforce the priority shares.
+
+Not cluster-safe, by design (FL-14): these scripts pass no KEYS and touch keys of several hash
+tags in one call (`{m:alias}`, a fallback's `{m:from_alias}`, `{r:id}`, `{a:account}`) and
+untagged ones (`:epoch`, `:reset_minute`, `:caller:*`). The start-up check refuses a store
+with cluster mode on; supporting cluster would need one hash tag per environment.
 """
 
 # ruff: noqa: E501  # Lua source in strings; wrapping its lines hurts reading it
@@ -25,18 +30,39 @@ local function mk(alias, name) return P .. ':{m:' .. alias .. '}:' .. name end
 local function num(v, d) if v == nil or v == false or v == cjson.null then return d end return tonumber(v) end
 local function hnum(key, field, d) return num(redis.call('HGET', key, field), d) end
 local function present(v) return v ~= nil and v ~= false and v ~= cjson.null end
+-- Costs and refunds go to HINCRBY, which raises on a fraction after earlier writes stayed (FL-9).
+local function whole(v) return math.floor(v + 0.5) end
 KEY_MS = num(T.budget_key_ms, 180000)  -- budget and limiter keys live this long (> 2 minutes)
+-- Every key a script writes has an expiry, sliding on each write (FL-7): a removed model's or
+-- deployment's breaker, limiter, health, rotation, leases and waiters stayed in the store for good.
+local DAY_MS = 86400000
+local function slide(key, ms) redis.call('PEXPIRE', key, ms) end
+local function held_ms() return math.max(KEY_MS, 2 * num(req.lease_ms, 60000)) end
+
+-- Budget hashes read once per script into a table (FL-11: each budget read the same fields with
+-- 2 to 3 HGETs, 16 to 24 reads a candidate where one HGETALL per hash does); `write` drops it.
+local rcache = {}
+local function rnum(key, field, d)
+  local h = rcache[key]
+  if h == nil then
+    h = {}
+    local flat = redis.call('HGETALL', key)
+    for i = 1, #flat, 2 do h[flat[i]] = flat[i + 1] end
+    rcache[key] = h
+  end
+  return num(h[field], d)
+end
 
 -- One budget: field prefix f, limit L per minute, burst fraction bf, window mode.
 local function avail(key, f, L, bf, mode)
   local burst = math.max(1, math.floor(L * bf))
   if mode == 'fixed' then
     local n = 0
-    if hnum(key, f .. '_win', -1) == minute then n = hnum(key, f .. '_n', 0) end
+    if rnum(key, f .. '_win', -1) == minute then n = rnum(key, f .. '_n', 0) end
     return L - n, n
   end
   local per = 60000 / L
-  local tat = math.max(hnum(key, f .. '_tat', now), now)
+  local tat = math.max(rnum(key, f .. '_tat', now), now)
   return (now + burst * per - tat) / per, tat
 end
 
@@ -46,7 +72,7 @@ local function room(key, f, L, c, R, bf, mode)
   local burst = math.max(1, math.floor(L * bf))
   if mode == 'fixed' then
     -- After a store reset, a fixed window holds until the next minute (plan T10).
-    if reset_minute == minute and hnum(key, f .. '_win', -1) ~= minute then
+    if reset_minute == minute and rnum(key, f .. '_win', -1) ~= minute then
       return (minute + 1) * 60000 - now, nil
     end
     local _, n = avail(key, f, L, bf, mode)
@@ -54,7 +80,7 @@ local function room(key, f, L, c, R, bf, mode)
     return (minute + 1) * 60000 - now, nil
   end
   local per = 60000 / L
-  local tat = math.max(hnum(key, f .. '_tat', now), now)
+  local tat = math.max(rnum(key, f .. '_tat', now), now)
   if c > burst and R == 0 then
     if tat <= now then return 0, now + c * per end
     return tat - now, nil
@@ -65,6 +91,7 @@ local function room(key, f, L, c, R, bf, mode)
 end
 
 local function write(key, f, mode, value)
+  rcache[key] = nil
   if mode == 'fixed' then
     redis.call('HSET', key, f .. '_win', minute, f .. '_n', value)
   else
@@ -108,13 +135,19 @@ local function budgets(alias, row, model, cls, account)
   local function add(key, f, L, kind)
     if present(L) and tonumber(L) > 0 then table.insert(list, {key, f, tonumber(L), kind}) end
   end
+  -- A class share of 0 (a reserve of 1) leaves the class no room at all: limit 0, which never
+  -- fits (FL-18: `add` dropped it, and the class ran with no rate cap of its own).
+  local function add_share(key, f, L, sh, kind)
+    if not present(L) or tonumber(L) <= 0 then return end
+    if sh <= 0 then table.insert(list, {key, f, 0, kind}) else add(key, f, L * sh, kind) end
+  end
   if limits == 'both' or limits == 'rpm' then
     add(rkey, 'rpm', row.rpm, 'r')
-    if share < 1 and present(row.rpm) then add(rkey, cls .. '_rpm', row.rpm * share, 'r') end
+    if share < 1 then add_share(rkey, cls .. '_rpm', row.rpm, share, 'r') end
   end
   if limits == 'both' or limits == 'tpm' then
     add(rkey, 'tpm', row.tpm, 't')
-    if share < 1 and present(row.tpm) then add(rkey, cls .. '_tpm', row.tpm * share, 't') end
+    if share < 1 then add_share(rkey, cls .. '_tpm', row.tpm, share, 't') end
   end
   if account then
     local akey = P .. ':{a:' .. row.account .. '}:rate'
@@ -123,8 +156,8 @@ local function budgets(alias, row, model, cls, account)
     add(akey, 'rpm', row.shared_rpm, 'r')
     add(akey, 'tpm', row.shared_tpm, 't')
     if ashare < 1 then
-      if present(row.shared_rpm) then add(akey, 'n_rpm', row.shared_rpm * ashare, 'r') end
-      if present(row.shared_tpm) then add(akey, 'n_tpm', row.shared_tpm * ashare, 't') end
+      add_share(akey, 'n_rpm', row.shared_rpm, ashare, 'r')
+      add_share(akey, 'n_tpm', row.shared_tpm, ashare, 't')
     end
   end
   return list
@@ -142,6 +175,7 @@ local function limit_of(alias, row)
     -- A new deployment takes its full share at once (plan E74).
     limit = cap
     redis.call('HSET', key, 'limit', tostring(limit))
+    slide(key, DAY_MS)
   end
   return math.max(1, math.floor(math.min(limit, cap))), cap
 end
@@ -212,7 +246,11 @@ if held then
   end
   local holder = redis.call('HGET', entry_key, 'worker')
   local hb = hnum(job_key, 'hb', 0)
-  local fresh = now - hb < num(req.lease_ms, 60000) and redis.call('HGET', entry_key, 'started') ~= false
+  -- Alive by its own lease too (FL-6): with the job record gone (expired, or a call with no
+  -- claim) hb read 0 and a live grant was dropped, so the call ran twice.
+  local leased = num(redis.call('ZSCORE', mk(alias, 'inprog'), held), 0) > now
+  local fresh = (leased or now - hb < num(req.lease_ms, 60000))
+    and redis.call('HGET', entry_key, 'started') ~= false
   if fresh then return cjson.encode({r = 'duplicate'}) end
   -- A dead owner (no heartbeat for a lease): drop its slot and entry (no refund).
   local old_dep = redis.call('HGET', entry_key, 'dep')
@@ -260,9 +298,14 @@ end
 local reserved = {}
 local function reserve_from(list, into)
   into = into or reserved
-  for _, id in ipairs(list) do
-    if id ~= rid then
-      local raw = redis.call('HGET', info_key, id)
+  -- One HMGET for every waiter read (FL-10: an HGET each, up to 400 a call).
+  local ids = {}
+  for _, id in ipairs(list) do if id ~= rid then table.insert(ids, id) end end
+  if #ids == 0 then return end
+  local raws = redis.call('HMGET', info_key, unpack(ids))
+  for k = 1, #ids do
+    do
+      local raw = raws[k]
       if raw then
         local w = cjson.decode(raw)
         if num(w.exp, 0) >= now then
@@ -292,8 +335,8 @@ if cls == 'n' and not foreign then
   reserve_from(redis.call('ZRANGE', wait_keys.p, 0, 199), priority_reserved)
 end
 
-local cost_r = num(req.cost_r, 1)
-local cost_t = num(req.cost_t, 0)
+local cost_r = whole(num(req.cost_r, 1))
+local cost_t = whole(num(req.cost_t, 0))
 local best_wait, best_reason = nil, nil
 -- A breaker's one probe call is in flight: its answer comes within an attempt, so a call
 -- waits for it instead of failing as `model_unavailable` (scenario P7 at 300 %: ten calls
@@ -335,7 +378,7 @@ local function evaluate(cand)
   if prio then
     local floor = num(model.normal_min_share, 0) * num(row.rpm, 0)
     local used = 0
-    if hnum(rkey, 'seen_win', -1) == minute then used = hnum(rkey, 'seen_n', 0) end
+    if rnum(rkey, 'seen_win', -1) == minute then used = rnum(rkey, 'seen_n', 0) end
     if floor <= 0 or used >= floor then
       res = {r = res.r + prio.r, t = res.t + prio.t, s = res.s + prio.s}
     end
@@ -345,6 +388,7 @@ local function evaluate(cand)
   local most = nil
   local taken = budgets(alias, row, model, cls, true)
   for _, b in ipairs(taken) do
+    if b[3] <= 0 then return {wait = (minute + 1) * 60000 - now, reason = 'reserve'} end
     local cost = cost_r
     local R = res.r
     if b[4] == 't' then cost, R = cost_t, res.t end
@@ -459,6 +503,9 @@ if sticky_dep and results[sticky_dep] then
   end
 end
 
+-- Rotation counters of the weighted pick, written only with a grant (FL-17: a pick that the
+-- fallback headroom check then refused had already moved the rotation).
+local rot_writes = {}
 local function pick(list)
   if #list == 0 then return nil end
   local strategy = req.strategy
@@ -476,11 +523,11 @@ local function pick(list)
     for _, cand in ipairs(list) do
       local w = num(rows[cand.key].weight, 1)
       local cw = hnum(rot, 'cw|' .. cand.key, 0) + w
-      redis.call('HSET', rot, 'cw|' .. cand.key, tostring(cw))
+      rot_writes['cw|' .. cand.key] = tostring(cw)
       total = total + w
       if best_cw == nil or cw > best_cw then best, best_cw = cand, cw end
     end
-    redis.call('HSET', rot, 'cw|' .. best.key, tostring(best_cw - total))
+    rot_writes['cw|' .. best.key] = tostring(best_cw - total)
     return best
   elseif strategy == 'headroom' then
     local mode = req.pick or 'percent'
@@ -520,6 +567,8 @@ if not chosen then
   local exp = now + num(req.waiter_ms, 2000)
   redis.call('ZADD', wait_keys[cls], pos, rid)
   redis.call('HSET', info_key, rid, cjson.encode({r = cost_r, t = cost_t, deps = deps, exp = exp}))
+  slide(wait_keys[cls], held_ms())
+  slide(info_key, held_ms())
   redis.call('ZADD', exp_key, exp, cls .. '|' .. rid)
   redis.call('PEXPIRE', exp_key, KEY_MS)
   return cjson.encode({r = 'wait', ms = math.max(1, math.floor(best_wait or num(T.wait_ms, 100))),
@@ -542,14 +591,17 @@ local lp, ln = lease_keys(alias, chosen.key)
 local lease_ms = num(req.lease_ms, 60000)
 redis.call('ZADD', (cls == 'p') and lp or ln, now + lease_ms, req.owner)
 redis.call('ZADD', mk(alias, 'inprog'), now + lease_ms, req.owner)
+slide((cls == 'p') and lp or ln, held_ms())
+slide(mk(alias, 'inprog'), held_ms())
 redis.call('HSET', entry_key, 'owner', req.owner, 'worker', req.worker, 'dep', chosen.key,
   'cls', cls, 'minute', minute, 'cost_r', cost_r, 'cost_t', cost_t, 'account', row.account,
   'started', now, 'request', rid, 'served', alias, 'mode', row.rate_window or 'smooth',
-  'bud', cjson.encode(res.taken))
+  'bud', cjson.encode(res.taken), 'job_owner', job_owner)
 redis.call('PEXPIRE', entry_key, lease_ms * 2)
 if res.probe then
   local cb = mk(alias, 'cb:' .. chosen.key)
   redis.call('HSET', cb, 'probe', req.owner, 'probe_at', now)
+  slide(cb, DAY_MS)
 end
 -- Running, by this worker: a fallback grant too, so a redelivery of the call is refused
 -- while it runs on the other model (it was granted again and ran twice).
@@ -580,6 +632,8 @@ if req.strategy == 'round_robin' then
   local rot = mk(alias, 'rot')
   redis.call('HSET', rot, 'rr|' .. chosen.key, redis.call('HINCRBY', rot, 'rr_seq', 1))
 end
+for field, value in pairs(rot_writes) do redis.call('HSET', mk(alias, 'rot'), field, value) end
+if req.strategy == 'round_robin' or next(rot_writes) then slide(mk(alias, 'rot'), DAY_MS) end
 local granted = {r = 'granted', dep = chosen.key, minute = minute, limit = res.limit,
   tier = chosen.tier}
 -- A stream's call: how far its chunk stream got (another worker may have begun it, R19); an
@@ -594,6 +648,7 @@ _SETTLE = r"""
 local function settle(alias, owner, rid, refund_r, refund_t, learn, outcome, latency, retry_after_ms)
   local entry_key = mk(alias, 'inprog:' .. rid)
   if redis.call('HGET', entry_key, 'owner') ~= owner then return 0 end
+  refund_r, refund_t = whole(refund_r), whole(refund_t)
   local dep = redis.call('HGET', entry_key, 'dep')
   local cls = redis.call('HGET', entry_key, 'cls')
   local granted_minute = hnum(entry_key, 'minute', minute)
@@ -682,7 +737,10 @@ local function settle(alias, owner, rid, refund_r, refund_t, learn, outcome, lat
       if hnum(health, dep .. '|lat_at', 0) < now - num(T.slow_stale_ms, 300000) then old = latency end
       redis.call('HSET', health, dep .. '|lat', tostring(old * 0.8 + latency * 0.2), dep .. '|lat_at', now)
       redis.call('HINCRBY', health, dep .. '|n', 1)
+      slide(health, DAY_MS)
     end
+    if redis.call('EXISTS', ac) == 1 then slide(ac, DAY_MS) end
+    if redis.call('EXISTS', cb) == 1 then slide(cb, DAY_MS) end
   end
   return 1
 end
@@ -699,30 +757,77 @@ return settle(req.alias, req.owner, req.request_id, num(req.refund_r, 0), num(re
 """
 )
 
-# req: alias, owner, request_id. Give everything back; no limiter or breaker learning.
+# The claim of a call this worker lets go (FL-1): `running` under job owner `jo` becomes
+# `queued` again, so another pod's receive of it is granted at once. It stayed `running` with a
+# fresh `hb`, and every other pod got `duplicate` for about one lease (60 s). Another owner's
+# claim, or a final state, is left alone.
+_RELEASE_FN = r"""
+local function release_claim(rid, jo)
+  if not jo or jo == '' then return 0 end
+  local job = P .. ':{r:' .. rid .. '}:job'
+  if redis.call('HGET', job, 'state') ~= 'running' or redis.call('HGET', job, 'owner') ~= jo then
+    return 0
+  end
+  redis.call('HSET', job, 'state', 'queued', 'hb', 0)
+  redis.call('HDEL', job, 'owner')
+  return 1
+end
+-- The job owner (`worker@tag`) inside an owner token `request|job owner|attempt`.
+local function job_owner_of(owner) return string.match(owner, '^.*|([^|]*)|[^|]*$') end
+"""
+
+# req: alias, owner, request_id, keep_claim (optional). Give everything back; no limiter or
+# breaker learning. Every give-back lets go of the call too, so the claim is released (FL-1)
+# unless `keep_claim` says this worker still holds the call.
 UNDO = (
     _COMMON
     + _SETTLE
+    + _RELEASE_FN
     + r"""
 local entry_key = mk(req.alias, 'inprog:' .. req.request_id)
 if redis.call('HGET', entry_key, 'owner') ~= req.owner then return 0 end
-return settle(req.alias, req.owner, req.request_id, hnum(entry_key, 'cost_r', 0),
+local jo = redis.call('HGET', entry_key, 'job_owner') or job_owner_of(req.owner)
+local done = settle(req.alias, req.owner, req.request_id, hnum(entry_key, 'cost_r', 0),
   hnum(entry_key, 'cost_t', 0), false, 'none', -1, 0)
+if done == 1 and not req.keep_claim then release_claim(req.request_id, jo) end
+return done
 """
 )
 
-# req: {lease_ms, items: [{alias, owner, request_id}], jobs: [{request_id, owner}]}. Heartbeat of
+# req: {jobs: [{request_id, owner}]} (owner: the job owner `worker@tag`). Release the claims of
+# calls given back with no grant (waiting, or between retries: the drain's hand-back), as UNDO
+# does for a granted one (FL-1). Reply: how many were released.
+RELEASE = (
+    _COMMON
+    + _RELEASE_FN
+    + r"""
+local n = 0
+for _, item in ipairs(req.jobs or {}) do n = n + release_claim(item.request_id, item.owner) end
+return n
+"""
+)
+
+# req: {lease_ms, items: [{alias, owner, request_id}], jobs: [{request_id, owner}], caller: {key,
+# ttl} (optional)}. Heartbeat of
 # held grants, and of the claim of held calls between grants (`jobs`, owner `worker@tag`).
-# Reply: {n = renewed, lost = owners whose entry was gone}.
+# Reply: {n = renewed, lost = owners whose entry was gone, epoch = the store's epoch or ''}.
 RENEW = (
     _COMMON
     + r"""
 local renewed = 0
 local lost = {}
-for _, item in ipairs(req.jobs or {}) do
-  local job = P .. ':{r:' .. item.request_id .. '}:job'
-  if redis.call('HGET', job, 'owner') == item.owner then redis.call('HSET', job, 'hb', now) end
+local lease_ms = num(req.lease_ms, 60000)
+-- The claim of a call this worker runs: hb, and a TTL that outlives the call (FL-12: a call that
+-- ran past the job TTL lost its claim, and a redelivery could run it again). Only the claim's
+-- own owner writes it: a fallback grant of worker A kept worker B's claim fresh.
+local function beat(rid, jo)
+  local job = P .. ':{r:' .. rid .. '}:job'
+  if not jo or redis.call('HGET', job, 'owner') ~= jo then return end
+  redis.call('HSET', job, 'hb', now)
+  local ttl = redis.call('PTTL', job)
+  if ttl >= 0 and ttl < lease_ms * 2 then redis.call('PEXPIRE', job, num(T.job_ttl_ms, 3600000)) end
 end
+for _, item in ipairs(req.jobs or {}) do beat(item.request_id, item.owner) end
 for _, item in ipairs(req.items) do
   local entry_key = mk(item.alias, 'inprog:' .. item.request_id)
   if redis.call('HGET', entry_key, 'owner') == item.owner then
@@ -733,20 +838,29 @@ for _, item in ipairs(req.items) do
     -- guards it), so a still-running call holds its slot again.
     redis.call('ZADD', mk(item.alias, 'lease:' .. dep .. ':' .. cls), until_, item.owner)
     redis.call('ZADD', mk(item.alias, 'inprog'), 'XX', until_, item.owner)
+    slide(mk(item.alias, 'lease:' .. dep .. ':' .. cls), held_ms())
+    slide(mk(item.alias, 'inprog'), held_ms())
     redis.call('PEXPIRE', entry_key, num(req.lease_ms, 60000) * 2)
-    local job = P .. ':{r:' .. item.request_id .. '}:job'
-    if redis.call('EXISTS', job) == 1 then redis.call('HSET', job, 'hb', now) end
+    beat(item.request_id, redis.call('HGET', entry_key, 'job_owner')
+      or string.match(item.owner, '^.*|([^|]*)|[^|]*$'))
     renewed = renewed + 1
   else
     table.insert(lost, item.owner)
   end
 end
-return cjson.encode({n = renewed, lost = lost})
+-- Folded in (FL-21), both optional: the process's caller key (a SET of its own before) and the
+-- store's epoch (a GET of its own), so a beat needs fewer round trips.
+if present(req.caller) then redis.call('SET', req.caller.key, '1', 'EX', req.caller.ttl) end
+return cjson.encode({n = renewed, lost = lost, epoch = redis.call('GET', P .. ':epoch') or ''})
 """
 )
 
-# req: {lease_ms, items: [{alias, owner, request_id, dep, cls, cost_r, cost_t}]}. After a
-# store reset, put back the slots and entries of calls still running (plan T10).
+# req: {lease_ms, items: [{alias, owner, request_id, dep, cls, cost_r, cost_t}, optional bud,
+# mode, account, job_owner]}. After a store reset, put back the slots and entries of calls still
+# running (plan T10), and their claims (FL-13: with the claim gone a redelivery of the call ran it
+# a second time). The entry keeps the budgets and window of its grant (sent, or today's row: the
+# store lost the counters anyway), so settle refunds the budgets it took. A cancelled call is not
+# put back.
 REREGISTER = (
     _COMMON
     + r"""
@@ -755,16 +869,41 @@ for _, item in ipairs(req.items) do
   -- A call whose result is stored has finished: never bring its slot back. An entry another
   -- owner holds now (it took over a lost grant) is left alone.
   local current = redis.call('HGET', mk(item.alias, 'inprog:' .. item.request_id), 'owner')
-  if redis.call('EXISTS', P .. ':{r:' .. item.request_id .. '}:res') == 0
+  local base = P .. ':{r:' .. item.request_id .. '}:'
+  if redis.call('EXISTS', base .. 'res') == 0 and redis.call('EXISTS', base .. 'cancel') == 0
     and (not current or current == item.owner) then
     local until_ = now + num(req.lease_ms, 60000)
     redis.call('ZADD', mk(item.alias, 'lease:' .. item.dep .. ':' .. item.cls), until_, item.owner)
     redis.call('ZADD', mk(item.alias, 'inprog'), until_, item.owner)
+    slide(mk(item.alias, 'lease:' .. item.dep .. ':' .. item.cls), held_ms())
+    slide(mk(item.alias, 'inprog'), held_ms())
     local entry_key = mk(item.alias, 'inprog:' .. item.request_id)
     local worker = string.match(item.owner, '^.*|([^|]*)|[^|]*$') or ''
     redis.call('HSET', entry_key, 'owner', item.owner, 'worker', worker, 'dep', item.dep,
       'cls', item.cls, 'minute', minute, 'cost_r', item.cost_r, 'cost_t', item.cost_t,
       'started', now, 'request', item.request_id, 'served', item.alias)
+    local model, rows = cfg_of(item.alias)
+    local row = rows and rows[item.dep]
+    local bud, mode, account = item.bud, item.mode, item.account
+    if not present(bud) and row then bud = budgets(item.alias, row, model, item.cls, true) end
+    if not present(mode) and row then mode = row.rate_window or 'smooth' end
+    if not present(account) and row then account = row.account end
+    if present(bud) and present(mode) then
+      if type(bud) == 'table' then bud = cjson.encode(bud) end
+      redis.call('HSET', entry_key, 'bud', bud, 'mode', mode)
+    end
+    if present(account) then redis.call('HSET', entry_key, 'account', account) end
+    local jo = item.job_owner
+    if not present(jo) then jo = string.match(item.owner, '^.*|([^|]*)|[^|]*$') end
+    if jo then
+      redis.call('HSET', entry_key, 'job_owner', jo)
+      local job = base .. 'job'
+      local state = redis.call('HGET', job, 'state')
+      if not state or state == 'queued' or state == 'running' then
+        redis.call('HSET', job, 'state', 'running', 'owner', jo, 'hb', now)
+        if redis.call('PTTL', job) < 0 then redis.call('PEXPIRE', job, num(T.job_ttl_ms, 3600000)) end
+      end
+    end
     redis.call('PEXPIRE', entry_key, num(req.lease_ms, 60000) * 2)
     done = done + 1
   end
@@ -781,7 +920,10 @@ SWEEP = (
     + r"""
 local removed = 0
 local inprog = mk(req.alias, 'inprog')
-for _, owner in ipairs(redis.call('ZRANGEBYSCORE', inprog, '-inf', now, 'LIMIT', 0, 200)) do
+-- Half a lease of grace (FL-24): RENEW brings back a lapsed lease, but a beat late by any amount
+-- after a sweep found the entry gone (`lost`, then a REREGISTER).
+local dead_by = now - math.floor(num(req.lease_ms, 0) / 2)
+for _, owner in ipairs(redis.call('ZRANGEBYSCORE', inprog, '-inf', dead_by, 'LIMIT', 0, 200)) do
   redis.call('ZREM', inprog, owner)
   local rid = string.match(owner, '^(.*)|[^|]*|[^|]*$')
   if rid then

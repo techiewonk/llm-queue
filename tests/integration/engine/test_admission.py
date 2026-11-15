@@ -440,3 +440,249 @@ async def test_a_dead_probe_is_freed_by_the_sweep(store: redis.asyncio.Redis, pr
     assert removed == 1
     assert (await store.hget(cb, "probe")) == b""
     assert (await r.ask("next", worker="w2", candidates=one)).kind == "granted"
+
+
+async def test_fl1_a_given_back_call_is_granted_to_another_pod_at_once(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-1: UNDO never released the call's claim, so another pod that received the given-back
+    message got `duplicate` for about one lease (the claim stayed `running`, hb fresh).
+    """
+    r = await rig(store, prefix)
+    a = await r.ask("c1", worker="pod-a", tag="m1")
+    assert a.kind == "granted"
+    assert await r.admission.undo("m", owner_token("c1", "pod-a@m1", 1), "c1")
+    b = await r.ask("c1", worker="pod-b", tag="m1")
+    assert b.kind == "granted"  # `duplicate` before the fix
+    job = f"{prefix}:{{r:c1}}:job"
+    assert await store.hget(job, "owner") == b"pod-b@m1"
+    # `keep_claim`: this worker still holds the call, so its claim stays.
+    assert await r.admission.undo("m", owner_token("c1", "pod-b@m1", 1), "c1", keep_claim=True)
+    assert (await r.ask("c1", worker="pod-c", tag="m1")).kind == "duplicate"
+
+
+async def test_fl6_a_live_grant_is_not_taken_over_when_the_job_record_is_gone(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-6: take-over judged "fresh" from the job record's hb only; with the record gone
+    (expired) hb read 0, the live grant was dropped and the call ran twice.
+    """
+    r = await rig(store, prefix)
+    assert (await r.ask("c1", worker="pod-a", tag="m1")).kind == "granted"
+    await store.delete(f"{prefix}:{{r:c1}}:job")
+    assert (await r.ask("c1", worker="pod-b", tag="m2")).kind == "duplicate"  # granted before
+
+
+async def test_fl9_a_fractional_cost_or_refund_is_rounded_not_half_applied(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-9: HINCRBY got the cost and refund straight from JSON; a fraction raised after the
+    budget writes (charged for nothing), and in FINISH after the refund (refunded per replay).
+    """
+    r = await rig(store, prefix, model={"tpm": 1000})
+    granted = await r.ask("c1", cost_t=12.5)  # raised before the fix
+    assert granted.kind == "granted"
+    assert await r.admission.finish(
+        "m",
+        owner_token("c1", "w1", 1),
+        "c1",
+        refund_r=0,
+        refund_t=2.5,  # type: ignore[arg-type]  # a float on purpose
+        outcome="ok",
+    )
+    assert not await store.exists(f"{prefix}:{{m:m}}:inprog:c1")
+
+
+async def test_fl12_renew_keeps_the_claim_alive_and_only_its_own(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-12: RENEW wrote hb but never extended the job record's TTL (a long call lost its
+    claim), and wrote hb with no owner check (A's fallback grant kept B's claim fresh).
+    """
+    r = await rig(store, prefix)
+    assert (await r.ask("c1", worker="pod-a", tag="m1")).kind == "granted"
+    job = f"{prefix}:{{r:c1}}:job"
+    await store.pexpire(job, 1000)  # about to run out
+    grant = [("m", owner_token("c1", "pod-a@m1", 1), "c1")]
+    assert await r.admission.renew(grant) == 1
+    assert await store.pttl(job) > 60_000  # 1000 ms before the fix
+    await store.hset(job, mapping={"owner": "pod-b@m2", "hb": 0})  # B claims it now
+    assert await r.admission.renew(grant) == 1
+    assert await store.hget(job, "hb") == b"0"  # A's beat no longer writes B's claim
+
+
+async def test_fl13_reregister_restores_the_claim_and_the_grant_budgets(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-13: after a store reset REREGISTER put back the entry without its budgets, window
+    and account, and not the claim, so a redelivery on another model could run the call twice.
+    A cancelled call is not put back.
+    """
+    r = await rig(store, prefix, model={"rpm": 100})
+    granted = await r.ask("c1", worker="pod-a", tag="m1", candidates=[Candidate("aws-a/r1")])
+    assert granted.kind == "granted"
+    owner = owner_token("c1", "pod-a@m1", 1)
+    entry = f"{prefix}:{{m:m}}:inprog:c1"
+    job = f"{prefix}:{{r:c1}}:job"
+    await store.delete(entry, job, f"{prefix}:{{m:m}}:inprog")  # the store lost them
+    item = {
+        "alias": "m",
+        "owner": owner,
+        "request_id": "c1",
+        "dep": "aws-a/r1",
+        "cls": "n",
+        "cost_r": 1,
+        "cost_t": 0,
+    }
+    assert await r.admission.reregister([item]) == 1
+    assert await store.hget(job, "state") == b"running"  # None before the fix
+    assert await store.hget(job, "owner") == b"pod-a@m1"
+    assert await store.hget(entry, "bud")
+    assert await store.hget(entry, "mode") == b"fixed"
+    other = await r.ask(
+        "c1",
+        worker="pod-b",
+        tag="m1",
+        alias="other",
+        foreign_from="m",
+        candidates=[Candidate("aws-a/r1")],
+    )
+    assert other.kind == "duplicate"
+    await store.delete(entry, job)
+    await store.set(f"{prefix}:{{r:c1}}:cancel", "1")
+    assert await r.admission.reregister([item]) == 0  # cancelled: not put back
+
+
+async def test_fl17_a_refused_weighted_pick_leaves_the_rotation_alone(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-17: the weighted pick wrote its rotation counters before the fallback headroom
+    check refused the grant, so calls that were never granted moved the rotation.
+    """
+    r = await rig(store, prefix)
+    other = [Candidate("aws-a/r1")]
+    refused = await r.ask(
+        "f1",
+        alias="other",
+        candidates=other,
+        foreign_from="m",
+        strategy="weighted",
+        require_pct=101,
+    )
+    assert (refused.kind, refused.reason) == ("busy", "headroom")
+    assert not await store.exists(f"{prefix}:{{m:other}}:rot")  # written before the fix
+    assert (await r.ask("g1", alias="other", candidates=other, strategy="weighted")).kind == (
+        "granted"
+    )
+    assert await store.exists(f"{prefix}:{{m:other}}:rot")
+
+
+async def test_fl18_a_class_share_of_zero_never_fits(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-18: an account priority_reserve of 1 gave normal calls a share of 0, which dropped
+    their budget, so normal calls ran with no account cap of their own.
+    """
+    r = await rig(store, prefix, account={"shared_rpm": 10, "priority_reserve": 1})
+    normal = await r.ask("n1")
+    assert (normal.kind, normal.reason) == ("wait", "reserve")  # granted before the fix
+    assert (await r.ask("p1", cls="p")).kind == "granted"
+
+
+async def test_fl24_a_slightly_late_beat_still_renews_after_a_sweep(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-24: SWEEP removed an entry the moment its lease ended, so a heartbeat late by any
+    amount found its grant `lost` (then a REREGISTER without its budgets).
+    """
+    r = await rig(store, prefix, lease_secs=1)
+    assert (await r.ask("c1")).kind == "granted"
+    await asyncio.sleep(1.1)  # time is what is under test: just past the lease
+    assert await r.admission.sweep("m") == 0  # removed (1) before the fix
+    assert await r.admission.renew([("m", owner_token("c1", "w1", 1), "c1")]) == 1
+
+
+async def test_fl7_every_admission_key_expires(store: redis.asyncio.Redis, prefix: str) -> None:
+    """FL-7: limiter, breaker, health, rotation, lease, in-progress and waiter keys had no
+    expiry, so a removed model's or deployment's keys stayed in the store for good.
+    """
+    r = await rig(store, prefix, model={"max_concurrency": 1, "priority_reserve": 0})
+    one = [Candidate("aws-a/r1")]
+    assert (await r.ask("a", candidates=one, strategy="round_robin")).kind == "granted"
+    assert (await r.ask("b", candidates=one)).kind == "wait"  # a waiter
+    await r.admission.finish(
+        "m", owner_token("a", "w1", 1), "a", refund_r=0, refund_t=0, outcome="fail", latency_ms=5
+    )
+    assert (await r.ask("b", pos=2, candidates=one, strategy="weighted")).kind == "granted"
+    await r.admission.renew([("m", owner_token("b", "w1", 1), "b")])
+    forever = []
+    async for key in store.scan_iter(match=f"{prefix}:{{m:*", count=500):
+        if await store.pttl(key) == -1 and not key.endswith(b":cfg"):
+            forever.append(key)
+    assert forever == []
+
+
+async def test_fl7_publishing_without_a_model_deletes_its_state_keys(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-7: PUBLISH deleted only a removed model's `cfg`; its waiters, in-progress set,
+    health and rotation stayed for good, since the sweep visits only registry models.
+    """
+    r = await rig(store, prefix)
+    assert (await r.ask("a", alias="other", candidates=[Candidate("aws-a/r1")])).kind == "granted"
+    await store.hset(f"{prefix}:{{m:other}}:health", "x", 1)
+    doc = copy.deepcopy(BASE)
+    doc["registry_version"] = 2
+    del doc["models"]["other"]
+    await RegistryStore(store, prefix, config=doc).boot()
+    left = [k async for k in store.scan_iter(match=f"{prefix}:{{m:other}}:*")]
+    assert not [k for k in left if k.rsplit(b":", 1)[-1] in (b"cfg", b"health", b"inprog")]
+
+
+async def test_fl21_renew_sets_the_caller_key_and_reads_the_epoch(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-21: a heartbeat sent SET caller, RENEW and GET epoch as separate round trips; RENEW
+    now does the first and the last too, when asked.
+    """
+    r = await rig(store, prefix)
+    await store.set(f"{prefix}:epoch", "1700000000")
+    caller = f"{prefix}:caller:pod-a"
+    assert await r.admission.renew_all([], caller=(caller, 30)) == (0, [])
+    assert 0 < await store.ttl(caller) <= 30
+    assert r.admission.last_epoch == "1700000000"
+
+
+async def test_cg7_sticky_key_hit_miss_and_expiry(store: redis.asyncio.Redis, prefix: str) -> None:
+    """CG-7: the sticky-session Lua path had one test (hit). A miss writes the key with its
+    TTL, a hit follows the key (even to a deployment the strategy would not pick), a call
+    with every deployment full waits, and the key expires with its TTL.
+    """
+    r = await rig(store, prefix, model={"rpm": 1})
+    key = f"{prefix}:{{m:m}}:sticky:s1"
+    miss = await r.ask("a", sticky_hash="s1", sticky_ttl_secs=0.3)
+    assert miss.deployment == "aws-a/r1"  # ordered: the first one
+    assert await store.get(key) == b"aws-a/r1"
+    assert 0 < await store.pttl(key) <= 300
+    await store.set(key, "aws-a/r2", px=300)
+    hit = await r.ask("b", sticky_hash="s1", sticky_ttl_secs=0.3)
+    assert hit.deployment == "aws-a/r2"
+    moved = await r.ask("c", sticky_hash="s1", sticky_ttl_secs=0.3, sticky_move_secs=0.001)
+    assert moved.kind == "wait"  # both full at rpm 1: no move possible, waits
+    await asyncio.sleep(0.4)  # time is what is under test: the key's TTL
+    assert not await store.exists(key)
+
+
+async def test_fl1_release_claims_of_calls_held_without_a_grant(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-1: a call handed back while waiting (no grant) kept its claim `running` too."""
+    r = await rig(store, prefix)
+    assert (await r.ask("c1", worker="pod-a", tag="m1")).kind == "granted"
+    await r.admission.finish(
+        "m", owner_token("c1", "pod-a@m1", 1), "c1", refund_r=0, refund_t=0, outcome="fail"
+    )  # between retries: no grant, the claim still `running` under pod-a
+    assert (await r.ask("c1", worker="pod-b", tag="m1")).kind == "duplicate"
+    assert await r.admission.release_claims([("c1", "pod-x@m1")]) == 0  # not its owner
+    assert await r.admission.release_claims([("c1", "pod-a@m1")]) == 1
+    assert (await r.ask("c1", worker="pod-b", tag="m1")).kind == "granted"

@@ -145,6 +145,7 @@ class Admission:
         # Owners this process settled (FINISH or UNDO sent), oldest first: a heartbeat that
         # found one lost re-registered it, a slot nobody freed until its lease ran out.
         self._settled: dict[str, float] = {}
+        self.last_epoch: str | None = None  # the store's epoch, as the last renew read it
         pace = timings or EngineTimings()
         self._t = {
             "probe_wait_ms": pace.admission_probe_wait_ms,
@@ -165,6 +166,7 @@ class Admission:
         self._renew = client.register_script(lua.RENEW)
         self._sweep = client.register_script(lua.SWEEP)
         self._reregister = client.register_script(lua.REREGISTER)
+        self._release = client.register_script(lua.RELEASE)
 
     async def _call(self, script: Any, body: dict[str, Any]) -> Any:
         args: list[Any] = [self.keys.prefix, orjson.dumps({**body, "t": self._t})]
@@ -261,19 +263,35 @@ class Admission:
             self.metrics.count("llmq_grants_lost_total", model=alias, step="finish")
         return settled
 
-    async def undo(self, alias: str, owner: str, request_id: str) -> bool:
+    async def undo(
+        self, alias: str, owner: str, request_id: str, *, keep_claim: bool = False
+    ) -> bool:
         """Give a grant back entirely, without learning (lost reply, refused claim).
 
-        Like `finish`, skipped (False, logged) when the store is unreachable: the lease expires
-        and SWEEP frees the slot. Callers no longer blanket-suppress its errors (EN-16).
+        The call's claim is released too (FL-1: another pod waited a lease for it), unless
+        `keep_claim` says this worker still holds the call. Like `finish`, skipped (False,
+        logged) when the store is unreachable: the lease expires and SWEEP frees the slot.
         """
         self._settle(owner)
-        body = {"alias": alias, "owner": owner, "request_id": request_id}
+        body: dict[str, Any] = {"alias": alias, "owner": owner, "request_id": request_id}
+        if keep_claim:
+            body["keep_claim"] = True
         try:
             return bool(await self._call(self._undo, body))
         except (StoreConnectionError, StoreTimeoutError, ReadOnlyError, OSError) as exc:
             logger.warning("undo_skipped", model=alias, request_id=request_id, error=str(exc))
             return False
+
+    async def release_claims(self, jobs: Sequence[tuple[str, str]]) -> int:
+        """Release the claims of calls given back with no grant: (request id, job owner) each.
+
+        The drain's hand-back of waiting calls: their claim stayed `running` and another pod
+        got `duplicate` for a lease (FL-1). A claim another owner holds is left alone.
+        """
+        if not jobs:
+            return 0
+        body = {"jobs": [{"request_id": r, "owner": o} for r, o in jobs]}
+        return int(await self._call(self._release, body))
 
     async def renew(self, items: Sequence[tuple[str, str, str]]) -> int:
         """Extend leases of held grants: (alias, owner, request id) each; how many were held."""
@@ -284,20 +302,27 @@ class Admission:
         self,
         items: Sequence[tuple[str, str, str]],
         jobs: Sequence[tuple[str, str]] = (),
+        *,
+        caller: tuple[str, int] | None = None,
     ) -> tuple[int, list[str]]:
         """The heartbeat: extend grants, refresh the claims of `jobs` (request id, job owner).
 
         Returns how many grants were renewed and the owners whose entry was gone (lost). An
         owner settled while this beat ran is not lost (its entry went with its FINISH or UNDO).
+        `caller` (key, ttl secs) also sets the process's caller key in the same script, and
+        `last_epoch` keeps the store's epoch it read (FL-21: two round trips of their own).
         """
-        if not items and not jobs:
+        if not items and not jobs and caller is None:
             return 0, []
-        body = {
+        body: dict[str, Any] = {
             "lease_ms": self.lease_ms,
             "items": [{"alias": a, "owner": o, "request_id": r} for a, o, r in items],
             "jobs": [{"request_id": r, "owner": o} for r, o in jobs],
         }
+        if caller is not None:
+            body["caller"] = {"key": caller[0], "ttl": int(caller[1])}
         raw = orjson.loads(await self._call(self._renew, body))
+        self.last_epoch = str(raw.get("epoch") or "") or None
         lost = raw.get("lost") or []
         lost = (
             [str(o) for o in lost if str(o) not in self._settled] if isinstance(lost, list) else []
@@ -344,5 +369,5 @@ class Admission:
         `deployments`: the model's deployment keys, whose leases past their end are removed
         even when their in-progress entry is already gone (scenario L4 left such leases).
         """
-        body = {"alias": alias, "deps": list(deployments)}
+        body = {"alias": alias, "deps": list(deployments), "lease_ms": self.lease_ms}
         return int(await self._call(self._sweep, body))

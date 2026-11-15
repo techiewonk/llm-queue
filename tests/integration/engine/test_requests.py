@@ -14,6 +14,7 @@ import redis.asyncio
 
 from llm_queue.engine.envelope import Envelope, Reply, params_hash, parse
 from llm_queue.engine.keys import Keys
+from llm_queue.engine.queue import QueueSettings
 from llm_queue.engine.requests import RequestStore
 from llm_queue.errors import UnsupportedEnvelopeError
 
@@ -115,6 +116,122 @@ async def test_app_ids_keep_their_result(store: redis.asyncio.Redis, prefix: str
     await requests.put_result(Reply(request_id="req-1", ok=True), final_state="done")
     await requests.take_result("req-1")
     assert await store.ttl(f"{prefix}:{{r:req-1}}:res") > 250
+
+
+async def test_fl2_a_replayed_take_still_returns_the_result(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-2: RESULT_TAKE deleted a library id's result in the read itself; redis-py's replay
+    after a dropped reply found nothing and the caller waited out its deadline.
+    """
+    requests = RequestStore(store, Keys(prefix))  # result_dedupe_secs = 0, the default
+    await requests.put_result(Reply(request_id="r", ok=True, response={"x": 1}), final_state="done")
+    first = await requests.take_result("r")
+    replay = await requests.take_result("r")  # the same script again, as the retry runs it
+    assert first is not None
+    assert replay is not None
+    assert replay.response == {"x": 1}
+    assert 0 < await store.pttl(f"{prefix}:{{r:r}}:res") <= 10_000  # gone within seconds
+
+
+@pytest.mark.parametrize("final", ["failed", "expired", "cancelled"])
+async def test_q2_an_id_that_ended_badly_runs_again(
+    store: redis.asyncio.Redis, prefix: str, final: str
+) -> None:
+    """Owner decision Q2: only a success is replayed. An id whose run failed (or expired, or
+    was cancelled) was answered `done` with the old failure; it now registers as `new`, its
+    old result, status, cancel mark and chunks gone.
+    """
+    requests = _store(store, prefix)
+    assert await _register(requests, "pod-a") == "new"
+    await store.set(f"{prefix}:{{r:req-1}}:cancel", "1")
+    await store.xadd(f"{prefix}:{{r:req-1}}:chunks", {"t": "x"})
+    await requests.put_result(
+        Reply(request_id="req-1", ok=False, error="provider_error"),
+        final_state=final,
+        status={"error": "provider_error"},
+    )
+    assert await _register(requests, "pod-b") == "new"  # `done` before
+    assert await requests.take_result("req-1") is None
+    assert (await requests.status("req-1"))["state"] == "waiting"
+    assert await requests.job("req-1") == {
+        **await requests.job("req-1"),
+        "state": "queued",
+        "caller": "pod-b",
+    }
+    assert not await store.exists(f"{prefix}:{{r:req-1}}:cancel", f"{prefix}:{{r:req-1}}:chunks")
+    assert await requests.callers("req-1") == ["pod-b"]
+
+
+async def test_q2_a_success_is_still_replayed(store: redis.asyncio.Redis, prefix: str) -> None:
+    """Q2: a successful end keeps answering `done` to a later registration of its id."""
+    requests = _store(store, prefix)
+    assert await _register(requests, "pod-a") == "new"
+    await requests.put_result(Reply(request_id="req-1", ok=True), final_state="done")
+    assert await _register(requests, "pod-b") == "done"
+
+
+async def test_q3_cancel_wins_for_every_caller_of_a_shared_id(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """Q3 / R3RC-1: a shared id was never cancelled (callers {A, B} is not a subset of {A}).
+
+    One caller's cancel now marks the call, in one script with the final-state check; a
+    finished call is not marked, and an attach after the mark joins the cancelled call.
+    """
+    requests = RequestStore(store, Keys(prefix))  # a 5 s takeover grace: B attaches
+    keys = Keys(prefix)
+    assert await _register(requests, "pod-a") == "new"
+    assert await _register(requests, "pod-b") == "attached"
+    pubsub = store.pubsub()
+    await pubsub.subscribe(keys.cancel_channel)
+    assert await requests.cancel(["req-1"], ttl_secs=60, channel=keys.cancel_channel) == 1
+    assert await store.get(f"{prefix}:{{r:req-1}}:cancel") == b"1"
+    heard = None
+    for _ in range(10):
+        message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.5)
+        if message:
+            heard = message["data"]
+            break
+    assert heard == b"req-1"
+    await pubsub.aclose()  # type: ignore[no-untyped-call]  # redis-py stubs lack it
+    assert await _register(requests, "pod-c") == "attached"  # joins the cancelled call
+    await requests.put_result(Reply(request_id="req-1", ok=True), final_state="done")
+    await store.delete(f"{prefix}:{{r:req-1}}:cancel")
+    assert await requests.cancel(["req-1"], ttl_secs=60, channel=keys.cancel_channel) == 0
+    assert not await store.exists(f"{prefix}:{{r:req-1}}:cancel")
+
+
+async def test_fl25_a_full_queue_on_takeover_keeps_the_record(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-25: REGISTER_SEND on a takeover with a full queue deleted the job, callers and
+    status, although the first sender's message may be in the stream (run for nobody).
+    """
+    from llm_queue.engine.queue import QueueFull, StreamQueues
+
+    requests = _store(store, prefix)  # takeover grace 0: the next sender takes over at once
+    queues = StreamQueues(store, Keys(prefix))
+    assert await _register(requests, "pod-a") == "new"  # unconfirmed; its send "lost"
+    await queues.send("q", b"first", QueueSettings(max_waiting=0))
+    with pytest.raises(QueueFull):
+        await requests.register_send(
+            "req-1",
+            caller="pod-b",
+            user_hash="u",
+            params_hash="p",
+            model="gpt120b",
+            priority=True,
+            app_id=False,
+            queue="q",
+            queue_keys=queues.queue_keys("q"),
+            bell=queues.bell("q"),
+            body=b"x",
+            max_waiting=1,
+            retention_secs=60,
+            keep_secs=60,
+        )
+    assert await requests.job("req-1")  # {} before the fix
 
 
 async def test_final_status_is_never_replaced(store: redis.asyncio.Redis, prefix: str) -> None:

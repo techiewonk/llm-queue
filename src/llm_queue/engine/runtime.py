@@ -3622,8 +3622,7 @@ class Engine:
                         # Dead letters age out on a timer too: only the next dead letter trimmed
                         # them, so a quiet queue kept its prompts for good (RESCAN X10).
                         keep = int(view.value(alias, "queue")["dlq_retention_secs"])
-                        for priority in (True, False):
-                            name = self._queue_name(view, alias, priority)
-                            await self.queues.trim_dead(name, keep)
+                        names = [self._queue_name(view, alias, p) for p in (True, False)]
+                        await self.queues.trim_dead_many(names, keep)  # one round trip (FL-20)
             except Exception as exc:
                 logger.warning("sweep_failed", error=str(exc))
