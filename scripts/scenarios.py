@@ -18,8 +18,11 @@ scenarios add checks (a faulted region serves again, one run for two callers ...
     python scripts/scenarios.py S4 --load at     # one load
     python scripts/scenarios.py --group store    # store worker provider registry caller pairs
     python scripts/scenarios.py all              # every scenario and pair, every load
+    python scripts/scenarios.py all --matrix default  # `at`, plus `burst` where it matters
+    python scripts/scenarios.py all --exclude S6 S7 S11  # without the Docker drills
     python scripts/scenarios.py S4 --profile prod  # production timers (slower)
-    python scripts/scenarios.py all --jobs 4     # 4 runs at a time (default; 1: one by one)
+    python scripts/scenarios.py all --jobs 4     # 4 runs at a time (default; 1: one by one;
+                                                 # `burst` units always one at a time)
     python scripts/scenarios.py S1 --seed 7      # replay the random choices of a run
 
 Every random choice is seeded (`--seed`, printed at the start). In parallel, each run is its own
@@ -47,6 +50,7 @@ import random
 import subprocess
 import sys
 import time
+import traceback
 import urllib.request
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -84,6 +88,16 @@ SLOW_ID = "openai.slow-1:0"  # C1's calls: their own fakellm keys, apart from th
 ORPHAN_ID = "openai.orphan-1:0"  # C2's calls
 RECOVERY_SECS = 30.0  # a faulted region must serve again within this after the fault
 LOADS = {"under": 0.5, "at": 1.0, "burst": 3.0}
+SETTLE_PROBE_SECS = 30.0  # after the fixed settle: until a probe call succeeds per caller (FT-9)
+# `--matrix default`: every scenario `at`, and `burst` only where load changes the code path
+# (refusals on time, held calls, store recovery under pressure). `under` takes the same paths
+# as `at` and was slower (call counts at a lower rate); it stays in `--matrix full` (FT-2).
+BURST_SET = frozenset(
+    {"S1", "S3", "S4", "S5", "S8", "R1", "C2", "X1", "X2", "X5", "M1", "L2", "L4"}
+)
+# Run one at a time even with --jobs: 300 % load on 3 workers, 2 callers and a fakellm per
+# unit is CPU-bound, and parallel units starved each other (FT-2).
+SERIAL_LOADS = frozenset({"burst"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -238,6 +252,32 @@ async def phase(
     return list(await asyncio.gather(*tasks))
 
 
+async def settled(ctx: Ctx, cap_secs: float = SETTLE_PROBE_SECS) -> None:
+    """Until one probe call succeeds through each caller (at most `cap_secs`), after a fault.
+
+    A fixed settle started `after` while callers were still in store-down mode at 300 % load
+    (X1, L2, L4: `queue_unavailable` 11 s into `after`), FT-9. Probes count as sent calls (the
+    provider-call bound) but not in any phase. A caller that never recovers within the cap is
+    a note, and its `after` calls then judge it.
+    """
+    t0 = time.monotonic()
+    waiting = list(ctx.queues)
+    probes = 0
+    while waiting and time.monotonic() - t0 < cap_secs:
+        replies = await asyncio.gather(
+            *(llmq.converse("chat", chat()) for llmq in waiting), return_exceptions=True
+        )
+        probes += len(waiting)
+        waiting = [q for q, r in zip(waiting, replies, strict=True) if isinstance(r, BaseException)]
+        if waiting:
+            await asyncio.sleep(0.5)
+    ctx.extra_sent += probes
+    ctx.notes.append(
+        f"settled: {probes} probe calls, {time.monotonic() - t0:.1f}s"
+        + (f"; {len(waiting)} caller(s) still failing at the cap" if waiting else "")
+    )
+
+
 async def run_one(scenario: Scenario, load: str, profile_name: str) -> bool:
     """Run one scenario under one load; print its numbers and verdict."""
     profile = PROFILES[profile_name]
@@ -290,7 +330,9 @@ async def run_one(scenario: Scenario, load: str, profile_name: str) -> bool:
             )
             await fault()
             phases["during"] = await during
-            await asyncio.sleep(scenario.settle_secs)
+            if scenario.settle_secs:
+                await asyncio.sleep(scenario.settle_secs)
+                await settled(ctx)
             phases["after"] = await phase(ctx, "after", rate, PHASE_CALLS["after"], None)
             if scenario.recovers:
                 await serves_again(ctx, phases["after"])
@@ -1450,6 +1492,40 @@ async def parallel(
     return results
 
 
+def plan(ids: list[str], loads: list[str] | None, matrix: str = "full") -> list[tuple[str, str]]:
+    """The (scenario, load) units of a run: `--load` if given, else the matrix's loads.
+
+    `full` is every scenario under every load (release); `default` is every scenario `at`
+    plus `burst` for BURST_SET (FT-2). Failover drills are not units (they run after).
+    """
+    units = []
+    for sid in ids:
+        if sid not in BY_ID:
+            continue
+        if loads:
+            chosen = loads
+        elif matrix == "full":
+            chosen = list(LOADS)
+        else:
+            chosen = ["at", "burst"] if sid in BURST_SET else ["at"]
+        units += [(sid, load) for load in chosen]
+    return units
+
+
+def guarded(name: str, run: Callable[[], bool]) -> bool:
+    """One unit's verdict; a harness exception fails that unit and the run goes on (FT-6).
+
+    A `RuntimeError` in one serial unit (an edit that never reached the store, a sampler that
+    raised) used to end every remaining scenario, the failover drills and the summary line.
+    """
+    try:
+        return run()
+    except Exception:
+        traceback.print_exc()
+        print(f"FAIL  {name} (harness error, traceback above)", flush=True)
+        return False
+
+
 def main() -> int:
     """Run the chosen scenarios under the chosen loads; exit 1 if any fails."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -1457,6 +1533,16 @@ def main() -> int:
     groups = sorted({s.group for s in SCENARIOS} | {"failover"})
     parser.add_argument("--group", choices=groups, action="append", help="may repeat")
     parser.add_argument("--load", choices=sorted(LOADS), action="append")
+    parser.add_argument(
+        "--matrix",
+        choices=("full", "default"),
+        default="full",
+        help="loads when --load is not given: full = every load; default = `at`, plus "
+        "`burst` where load changes the path",
+    )
+    parser.add_argument(
+        "--exclude", nargs="+", action="extend", default=[], help="scenario ids to leave out"
+    )
     parser.add_argument("--profile", choices=sorted(PROFILES), default="fast")
     parser.add_argument("--jobs", type=int, default=4, help="runs at a time (1: one by one)")
     parser.add_argument("--list", action="store_true")
@@ -1464,7 +1550,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.list:
         for s in SCENARIOS:
-            print(f"{s.sid:4} {s.group:9} {s.title}: {s.rule}")
+            burst = " [burst in the default matrix]" if s.sid in BURST_SET else ""
+            print(f"{s.sid:4} {s.group:9} {s.title}: {s.rule}{burst}")
         for sid, name in FAILOVER.items():
             print(f"{sid:4} failover  Docker failover drill `{name}` (failover.py)")
         return 0
@@ -1477,34 +1564,43 @@ def main() -> int:
             ids += list(FAILOVER)
         else:
             ids += [s.sid for s in SCENARIOS if s.group == group]
-    unknown = [i for i in ids if i not in BY_ID and i not in FAILOVER]
+    unknown = [i for i in [*ids, *args.exclude] if i not in BY_ID and i not in FAILOVER]
+    ids = [i for i in dict.fromkeys(ids) if i not in set(args.exclude)]
     if unknown or not ids:
         parser.error(f"unknown or no scenario: {unknown}; see --list")
-    ids = list(dict.fromkeys(ids))
-    loads = args.load or list(LOADS)
     started = time.monotonic()
     results: dict[str, bool] = {}
-    shared = [(sid, load) for sid in ids if sid in BY_ID and sid not in ALONE for load in loads]
-    alone = [(sid, load) for sid in ids if sid in ALONE for load in loads]
-    if args.jobs > 1 and len(shared) > 1:
-        results.update(asyncio.run(parallel(shared, args.profile, args.jobs, seed)))
+    units = plan(ids, args.load, args.matrix)
+    alone = [u for u in units if u[0] in ALONE]
+    shared = [u for u in units if u[0] not in ALONE and u[1] not in SERIAL_LOADS]
+    serial = [u for u in units if u[0] not in ALONE and u[1] in SERIAL_LOADS]
+    if args.jobs > 1 and len(shared) + len(serial) > 1:
+        # Each unit its own process (a crash or hang stays in it); burst ones one at a time.
+        if shared:
+            results.update(asyncio.run(parallel(shared, args.profile, args.jobs, seed)))
+        if serial:
+            results.update(asyncio.run(parallel(serial, args.profile, 1, seed)))
     else:
-        alone = shared + alone
+        alone = shared + serial + alone
     if alone:
         print(f"  logs of worker processes: {log_dir()}", flush=True)
     for sid, load in alone:
         random.seed(f"{seed}:{sid}:{load}")  # the same choices for a unit, alone or in parallel
-        results[f"{sid} {load}"] = asyncio.run(run_one(BY_ID[sid], load, args.profile))
+
+        def one(sid: str = sid, load: str = load) -> bool:
+            return asyncio.run(run_one(BY_ID[sid], load, args.profile))
+
+        results[f"{sid} {load}"] = guarded(f"{sid} {load}", one)
     for sid in [i for i in ids if i in FAILOVER]:
 
-        async def drill(name: str = FAILOVER[sid]) -> bool:
-            return bool(await failover.drill(name))
+        def drill(name: str = FAILOVER[sid]) -> bool:
+            try:  # a failed nodes_up still removes what it started (CO-17)
+                failover.nodes_up()
+                return bool(asyncio.run(failover.drill(name)))
+            finally:
+                failover.nodes_down()
 
-        try:  # a failed nodes_up still removes what it started (CO-17)
-            failover.nodes_up()
-            results[sid] = asyncio.run(drill())
-        finally:
-            failover.nodes_down()
+        results[sid] = guarded(sid, drill)
     failed = [k for k, ok in results.items() if not ok]
     print(
         f"{len(results) - len(failed)}/{len(results)} passed in {time.monotonic() - started:.0f}s"
