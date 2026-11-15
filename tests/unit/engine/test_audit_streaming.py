@@ -60,6 +60,7 @@ async def test_en19_background_flush_failure_is_logged(caplog: pytest.LogCapture
     """EN-19: a failed timer flush was stored silently and lost if the call ended by error()."""
     writer = ChunkWriter(Client(), "k", "a", flush_ms=10, max_bytes=1_000_000, ttl_secs=60)  # type: ignore[arg-type]  # fake
     writer._seq = 1  # past the first event: later ones wait for the timer
+    writer._content = True  # and past the first text (R3ST-12)
     writer._last = asyncio.get_running_loop().time() + 1e9
     with caplog.at_level(logging.WARNING):
         await writer.add({"x": 1})

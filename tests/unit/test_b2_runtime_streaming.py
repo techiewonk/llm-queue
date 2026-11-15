@@ -64,7 +64,8 @@ async def test_failed_flush_keeps_its_events() -> None:
     await writer.add(_delta("b"))
     texts = [e["contentBlockDelta"]["delta"]["text"] for e in _events(store)]
     assert texts == ["a", "b"]
-    assert [int(e["seq"]) for e in store.entries] == [1]
+    # The failed write may have reached the store: sent again under its own seq (R3ST-7).
+    assert [int(e["seq"]) for e in store.entries] == [1, 2]
 
 
 async def test_end_raises_a_background_flush_failure() -> None:

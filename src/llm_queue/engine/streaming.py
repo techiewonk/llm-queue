@@ -73,6 +73,11 @@ class ChunkWriter:
         self._lock = asyncio.Lock()
         self._timer: asyncio.Task[None] | None = None
         self._failed: Exception | None = None
+        # A write whose outcome is unknown (a store error or a cancel mid-XADD): sent again, with
+        # the same seq, before anything else. The reader skips the copy if the first landed.
+        self._doubt: tuple[int, str, bytes, int | None] | None = None
+        self._content = False  # an event with answer content (text, tool, reasoning) was sent
+        self.closed = False  # `end` or `error` was written
         self.partial: list[str] = []
 
     @property
@@ -86,20 +91,25 @@ class ChunkWriter:
         return "".join(self.partial)
 
     async def add(self, event: Any) -> None:
-        """One provider event: written now if it is the first or the flush window has passed."""
+        """One provider event: written now if it is early or the flush window has passed.
+
+        Every event up to the first with answer content is written at once: the first text
+        delta waited up to `stream_flush_ms` behind `messageStart`, and time to first token is
+        the number users see (R3ST-12).
+        """
         if self._failed is not None:
             raise self._failed
         # `exclude_unset`, not `exclude_none`: the wire shape, with the nulls the server sent;
         # `chunk["choices"][0]["finish_reason"]` raised KeyError on most chunks (R3ST-10).
         data = event.model_dump(exclude_unset=True) if hasattr(event, "model_dump") else event
         self._buffer.append(data)
-        if text := text_of(data):
+        text = text_of(data)
+        if text:
             self.partial.append(text)
-        if (
-            self._seq == 0
-            or self._flush_secs == 0
-            or time.monotonic() - self._last >= self._flush_secs
-        ):
+        early = not self._content
+        if early:
+            self._content = bool(text) or _has_content(data)
+        if early or self._flush_secs == 0 or time.monotonic() - self._last >= self._flush_secs:
             await self._flush()
         elif self._timer is None or self._timer.done():
             self._timer = asyncio.create_task(self._flush_later())
@@ -114,61 +124,201 @@ class ChunkWriter:
             # so the failure went unseen (EN-19).
             logger.warning("chunk_flush_failed", key=self.key, error_type=type(exc).__name__)
 
-    async def _write(self, kind: str, data: Any, *, ttl_secs: int | None = None) -> None:
+    async def _write(
+        self, kind: str, data: Any, *, ttl_secs: int | None = None, capped: bool = True
+    ) -> None:
+        """Write one entry under the next seq; the lock is held.
+
+        The seq is taken before the write (R3ST-7, FE-3): a write cut by a cancel or a store
+        error may have reached the store, and the next entry under the same seq was dropped by
+        the reader as a re-read, so the caller never saw the `end` or `error` entry. The entry
+        is kept in doubt and sent again, same seq, before the next one.
+        """
         payload = orjson.dumps(data, default=_chunk_default)
-        size = self._bytes + len(payload)  # counted only once written, like the sequence
-        if size > self._max_bytes:
+        size = self._bytes + len(payload)
+        # `end` is not capped (R3ST-13): an answer delivered in full failed on its last entry.
+        if capped and size > self._max_bytes:
             raise StreamTooLarge(f"the stream is above {self._max_bytes} bytes")
-        seq = self._seq + 1  # counted only once written: a failed write leaves no gap
+        self._seq += 1
+        self._bytes = size
+        self._doubt = (self._seq, kind, payload, ttl_secs)
+        await self._send()
+
+    async def _send(self) -> None:
+        """Send the entry in doubt; it stays in doubt until the store confirmed it."""
+        assert self._doubt is not None
+        seq, kind, payload, ttl_secs = self._doubt
         async with self._client.pipeline(transaction=False) as pipe:
             pipe.xadd(self.key, {"seq": seq, "att": self.attempt_id, "t": kind, "d": payload})
             pipe.expire(
                 self.key, ttl_secs or self._ttl_secs
             )  # every write: the first may have failed
             await pipe.execute()
-        self._seq = seq
-        self._bytes = size
+        self._doubt = None
         self._last = time.monotonic()
 
     async def _flush(self) -> None:
         async with self._lock:
-            if self._buffer:
-                events, self._buffer = self._buffer, []
-                try:
-                    await self._write("chunk", events)
-                except Exception:
-                    # Kept for the next flush: dropped, the stream ended "ok" with chunks
-                    # missing (RESCAN S1).
-                    self._buffer = events + self._buffer
-                    raise
+            await self._flush_locked()
 
-    async def end(self, usage: Mapping[str, Any]) -> None:
+    async def _flush_locked(self) -> None:
+        if self._doubt is not None:
+            await self._send()
+        if self._buffer:
+            events, self._buffer = self._buffer, []
+            try:
+                await self._write("chunk", events)
+            except StreamTooLarge:
+                # Kept: `error` still carries their text (RESCAN S1). Any other failure left
+                # them in doubt, to be sent again (R3ST-7).
+                self._buffer = events + self._buffer
+                raise
+
+    async def end(self, usage: Mapping[str, Any], meta: Mapping[str, Any] | None = None) -> None:
         """Write what is left, then the `end` entry; a background flush's failure raises here.
 
         After `end` the stream lives `END_TTL_SECS` more: a read stream (up to 8 MB) stayed
-        for the result TTL plus the timeout (RESCAN S3).
+        for the result TTL plus the timeout (RESCAN S3). `meta` (served model, deployment,
+        fallback, attempts) is for stream callers, who never see the call's `Reply` (R3ST-9).
         """
         await self._stop_timer()
         if self._failed is not None:
             raise self._failed
-        await self._flush()
+        data: dict[str, Any] = {"usage": dict(usage)}
+        if meta is not None:
+            data["meta"] = dict(meta)
         async with self._lock:
-            await self._write("end", {"usage": dict(usage)}, ttl_secs=END_TTL_SECS)
+            await self._flush_locked()
+            await self._write("end", data, ttl_secs=END_TTL_SECS, capped=False)
+            self.closed = True
 
     async def error(self, kind: str, message: str) -> None:
-        """End the stream with an error that carries the partial text (best effort)."""
+        """End the stream with an error that carries the partial text (best effort).
+
+        A no-op once the stream ended: a cancel that came after `end` wrote an error entry
+        nobody reads.
+        """
+        if self.closed:
+            return
         await self._stop_timer()
-        with contextlib.suppress(StreamTooLarge):
-            await self._flush()
         async with self._lock:
-            self._bytes = 0  # the error entry is always written
+            with contextlib.suppress(StreamTooLarge):
+                await self._flush_locked()
             await self._write(
-                "error", {"kind": kind, "message": message, "partial": self.partial_text}
+                "error",
+                {"kind": kind, "message": message, "partial": self.partial_text},
+                capped=False,  # the error entry is always written
             )
+            self.closed = True
 
     async def _stop_timer(self) -> None:
-        if self._timer is not None and not self._timer.done():
-            await _cancel_and_wait([self._timer])
+        """Stop the flush timer; a flush it has in flight finishes first.
+
+        Cancelled inside its write, the timer lost the batch or left the seq behind, and the
+        `end` written next under the same seq was dropped by the reader (FE-3).
+        """
+        timer = self._timer
+        if timer is None or timer.done():
+            return
+        async with self._lock:  # the timer is asleep or waiting for the lock once this is held
+            timer.cancel()
+        await _cancel_and_wait([timer])
+
+
+def _has_content(event: Mapping[str, Any]) -> bool:
+    """True for an event that carries answer content: a text, tool or reasoning delta."""
+    if "contentBlockDelta" in event:
+        return True
+    choices = event.get("choices") or []
+    if choices and isinstance(choices[0], Mapping):
+        delta = choices[0].get("delta") or {}
+        return any(key != "role" and value for key, value in delta.items())
+    return False
+
+
+def replay_events(response: Mapping[str, Any] | None) -> list[dict[str, Any]] | None:
+    """Stream events rebuilt from a call's kept reply; None for a shape this cannot rebuild.
+
+    For an app id streamed again once its chunks expired (`END_TTL_SECS`) while its result is
+    still kept: the stream ended with no event and no error (R3ST-6). Bedrock gets the
+    ConverseStream events of the body, OpenAI-compatible one chunk plus a usage chunk.
+    """
+    if not isinstance(response, Mapping):
+        return None
+    if isinstance(response.get("output"), Mapping):
+        return _converse_events(response)
+    if isinstance(response.get("choices"), list):
+        return _chat_events(response)
+    return None
+
+
+def _converse_events(body: Mapping[str, Any]) -> list[dict[str, Any]]:
+    message = body["output"].get("message") or {}
+    events: list[dict[str, Any]] = [{"messageStart": {"role": message.get("role", "assistant")}}]
+    for index, block in enumerate(message.get("content") or []):
+        deltas: list[dict[str, Any]] = []
+        if "text" in block:
+            deltas.append({"text": block["text"]})
+        elif "toolUse" in block:
+            tool = block["toolUse"]
+            start = {k: tool[k] for k in ("toolUseId", "name") if k in tool}
+            events.append(
+                {"contentBlockStart": {"start": {"toolUse": start}, "contentBlockIndex": index}}
+            )
+            raw = tool.get("input", {})
+            text = raw if isinstance(raw, str) else orjson.dumps(raw).decode()
+            deltas.append({"toolUse": {"input": text}})
+        elif "reasoningContent" in block:
+            reasoning = block["reasoningContent"]
+            if "redactedContent" in reasoning:
+                deltas.append(
+                    {"reasoningContent": {"redactedContent": reasoning["redactedContent"]}}
+                )
+            part = reasoning.get("reasoningText") or {}
+            if "text" in part:
+                deltas.append({"reasoningContent": {"text": part["text"]}})
+            if "signature" in part:
+                deltas.append({"reasoningContent": {"signature": part["signature"]}})
+        elif "citationsContent" in block:
+            cited = block["citationsContent"]
+            text = "".join(str(c.get("text", "")) for c in cited.get("content") or [])
+            deltas.append({"text": text})
+            deltas.extend({"citation": c} for c in cited.get("citations") or [])
+        events.extend(
+            {"contentBlockDelta": {"delta": delta, "contentBlockIndex": index}} for delta in deltas
+        )
+        events.append({"contentBlockStop": {"contentBlockIndex": index}})
+    stop: dict[str, Any] = {"stopReason": body.get("stopReason")}
+    if "additionalModelResponseFields" in body:
+        stop["additionalModelResponseFields"] = body["additionalModelResponseFields"]
+    events.append({"messageStop": stop})
+    metadata = {k: body[k] for k in ("usage", "metrics", "trace") if k in body}
+    if metadata:
+        events.append({"metadata": metadata})
+    return events
+
+
+def _chat_events(body: Mapping[str, Any]) -> list[dict[str, Any]]:
+    head = {k: body[k] for k in ("id", "created", "model", "system_fingerprint") if k in body}
+    head["object"] = "chat.completion.chunk"
+    choices = []
+    for choice in body["choices"]:
+        delta = dict(choice.get("message") or {})
+        if delta.get("tool_calls"):
+            delta["tool_calls"] = [
+                {"index": i, **call} for i, call in enumerate(delta["tool_calls"])
+            ]
+        choices.append(
+            {
+                "index": choice.get("index", 0),
+                "delta": delta,
+                "finish_reason": choice.get("finish_reason"),
+            }
+        )
+    events: list[dict[str, Any]] = [{**head, "choices": choices}]
+    if body.get("usage") is not None:
+        events.append({**head, "choices": [], "usage": body["usage"]})
+    return events
 
 
 class ChunkReader:
@@ -187,16 +337,24 @@ class ChunkReader:
         self._client = client
         self._block_ms = block_ms
         self._wake_key = wake_key
-        self._open: dict[str, tuple[asyncio.Queue[dict[str, Any]], list[str]]] = {}
+        # Per open stream: its queue, the last entry id read (bytes, in a list to update in
+        # place) and its key as a packed RESP argument, built once (R3PF-2).
+        self._open: dict[str, tuple[asyncio.Queue[dict[str, Any]], list[bytes], bytes]] = {}
         self._task: asyncio.Task[None] | None = None
         self._reading: set[str] | None = None  # the keys of the blocking read in flight
         self._woken = False  # a wake-up was sent for the read in flight
         self._rings: set[asyncio.Task[None]] = set()
 
     def open(self, key: str) -> asyncio.Queue[dict[str, Any]]:
-        """Start reading a chunk stream from its beginning; entries arrive on the queue."""
+        """Start reading a chunk stream from its beginning; entries arrive on the queue.
+
+        `ValueError` when this process already reads it: a second open replaced the first's
+        queue and the first's close then removed the second's, so both starved (R3ST-8).
+        """
+        if key in self._open:
+            raise ValueError(f"the chunk stream {key} is already open in this process")
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        self._open[key] = (queue, ["0"])
+        self._open[key] = (queue, [b"0"], _arg(key.encode()))
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._read())
         elif (
@@ -237,12 +395,9 @@ class ChunkReader:
     async def _read(self) -> None:
         failures = 0
         while self._open:
-            streams: dict[Any, Any] = {key: last[0] for key, (_, last) in self._open.items()}
-            if self._wake_key is not None:
-                streams[self._wake_key] = "$"  # only wake-ups sent while this read blocks
-            self._reading, self._woken = set(streams), False
+            self._reading, self._woken = set(self._open), False
             try:
-                found: Any = await self._client.xread(streams, block=self._block_ms)
+                found: Any = await self._xread()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -258,17 +413,23 @@ class ChunkReader:
             if failures:
                 logger.info("chunk_reader_recovered", failures=failures)
                 failures = 0
-            for raw_key, entries in found or []:
+            # A raw reply: a map under RESP3, a list of [key, entries] pairs under RESP2.
+            for raw_key, entries in found.items() if isinstance(found, Mapping) else found or []:
                 key = _text(raw_key)
                 if key not in self._open:
                     continue
-                queue, last = self._open[key]
+                queue, last, _ = self._open[key]
                 for entry_id, fields in entries:
-                    last[0] = _text(entry_id)
+                    last[0] = entry_id if isinstance(entry_id, bytes) else str(entry_id).encode()
                     # One bad entry is skipped: it ended the reader shared by every stream of
                     # this process (RESCAN S11); the stream's caller then sees a gap.
                     try:
-                        entry = {_text(k): v for k, v in fields.items()}
+                        pairs = (
+                            fields.items()
+                            if isinstance(fields, Mapping)
+                            else zip(fields[::2], fields[1::2], strict=True)
+                        )
+                        entry = {_text(k): v for k, v in pairs}
                         item = {
                             "seq": int(entry["seq"]),
                             "att": _text(entry.get("att", b"")),
@@ -279,6 +440,53 @@ class ChunkReader:
                         logger.warning("chunk_entry_bad", error_type=type(exc).__name__)
                         continue
                     queue.put_nowait(item)
+
+    async def _xread(self) -> Any:
+        """One blocking XREAD over every open stream (and the wake stream).
+
+        Packed here from each stream's cached key argument and sent on a pooled connection:
+        redis-py's `xread` built a dict and packed every key and id in Python again on each
+        turn, 3.6 ms per read at 1,000 open streams (R3PF-2). The reply is raw (a map under
+        RESP3, a list of pairs under RESP2; fields as a flat list). A client without a pool (a
+        test fake) gets the plain command.
+        """
+        pool = getattr(self._client, "connection_pool", None)
+        if pool is None:
+            streams: dict[Any, Any] = {key: last[0] for key, (_, last, _) in self._open.items()}
+            if self._wake_key is not None:
+                streams[self._wake_key] = "$"  # only wake-ups sent while this read blocks
+            return await self._client.xread(streams, block=self._block_ms)
+        command = self._command()
+        conn = await pool.get_connection()
+        try:
+            await conn.send_packed_command(command)
+            return await conn.read_response()
+        except BaseException:
+            # Cancelled or failed mid-read: the reply may still come on this connection, and
+            # the next command would read it as its own.
+            await asyncio.shield(conn.disconnect())
+            raise
+        finally:
+            await pool.release(conn)
+
+    def _command(self) -> bytes:
+        """The packed `XREAD BLOCK ms STREAMS keys... ids...` of the open streams."""
+        opened = list(self._open.values())
+        keys = [packed for _, _, packed in opened]
+        ids = [_arg(last[0]) for _, last, _ in opened]
+        if self._wake_key is not None:
+            keys.append(_arg(self._wake_key.encode()))
+            ids.append(b"$1\r\n$\r\n")  # only wake-ups sent while this read blocks
+        head = b"*%d\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n%s$7\r\nSTREAMS\r\n" % (
+            4 + 2 * len(keys),
+            _arg(b"%d" % self._block_ms),
+        )
+        return b"".join([head, *keys, *ids])
+
+
+def _arg(value: bytes) -> bytes:
+    """One RESP bulk-string argument."""
+    return b"$%d\r\n%s\r\n" % (len(value), value)
 
 
 async def _cancel_and_wait(tasks: list[asyncio.Task[None]]) -> None:
