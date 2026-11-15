@@ -147,7 +147,12 @@ class QueuedHTTPTransport(httpx.AsyncBaseTransport, httpx.BaseTransport):
         elif path.endswith("/embeddings"):
             route = "embeddings"
         else:
-            raise _RequestRejected(404, f"route {path} is not supported by the queue", "route")
+            raise _RequestRejected(
+                404,
+                f"route {path} is not supported by the queue: only /chat/completions and "
+                "/embeddings are queued (set use_responses_api=False)",
+                "route",
+            )
         try:
             body = orjson.loads(raw or b"{}")
         except ValueError as exc:

@@ -8,13 +8,14 @@ them (served model, deployment, attempts, queue wait) in `response_metadata`.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from pydantic import Field, model_validator
 
 from llm_queue.http_transport import META_KEY, QUEUED_BASE_URL, QueuedHTTPTransport
+from llm_queue.langchain._client import checked_values
 
 if TYPE_CHECKING:
     from langchain_core.outputs import ChatResult
@@ -25,6 +26,7 @@ _PLACEHOLDER_API_KEY = "llmq-queued"
 
 def _queued_client_values(values: Any) -> Any:
     """Point both SDK clients at a queued transport built from the raw constructor values."""
+    values = checked_values(values)
     if not isinstance(values, dict):
         return values
     transport = QueuedHTTPTransport(
@@ -64,12 +66,13 @@ class QueuedChatOpenAI(_ClosesClients, ChatOpenAI):
     """`ChatOpenAI` whose HTTP calls are answered by the LLM queue's `chat` op.
 
     `model_alias` is the queue alias; when unset, the request's `model` (this class's `model`)
-    is used as the alias. Streaming is always off, so `astream()` yields one full message.
+    is used as the alias. Streaming is always off, so `astream()` yields one full message. The
+    Responses API is off too: only `/chat/completions` and `/embeddings` are queued (R3AP-13).
     """
 
     llmq: Any = Field(default=None, exclude=True)
     model_alias: str | None = None
-    allow_fallback: str = "all"
+    allow_fallback: Literal["all", "regions", "none"] = "all"
     priority: bool | None = None
     queue_timeout_secs: float | None = None
 
@@ -80,6 +83,16 @@ class QueuedChatOpenAI(_ClosesClients, ChatOpenAI):
         if isinstance(values, dict):
             values["streaming"] = False
             values["disable_streaming"] = True
+            # langchain-openai 0.3.26+ posts to `/responses` when asked to, or by itself for
+            # `reasoning`, built-in tools or `output_version="responses/v1"`; the queue answered
+            # 404, which read as a missing model (R3AP-13).
+            if values.get("use_responses_api"):
+                raise ValueError(
+                    "use_responses_api=True is not supported: the queue serves "
+                    "/chat/completions and /embeddings only"
+                )
+            if "use_responses_api" in ChatOpenAI.model_fields:
+                values["use_responses_api"] = False
             values.setdefault("name", ChatOpenAI.__name__)  # trace run name as the parent's
         return values
 

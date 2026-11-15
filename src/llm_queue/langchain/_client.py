@@ -89,6 +89,22 @@ def get_default_queue() -> QueueClient:
     return _default_queue
 
 
+def checked_values(values: Any) -> Any:
+    """Constructor values with `llmq` checked against `QueueClient` (R3AP-14).
+
+    A wrong object was found only at the first call, as an `AttributeError` deep in the
+    adapter; now the constructor names the methods it needs.
+    """
+    if isinstance(values, dict):
+        llmq = values.get("llmq")
+        if llmq is not None and not isinstance(llmq, QueueClient):
+            raise ValueError(
+                f"llmq must be an LLMQueue (or an object with converse, converse_sync, chat, "
+                f"embed and embed_sync), not {type(llmq).__name__}"
+            )
+    return values
+
+
 def resolve_queue(explicit: Any) -> QueueClient:
     """The adapter's own queue if it has one, else the default, looked up on every call."""
     return cast("QueueClient", explicit) if explicit is not None else get_default_queue()

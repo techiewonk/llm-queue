@@ -5,8 +5,10 @@ LangChain / LangGraph chains, agents and RAG pipelines.
 
 ## Key points
 
-- `QueuedChatBedrockConverse` is a `ChatBedrockConverse`. Tools, streaming and structured
-  output work as usual.
+- `QueuedChatBedrockConverse` is a `ChatBedrockConverse`. Tools and structured output work as
+  usual. Streaming does not: `astream()`, `astream_events()` and LangGraph's
+  `stream_mode="messages"` yield the whole answer as one chunk (the adapters turn streaming off).
+  For tokens as they arrive, call `LLMQueue.converse_stream` (see [Stream](stream.md)).
 - `QueuedBedrockEmbeddings` is a `BedrockEmbeddings`.
 - Both find the started `LLMQueue` on their own. `model_alias` names a registry model, and the
   `model_id` comes from the registry.

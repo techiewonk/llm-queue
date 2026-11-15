@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import get_args, get_type_hints
+from typing import Any, get_args, get_type_hints
 from unittest.mock import MagicMock
 
 import llm_queue
@@ -18,6 +18,20 @@ from llm_queue.engine.status import StatusReader
 from llm_queue.registry import load_registry
 
 FIXTURE = Path(__file__).parent / "registry" / "fixtures" / "smallest.json"
+
+
+class _Queue:
+    """The five methods `QueueClient` needs (never called here)."""
+
+    async def converse(self, *_: Any, **__: Any) -> Any: ...
+
+    def converse_sync(self, *_: Any, **__: Any) -> Any: ...
+
+    async def chat(self, *_: Any, **__: Any) -> Any: ...
+
+    async def embed(self, *_: Any, **__: Any) -> Any: ...
+
+    def embed_sync(self, *_: Any, **__: Any) -> Any: ...
 
 
 def test_r3ap3_deployment_status_declares_every_key() -> None:
@@ -45,3 +59,36 @@ def test_q38_kind_is_a_literal_of_every_kind() -> None:
     assert frozenset(get_args(Kind)) == KINDS
     assert "request_too_large" in KINDS
     assert CallFailed("rejected", "x").kind == "rejected"
+
+
+def test_r3ap13_queued_chat_openai_stays_off_the_responses_api() -> None:
+    """R3AP-13: the Responses API posted to /responses, which the queue answered with 404."""
+    import pytest
+
+    pytest.importorskip("langchain_openai")
+    from pydantic import ValidationError
+
+    from llm_queue.langchain.openai import QueuedChatOpenAI
+
+    chat = QueuedChatOpenAI(model="m", llmq=_Queue())
+    if "use_responses_api" in type(chat).model_fields:
+        assert chat.use_responses_api is False
+        with pytest.raises(ValidationError, match="use_responses_api"):
+            QueuedChatOpenAI(model="m", llmq=_Queue(), use_responses_api=True)
+
+
+def test_r3ap14_adapters_check_llmq_and_allow_fallback() -> None:
+    """R3AP-14: a wrong `llmq` or `allow_fallback` was found only at the first call."""
+    import pytest
+
+    pytest.importorskip("langchain_openai")
+    from pydantic import ValidationError
+
+    from llm_queue.langchain.openai import QueuedChatOpenAI, QueuedOpenAIEmbeddings
+
+    with pytest.raises(ValidationError, match="llmq must be an LLMQueue"):
+        QueuedChatOpenAI(model="m", llmq=object())
+    with pytest.raises(ValidationError, match="llmq must be an LLMQueue"):
+        QueuedOpenAIEmbeddings(model="m", llmq=object())
+    with pytest.raises(ValidationError, match="allow_fallback"):
+        QueuedChatOpenAI(model="m", llmq=_Queue(), allow_fallback="everywhere")
