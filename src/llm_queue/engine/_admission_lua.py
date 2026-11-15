@@ -798,8 +798,12 @@ return cjson.encode({n = renewed, lost = lost})
 """
 )
 
-# req: {lease_ms, items: [{alias, owner, request_id, dep, cls, cost_r, cost_t}]}. After a
-# store reset, put back the slots and entries of calls still running (plan T10).
+# req: {lease_ms, items: [{alias, owner, request_id, dep, cls, cost_r, cost_t}, optional bud,
+# mode, account, job_owner]}. After a store reset, put back the slots and entries of calls still
+# running (plan T10), and their claims (FL-13: with the claim gone a redelivery of the call ran it
+# a second time). The entry keeps the budgets and window of its grant (sent, or today's row: the
+# store lost the counters anyway), so settle refunds the budgets it took. A cancelled call is not
+# put back.
 REREGISTER = (
     _COMMON
     + r"""
@@ -808,7 +812,8 @@ for _, item in ipairs(req.items) do
   -- A call whose result is stored has finished: never bring its slot back. An entry another
   -- owner holds now (it took over a lost grant) is left alone.
   local current = redis.call('HGET', mk(item.alias, 'inprog:' .. item.request_id), 'owner')
-  if redis.call('EXISTS', P .. ':{r:' .. item.request_id .. '}:res') == 0
+  local base = P .. ':{r:' .. item.request_id .. '}:'
+  if redis.call('EXISTS', base .. 'res') == 0 and redis.call('EXISTS', base .. 'cancel') == 0
     and (not current or current == item.owner) then
     local until_ = now + num(req.lease_ms, 60000)
     redis.call('ZADD', mk(item.alias, 'lease:' .. item.dep .. ':' .. item.cls), until_, item.owner)
@@ -818,6 +823,28 @@ for _, item in ipairs(req.items) do
     redis.call('HSET', entry_key, 'owner', item.owner, 'worker', worker, 'dep', item.dep,
       'cls', item.cls, 'minute', minute, 'cost_r', item.cost_r, 'cost_t', item.cost_t,
       'started', now, 'request', item.request_id, 'served', item.alias)
+    local model, rows = cfg_of(item.alias)
+    local row = rows and rows[item.dep]
+    local bud, mode, account = item.bud, item.mode, item.account
+    if not present(bud) and row then bud = budgets(item.alias, row, model, item.cls, true) end
+    if not present(mode) and row then mode = row.rate_window or 'smooth' end
+    if not present(account) and row then account = row.account end
+    if present(bud) and present(mode) then
+      if type(bud) == 'table' then bud = cjson.encode(bud) end
+      redis.call('HSET', entry_key, 'bud', bud, 'mode', mode)
+    end
+    if present(account) then redis.call('HSET', entry_key, 'account', account) end
+    local jo = item.job_owner
+    if not present(jo) then jo = string.match(item.owner, '^.*|([^|]*)|[^|]*$') end
+    if jo then
+      redis.call('HSET', entry_key, 'job_owner', jo)
+      local job = base .. 'job'
+      local state = redis.call('HGET', job, 'state')
+      if not state or state == 'queued' or state == 'running' then
+        redis.call('HSET', job, 'state', 'running', 'owner', jo, 'hb', now)
+        if redis.call('PTTL', job) < 0 then redis.call('PEXPIRE', job, num(T.job_ttl_ms, 3600000)) end
+      end
+    end
     redis.call('PEXPIRE', entry_key, num(req.lease_ms, 60000) * 2)
     done = done + 1
   end

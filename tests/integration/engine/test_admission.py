@@ -511,6 +511,48 @@ async def test_fl12_renew_keeps_the_claim_alive_and_only_its_own(
     assert await store.hget(job, "hb") == b"0"  # A's beat no longer writes B's claim
 
 
+async def test_fl13_reregister_restores_the_claim_and_the_grant_budgets(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FL-13: after a store reset REREGISTER put back the entry without its budgets, window
+    and account, and not the claim, so a redelivery on another model could run the call twice.
+    A cancelled call is not put back.
+    """
+    r = await rig(store, prefix, model={"rpm": 100})
+    granted = await r.ask("c1", worker="pod-a", tag="m1", candidates=[Candidate("aws-a/r1")])
+    assert granted.kind == "granted"
+    owner = owner_token("c1", "pod-a@m1", 1)
+    entry = f"{prefix}:{{m:m}}:inprog:c1"
+    job = f"{prefix}:{{r:c1}}:job"
+    await store.delete(entry, job, f"{prefix}:{{m:m}}:inprog")  # the store lost them
+    item = {
+        "alias": "m",
+        "owner": owner,
+        "request_id": "c1",
+        "dep": "aws-a/r1",
+        "cls": "n",
+        "cost_r": 1,
+        "cost_t": 0,
+    }
+    assert await r.admission.reregister([item]) == 1
+    assert await store.hget(job, "state") == b"running"  # None before the fix
+    assert await store.hget(job, "owner") == b"pod-a@m1"
+    assert await store.hget(entry, "bud")
+    assert await store.hget(entry, "mode") == b"fixed"
+    other = await r.ask(
+        "c1",
+        worker="pod-b",
+        tag="m1",
+        alias="other",
+        foreign_from="m",
+        candidates=[Candidate("aws-a/r1")],
+    )
+    assert other.kind == "duplicate"
+    await store.delete(entry, job)
+    await store.set(f"{prefix}:{{r:c1}}:cancel", "1")
+    assert await r.admission.reregister([item]) == 0  # cancelled: not put back
+
+
 async def test_fl1_release_claims_of_calls_held_without_a_grant(
     store: redis.asyncio.Redis, prefix: str
 ) -> None:
