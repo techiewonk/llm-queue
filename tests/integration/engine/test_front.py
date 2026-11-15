@@ -37,6 +37,23 @@ def _doc(url: str) -> dict[str, Any]:
         "model_id": "gpt-oss-120b",
         "deployments": {"vllm": {"confirmed": ["dc1"]}},
     }
+    # Disabled, with a fallback model of the other provider (Q40): calls are converted.
+    doc["models"]["to-openai"] = {
+        "type": "chat",
+        "provider": "bedrock",
+        "model_id": "meta.llama3-8b-instruct-v1:0",
+        "enabled": False,
+        "model_fallback": {"on": ["exhausted"], "models": ["local"]},
+        "deployments": {"aws-a": {"confirmed": ["r1"]}},
+    }
+    doc["models"]["to-bedrock"] = {
+        "type": "chat",
+        "provider": "openai",
+        "model_id": "gpt-oss-20b",
+        "enabled": False,
+        "model_fallback": {"on": ["exhausted"], "models": ["small"]},
+        "deployments": {"vllm": {"confirmed": ["dc1"]}},
+    }
     doc["models"]["local-emb"] = {
         "type": "embedding",
         "provider": "openai",
@@ -55,10 +72,12 @@ async def llmq(
     await server.start_server()
     url = str(server.make_url("")).rstrip("/")
     port = store.connection_pool.connection_kwargs["port"]
+    # A plain name (FO-20 refuses the fixture's `:`); its keys are deleted below.
+    key_prefix = prefix.replace(":", "-")
     env = {
         "LLMQ_STORE_URL": f"redis://:localdev@127.0.0.1:{port}/0",
         "LLMQ_ENVIRONMENT": "test",
-        "LLMQ_KEY_PREFIX": prefix,
+        "LLMQ_KEY_PREFIX": key_prefix,
         "LLMQ_REGISTRY": json.dumps(_doc(url)),
         "LLMQ_BEDROCK_ENDPOINT_URL": url,
         "LLMQ_METRICS_SINK": "none",
@@ -84,6 +103,9 @@ async def llmq(
     yield queue
     await queue.stop()
     await server.close()
+    keys = [k async for k in store.scan_iter(match=f"{key_prefix}:*", count=500)]
+    if keys:
+        await store.delete(*keys)
 
 
 async def test_converse_with_request_context(llmq: LLMQueue) -> None:
@@ -199,6 +221,44 @@ async def test_langchain_openai_chat_and_embeddings(llmq: LLMQueue) -> None:
     emb = QueuedOpenAIEmbeddings(model="local-emb", llmq=llmq)
     vectors = await emb.aembed_documents(["a", "b", "c"])
     assert len(vectors) == 3
+
+
+async def test_q40_a_fallback_of_the_other_provider_is_converted(llmq: LLMQueue) -> None:
+    """Q40: a fallback model of the other provider got the caller's request unchanged (a
+    Converse body at an OpenAI server, or the other way round) and the caller got the other
+    shape back. The request and reply are now converted; a stream does not fall back.
+    """
+    converse = {
+        "system": [{"text": "be brief"}],
+        "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+        "inferenceConfig": {"maxTokens": 50, "temperature": 0.2},
+    }
+    reply = await llmq.converse("to-openai", converse)
+    assert reply.meta.served_model == "local"
+    assert reply.response is not None
+    assert reply.response["output"]["message"]["content"][0]["text"]
+    assert reply.response["stopReason"] == "end_turn"
+    assert reply.meta.tokens_out
+    assert reply.response["usage"]["outputTokens"] == reply.meta.tokens_out
+    chat = {
+        "messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hi"},
+        ],
+        "max_tokens": 50,
+    }
+    reply = await llmq.chat("to-bedrock", chat)
+    assert reply.meta.served_model == "small"
+    assert reply.response is not None
+    choice = reply.response["choices"][0]
+    assert choice["message"]["content"]
+    assert choice["finish_reason"] == "stop"
+    assert reply.meta.tokens_out
+    assert reply.response["usage"]["completion_tokens"] == reply.meta.tokens_out
+    with pytest.raises(CallFailed) as info:
+        async for _ in llmq.converse_stream("to-openai", converse):
+            pass
+    assert info.value.kind == "model_unavailable"
 
 
 def test_error_mapping() -> None:

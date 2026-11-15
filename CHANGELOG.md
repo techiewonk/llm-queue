@@ -128,9 +128,15 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
   warns (`config_cross_check`) when a model's `attempt_timeout_secs` is above its client's
   read timeout in `Tuning` or its call timeout above `LLMQ_STATUS_TTL_SECS`. Cross-field messages show values and levels and use the dotted
   override path `settings set` takes (R3CF-17).
-- **A fallback model of another provider is allowed** (owner Q40, R3CF-6): the changelog and
-  docs said it was refused; it never was. The request is not converted between shapes yet, so
-  the validator warns. A disabled fallback target and unknown `blocked_regions` stay warnings.
+- **A fallback model of another provider is allowed and converted** (owner Q40, R3CF-6): the
+  changelog and docs said it was refused; it never was, and the caller's request reached the
+  other provider unchanged (a Converse body at an OpenAI server) with the reply in the other
+  shape. Requests and replies are now converted between Converse and OpenAI chat (messages
+  with text, images, tool use and results; system prompt; tools and tool choice; output and
+  sampling settings; stop reason and usage), by `llm_queue.engine.shapes`. A request with a
+  part the other shape cannot carry skips that target; streams do not fall back across shapes.
+  The validator still warns where such a target is configured. A disabled fallback target and
+  unknown `blocked_regions` stay warnings.
 - **Admin HTTP status codes** (FO-6, FO-7, FO-17): a write that lost the compare-and-set race
   answers 409 with `Retry-After` (was 400); a route hit before the registry loaded answers 503
   (was a 500); only an unknown model is a 404 (any internal `KeyError` was).

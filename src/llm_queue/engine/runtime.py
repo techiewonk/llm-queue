@@ -40,7 +40,7 @@ from llm_queue._version import __version__
 from llm_queue.clients.pool import CredentialsRefreshSlow, CredentialsUnavailable, route_for
 from llm_queue.clients.providers import Providers
 from llm_queue.clients.timing import AttemptTimeout, Timing
-from llm_queue.engine import hooks, inference, tokens
+from llm_queue.engine import hooks, inference, shapes, tokens
 from llm_queue.engine._codec import text
 from llm_queue.engine.admission import (
     Admission,
@@ -153,6 +153,16 @@ def _op_of(view: ResolvedRegistry, alias: str) -> str:
     """The provider operation of a model's calls (Converse, InvokeModel, chat, embeddings)."""
     entry = view.registry.models[alias]
     return OPS.get((entry.provider, entry.type), "chat" if entry.type == "chat" else "embeddings")
+
+
+def _served_op(view: ResolvedRegistry, alias: str, env: Envelope) -> str:
+    """The provider operation for `alias` serving `env`: its own shape when it differs (Q40).
+
+    `env.op` is the caller's model's shape (Converse or OpenAI chat); a fallback model of the
+    other provider is sent its own, converted (`shapes`).
+    """
+    op = _op_of(view, alias)
+    return op if shapes.converts(env.op, op) else env.op
 
 
 def _by_deployment(view: ResolvedRegistry, alias: str, name: str) -> float:
@@ -939,22 +949,32 @@ class Engine:
         view = self.registry.current
         alias = view.registry.alias_of(model)
         rid = request_id or stream_id or new_id()
+        # The caller's shape (its model's provider), kept when a fallback model of the other
+        # provider serves it: the request and reply are converted on the worker (Q40).
+        op = _op_of(view, alias)
         if view.effective(alias, "enabled").level == "model" and not view.value(alias, "enabled"):
             rule = view.value(alias, "model_fallback")
             if not rule or allow_fallback != "all" or not rule["models"]:
                 raise CallFailed("model_disabled", f"{alias} is disabled", request_id=rid)
             # The first target that can take calls: one disabled itself (model, every
-            # deployment or every account) got them all and failed each (RESCAN R8).
+            # deployment or every account) got them all and failed each (RESCAN R8). A target
+            # of another shape needs a request that converts, and never takes a stream.
             targets = [item["model"] for item in rule["models"]]
-            usable = [t for t in targets if t in view.registry.models and _takes_calls(view, t)]
+            usable = [
+                t
+                for t in targets
+                if t in view.registry.models
+                and _takes_calls(view, t)
+                and self._shape_ok(view, t, op, params, stream=stream)
+            ]
             if not usable:
                 raise CallFailed(
                     "model_unavailable",
-                    f"{alias} is disabled and no fallback model is enabled",
+                    f"{alias} is disabled and no fallback model is enabled (or none takes this "
+                    "request's shape)",
                     request_id=rid,
                 )
             alias = usable[0]
-        op = _op_of(view, alias)
         # Here, not in the front door, so every path meets it: async and sync calls, streams,
         # embeddings, jobs and the LangChain adapters (plan C1). One orjson pass over the params,
         # kept for the message itself (FO-21: it was encoded a second time by `dumps`).
@@ -1009,6 +1029,32 @@ class Engine:
             # fell during an outage and read as "traffic fell" (R3OB-5).
             self.metrics.count("llmq_caller_failures_total", model=alias, outcome=str(exc.kind))
             raise
+
+    def _shape_ok(
+        self,
+        view: ResolvedRegistry,
+        target: str,
+        op: str,
+        params: Mapping[str, Any],
+        *,
+        stream: bool,
+    ) -> bool:
+        """Whether a fallback model can serve a call of shape `op` (Q40).
+
+        Same shape: always. The other shape: not for a stream (its events are not converted),
+        and only when the request converts (`shapes.unconvertible`); either is logged.
+        """
+        target_op = _op_of(view, target)
+        if not shapes.converts(op, target_op):
+            return True
+        if stream:
+            logger.info("fallback_shape_skipped", model=target, reason="stream")
+            return False
+        reason = shapes.unconvertible(params, op, target_op)
+        if reason is not None:
+            logger.info("fallback_shape_skipped", model=target, reason=reason)
+            return False
+        return True
 
     @contextlib.contextmanager
     def _caller_ref(self, rid: str) -> Iterator[None]:
@@ -1846,9 +1892,10 @@ class Engine:
                     ) from exc
                 budget = float(view.value(alias, "attempt_timeout_secs", dep.key))
                 timing = Timing(budget, float(view.value(alias, "stream_idle_secs")), budget)
+                served_op = _served_op(view, alias, envelope)
                 try:
                     result = await provider.call(
-                        envelope.op,
+                        served_op,
                         params,
                         route,
                         timing,
@@ -1883,9 +1930,8 @@ class Engine:
                 )
                 # Tokens spent with no record before: the store is down, so only here (R3OB-5).
                 self._outcome(envelope, alias, dep.account, dep.region, "ok", meta, "static_cap")
-                return Reply(
-                    request_id=envelope.request_id, ok=True, response=result.response, meta=meta
-                )
+                response = shapes.reply(result.response, envelope.op, served_op, model=alias)
+                return Reply(request_id=envelope.request_id, ok=True, response=response, meta=meta)
         raise CallFailed(
             kind, str(error or "no usable deployment"), request_id=envelope.request_id
         ) from error
@@ -2750,10 +2796,18 @@ class Engine:
                 dropped = (*dropped, *_TOOL_FIELDS)
             params = {k: v for k, v in params.items() if k not in dropped}
             limits = {**limits, "on_exceed": "clamp"}
+        op = _served_op(view, alias, env)
+        if op != env.op:
+            # A fallback model of the other provider (Q40): its own request shape, its own
+            # defaults and limits applied after.
+            try:
+                params = shapes.request(params, env.op, op)
+            except shapes.ShapeError as exc:
+                raise inference.InferenceRejected(f"{alias}: {exc}") from exc
         embedding = entry.type == "embedding"
         request = inference.apply(
             entry.provider,
-            env.op,
+            op,
             params,
             view.value(alias, "inference", dep) or {},
             limits,
@@ -3141,6 +3195,8 @@ class Engine:
             other = item["model"]
             if other not in view.registry.models or not _takes_calls(view, other):
                 continue
+            if not self._shape_ok(view, other, env.op, env.params, stream=env.stream):
+                continue
             pct = int(view.value(other, "require_headroom_pct")) if item["require_headroom"] else 0
             ask = self._ask(
                 view, other, held, attempt, frozenset(), foreign_from=alias, require_pct=pct
@@ -3459,6 +3515,7 @@ class Engine:
             "cost_r": 1,
             "cost_t": estimate.total,
         }
+        served_op = _served_op(view, alias, env)
         writer = held.writer = None
         if env.stream and env.op in ("converse", "chat"):
             writer = held.writer = ChunkWriter(
@@ -3504,7 +3561,7 @@ class Engine:
         try:
             async with outer:
                 result = await provider.call(
-                    env.op,
+                    served_op,
                     params,
                     route,
                     timing,
@@ -3691,7 +3748,9 @@ class Engine:
             tokens_out=result.usage.output_tokens,
             worker=self.worker_id,
         )
-        reply = Reply(request_id=env.request_id, ok=True, response=result.response, meta=meta)
+        # In the caller's shape: a fallback model of the other provider answered (Q40).
+        response = shapes.reply(result.response, env.op, served_op, model=alias)
+        reply = Reply(request_id=env.request_id, ok=True, response=response, meta=meta)
         self._bad_accounts.pop((deployment.account, deployment.region), None)  # (plan A4)
         self._record(held, alias, deployment.account, deployment.region, "ok", meta)
         if self.settings.debug_capture_allowed and view.value(alias, "debug_capture"):
