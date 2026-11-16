@@ -65,6 +65,7 @@ from llm_queue.engine.health import Health
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.metrics import GaugeSet, Metrics, NullSink
 from llm_queue.engine.offload import ResultOffload
+from llm_queue.engine.purge import PurgeService, PurgeSettings
 from llm_queue.engine.queue import (
     Message,
     NotReplicated,
@@ -243,6 +244,7 @@ class EngineSettings:
     # `static_cap` then answer at once instead of re-trying the store (1.5-21.5 s per call).
     outage_memo_secs: float = 3.0
     timings: EngineTimings = field(default_factory=EngineTimings)  # `Tuning.engine`
+    purge: PurgeSettings = field(default_factory=PurgeSettings)  # LLMQ_*PURGE*, TENANT_INDEX
 
 
 # ARGV: key prefix, request ids... Reply: {the 0-based indexes of the ids with a stored result,
@@ -618,6 +620,17 @@ class Engine:
         tail = new_id()[-14:]  # the random tail: the head is time
         self.worker_id = f"{worker_id}-{tail[-6:]}" if worker_id else tail
         self.clock = StoreClock()
+        self.purge = PurgeService(  # `LLMQueue.purge`; auto purge runs in the sweep loop
+            state,
+            registry,
+            queue_client=queue_store,
+            queue_prefix=self.settings.queue_prefix,
+            settings=self.settings.purge,
+            hash_id=self.hash_id,
+            metrics=self.metrics,
+            status_ttl_secs=self.settings.status_ttl_secs,
+            owner=self.worker_id,
+        )
         self._tasks: list[asyncio.Task[None]] = []
         self._running: set[asyncio.Task[None]] = set()
         self._held: dict[str, _Held] = {}
@@ -1501,6 +1514,8 @@ class Engine:
             return found.outcome, found.outcome in ("new", "takeover")
 
         outcome, sent = await register()
+        if outcome in ("new", "takeover"):
+            await self._index_tenant(envelope, call_secs)
         waiter = self._waiters.setdefault(rid, asyncio.get_running_loop().create_future())
         loop = asyncio.get_running_loop()
         until = loop.time() + call_secs + self.settings.caller_margin_secs
@@ -1526,6 +1541,24 @@ class Engine:
                 return reply
             # The send this caller attached to never happened: register again.
             outcome, sent = await register()
+
+    async def _index_tenant(self, envelope: Envelope, call_secs: float) -> None:
+        """`LLMQ_TENANT_INDEX`: note a new call under its tenant, for a tenant purge (K2).
+
+        A failed write never fails the call: the purge only misses that call.
+        """
+        if not self.settings.purge.tenant_index:
+            return
+        try:
+            await self.purge.index_call(
+                envelope.tenant_id,
+                envelope.user_id,
+                envelope.request_id,
+                now_ms=int(self.clock.now() * 1000),
+                keep_ms=int((call_secs + self.settings.caller_margin_secs) * 1000),
+            )
+        except Exception as exc:
+            logger.warning("tenant_index_failed", request_id=envelope.request_id, error=repr(exc))
 
     async def embed(
         self,
@@ -4870,10 +4903,18 @@ class Engine:
         if wanted is not None and self.registry.changes != wanted:
             await self._reload_registry(None)
 
+    async def _purge_tick(self) -> None:
+        """Auto purge (owner K1): schedule what left the registry, purge what is due."""
+        try:
+            await self.purge.tick(self.registry.current)
+        except Exception as exc:
+            logger.warning("purge_failed", target="auto", error=repr(exc))
+
     async def _sweeper(self) -> None:
         """One process at a time removes in-progress entries of dead owners and old dead letters."""
         while True:
             await asyncio.sleep(self.settings.sweep_secs)
+            await self._purge_tick()
             try:
                 lock = await self.state.set(
                     f"{self.keys.prefix}:lock:sweep",

@@ -43,6 +43,7 @@ from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.jobs import JobFn, JobRunner, JobSettings
 from llm_queue.engine.metrics import Metrics, sink_for
 from llm_queue.engine.offload import ResultOffload
+from llm_queue.engine.purge import PurgeService, PurgeSettings
 from llm_queue.engine.queue import QueueFull
 from llm_queue.engine.runtime import Engine, EngineSettings
 from llm_queue.engine.settings import InfraSettings
@@ -369,6 +370,7 @@ class LLMQueue:
                 strict=settings.strict,
                 debug_capture_allowed=settings.debug_capture_from_config,
                 timings=tuning.engine,
+                purge=PurgeSettings.from_infra(settings),
             )
             return Engine(
                 state,
@@ -892,6 +894,14 @@ class LLMQueue:
     def registry(self) -> RegistryStore:
         """The registry store (live edits, audit, rollback)."""
         return self._engine.registry
+
+    @property
+    def purge(self) -> PurgeService:
+        """Purges of removed models, deployments and tenants (dry runs, audited, auto purge).
+
+        `await llmq.purge.tenant("acme", actor=user)`; see docs/how-to/purge.md.
+        """
+        return self._engine.purge
 
     def http_router(
         self,
