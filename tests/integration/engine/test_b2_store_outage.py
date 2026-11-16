@@ -101,7 +101,9 @@ async def test_store_down_retry_answers_by_the_deadline(
     started = time.monotonic()
     with pytest.raises(CallFailed) as info:
         await engine.call("small", CHAT, timeout_secs=1.5)  # 0.5 s left after the pause
-    assert info.value.kind == "deadline_exceeded"
+    # Either ends it on time: the deadline, or the pause path giving up on a store still down
+    # with no time left (a slower runner reached that first in GitHub CI).
+    assert info.value.kind in {"deadline_exceeded", "queue_unavailable"}
     assert time.monotonic() - started < 1.5 + 0.5 + 0.5  # 3.5 s before the fix
 
 
