@@ -92,6 +92,7 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `pool_replan_failed` | warning | engine/runtime.py |
 | `prober_failed` | warning | engine/runtime.py |
 | `pubsub_stale` | warning | engine/runtime.py |
+| `purge_deferred` | warning | engine/purge.py (a due auto purge waits: the stored registry could not be read, was refused, or this process runs on its own config) |
 | `purge_failed` | warning | engine/purge.py, engine/runtime.py |
 | `purge_scheduled` | info | engine/purge.py |
 | `purge_unscheduled` | info | engine/purge.py, engine/http.py |
@@ -132,6 +133,7 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `start_rollback_failed` | warning | core.py |
 | `state_store_promoted` | error | engine/runtime.py |
 | `state_store_reset_detected` | error | engine/runtime.py |
+| `queue_store_unreachable_at_start` | error | engine/runtime.py |
 | `state_store_unreachable_at_start` | error | engine/runtime.py |
 | `static_cap_attempt_failed` | warning | engine/runtime.py |
 | `stop_metrics_flush_failed` | warning | engine/runtime.py |

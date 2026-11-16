@@ -65,7 +65,7 @@ app.include_router(llmq.http_router(dependencies=[Depends(require_admin)]), pref
 | `POST /purge/model` | as above (the purge routes exist only with `allow_writes=True`) | `{"model": M, "force"?: bool, "dry_run"?: bool}`; the purge report. **`dry_run` defaults to true**: send `false` to purge |
 | `POST /purge/deployment` | as above | `{"model": M, "deployment": D, "force"?, "wait"?, "wait_secs"?, "dry_run"?}`; waits at most `LLMQ_HTTP_PURGE_WAIT_SECS` (60): a larger or omitted `wait_secs` is capped to it |
 | `POST /purge/tenant` | as above | `{"tenant": T, "remove"?: ["keys", "queued", "running"], "models"?: [M], "dry_run"?}` |
-| `POST /registry/gc` | as above | `{"force"?, "dry_run"?}`: everything the registry no longer has; waits for running calls at most `LLMQ_HTTP_PURGE_WAIT_SECS` (60) |
+| `POST /registry/gc` | as above | `{"force"?, "wait_secs"?, "dry_run"?}`: everything the registry no longer has; waits for running calls at most `LLMQ_HTTP_PURGE_WAIT_SECS` (60) per removed deployment (a larger or omitted `wait_secs` is capped to it) |
 | `GET /purge/scheduled` | as above | Auto purges waiting for their grace |
 | `POST /purge/scheduled/cancel` | as above | `{"target": "alias" or "alias/account/name"}`: keep that state |
 
