@@ -1,50 +1,150 @@
 # llm-queue
 
-LLM calls through a queue on Valkey or Redis, under RPM / TPM budgets per **deployment**
-(model x account x region), balanced across regions and accounts, with fallback regions,
-fallback models, health checks and status. Works with Amazon Bedrock and OpenAI-compatible
-servers (vLLM), and with LangChain. The queue, the budgets and the results live in one store, so
-admission (deployment, RPM, TPM, concurrency slot) is one atomic step, and 1 pod behaves the
-same as 50.
+[![PyPI](https://img.shields.io/pypi/v/llm-queue)](https://pypi.org/project/llm-queue/)
+[![Python](https://img.shields.io/pypi/pyversions/llm-queue)](https://pypi.org/project/llm-queue/)
+[![CI](https://github.com/techiewonk/llm-queue/actions/workflows/ci.yml/badge.svg)](https://github.com/techiewonk/llm-queue/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/techiewonk/llm-queue/blob/main/LICENSE)
+[![Docs](https://img.shields.io/badge/docs-techiewonk.github.io-informational)](https://techiewonk.github.io/llm-queue/)
 
-## Install
+**llm-queue runs your LLM calls through a shared queue on Valkey or Redis, inside your own
+pods.** Every call is admitted against RPM, TPM and concurrency budgets per *deployment* (one
+model in one account and one region), in one atomic step in the store, so 50 pods share a
+budget as exactly as one. Calls wait in order, priority calls go first, and when a region runs
+out of budget or breaks, calls spill to fallback regions and fallback models by rule. It works
+with Amazon Bedrock and OpenAI-compatible servers (such as vLLM), and with LangChain.
 
+## Why llm-queue
+
+- **Budgets that hold across pods, accounts and regions.** RPM, TPM (output tokens weighted,
+  cache reads optional) and concurrency per deployment, budgets shared by an account, smooth or
+  calendar-minute windows. Measured on fakellm: 1,800 of 1,800 calls a minute, held exactly.
+- **Priority without starvation.** Priority calls are read first, with a reserved share; normal
+  calls keep a minimum share.
+- **Fallback by rule.** Confirmed regions first, then fallback regions or inference profiles,
+  then fallback models (also across providers: Bedrock and OpenAI-compatible requests are
+  converted), each after a cause lasts a set time.
+- **At-least-once delivery.** A worker that dies mid-call gives the call to another one; a call
+  whose record the store lost is sent again; a request id replays a success and re-runs a
+  failure; a cancel stops the call for every caller of its id.
+- **Health per deployment.** Circuit breakers, slow-deployment detection, probes, and a
+  provider throttle that takes a deployment out for every pod at once.
+- **Streaming**, with the same budgets and fallback rules, chunk batching and idle cut-off.
+- **Embeddings with codecs** for Titan, Cohere and OpenAI, `register_embedding_family` for a new
+  family, batching, and a refused batch split so only the bad text fails.
+- **Background jobs** on the same store: deduplicated sends, exponential retries for about an
+  hour, dead letters kept 7 days, per-name concurrency.
+- **Per-tenant fairness** (off by default): weighted shares with lending, hard per-tenant
+  quotas, or round robin between tenants.
+- **LangChain adapters** for Bedrock Converse and OpenAI-compatible chat and embeddings, with
+  optional token streaming (`queue_streaming=True`).
+- **Observability.** CloudWatch EMF or Prometheus metrics (`GET /metrics`), alerts, a status
+  API, health and readiness routes, a CLI, and a documented list of every log event.
+- **A live registry.** Accounts, models and every setting live in one JSON document, validated
+  with every problem listed at once, published to the store, edited live with an audit trail
+  and rolled back; a JSON Schema is printed by `llm-queue registry schema`.
+
+## How it works
+
+```mermaid
+flowchart LR
+  APP["App code<br/>or LangChain adapter"] -->|"converse / embed"| Q[("Valkey / Redis<br/>queues, budgets, results")]
+  Q -->|"one atomic admission:<br/>deployment, RPM, TPM, slot"| W["Workers<br/>(in the app's own pods)"]
+  W --> D1["Bedrock<br/>account A / region 1"]
+  W --> D2["Bedrock<br/>account B / region 2"]
+  W --> D3["OpenAI-compatible<br/>(vLLM)"]
+  W -->|"result"| Q
+  Q -->|"reply"| APP
 ```
-pip install "llm-queue[langchain-aws]"            # Bedrock + LangChain
-pip install "llm-queue[openai,langchain-openai]"  # OpenAI-compatible
-pip install "llm-queue[http]"                     # status and health routes for FastAPI
+
+Each process is a caller, a worker or both. A caller registers the call and sends it to the
+model's queue; a worker takes it, asks the store for a deployment with budget (one Lua script:
+deployment, RPM, TPM and a concurrency slot together), calls the provider and stores the
+result; the caller wakes up and reads it. There is no separate service to run: only the store.
+
+## Quickstart
+
+```bash
+pip install "llm-queue[langchain-aws]"            # Bedrock (+ LangChain)
+pip install "llm-queue[openai,langchain-openai]"  # OpenAI-compatible servers (+ LangChain)
+pip install "llm-queue[http,metrics]"             # FastAPI routes, Prometheus metrics
 ```
 
-## Example
+Python 3.12 or newer, and Valkey 8 or Redis 7.2+ (one primary, replicas allowed; cluster mode is
+not supported). A registry with one model:
+
+```json
+{
+  "registry_version": 1,
+  "accounts": {"aws-main": {"kind": "aws"}},
+  "models": {
+    "gpt120b": {
+      "type": "chat", "provider": "bedrock", "model_id": "openai.gpt-oss-120b-1:0",
+      "rpm": 60, "tpm": 100000,
+      "deployments": {"aws-main": {"confirmed": ["us-east-1"]}}
+    }
+  }
+}
+```
+
+```bash
+export LLMQ_ENVIRONMENT=dev                    # unset is strict: TLS store, id salt, key prefix
+export LLMQ_STORE_URL=redis://localhost:6379
+export LLMQ_REGISTRY_FILE=registry.json
+```
 
 ```python
-from llm_queue import LLMQueue, CallFailed, request_context
+import asyncio
 
-llmq = LLMQueue.from_env()               # LLMQ_STORE_URL, LLMQ_REGISTRY, ...
-await llmq.start()                       # publish / load the registry, run the workers
-try:
-    with request_context(priority=True, user_id=uid):
-        reply = await llmq.converse("gpt120b", {"messages": [...]}, max_wait_secs=5)
-    print(reply.response, reply.meta.deployment)
-except CallFailed as exc:                # exc.kind: rate_limited, model_unavailable, ...
-    ...
-await llmq.stop()
+from llm_queue import CallFailed, LLMQueue, request_context
+
+
+async def main() -> None:
+    llmq = LLMQueue.from_env()     # reads LLMQ_*
+    await llmq.start()             # loads the registry and runs workers in this process
+    try:
+        request = {"messages": [{"role": "user", "content": [{"text": "Say hello."}]}]}
+        with request_context(priority=True, user_id="u-1"):
+            reply = await llmq.converse("gpt120b", request)
+        print(reply.response["output"]["message"]["content"], reply.meta.deployment)
+    except CallFailed as exc:      # exc.kind: rate_limited, model_unavailable, ...
+        print(exc.kind, exc.retry_after_secs)
+    finally:
+        await llmq.stop()
+
+
+asyncio.run(main())
 ```
 
-Start one `LLMQueue` per process, after any fork. With `LLMQ_ENVIRONMENT` unset the process is
-strict (TLS store, `LLMQ_ID_HASH_SALT` of 16+ characters, `LLMQ_KEY_PREFIX`); set
-`LLMQ_ENVIRONMENT=dev` on a laptop. Coming from 0.1.0b1:
-[Upgrade from 0.1.0b1](https://techiewonk.github.io/llm-queue/how-to/upgrade/). Every variable:
-[Environment variables](https://techiewonk.github.io/llm-queue/reference/environment/).
+Start one `LLMQueue` per process, after any fork. The
+[Getting started](https://techiewonk.github.io/llm-queue/tutorials/getting-started/) tutorial
+runs this against a local Valkey and a fake Bedrock, and
+[the samples](https://github.com/techiewonk/llm-queue/tree/main/samples) cover streaming,
+embeddings, sync code, errors and fallback, jobs, status, LangChain and the HTTP router.
+
+## When to use it
+
+Use llm-queue when several processes or services call the same models and must share their
+provider quotas: a per-process rate limiter cannot see the other pods, and a gateway service
+adds a network hop and a service to run. llm-queue keeps the calls in your own processes and
+needs only the store; measured on fakellm, the queue adds 0-15 ms at p95 over a direct call
+([Performance](https://techiewonk.github.io/llm-queue/explanation/performance/)).
+
+It is not the right tool when one process makes a few calls (the provider SDK's retries are
+enough), when your store runs in cluster mode, or when you need providers other than Bedrock and
+OpenAI-compatible servers without writing a provider (`register_account_kind` and the
+[extension points](https://techiewonk.github.io/llm-queue/reference/extension-points/) allow
+one). It is a beta: see [STABILITY](https://github.com/techiewonk/llm-queue/blob/main/STABILITY.md).
 
 ## Documentation
 
 Full documentation: **https://techiewonk.github.io/llm-queue/**
 
+- [What's new in 0.1.0b2](https://techiewonk.github.io/llm-queue/whats-new/) and
+  [Upgrade from 0.1.0b1](https://techiewonk.github.io/llm-queue/how-to/upgrade/)
 - [Getting started](https://techiewonk.github.io/llm-queue/tutorials/getting-started/): install, local stack, a registry, the first call
-- [How-to guides](https://techiewonk.github.io/llm-queue/how-to/configure/): configure, Bedrock IAM, tune, call, operate, share models across services, secure, test, upgrade
-- [Explanation](https://techiewonk.github.io/llm-queue/explanation/architecture/): architecture, the life of a call, admission, failures and recovery
-- [Reference](https://techiewonk.github.io/llm-queue/reference/configuration/): settings, error kinds, CLI and HTTP, the Python API
+- [How-to guides](https://techiewonk.github.io/llm-queue/how-to/configure/): configure, Bedrock IAM, tune, call, jobs, large results, operate, monitor, share models across services, secure, test
+- [Explanation](https://techiewonk.github.io/llm-queue/explanation/architecture/): architecture, the life of a call, admission, tenant fairness, failures and recovery
+- [Reference](https://techiewonk.github.io/llm-queue/reference/configuration/): every setting with its default and range, the registry document and its JSON Schema, environment variables, error kinds, log events, CLI and HTTP, the Python API
 
 Project: [CHANGELOG](https://github.com/techiewonk/llm-queue/blob/main/CHANGELOG.md),
 [CONTRIBUTING](https://github.com/techiewonk/llm-queue/blob/main/CONTRIBUTING.md),
