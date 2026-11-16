@@ -179,3 +179,17 @@ async def test_a_caller_only_process_sweeps_with_its_own_lock(make: Make) -> Non
         await asyncio.sleep(0.1)
     assert not await engine.state.exists(key)
     assert not await engine.state.exists(f"{engine.keys.prefix}:lock:sweep")
+
+
+async def test_a_worker_only_process_reads_its_results_at_once(make: Make) -> None:
+    """0.1.1: with no result reader a worker-only process waited for the poll safety net."""
+    import dataclasses
+
+    from engine_testkit import CHAT
+
+    engine, _ = await make(caller=False)
+    engine.settings = dataclasses.replace(engine.settings, poll_secs=30)
+    started = time.monotonic()
+    reply = await engine.call("small", CHAT)
+    assert reply.ok
+    assert time.monotonic() - started < 5

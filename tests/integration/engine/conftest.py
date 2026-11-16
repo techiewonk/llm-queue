@@ -76,6 +76,7 @@ async def make(store: redis.asyncio.Redis, prefix: str) -> AsyncIterator[Make]:
         scenario: dict[str, Any] | None = None,
         *,
         worker: bool = True,
+        caller: bool = True,
     ) -> tuple[Engine, FakeEngine]:
         fake = FakeEngine(Scenario.from_mapping(scenario or {}))
         server = TestServer(create_app(engine=fake), host="127.0.0.1")
@@ -99,7 +100,7 @@ async def make(store: redis.asyncio.Redis, prefix: str) -> AsyncIterator[Make]:
                 lease_secs=3, poll_secs=0.2, sweep_secs=1, key_expiry=KEY_EXPIRY
             ),
         )
-        await engine.start(worker=worker)
+        await engine.start(worker=worker, caller=caller)
         engines.append(engine)
         return engine, fake
 

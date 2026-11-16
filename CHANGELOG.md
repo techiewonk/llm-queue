@@ -21,6 +21,12 @@ apply when coming from 0.1.0b2 or earlier.
   `document_input_type="search_query"`; before, `embed_documents` always sent
   `search_document` and changed the vectors.
 
+### Fixed
+
+- A worker-only process (`LLMQ_MODE=worker`) that makes calls itself, such as a job that
+  embeds, ran no result reader: each call waited for the `poll_secs` safety net (5 s) before
+  it saw its result. The result reader now runs in every role.
+
 ### Documentation
 
 - In-depth architecture, call flows for every path and failure mode, and the list of tested

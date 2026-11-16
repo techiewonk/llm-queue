@@ -766,10 +766,11 @@ class Engine:
                 )
         # Last and never raising: the minute re-read publishes the mode when this one fails.
         await self._publish_expiry_safely()
-        if caller:
-            self._pubsub = self.state.pubsub()
-            self._loop(self._result_reader(), "result_reader")
-            self._loop(self._result_sweep(), "result_sweep")
+        # Every role: a worker-only process still makes calls (a job that embeds, a tool), and
+        # with no reader each waited for the `poll_secs` (5 s) safety net (docs review 0.1.1).
+        self._pubsub = self.state.pubsub()
+        self._loop(self._result_reader(), "result_reader")
+        self._loop(self._result_sweep(), "result_sweep")
         if worker:
             self._worker = True
             self._sync_model_loops()
