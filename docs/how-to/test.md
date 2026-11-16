@@ -41,9 +41,11 @@ answer; they never skip silently. Engine tests run on both Valkey and Redis.
 | `store` | failover options, readiness, preStop, HTTP writes + `scripts/failover.py` drill | `test_store_and_http.py` |
 | `load` | `scripts/load.py`: 2,000 calls over 3 workers (all succeed, none left held); 300 calls on a 600 RPM model (at most burst + rate served, the rest `rate_limited`, none past its deadline) | |
 | `gates` | `scripts/gates.py`: B17, B19, B22, B23, B33, B34, B56 / B93, B91, B92, B94-B97 (~20 min) | |
-| `samples` | `scripts/samples.py`: the nine samples on fakellm (`--live` real Bedrock, `--store env` a TLS store) | |
+| `samples` | `scripts/samples.py`: the ten samples on fakellm (`--live` real Bedrock, `--store env` a TLS store) | |
 | `scenarios` | `scripts/scenarios.py`: fault scenarios x 3 loads, plus the Docker failover drills | |
+| `unit` | every unit test, no stack needed | `tests/unit` |
 | `soak3` / `soak10` / `soak20` | `scripts/soak.py --minutes N` (not in `all`) | |
+| `evict` | `scripts/evict_drill.py`: a full evicting store under queue traffic, `volatile-lru` (swept key expiry) and `noeviction` (not in `all`; needs Docker; about 15 min, `--quick` 500 calls) | |
 | `bench` | `scripts/bench.py`, not gating: it prints numbers and never fails the run | |
 
 pytest fails a test after 120 s (pytest-timeout) and CI requires 89 % branch coverage.
@@ -70,16 +72,17 @@ python scripts/check.py scenarios --quick            # every scenario, one load 
 | `--load` (repeatable) | `under` (50 % of the budget), `at` (100 %), `burst` (300 %) |
 | `--profile` | `fast` (default: short leases, visibility, deadlines and lifetimes; 10-40 s a scenario), `prod` (production timers) |
 | `--jobs` | runs at a time (default 4; 1 runs them one by one) |
-| `--group` | `worker`, `store`, `provider`, `registry`, `caller`, `pairs`, `failover` |
+| `--group` | `worker`, `store`, `provider`, `registry`, `caller`, `clients`, `pairs`, `failover` |
 | `--seed` | seed of every random choice (printed at the start; the same in `gates.py` and `soak.py`), to replay a run |
 
 | Group | Scenarios |
 |---|---|
 | worker | S1 killed, S2 graceful restart, S3 all down then back |
-| store | S4 blocked, S5 half-open, S8 keys reset, S9 out of memory, S10 slow; S6 / S7 / S11 failover drills on Docker nodes |
+| store | S4 blocked, S5 half-open, S8 keys reset, S9 out of memory, S10 slow; S6 / S7 / S11 failover drills on Docker nodes; L2 streams, L3 separate queue store blocked, L4 embeddings, each under faults |
 | provider (fakellm) | P1 throttled, P2 5xx, P3 hangs, P4 model not in region, P5 bad credentials, P7 every region down |
 | registry | R1 rpm cut live, R2 region disabled, R3 kill switch, R4 bad edit refused |
 | caller | C1 cancel, C2 caller process dies, C3 duplicate request id |
+| clients | M1 many caller pods on one model, M2 services on different registry versions, M3 caller-only and worker-only pods |
 | pairs | X1-X8: two faults at once (store block + worker kill, rpm cut + throttle ...) |
 
 ## Soak
@@ -150,8 +153,10 @@ store's clock for this.
 ## Nightly
 
 `.github/workflows/nightly.yml` (02:17 UTC, or run by hand) runs what CI cannot run on every
-push: `scenarios.py all --load under`, `gates.py --quick` and a 10-minute soak, on fakellm
-and the Docker stack, and keeps `reports/` as an artifact for 7 days.
+push: `scenarios.py all --load under`, `gates.py --quick`, a 10-minute soak, and the engine
+integration tests with `LLMQ_TEST_KEY_EXPIRY=swept` (key expiry as on a shared `volatile-*`
+store; CI runs them with `auto`, which is native on the stack's `noeviction` Valkey), on
+fakellm and the Docker stack, and keeps `reports/` as an artifact for 7 days.
 
 ## Logs
 
@@ -165,6 +170,9 @@ and the Docker stack, and keeps `reports/` as an artifact for 7 days.
 
 ## Before a release
 
-Run `python scripts/check.py all` (without `--quick`) and `python scripts/check.py soak20`.
+Run `python scripts/check.py all --release` (every scenario x every load), `python scripts/check.py soak20`
+and, for a change to key expiry or the store, `python scripts/check.py evict`. Gate B91's
+2 ms mark depends on the machine: on a Windows / Docker Desktop host both 0.1.0b2 and 0.1.0b3
+measure 3-4 ms (see [Tested scenarios](../explanation/tested-scenarios.md)).
 
 More on writing tests and check steps is in [Contributing](../project/contributing.md).

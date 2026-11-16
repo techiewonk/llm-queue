@@ -26,9 +26,9 @@ processes as pods on one machine).
 |---|---|
 | Store scripts per queued call | 11.6 (B19, 2,000 calls in 10 s). By the code: caller `REGISTER`, `SEND`, `CONFIRM`, `RESULT_TAKE`; worker `RECEIVE` (batched), `CALLERS_ALIVE`, `PICK_TAKE`, first-attempt counter, `FINISH`, `RESULT_PUT`, `STATUS_SET`, `ACK`; plus doorbell and heartbeat. About 4 ms of store time per call on an in-VPC store (plan estimate) |
 | Store work vs process count | 248 commands per call on 2 processes, 252 on 8 (B22) |
-| Admission | `PICK_TAKE` p99 0.94 ms with 20 models x 30 deployments (B91; plan asks 2 ms) |
+| Admission | `PICK_TAKE` p99 0.94 ms with 20 models x 30 deployments (B91, measured on a quiet Linux host; plan asks 2 ms). Machine-dependent: a Windows / Docker Desktop host measured 3.8-4.3 ms for 0.1.0b2 and 3.0-3.5 ms for 0.1.0b3 (2026-11-16) |
 | Status | 20 x 30 report (210 KB) in 47 ms, 375 ms cold; 6.5 s before one script per model (B91) |
-| Queue overhead | +0 ms at p95 over a direct call, 141 ms both (B34); CHANGELOG: 0-15 ms p95; 290 calls/s on 4 workers |
+| Queue overhead | +0-15 ms p95 over a direct call (B34). B34 judges against `scripts/baselines/perf.json`, re-recorded 2026-11-15 on the dev machine as the median of 3 ramps: queued p95 218 ms, ceiling 349.6 calls/s (an earlier run: 141 ms, 290 calls/s on 4 workers) |
 | Waiting callers | 2,000 waiting: 1,976 store calls/s before, 499/s after (pub/sub + sweep, B56) |
 | Budgets | 1,800 of 1,800 a minute on 9 deployments, none above its RPM, priority wait p95 0.27 s (B17); normal class at 100 % of its 80 % (B56 / B93) |
 | Recovery | Waiter pod killed: next waiter within 1.3 s smooth, 0.02 s after the minute fixed (B94); first call after idle 125 ms (B92) |
