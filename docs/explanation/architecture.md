@@ -99,8 +99,8 @@ A caller-only pod still calls providers in three cases: sync calls, calls routed
 
 | | `both` (default) | `caller` | `worker` |
 |---|---|---|---|
-| Makes calls (`converse`, `embed`, `send_job`, `cancel`, `status`) | yes | yes | yes, but slowly when queued: no result reader runs, so the caller reads its result after `poll_secs` (5 s) and then every `result_recheck_secs` (60 s). From the code; no test covers it (unverified) |
-| Result wake-ups (`_result_reader`, `_result_sweep`) | yes | yes | no |
+| Makes calls (`converse`, `embed`, `send_job`, `cancel`, `status`) | yes | yes | yes (a job that embeds, a tool) |
+| Result wake-ups (`_result_reader`, `_result_sweep`) | yes | yes | yes (since 0.1.1: before, a worker-only process saw its own results only at the 5 s `poll_secs` safety net) |
 | Receive loops, held calls, attempts | yes | no | yes |
 | Sweeper (+ auto purge), prober, alerts, cancel reader, client warm-up | yes | no | yes |
 | Job runners (`register_job`) | yes | refused (`ConfigError`) | yes |
@@ -375,8 +375,8 @@ are defaults. [Background tasks](background.md) has more on each.
 | `_store_prober` | all | 5 s; eviction policy read again every 12th round (1 min) | - | Write probe per store for readiness (`ok`, `read_only`, `down`); ends the outage memos; publishes the key expiry mode again |
 | `registry_reload` (`RegistryStore.run`) | all | `LLMQ_CFG_RELOAD_SECS` (30 s), back-off on failure | - | Reload; republish its own document when the stored one is lost or invalid |
 | `offload_lifecycle` | all | once at start | - | Warn when the S3 bucket has no expiry rule for the offload prefix |
-| `_result_reader` | caller | pub/sub on `P:done:WORKER` | - | Wake waiting callers; a re-subscribe wakes all; a ping every 5 s, reset after two silent pings |
-| `_result_sweep` | caller | 5 s | - | One `_RESULTS_EXIST` script per 500 waiting ids finds results pub/sub missed; three such sweeps in a row reset the reader |
+| `_result_reader` | every role | pub/sub on `P:done:WORKER` | - | Wake waiting callers; a re-subscribe wakes all; a ping every 5 s, reset after two silent pings |
+| `_result_sweep` | every role | 5 s | - | One `_RESULTS_EXIST` script per 500 waiting ids finds results pub/sub missed; three such sweeps in a row reset the reader |
 | `ChunkReader` | caller | while streams are open, `XREAD` block 100 ms | - | Deliver the chunks of every open stream |
 | `_model_loop` (one per model) | worker | busy: no wait; idle: doorbell `BLPOP` 50 ms, 1 s after 20 empty polls | - | Receive and admit |
 | `_hold` (one per held call) | worker | `min(wait, 1 s)` | - | `EXTEND`, fallback checks, `PICK_TAKE` again |

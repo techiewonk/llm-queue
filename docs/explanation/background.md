@@ -6,7 +6,7 @@ what each loop touches in the store, is in
 
 ```mermaid
 flowchart TB
-  subgraph caller["Caller side (LLMQ_MODE both / caller)"]
+  subgraph caller["Caller side (LLMQ_MODE both / caller; result reader and sweep in every role)"]
     c1["_result_reader: pub/sub wake-ups"]
     c2["_result_sweep: every 5 s"]
     c3["ChunkReader: open streams"]
@@ -40,8 +40,8 @@ flowchart TB
 | `_alert_loop` | worker | 30 s, one process (lock) | status report, alert gauges, a log line per flip |
 | `_cancel_reader` | worker | pub/sub | cancel running attempts named on `P:cancel` |
 | `_warm_clients` | worker | once at start | build every Bedrock client (first call 1,032 ms before, ~140 ms after) |
-| `_result_reader` | caller | pub/sub | wake waiters; on re-subscribe wake all |
-| `_result_sweep` | caller | 5 s | one script finds results of all waiting callers |
+| `_result_reader` | every role | pub/sub | wake waiters; on re-subscribe wake all |
+| `_result_sweep` | every role | 5 s | one script finds results of all waiting callers |
 | `RegistryStore.run` | both | `LLMQ_CFG_RELOAD_SECS` (30) | reload; republish when the stored registry was lost or older |
 | `_ttl_sweeper` | both | `sweep_secs` (10 s), one process (lock `P:lock:ttlsweep`) | `TTL_SWEEP`: delete keys due in the expiry index `P:ttl` of each store, in both key expiry modes (see [Key expiry modes](storage.md#key-expiry-modes)) |
 | `_store_prober` | both | 5 s; the eviction policy again every minute | a short write per store for readiness; ends the outage memos; publishes the key expiry mode again |
