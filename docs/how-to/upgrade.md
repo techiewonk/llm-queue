@@ -1,10 +1,72 @@
-# Upgrade from 0.1.0b1
+# Upgrade
 
-0.1.0b2 keeps no backward compatibility with 0.1.0b1 (both are betas). This page lists every
-change an app pinned to 0.1.0b1 may have to make, in the order to make them. The full list of
-changes is in [CHANGELOG.md](../project/changelog.md).
+What an app has to do when it moves to a new release, newest first. The full list of changes is
+in [CHANGELOG.md](../project/changelog.md).
 
-## 1. Drain every 0.1.0b1 worker first
+## From 0.1.0b2 to 0.1.0b3
+
+0.1.0b3 keeps the message format and the key layout of 0.1.0b2, so pods of both releases can
+share a queue on a `noeviction` store. What changes is how keys expire (key expiry modes, for a
+shared `volatile-*` cache store) and that removed models and deployments are purged
+automatically.
+
+### 1. Upgrade every pod
+
+| Store policy | Mixed 0.1.0b2 / 0.1.0b3 fleet |
+|---|---|
+| `noeviction` | Fine. `LLMQ_KEY_EXPIRY=auto` picks `native` there, as 0.1.0b2 does. Roll out as usual |
+| `volatile-*` | Finish the rollout first. 0.1.0b2 pods do not read the store's mode (`P:expiry`) and always write native TTLs, so their keys stay evictable; in strict mode they are not ready on such a store anyway |
+| `allkeys-*` | Not supported by either release |
+
+Upgrade all pods; do not keep 0.1.0b2 pods on a store you share with a cache.
+
+### 2. Switching key expiry modes
+
+Moving a store from `native` to `swept` (an upgrade on a `volatile-lru` node, or a policy change
+under `auto`) loses nothing. In `swept` mode setting an expiry also clears the key's native TTL
+(`PERSIST`); in `native` mode it also removes the key's `P:ttl` member; reading the time left
+counts either. Each key moves to the new mode on its next write; a key never written again
+keeps its old expiry (native TTL or index member) and still goes then. Until then, keys that
+still have a native TTL can be evicted by a `volatile-*` policy (at most a day, for the slowest
+keys). See [Key expiry modes](../explanation/storage.md#key-expiry-modes).
+
+### 3. Rolling back to 0.1.0b2 after running `swept`
+
+0.1.0b2 has no expiry sweep: a key whose expiry is only in `P:ttl` would never expire under it.
+Drain the index before you roll back:
+
+1. Make sure the store is `noeviction` (0.1.0b2 is not ready on `volatile-*` in strict mode).
+2. Set `LLMQ_KEY_EXPIRY=native` on every 0.1.0b3 pod and roll it out. Each write now moves its
+   key back to a native TTL, and the index sweep keeps running in `native` mode, deleting the
+   indexed keys as they come due.
+3. Keep them running for at least the longest key lifetime: 1 day by default, longer if you
+   raised a retention or TTL setting.
+4. Check the index is about empty on each store (a separate queue store has its own), then roll
+   back:
+
+   ```bash
+   valkey-cli -u "$LLMQ_STORE_URL" ZCARD llmq:ttl        # about 0; llmq is LLMQ_KEY_PREFIX
+   ```
+
+Leftover `P:expiry`, `P:ttl` and `P:purge` keys are harmless to 0.1.0b2.
+
+### 4. Purge
+
+| Change | What to do |
+|---|---|
+| Auto purge is on (`LLMQ_AUTO_PURGE=true`): a model or deployment dropped from the registry has its store state deleted after `LLMQ_PURGE_GRACE_SECS` (900) unless it comes back | Nothing, or set `LLMQ_AUTO_PURGE=false` to keep the 0.1.0b2 behaviour. If you raised `timeout_max_secs` above 900, raise the grace to at least the same |
+| `llm-queue registry gc` prints the purge report: `deleted_keys` and `dry_run` instead of `would_delete` | Update scripts that parse its output |
+| `registry gc` also purges removed deployments of live models, and keeps a removed model's queue that still holds messages unless `--force` | Add `--force` where you relied on it deleting such queues |
+| New error `PurgeRefused` (HTTP 409) | Catch it where you call the purge service; see [Errors](../reference/errors.md#purgerefused) |
+
+See [Purge store state](purge.md) and [Run on a shared cache store](shared-cache-store.md).
+
+## From 0.1.0b1 to 0.1.0b2
+
+0.1.0b2 keeps no backward compatibility with 0.1.0b1 (both are betas). This section lists every
+change an app pinned to 0.1.0b1 may have to make, in the order to make them.
+
+### 1. Drain every 0.1.0b1 worker first
 
 Mixed fleets are **not supported**: 0.1.0b1 and 0.1.0b2 pods must not share a queue. A message
 carrying bytes (images, documents) is written in a form 0.1.0b1 does not decode, and 0.1.0b1
@@ -14,7 +76,7 @@ sends it to Bedrock as is. Before the first 0.1.0b2 pod starts:
 2. Let the queues empty, then stop the 0.1.0b1 pods.
 3. Deploy 0.1.0b2, then set the models back on (`llm-queue registry set --model M enabled=true`).
 
-## 2. Environment
+### 2. Environment
 
 | Change | What to do |
 |---|---|
@@ -27,7 +89,7 @@ sends it to Bedrock as is. Before the first 0.1.0b2 pod starts:
 | `LLMQ_DRAIN_SECS` default 25 (was 45) | Keep `terminationGracePeriodSeconds` above it |
 | `LLMQ_CALLER_TTL_SECS` minimum | At least `LLMQ_LEASE_SECS / 3 + max(5, LLMQ_LEASE_SECS / 6)`; the defaults pass |
 
-## 3. Registry document
+### 3. Registry document
 
 | Change | What to do |
 |---|---|
@@ -43,7 +105,7 @@ sends it to Bedrock as is. Before the first 0.1.0b2 pod starts:
 | A `role_arn` must be an IAM role ARN; padded `model_id` / `profile_id` are refused | Fix the values |
 | `min_lib_version` must be a version such as `0.1.0b2` | Fix it or remove it |
 
-## 4. Code
+### 4. Code
 
 | Change | What to do |
 |---|---|
@@ -64,7 +126,7 @@ sends it to Bedrock as is. Before the first 0.1.0b2 pod starts:
 | An app's `worker_id` is a prefix; a random part is always added | Match worker ids by prefix in dashboards |
 | `register_job` refuses a function that is not async; `send_job(job_id=X)` is deduplicated for 24 h; failed jobs retry for about an hour, then are dead-lettered for 7 days | Make job functions `async def`; see [Run background jobs](jobs.md) |
 
-## 5. HTTP, CLI and operations
+### 5. HTTP, CLI and operations
 
 | Change | What to do |
 |---|---|
@@ -76,7 +138,7 @@ sends it to Bedrock as is. Before the first 0.1.0b2 pod starts:
 | `llm-queue request ID` exits 1 for an unknown id; `drain --wait` exits 3 on timeout (both were 0) | Check exit codes in deploy scripts |
 | A `/drain` preStop route must answer GET | Use `@app.api_route("/drain", methods=["GET", "POST"])` as in sample 09 |
 
-## 6. OpenAI transport and LangChain
+### 6. OpenAI transport and LangChain
 
 The OpenAI-compatible transport (`QueuedChatOpenAI`, `QueuedOpenAIEmbeddings`, a raw SDK client on
 `QueuedHTTPTransport`) answers some kinds with another status, so the SDK raises another class:

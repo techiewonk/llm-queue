@@ -17,7 +17,7 @@ write (`uid:<n>` when the user has no passwd entry, as in a container run under 
 | `llm-queue registry diff` | What is live but not in this process's config |
 | `llm-queue registry log [--count N] [--path P]` | The audit trail (default 20 entries): publishes, edits and CLI cancels |
 | `llm-queue registry publish [--from-version N]` | Publish `LLMQ_REGISTRY`, or roll back to version N |
-| `llm-queue registry gc --yes\|--dry-run [--force]` | Purge the store state of every model and deployment the registry no longer has (`PurgeService.removed`); queues only when empty unless `--force`. Prints the purge report |
+| `llm-queue registry gc --yes\|--dry-run [--force] [--no-wait]` | Purge the store state of every model and deployment the registry no longer has (`PurgeService.removed`); queues only when empty unless `--force`; `--no-wait` does not wait for a removed deployment's running calls. Prints the purge report |
 | `llm-queue purge model M --yes\|--dry-run [--force]` | Purge a removed model: its keys, queues (empty ones unless `--force`) and doorbells. Refused while the registry has it, unless `--force` |
 | `llm-queue purge deployment M D --yes\|--dry-run [--force] [--no-wait] [--wait-secs S]` | Purge a removed deployment (`account/name`) of model M; waits for its running calls (`LLMQ_PURGE_WAIT`, `LLMQ_PURGE_WAIT_SECS`) |
 | `llm-queue purge tenant T --yes\|--dry-run [--remove keys,queued,running] [--models M1,M2]` | Purge a tenant's fairness state (default `LLMQ_TENANT_PURGE_DEFAULT`); `queued` / `running` cancel its calls and need `LLMQ_TENANT_INDEX` |
@@ -63,9 +63,9 @@ app.include_router(llmq.http_router(dependencies=[Depends(require_admin)]), pref
 | `POST /registry?model=M` | `dependencies`, `allow_writes=True`, header `X-LLMQ-Admin` | Live edit: a JSON body of `path: value` (at most 100 paths), audited under `actor(request)` |
 | `POST /registry/block` | `dependencies`, `allow_writes=True`, header `X-LLMQ-Admin` | Block or unblock: a JSON body `{"region": R}` or `{"account": A}`, with `"on": true\|false` (default true), audited |
 | `POST /purge/model` | as above (the purge routes exist only with `allow_writes=True`) | `{"model": M, "force"?: bool, "dry_run"?: bool}`; the purge report. **`dry_run` defaults to true**: send `false` to purge |
-| `POST /purge/deployment` | as above | `{"model": M, "deployment": D, "force"?, "wait"?, "wait_secs"?, "dry_run"?}` |
+| `POST /purge/deployment` | as above | `{"model": M, "deployment": D, "force"?, "wait"?, "wait_secs"?, "dry_run"?}`; waits at most `LLMQ_HTTP_PURGE_WAIT_SECS` (60): a larger or omitted `wait_secs` is capped to it |
 | `POST /purge/tenant` | as above | `{"tenant": T, "remove"?: ["keys", "queued", "running"], "models"?: [M], "dry_run"?}` |
-| `POST /registry/gc` | as above | `{"force"?, "dry_run"?}`: everything the registry no longer has |
+| `POST /registry/gc` | as above | `{"force"?, "dry_run"?}`: everything the registry no longer has; waits for running calls at most `LLMQ_HTTP_PURGE_WAIT_SECS` (60) |
 | `GET /purge/scheduled` | as above | Auto purges waiting for their grace |
 | `POST /purge/scheduled/cancel` | as above | `{"target": "alias" or "alias/account/name"}`: keep that state |
 

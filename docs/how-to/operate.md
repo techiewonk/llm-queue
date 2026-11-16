@@ -79,7 +79,7 @@ Measured: 4 rolling restarts, 0 calls lost (gate B33).
 |---|---|
 | `GET /health/live` | 200 while the library's background loops run and the heartbeat makes progress; **503** when a loop died or the heartbeat stalled for a lease. Once `stop()` begins it stays 200, so a draining pod is not restarted. It reads the process's own state only, never the store |
 | `GET /health/ready` | 200 when the registry is loaded and the process is not draining, else 503. In strict mode a store whose eviction policy can evict the library's keys (`allkeys-*`, or `volatile-*` with native key expiry) also answers 503, with the reason |
-| `await llmq.health()` | `live`, `ready`, `stores` (`state`, `queue`), `eviction_policy`, `worker`, `version`, `registry_version`, `held`, `heartbeat_age_secs`; plus `live_reason` when not live, `not_ready_reason` when not ready (strict mode and an evicting store) and `queue_eviction_policy` with a separate queue store |
+| `await llmq.health()` | `live`, `ready`, `stores` (`state`, `queue`), `eviction_policy`, `key_expiry` (`native` or `swept`), `worker`, `version`, `registry_version`, `held`, `heartbeat_age_secs`; plus `live_reason` when not live, `not_ready_reason` when not ready (strict mode and an evicting store) and `queue_eviction_policy` with a separate queue store |
 
 A liveness probe on `/health/live` restarts a pod whose loops died (0.1.0b1 always answered
 200): keep its `failureThreshold` at 3 or more so one slow beat does not restart a healthy pod.
@@ -140,11 +140,13 @@ llm-queue block --region R                  # stop using a region (or --account 
 llm-queue unblock --region R
 llm-queue drain M --yes --wait              # disable a model for new calls; serve waiting ones
 llm-queue dlq list --model M                # dead letters; also show, redrive, purge
+llm-queue purge model M --dry-run           # what a purge of a removed model would delete
+llm-queue purge tenant T --yes              # a tenant's fairness state (also: deployment)
 ```
 
 Commands that delete or move data (`drain`, `dlq redrive`, `dlq purge`, `registry gc`,
-`cancel`) need `--yes`; `--dry-run` shows what they would do. `llm-queue dlq list --job J`
-lists dead jobs.
+`purge model|deployment|tenant`, `cancel`) need `--yes`; `--dry-run` shows what they would do. `llm-queue dlq list --job J`
+lists dead jobs. Purges are described in [Purge](purge.md).
 
 `--actor NAME` records who made a change. Live edits and their limits are in
 [Configure](configure.md#live-edits). Every command is in [CLI and HTTP](../reference/cli-http.md).

@@ -72,7 +72,7 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `job_task_failed` | warning | engine/jobs.py |
 | `job_upkeep_failed` | warning | engine/jobs.py |
 | `key_expiry_changed` | warning | engine/runtime.py |
-| `key_expiry_publish_failed` | debug | engine/runtime.py |
+| `key_expiry_publish_failed` | warning | engine/runtime.py |
 | `llmq_call_finished` | info | engine/runtime.py |
 | `llmq_purge` | info | engine/purge.py |
 | `llmq_registry_audit` | info | registry/store.py |

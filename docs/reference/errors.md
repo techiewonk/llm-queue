@@ -2,7 +2,8 @@
 
 Everything raised to callers is an `LLMQueueError`. A failed call raises `CallFailed` with a
 `kind`; bad configuration raises `ConfigError` (or one of its subclasses); an admin operation the
-store cannot serve raises `StoreUnavailable`.
+store cannot serve raises `StoreUnavailable`; a purge that would delete state still in use raises
+`PurgeRefused`.
 
 ```text
 LLMQueueError
@@ -13,6 +14,7 @@ LLMQueueError
 │   ├── LiveEditRefused   a live edit touched fields that change only with a deploy
 │   ├── UnknownModel      a model name not in the registry (also a KeyError)
 │   └── MissingExtra      an optional feature's extra is not installed (also an ImportError)
+├── PurgeRefused          a purge would delete state still in use; nothing was deleted
 └── StoreUnavailable      the store cannot serve an admin operation (also a ConnectionError)
 ```
 
@@ -75,6 +77,23 @@ Raised by `cancel`, `status`, `request_status`, `send_job` and the registry's re
 when the state store is unreachable, read-only (after a failover) or full. Calls never raise it;
 they raise `CallFailed` (`queue_unavailable`). It is also a `ConnectionError`. Retry after the
 store is back; see [Operate](../how-to/operate.md#store-failover).
+
+## PurgeRefused
+
+Raised by a `PurgeService` purge (`llmq.purge`, `PurgeService.from_env()`, the CLI and the HTTP
+purge routes) that would delete state still in use, or that needs a setting that is off.
+Nothing was deleted. It is a direct `LLMQueueError`, not a `ConfigError`. Raised when:
+
+- `model(alias)` names a model the stored registry still has (pass `force=True`, or remove it
+  from the registry first);
+- `deployment(alias, "account/name")` names a deployment the stored registry still has (same);
+- `tenant(..., remove=...)` asks for `queued` or `running` while `LLMQ_TENANT_INDEX` is off (the
+  per-tenant call index is needed to find the calls).
+
+A dry run (`plan_*`, `dry_run=True`) raises it too, so a plan shows the refusal before you
+purge. The HTTP routes answer 409 with `{"error": ...}` and no `Retry-After`; the CLI prints the
+message and exits 1. A bad argument (an unknown `remove` part) is a `ConfigError` instead. See
+[Purge store state](../how-to/purge.md).
 
 ## ConfigError
 

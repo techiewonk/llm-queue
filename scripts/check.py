@@ -14,6 +14,7 @@ use fakellm (`python scripts/samples.py --live` runs the samples on real Bedrock
     python scripts/check.py all --release  # before a release: every scenario x every load
     python scripts/check.py soak3       # soaks (not in `all`): 3 min smoke, soak10, soak20
     python scripts/check.py soak20      # before a release
+    python scripts/check.py evict       # eviction drill (not in `all`, needs Docker), ~15 min
     python scripts/check.py --list      # what each step runs
 
 `all` lints and type-checks the union of every step's paths once, runs the union of the unit
@@ -261,6 +262,15 @@ STEPS: dict[str, Step] = {
         quick=("--reps", "2", "--idle", "10"),
         in_all=False,  # numbers only (104 s); run on purpose (FT-14)
         gating=False,
+    ),
+    "evict": Step(
+        "Eviction drill: a full evicting store (volatile-lru, noeviction) under queue traffic",
+        sources=("scripts/evict_drill.py",),
+        tests=(),
+        extra=(("scripts/evict_drill.py",),),  # its own Valkey in Docker and its own fakellm
+        quick=("--calls", "500"),
+        in_all=False,  # ~15 min for both policies; run on purpose (and after expiry changes)
+        timeout_secs=2700,
     ),
     **{
         f"soak{minutes}": Step(

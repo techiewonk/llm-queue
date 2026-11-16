@@ -7,6 +7,56 @@ public API (see STABILITY.md).
 
 ## [Unreleased]
 
+## [0.1.0b3] - 2026-11-16
+
+Key expiry modes, so llm-queue can share a `volatile-*` cache store (ElastiCache's default
+`volatile-lru`), and a purge service for removed models, deployments and tenants.
+
+### Upgrading from 0.1.0b2
+
+The message format and the key layout are unchanged, so 0.1.0b2 and 0.1.0b3 pods can share a
+queue on a `noeviction` store. [Upgrade](https://techiewonk.github.io/llm-queue/how-to/upgrade/)
+has the same list with more detail.
+
+1. **Upgrade every pod.** 0.1.0b2 pods do not read the store's key expiry mode (`P:expiry`)
+   and always write native TTLs. On a `noeviction` store `auto` picks `native`, the same as
+   0.1.0b2, so a mixed fleet is fine there during a rolling upgrade. On a `volatile-*` store a
+   0.1.0b2 pod is not ready in strict mode anyway, and its keys stay evictable: finish the
+   rollout before you rely on the store being shared.
+2. **Switching modes loses nothing.** In `swept` mode setting an expiry also clears the key's
+   native TTL (`PERSIST`); in `native` mode it also removes the key's `P:ttl` member; reading
+   the time left counts either. Keys move to the new mode on their next write; a key never
+   written again keeps its old expiry and still goes then.
+3. **Rolling back to 0.1.0b2 after running `swept`.** 0.1.0b2 has no expiry sweep, so a key
+   whose expiry is only in `P:ttl` would never expire under it. Before rolling back, set
+   `LLMQ_KEY_EXPIRY=native` on the 0.1.0b3 pods (the store must be `noeviction` for 0.1.0b2
+   to be ready in strict mode) and keep them running for at least the longest key lifetime (1
+   day by default; longer if you raised a retention or TTL setting). In `native` mode each write
+   moves its key back to a native TTL, and the index sweep keeps running and deletes the
+   indexed keys as they come due. Roll back when `ZCARD <prefix>:ttl` is about 0 on each store
+   (a separate queue store has its own). Leftover `P:expiry`, `P:ttl` and `P:purge` keys are
+   harmless to 0.1.0b2.
+4. **`llm-queue registry gc` output and scope.** It prints the purge report: `deleted_keys` and
+   `dry_run` instead of `would_delete`. It also purges removed deployments of live models, and
+   keeps a removed model's queue that still holds messages unless `--force`. Update scripts that
+   parse its output.
+5. **Auto purge is on by default.** When a publish drops a model or deployment, its store state
+   is purged after `LLMQ_PURGE_GRACE_SECS` (900). Set `LLMQ_AUTO_PURGE=false` to keep the
+   0.1.0b2 behaviour (state stays until you purge it by hand).
+
+### Changed (behaviour)
+
+- **Auto purge on by default** (`LLMQ_AUTO_PURGE=true`): a model or deployment dropped from
+  the registry has its store state deleted after the grace (900 s) unless it comes back.
+  0.1.0b2 kept that state until `registry gc`. `LLMQ_AUTO_PURGE=false` restores that.
+- **`auto` key expiry picks `swept` on a `volatile-*` store** (and on `allkeys-*` or an
+  unreadable policy): llm-queue's keys get no TTL and the sweep deletes them, up to 10 s late.
+  0.1.0b2 always set native TTLs. On `noeviction` nothing changes. `LLMQ_KEY_EXPIRY=native`
+  restores the 0.1.0b2 behaviour (and leaves a `volatile-*` store not ready in strict mode).
+- **`registry gc`** also purges removed deployments of live models, keeps non-empty queues
+  unless `--force`, and prints the purge report (`deleted_keys`, `dry_run`) instead of
+  `would_delete`.
+
 ### Added
 
 - Docs: a reference page listing every log event the library writes, with its level and
@@ -29,12 +79,19 @@ public API (see STABILITY.md).
 - Auto purge: when a publish drops a model or deployment, it is purged after
   `LLMQ_PURGE_GRACE_SECS` (900) unless it came back meanwhile (`LLMQ_AUTO_PURGE`, default on);
   `purge.scheduled()` / `cancel_scheduled()` list and keep pending ones.
-- CLI `llm-queue purge model|deployment|tenant --yes|--dry-run`; HTTP routes `POST
-  /purge/model`, `/purge/deployment`, `/purge/tenant`, `/registry/gc`, `GET /purge/scheduled`,
-  `POST /purge/scheduled/cancel` (only with `allow_writes=True`, `X-LLMQ-Admin`; `dry_run`
-  defaults to true).
+- Auto purge runs only in worker processes. A process's first tick after start only records
+  the registry it sees (a baseline), so a start never schedules a purge. Before it purges, it
+  reads the stored registry strictly and skips the purge on any read error or refusal. An auto
+  deployment purge does not wait for running calls: the grace (900 s) is as long as the longest
+  call the registry allows (`timeout_max_secs`, 900 s by default).
+- CLI `llm-queue purge model|deployment|tenant --yes|--dry-run`; `--no-wait` on `purge
+  deployment` and `registry gc`. HTTP routes `POST /purge/model`, `/purge/deployment`,
+  `/purge/tenant`, `/registry/gc`, `GET /purge/scheduled`, `POST /purge/scheduled/cancel` (only
+  with `allow_writes=True`, `X-LLMQ-Admin`; `dry_run` defaults to true). An HTTP purge waits for
+  running calls at most `LLMQ_HTTP_PURGE_WAIT_SECS` (60, 0 to 3600); a larger or omitted
+  `wait_secs` is capped to it.
 - Settings `LLMQ_AUTO_PURGE`, `LLMQ_PURGE_GRACE_SECS`, `LLMQ_PURGE_WAIT`,
-  `LLMQ_PURGE_WAIT_SECS`, `LLMQ_PURGE_BATCH`, `LLMQ_TENANT_PURGE_DEFAULT` and
+  `LLMQ_PURGE_WAIT_SECS`, `LLMQ_HTTP_PURGE_WAIT_SECS`, `LLMQ_PURGE_BATCH`, `LLMQ_TENANT_PURGE_DEFAULT` and
   `LLMQ_TENANT_INDEX` (off: the per-tenant call index costs one write per call).
 - Key expiry modes (`LLMQ_KEY_EXPIRY=auto|native|swept`, default `auto`): llm-queue can share a
   store whose `maxmemory-policy` is `volatile-*` (ElastiCache's default `volatile-lru`, an app
@@ -44,8 +101,17 @@ public API (see STABILITY.md).
   is the store's (`P:expiry`; missing means `native`), written at start, every minute and after
   a store reset. New settings `LLMQ_TTL_SWEEP_BATCH` (500) and `LLMQ_TTL_SWEEP_ROUNDS` (100);
   `health()["key_expiry"]`; gauge `llmq_key_expiry_swept{store}`; counter
-  `llmq_ttl_swept_total`; log events `key_expiry_changed`, `key_expiry_publish_failed`,
-  `ttl_sweep_failed`. How-to: `docs/how-to/shared-cache-store.md`.
+  `llmq_ttl_swept_total`; log events `key_expiry_changed`, `key_expiry_publish_failed`
+  (warning), `ttl_sweep_failed`. Until a process has published its mode it reports the mode its
+  setting asks for (`native` for `auto`). How-to: `docs/how-to/shared-cache-store.md`.
+- Switching key expiry modes loses nothing: in `swept` mode setting an expiry also clears the
+  key's native TTL (`PERSIST`), in `native` mode it also removes the key's `P:ttl` member, and
+  reading the time left counts either; keys move to the new mode on their next write.
+- The expiry sweep has its own lock, `P:lock:ttlsweep` (a native TTL on purpose), and runs in
+  every process, workers and callers, every `sweep_secs` (10 s): up to 500 x 100 = 50000 keys
+  per 10 s by default. The worker sweep keeps `P:lock:sweep`.
+- `scripts/evict_drill.py`: an eviction drill that fills a throwaway store under queue traffic
+  with `volatile-lru` and `noeviction` (see CONTRIBUTING.md).
 - Docs: a reference page listing every key, stream and channel the library keeps in the store,
   with its fields, writers, readers, lifetime in each key expiry mode, what is lost if it is
   evicted under each policy, and code references (`docs/reference/store-keys.md`, with a JSON
@@ -67,10 +133,6 @@ public API (see STABILITY.md).
   its first read (cut to 2 s, not deleted), the request record's lifetimes, what the queue
   store holds, and readiness in strict mode. New section "Key expiry modes"; the store
   requirements now read `noeviction` **or** `volatile-*` with `swept`.
-
-- `llm-queue registry gc` now purges removed deployments of live models too, and keeps a
-  removed model's queue that still holds messages unless `--force` (it deleted it before). Its
-  output is the purge report: `deleted_keys` with `dry_run`, instead of `would_delete`.
 
 ## [0.1.0b2] - 2026-11-15
 
@@ -1059,6 +1121,7 @@ First beta, for test runs (`pip install --pre llm-queue`).
 - **Docs site** (Zensical on GitHub Pages): tutorial, how-to guides, explanation with
   diagrams, an API reference from the docstrings.
 
-[Unreleased]: https://github.com/techiewonk/llm-queue/compare/v0.1.0b2...HEAD
+[Unreleased]: https://github.com/techiewonk/llm-queue/compare/v0.1.0b3...HEAD
+[0.1.0b3]: https://github.com/techiewonk/llm-queue/compare/v0.1.0b2...v0.1.0b3
 [0.1.0b2]: https://github.com/techiewonk/llm-queue/compare/v0.1.0b1...v0.1.0b2
 [0.1.0b1]: https://github.com/techiewonk/llm-queue/releases/tag/v0.1.0b1

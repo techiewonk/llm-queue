@@ -73,12 +73,16 @@ async def main() -> None:
     ):
         ready = await client.get("/llm-queue/health/ready")
         print(f"GET /health/ready -> {ready.status_code} {ready.json()}")
-        # Strict mode keeps a pod not ready on a store that evicts keys (owner decision Q10):
-        # an ElastiCache group left on its default `volatile-lru` shows it here. Set the
-        # group's maxmemory-policy to noeviction before deploying.
+        # Strict mode keeps a pod not ready on a store that can evict its keys (owner decision
+        # Q10). On a `volatile-*` store (ElastiCache's default `volatile-lru`) the default
+        # LLMQ_KEY_EXPIRY=auto picks `swept` and the pod is ready; `native` there, or an
+        # `allkeys-*` policy, shows here. Keep `swept` (auto), or set noeviction.
         reason = str(ready.json().get("not_ready_reason", ""))
         if ready.status_code == 503 and "maxmemory-policy" in reason:
-            print("    not ready because the store evicts keys: set maxmemory-policy noeviction")
+            print(
+                "    not ready because the store can evict keys: on volatile-* keep "
+                "LLMQ_KEY_EXPIRY=auto (swept), or set maxmemory-policy noeviction"
+            )
         else:
             assert ready.status_code == 200
 

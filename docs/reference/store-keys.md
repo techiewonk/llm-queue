@@ -18,6 +18,13 @@ store in `P:expiry` (see [Key expiry modes](../explanation/storage.md#key-expiry
   "indexed in `P:ttl`", "native (on purpose)" (a few keys keep their TTL: losing them is
   harmless) or "no expiry".
 
+Switching modes loses nothing. In `swept` mode, setting an expiry also clears the key's native
+TTL (`PERSIST`); in `native` mode it also removes the key's `P:ttl` member; reading the time
+left counts either. So after a switch (a 0.1.0b2 store upgraded on a `volatile-lru` node, or a
+policy change under `auto`) each key moves to the new mode on its next write, and a key never
+written again keeps its old expiry (native TTL or index member) and still goes then: the index
+sweep runs in both modes.
+
 Example: `P:{r:ID}:status` lives 1800 s in both modes. In `native` it has a TTL of 1800 s; in
 `swept` it has no TTL, `P:ttl` holds `llmq:{r:ID}:status -> now + 1800000`, and the sweep that
 runs after that time deletes it.
@@ -33,15 +40,15 @@ runs after that time deletes it.
   plus a random tail, `runtime.py:624-625`), `MINUTE` a Unix minute on the store clock.
 - **Store**: `state` is `LLMQ_STORE_URL`. `queue` is `LLMQ_QUEUE_STORE_URL` when set, else the
   same store (`runtime.py:594`).
-- **Citations** are `file:line` in the source this page ships with (`dev/0.1.0b3` after
-  `21fe9b0`). Files are under `src/llm_queue/engine/` unless they start with `registry/` (under
+- **Citations** are `file:line` in the source this page ships with (`dev/0.1.0b3` at
+  `0fa93c4`); most name the function too, so a cite stays findable when lines move. Files are under `src/llm_queue/engine/` unless they start with `registry/` (under
   `src/llm_queue/registry/`) or are `tuning.py` (`src/llm_queue/tuning.py`). A bare `:123` repeats the file named last in the same cell.
 - Defaults: `budget_key_ms` = 180 s (`tuning.py:104`); lease = `LLMQ_LEASE_SECS` = 60 s;
   "held" lifetime = `max(budget_key_ms, 2 x lease)` = 180 s (`_admission_lua.py:41`);
   `DAY_MS` = 1 day, a constant (`_admission_lua.py:39`).
 - `EXPIRE`, `EX` and `PX` in the "Written by" cells name the native form. The code writes every
   expiry through `X.expire` / `X.set` (Lua) or `Expiry.expire` / `Expiry.set` (Python,
-  `expiry.py:29-68,128-149`), so in `swept` mode the same write goes to `P:ttl` instead. The keys
+  `expiry.py:29-70,138-159`), so in `swept` mode the same write goes to `P:ttl` instead. The keys
   marked "native (on purpose)" call the store directly and keep their TTL in both modes.
 - "Sliding" means the TTL is set again on each write, so the key lives that long after its
   last use. "Fixed" means set once (or set again only by the writes named).
@@ -152,14 +159,14 @@ mode `TTL_SWEEP` deletes every due key in `P:ttl`. Alerts (`P:alert:*`) and debu
 | Request records | `P:{r:ID}:status` | hash | state | `LLMQ_STATUS_TTL_SECS` (1800 s); a write never shortens it (`requests.py:231`). A final state is never replaced (`:218-222`). | indexed in `P:ttl` |
 | Request records | `P:{r:ID}:cancel` | string | state | `LLMQ_STATUS_TTL_SECS` (1800 s). | indexed in `P:ttl` |
 | Results & streaming | `P:{r:ID}:res` | string | state | `LLMQ_RESULT_TTL_SECS` (300 s), fixed from the write. After the first read of a library-made id: `LLMQ_RESULT_DEDUPE_SECS` when above 0, else 2 s (`TAKE_GRACE_MS`, `requests.py:324,329-334`). An app-supplied id keeps 300 s. An offloaded marker is dropped after the offload read (`RESULT_DROP`, `requests.py:301-312,337`). | indexed in `P:ttl` |
-| Results & streaming | `P:{r:ID}:chunks` | stream | state | `LLMQ_RESULT_TTL_SECS` + the call's timeout (`runtime.py:3613`), set again on each write. After `end`: `END_TTL_SECS` (30 s, `streaming.py:29,194`). | indexed in `P:ttl` |
+| Results & streaming | `P:{r:ID}:chunks` | stream | state | `LLMQ_RESULT_TTL_SECS` + the call's timeout (`runtime.py:3617`), set again on each write. After `end`: `END_TTL_SECS` (30 s, `streaming.py:29,194`). | indexed in `P:ttl` |
 | Results & streaming | `P:offload` | string | state | Fixed 7 days (`OFFLOAD_FLAG_SECS`, `requests.py:53`), set again on each start and offloaded write. | indexed in `P:ttl` |
 | Queues (streams) | `P:{q:NAME}:s` | stream | queue | No TTL. `MINID ~` now minus `queue.retention_secs` (86400 s; at most 14 days, `registry/settings.py:313-319`), applied only when a message is added (`queue.py:52`). A message leaves on ack (`XDEL`). | no expiry |
 | Queues (streams) | `P:{q:NAME}:vis` | zset | queue | No TTL. Members leave on ack, dead letter, or when their message is gone (`queue.py:142`). | no expiry |
 | Queues (streams) | `P:{q:NAME}:gen` | hash | queue | No TTL. | no expiry |
 | Queues (streams) | `P:{q:NAME}:fails` | hash | queue | No TTL. | no expiry |
 | Queues (streams) | `P:{q:NAME}:st` | hash | queue | No TTL. | no expiry |
-| Queues (streams) | `P:{q:NAME}:dlq` | stream | queue | No TTL. `MINID ~` now minus `queue.dlq_retention_secs` (86400 s for models; jobs `LLMQ_JOB_DEAD_RETENTION_SECS` 7 days, `jobs.py:68`) on each new dead letter, and on a timer: the sweeper every `sweep_secs` (10 s, `runtime.py:5006-5008`) and each job loop's upkeep (`jobs.py:402`). | no expiry |
+| Queues (streams) | `P:{q:NAME}:dlq` | stream | queue | No TTL. `MINID ~` now minus `queue.dlq_retention_secs` (86400 s for models; jobs `LLMQ_JOB_DEAD_RETENTION_SECS` 7 days, `jobs.py:68`) on each new dead letter, and on a timer: the sweeper every `sweep_secs` (10 s, `runtime.py:5035-5037`) and each job loop's upkeep (`jobs.py:402`). | no expiry |
 | Queues (streams) | `P:{q:NAME}:meta` | hash | queue | No TTL. | no expiry |
 | Queues (streams) | `P:rcv:WORKER:ALIAS` | string | queue | Fixed: the queue's `visibility_secs` (60 s). | indexed in `P:ttl` |
 | Doorbells & wakeups | `P:bell:NAME` | list | queue | Fixed 60 s from the last push. | indexed in `P:ttl` |
@@ -173,6 +180,7 @@ mode `TTL_SWEEP` deletes every due key in `P:ttl`. Alerts (`P:alert:*`) and debu
 | Process liveness & locks | `P:caller:WORKER` | string | state | Fixed: `max(LLMQ_CALLER_TTL_SECS (30), ceil(2 x LLMQ_LEASE_SECS / 3) + 5)` = 45 s by default (`runtime.py:584-586`), set again on every beat and send. | indexed in `P:ttl` |
 | Process liveness & locks | `P:epoch` | string | state | No TTL. | no expiry |
 | Process liveness & locks | `P:lock:sweep` | string | state | Fixed `sweep_secs` (10 s, `runtime.py:228`). | native (on purpose) |
+| Process liveness & locks | `P:lock:ttlsweep` | string | state | Fixed `sweep_secs` (10 s, `runtime.py:228`). | native (on purpose) |
 | Process liveness & locks | `P:lock:probe` | string | state | Fixed `PROBE_EVERY_SECS` (5 s); 35 s (`PROBE_TIMEOUT_SECS` 30 + 5) while a probe runs (`runtime.py:115-116`). | native (on purpose) |
 | Process liveness & locks | `P:lock:alerts` | string | state | Fixed `ALERT_LOCK_SECS` (45 s, `runtime.py:118`), renewed every 30 s tick. | native (on purpose) |
 | Process liveness & locks | `P:health:WORKER` | string | state and queue | Fixed 5 s. | native (on purpose) |
@@ -216,9 +224,9 @@ mode. `noeviction` is the same in both modes. `allkeys-*` evicts any key in eith
   keys closest to expiry first, so the short-lived ones go first: doorbells (60 s),
   `inprog:ID` (120 s), `caller` keys (45 s), a result already read (2 s). The `caller` keys and
   `inprog:ID` entries are the costly ones to lose.
-- **`volatile-*` with swept expiry** can evict only the six keys kept on native TTLs on purpose
-  (`P:lock:sweep`, `P:lock:probe`, `P:lock:alerts`, `P:lock:purge`, `P:health:WORKER`,
-  `P:{r:ID}:debug`): losing any of them is harmless. Every other key has no TTL, so it is never
+- **`volatile-*` with swept expiry** can evict only the seven keys kept on native TTLs on
+  purpose (`P:lock:sweep`, `P:lock:ttlsweep`, `P:lock:probe`, `P:lock:alerts`, `P:lock:purge`,
+  `P:health:WORKER`, `P:{r:ID}:debug`): losing any of them is harmless. Every other key has no TTL, so it is never
   a candidate. When the store is full and only keys without a TTL are left, it refuses writes
   (`OOM`) exactly as under `noeviction`. The app's own keys with TTLs are evicted first.
 - **`allkeys-*`** can evict anything, including the keys with no TTL: the registry, `cfg`, the
@@ -229,12 +237,12 @@ What the library checks:
 | Check | When | What happens |
 |---|---|---|
 | Cluster mode (`INFO cluster`) | `start()` | `ConfigError`: refused (`store_checks.py:67-94`, `runtime.py:740-742`) |
-| `maxmemory-policy` (`CONFIG GET`, else `INFO memory`; `unknown` if neither works) | `start()`, then every 12 store probes (about 1 minute) | Logs `store_eviction_policy` when `eviction_warning(policy, mode)` warns (`store_checks.py:51-64,90-94`): `allkeys-*` always; `volatile-*` only with native TTLs. Re-read by `_read_policies` (`runtime.py:4322-4339`, `POLICY_EVERY_ROUNDS` = 12, `HEALTH_PROBE_EVERY_SECS` = 5 s, `runtime.py:110,119`) |
-| Key expiry mode | `start()`, every minute, after a store reset | `_apply_expiry` (`runtime.py:4341-4353`) writes `decide(LLMQ_KEY_EXPIRY, policy)` (`expiry.py:86-94`) to each store's `P:expiry`; a change logs `key_expiry_changed` (warning) |
-| Readiness, strict (`LLMQ_ENVIRONMENT` not `dev`/`local`/`test`/`ci`; unset is strict) | each `health_check()` | `_evicting()` returns a reason: `ready: false` with `not_ready_reason` (`runtime.py:4248-4253,4297-4305`); gauge `llmq_ready` 0 (`runtime.py:4477-4485`) |
-| Readiness, dev | each `health_check()` | Ready; warning at start only; `eviction_policy` and `key_expiry` in `health()` (`runtime.py:4263-4266`) |
-| Gauges | each metrics tick | `llmq_store_eviction_unsafe{store}` 1 when unsafe in the store's mode; `llmq_key_expiry_swept{store}` 1 in `swept` (`runtime.py:4478-4482`) |
-| Expiry sweep | every `sweep_secs` (10 s), one process (`P:lock:sweep`) | `TTL_SWEEP` deletes due keys, `LLMQ_TTL_SWEEP_BATCH` (500) per run, at most `LLMQ_TTL_SWEEP_ROUNDS` (100) runs per sweep (`runtime.py:4359-4375`); counted in `llmq_ttl_swept_total`. It runs in both modes |
+| `maxmemory-policy` (`CONFIG GET`, else `INFO memory`; `unknown` if neither works) | `start()`, then every 12 store probes (about 1 minute) | Logs `store_eviction_policy` when `eviction_warning(policy, mode)` warns (`store_checks.py:51-64,90-94`): `allkeys-*` always; `volatile-*` only with native TTLs. Re-read by `_read_policies` (`runtime.py:4326-4339`, `POLICY_EVERY_ROUNDS` = 12, `HEALTH_PROBE_EVERY_SECS` = 5 s, `runtime.py:110,119`) |
+| Key expiry mode | `start()`, every minute, after a store reset | `_apply_expiry` (`runtime.py:4349-4361`) writes `decide(LLMQ_KEY_EXPIRY, policy)` (`expiry.py:97-105`) to each store's `P:expiry`; a change logs `key_expiry_changed` (warning), a failed write `key_expiry_publish_failed` (warning, `_publish_expiry_safely` `runtime.py:4342-4347`). Until a process has published its mode it reports the mode its setting asks for (`native` for `auto`) |
+| Readiness, strict (`LLMQ_ENVIRONMENT` not `dev`/`local`/`test`/`ci`; unset is strict) | each `health_check()` | `_evicting()` returns a reason: `ready: false` with `not_ready_reason` (`runtime.py:4252-4257,4301-4309`); gauge `llmq_ready` 0 (`runtime.py:4502-4510`) |
+| Readiness, dev | each `health_check()` | Ready; warning at start only; `eviction_policy` and `key_expiry` in `health()` (`runtime.py:4267-4270`) |
+| Gauges | each metrics tick | `llmq_store_eviction_unsafe{store}` 1 when unsafe in the store's mode; `llmq_key_expiry_swept{store}` 1 in `swept` (`runtime.py:4503-4507`) |
+| Expiry sweep | every `sweep_secs` (10 s), in every process (workers and callers), one at a time under its own lock `P:lock:ttlsweep` (the worker sweep keeps `P:lock:sweep`) | `TTL_SWEEP` deletes due keys, `LLMQ_TTL_SWEEP_BATCH` (500) per run, at most `LLMQ_TTL_SWEEP_ROUNDS` (100) runs per sweep (`runtime.py:4384-4400`); counted in `llmq_ttl_swept_total`. It runs in both modes |
 
 An unreadable policy (`unknown`) never fails readiness (`store_checks.py:57`); with `auto` it
 gets `swept`.
@@ -253,7 +261,7 @@ gets `swept`.
 | `Tuning.engine.job_ttl_ms` | 3600000 ms (`tuning.py:110`) | a `job` record a worker's claim created |
 | `Tuning.registry.history_size` | 20 (`tuning.py:120`) | `{reg}:history` versions kept |
 | `EngineSettings.waiter_secs` (no env var) | 2 s (`runtime.py:222`) | a waiter's `exp` in `waitinfo` / `waitexp` |
-| `EngineSettings.sweep_secs` (no env var) | 10 s (`runtime.py:228`) | `lock:sweep`; how often dead letters are trimmed |
+| `EngineSettings.sweep_secs` (no env var) | 10 s (`runtime.py:228`) | `lock:sweep`, `lock:ttlsweep`; how often dead letters are trimmed and the expiry index is swept |
 | Model `queue.retention_secs` | 86400 s, max 14 days (`registry/settings.py:313-319`) | `{q}:s` `MINID` trim; jobs `returns` TTL |
 | Model `queue.dlq_retention_secs` | 86400 s (`registry/settings.py:319`) | `{q}:dlq` `MINID` trim |
 | Model `queue.visibility_secs` | 60 s (`registry/settings.py:315`) | `vis` scores; `P:rcv:*` TTL |
@@ -263,7 +271,7 @@ gets `swept`.
 | `LLMQ_JOB_DEDUPE_SECS` | 86400 s (`jobs.py:64`) | jobs `id:JOBID` |
 | `LLMQ_JOB_DEAD_RETENTION_SECS` | 604800 s (`jobs.py:68`) | jobs `dlq` trim; `P:jobs:QP` TTL |
 | `LLMQ_KEY_EXPIRY` | `auto` (`settings.py:281`) | how every expiry is kept: native TTLs or the index `P:ttl` (`auto`: native on `noeviction`, else swept). Lifetimes stay the same |
-| `LLMQ_TTL_SWEEP_BATCH` / `LLMQ_TTL_SWEEP_ROUNDS` | 500 / 20 (`settings.py:392-393`) | how many due keys one sweep deletes (at most 10000 per 10 s by default); a bigger backlog waits for the next sweep |
+| `LLMQ_TTL_SWEEP_BATCH` / `LLMQ_TTL_SWEEP_ROUNDS` | 500 / 100 (`settings.py:392-393`; 1-5000 / 1-10000) | how many due keys one sweep deletes (at most 500 x 100 = 50000 per 10 s by default); a bigger backlog waits for the next sweep |
 | `LLMQ_PURGE_GRACE_SECS` | 900 s | `P:purge` due times |
 | `LLMQ_TENANT_INDEX` | false | writes `P:tenant:H:reqs` at all |
 
@@ -278,13 +286,13 @@ before confirmation); 30 s (`END_TTL_SECS` after a stream's end, the jobs `consu
 
 | Channel or key | Kind | Who writes | Who waits | Safety net |
 |---|---|---|---|---|
-| `P:done:CALLER` | pub/sub | `RESULT_PUT` / `SETTLE_DONE` publish the request id to each member of `{r:ID}:callers` (`requests.py:249-251,278-280`) | `_result_reader` of that process (`runtime.py:2383-2390`) | `_result_sweep`: one script per process every `poll_secs` (5 s) checks every waiting id (`runtime.py:2346-2381`); 3 sweeps in a row finding unannounced results reset the subscriber (`runtime.py:124`) |
-| `P:cancel` | pub/sub | `CANCEL` (`requests.py:351`), from `cancel()` and the CLI | `_cancel_reader` of every worker (`runtime.py:1761-1771`) | `MGET` of the `cancel` keys of running calls on resubscribe and every heartbeat (`runtime.py:1772,1801-1824,4811`) |
-| `P:bell:NAME` | list, `BLPOP` | one token per send, return without delay, reclaim, redrive (`queue.py:48-59,193-199,489-505`) | idle model loops (`runtime.py:2477`) and job loops (`jobs.py:438`) | the `BLPOP` timeout: `idle_slow_secs` (1 s), jobs 0.5 s; a worker that cannot serve a token puts it back (`runtime.py:2462`) |
+| `P:done:CALLER` | pub/sub | `RESULT_PUT` / `SETTLE_DONE` publish the request id to each member of `{r:ID}:callers` (`requests.py:249-251,278-280`) | `_result_reader` of that process (`runtime.py:2387-2394`) | `_result_sweep`: one script per process every `poll_secs` (5 s) checks every waiting id (`runtime.py:2350-2385`); 3 sweeps in a row finding unannounced results reset the subscriber (`runtime.py:124`) |
+| `P:cancel` | pub/sub | `CANCEL` (`requests.py:351`), from `cancel()` and the CLI | `_cancel_reader` of every worker (`runtime.py:1765-1775`) | `MGET` of the `cancel` keys of running calls on resubscribe and every heartbeat (`runtime.py:1776,1805-1828,4836`) |
+| `P:bell:NAME` | list, `BLPOP` | one token per send, return without delay, reclaim, redrive (`queue.py:48-59,193-199,489-505`) | idle model loops (`runtime.py:2481`) and job loops (`jobs.py:438`) | the `BLPOP` timeout: `idle_slow_secs` (1 s), jobs 0.5 s; a worker that cannot serve a token puts it back (`runtime.py:2466`) |
 | `P:chunkwake:WORKER` | stream, `XREAD BLOCK` | `ChunkReader._ring` when a stream opens during a blocked read (`streaming.py:380-387`) | the process's shared `XREAD` (`streaming.py:452-466`) | the block ends every `stream_read_block_ms` (100 ms) |
 | `P:{r:ID}:chunks` | stream, `XREAD BLOCK` | the worker's `ChunkWriter` (`streaming.py:150-160`) | the caller's `ChunkReader` | idle timeout of the stream call |
 
-Subscribers ping every 5 s and are reset when silent for two pings (`runtime.py:123,2264-2280`).
+Subscribers ping every 5 s and are reset when silent for two pings (`runtime.py:123,2268-2284`).
 
 ## Life of one call
 
@@ -307,7 +315,7 @@ Other paths: a handler failure runs `FAIL` (`queue.py:410-427`: `fails` +1, `st=
 delayed; `dlq` at `max_receives`); a give-back runs `UNDO` (refund, release the claim to
 `queued`) and `RETURN` (`queue.py:363-374`); a cancel writes `{r}:cancel` and publishes on
 `P:cancel`. With a separate queue store, step 1 is `REGISTER`, `SEND` and `CONFIRM`, and step 6
-is `RESULT_PUT`, `ACK` and `FINISH` (`runtime.py:3860-3882`).
+is `RESULT_PUT`, `ACK` and `FINISH` (`runtime.py:3864-3886`).
 
 ## The registry document
 
@@ -382,7 +390,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Store | state |
 | Schema | Field = registry version, value = that version's whole document JSON. |
 | Written by | `PUBLISH` `registry/_lua.py:63-69` (keeps the newest `Tuning.registry.history_size`, 20). |
-| Read by | `RegistryStore.versions` `registry/store.py:895`; rollback `registry/store.py:912`; `registry gc` / auto purge (`_aliases_in_history` `purge.py:775-783`). |
+| Read by | `RegistryStore.versions` `registry/store.py:895`; rollback `registry/store.py:912`; `registry gc` / auto purge (`_aliases_in_history` `purge.py:781-789`). |
 | Lifetime (native) | No TTL. Oldest versions are `HDEL`ed past `history_size` (`tuning.py:120`). |
 | Swept mode | No expiry, in both modes. |
 | Count | Bounded: 20 documents by default. |
@@ -403,7 +411,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Swept mode | No expiry, in both modes. |
 | Count | 1 per model. Grows with deployments (roughly 0.5-1 KB each, unverified). |
 | If evicted (`volatile-*`, native mode) | Not evictable: the key has no TTL. |
-| If evicted (`allkeys-*`) | `PICK_TAKE` answers `no_config` (`_admission_lua.py:361`). The worker calls `registry.refresh()` (`runtime.py:3066-3069`), which republishes only when the document is missing or older (`registry/store.py:971`), so with the document intact the numbers stay missing: calls are released with a 5 s delay or fail `queue_unavailable` (`runtime.py:3079-3088`) until the next publish or live edit. From code reading, not tested. |
+| If evicted (`allkeys-*`) | `PICK_TAKE` answers `no_config` (`_admission_lua.py:361`). The worker calls `registry.refresh()` (`runtime.py:3070-3073`), which republishes only when the document is missing or older (`registry/store.py:971`), so with the document intact the numbers stay missing: calls are released with a 5 s delay or fail `queue_unavailable` (`runtime.py:3083-3092`) until the next publish or live edit. From code reading, not tested. |
 | Deleted by | `PUBLISH` for models removed from the registry, with `health`, `rot`, `inprog`, `wait:p`, `wait:n`, `waitinfo`, `waitexp` (`registry/_lua.py:73-79`); a model purge (`purge.py:515-557`). |
 
 ### Model admission
@@ -430,7 +438,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 |---|---|
 | Type | string |
 | Store | state |
-| Schema | The deployment key the session last ran on. `HASH` is the keyed hash (`LLMQ_ID_HASH_SALT`, HMAC-SHA256, 16 hex) of the session id or the custom sticky key (`runtime.py:1415-1423`, `runtime.py:2770-2779`). |
+| Schema | The deployment key the session last ran on. `HASH` is the keyed hash (`LLMQ_ID_HASH_SALT`, HMAC-SHA256, 16 hex) of the session id or the custom sticky key (`runtime.py:1419-1427`, `runtime.py:2774-2783`). |
 | Written by | `PICK_TAKE` at grant `_admission_lua.py:809-811` (`SET ... PX`). |
 | Read by | `PICK_TAKE` `_admission_lua.py:616-621`. |
 | Lifetime (native) | Model setting `sticky.idle_ttl_secs` (default 1800 s, `registry/resolve.py:213`), set again on every grant: it lapses after that long idle. |
@@ -447,8 +455,8 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | hash |
 | Store | state |
 | Schema | `retries` (retry attempts this minute), `first` (first attempts granted this minute). `MINUTE` = Unix minute on the store clock. |
-| Written by | `_retry_allowed` `runtime.py:3521-3527` (`HINCRBY retries`, `EXPIRE 180`); `PICK_TAKE` `_admission_lua.py:804-808` (`HINCRBY first`, `EXPIRE 180`). |
-| Read by | `_retry_allowed` `runtime.py:3522-3527` (this and the previous minute). |
+| Written by | `_retry_allowed` `runtime.py:3525-3531` (`HINCRBY retries`, `EXPIRE 180`); `PICK_TAKE` `_admission_lua.py:804-808` (`HINCRBY first`, `EXPIRE 180`). |
+| Read by | `_retry_allowed` `runtime.py:3526-3531` (this and the previous minute). |
 | Lifetime (native) | Fixed 180 s from the last write (literal 180). |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
 | Count | Bounded: about 3 per model at a time. 2 fields. |
@@ -497,7 +505,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | string |
 | Store | state |
 | Schema | The Unix minute in which a store reset was detected. |
-| Written by | `_check_epoch` `runtime.py:4907-4909` (`SET ... EX 120`). |
+| Written by | `_check_epoch` `runtime.py:4933-4935` (`SET ... EX 120`). |
 | Read by | Every admission script `_admission_lua.py:71`; fixed-window hold `:76-78`. |
 | Lifetime (native) | Fixed 120 s. |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
@@ -570,7 +578,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Lifetime (native) | Key: sliding `max(budget_key_ms, 2 x lease)` = 180 s by default (`_admission_lua.py:41`). Members end at their score (`LLMQ_LEASE_SECS`, 60 s, renewed every lease / 3). |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
 | Count | 2 per deployment. One member per running call. |
-| If evicted (`volatile-*`, native mode) | Slots in use are forgotten: the deployment can get more concurrent calls than its limit until each running call's next heartbeat puts its lease back (`RENEW`, every lease / 3 = 20 s, `runtime.py:4747`). More throttles possible. |
+| If evicted (`volatile-*`, native mode) | Slots in use are forgotten: the deployment can get more concurrent calls than its limit until each running call's next heartbeat puts its lease back (`RENEW`, every lease / 3 = 20 s, `runtime.py:4772`). More throttles possible. |
 | If evicted (`allkeys-*`) | Same as volatile. |
 | Deleted by | TTL; `SWEEP` prunes lapsed members; a model purge (`purge.py:515-557`); a deployment purge (`purge.py:582-609`). Not deleted by `PUBLISH`. |
 
@@ -602,7 +610,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Lifetime (native) | Fixed `PEXPIRE 2 x lease` (120 s) at grant (`_admission_lua.py:781`), set again by every heartbeat (`:1033`). |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
 | Count | One per running call. About 0.5 KB. |
-| If evicted (`volatile-*`, native mode) | The next `RENEW` reports the grant lost and the worker registers it again (`runtime.py:4798-4801`). If it goes after the provider answered, `FINISH` finds no owner: no refund (the estimate stays charged) and the slot stays held until its lease ends. A redelivered copy is still refused while the job heartbeat is fresh (`_admission_lua.py:394-403`). |
+| If evicted (`volatile-*`, native mode) | The next `RENEW` reports the grant lost and the worker registers it again (`runtime.py:4823-4826`). If it goes after the provider answered, `FINISH` finds no owner: no refund (the estimate stays charged) and the slot stays held until its lease ends. A redelivered copy is still refused while the job heartbeat is fresh (`_admission_lua.py:394-403`). |
 | If evicted (`allkeys-*`) | Same as volatile. |
 | Deleted by | `settle` (`DEL`, `_admission_lua.py:879`); a dead holder `:435`; `SWEEP` `:1136`; TTL. |
 
@@ -632,7 +640,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Store | state |
 | Schema | Breaker: `state` (`closed`/`open`), `failures`, `fail_at` (ms), `until` (ms, open until), `probe` (owner token of the probe call, or empty), `probe_at` (ms). Throttle backoff: `thr_n` (throttles in a row), `thr_until` (ms, skipped until). |
 | Written by | `settle` `_admission_lua.py:893-922`; probe grant `:782-786`; probe freed by a dead holder `:432`, `settle` `:876-877`, `SWEEP` `:1134`. |
-| Read by | `evaluate` `_admission_lua.py:537-551`; `_MODEL_STATUS` `status.py:48`; `runtime.py:3169-3172`. |
+| Read by | `evaluate` `_admission_lua.py:537-551`; `_MODEL_STATUS` `status.py:48`; `runtime.py:3173-3176`. |
 | Lifetime (native) | Sliding 1 day after each learned outcome (`_admission_lua.py:933`) and probe grant (`:785`). |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
 | Count | 1 per deployment. Up to 8 fields. |
@@ -794,13 +802,13 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 |---|---|
 | Type | hash |
 | Store | state |
-| Schema | The claim record: `state` (`queued`, `running`, `done`, `failed`, `expired`, `cancelled`), `user` (keyed hash of the user or session id, `runtime.py:1483`), `params` (params hash, `envelope.py:161`), `caller` (worker id of the sender), `confirmed` (`0`/`1`), `created` (store secs), `app` (`1`: app-supplied id), `direct` (`1`: run in the caller's process), `owner` (`WORKER@TAG` running it), `hb` (ms of its last heartbeat). |
+| Schema | The claim record: `state` (`queued`, `running`, `done`, `failed`, `expired`, `cancelled`), `user` (keyed hash of the user or session id, `runtime.py:1487`), `params` (params hash, `envelope.py:161`), `caller` (worker id of the sender), `confirmed` (`0`/`1`), `created` (store secs), `app` (`1`: app-supplied id), `direct` (`1`: run in the caller's process), `owner` (`WORKER@TAG` running it), `hb` (ms of its last heartbeat). |
 | Written by | `register` `requests.py:69-160`; `REGISTER_SEND` `requests.py:180-188`; `CONFIRM` `requests.py:196-202`; `RESULT_PUT` `requests.py:245-248`; `SETTLE_DONE` `requests.py:274-277`; `PICK_TAKE` `_admission_lua.py:789-793`; `release_claim` `:955-964`; `RENEW` `:1013-1019`; `REREGISTER` `:1096-1101`. |
-| Read by | `register` `requests.py:71`; `PICK_TAKE` `_admission_lua.py:372,396-397,413`; `RESULT_TAKE` / `_DROP_READ` `requests.py:302,329`; `CANCEL` `requests.py:348`; `_RESULTS_EXIST` `runtime.py:263`; `_lost` `runtime.py:2233-2244`. |
+| Read by | `register` `requests.py:71`; `PICK_TAKE` `_admission_lua.py:372,396-397,413`; `RESULT_TAKE` / `_DROP_READ` `requests.py:302,329`; `CANCEL` `requests.py:348`; `_RESULTS_EXIST` `runtime.py:263`; `_lost` `runtime.py:2237-2248`. |
 | Lifetime (native) | Created with 30 s (`unconfirmed_secs`, `requests.py:380`). After the send: the call's deadline + `LLMQ_STATUS_TTL_SECS` (1800 s) (`requests.py:509,527`). After the result: `LLMQ_STATUS_TTL_SECS` (`requests.py:247`). A record a worker's claim made: `Tuning.engine.job_ttl_ms` (3600 s, `_admission_lua.py:792,1100`); `RENEW` pushes it back to `job_ttl_ms` when under 2 leases are left (`:1018`). |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
 | Count | One per request. About 200-400 B. |
-| If evicted (`volatile-*`, native mode) | Duplicate protection is lost. A waiting caller's result sweep finds the record gone and sends the call again (`runtime.py:2375-2379`, `_lost` `runtime.py:2240-2241`), so the provider can run it twice. A redelivered message is no longer refused as a duplicate. |
+| If evicted (`volatile-*`, native mode) | Duplicate protection is lost. A waiting caller's result sweep finds the record gone and sends the call again (`runtime.py:2379-2383`, `_lost` `runtime.py:2244-2245`), so the provider can run it twice. A redelivered message is no longer refused as a duplicate. |
 | If evicted (`allkeys-*`) | Same as volatile. |
 | Deleted by | TTL; `ABANDON` `requests.py:208`; a full queue in `REGISTER_SEND` `requests.py:182`; a re-run of a failed id `requests.py:126`. |
 
@@ -826,8 +834,8 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 |---|---|
 | Type | hash |
 | Store | state |
-| Schema | `state` (`waiting`, `in_progress`, `done`, `failed`, `expired`, `cancelled`), `model`, `priority` (`1`/`0`), `enqueued_at` (store secs.micros), `<state>_at`, then on the end `served_model`, `deployment`, `attempts`, `tokens_in`, `tokens_out`, or `error` (the failure kind) (`runtime.py:3853-3859,4093`). |
-| Written by | `register` create `requests.py:93-98`; `set_status` `requests.py:216-234` from `RESULT_PUT` `:253`, `SETTLE_DONE` `:282`, `STATUS_SET` `:359` (fallback `in_progress`, `runtime.py:3299`). |
+| Schema | `state` (`waiting`, `in_progress`, `done`, `failed`, `expired`, `cancelled`), `model`, `priority` (`1`/`0`), `enqueued_at` (store secs.micros), `<state>_at`, then on the end `served_model`, `deployment`, `attempts`, `tokens_in`, `tokens_out`, or `error` (the failure kind) (`runtime.py:3857-3863,4097`). |
+| Written by | `register` create `requests.py:93-98`; `set_status` `requests.py:216-234` from `RESULT_PUT` `:253`, `SETTLE_DONE` `:282`, `STATUS_SET` `:359` (fallback `in_progress`, `runtime.py:3303`). |
 | Read by | `RequestStore.status` `requests.py:803`; `StatusReader.request` `status.py:245`; `register` `requests.py:93`. |
 | Lifetime (native) | `LLMQ_STATUS_TTL_SECS` (1800 s); a write never shortens it (`requests.py:231`). A final state is never replaced (`:218-222`). |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
@@ -843,8 +851,8 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | string |
 | Store | state |
 | Schema | `1`: a cancel is pending for this id (any caller's cancel wins for all). |
-| Written by | `CANCEL` `requests.py:345-356` (`SET ... EX`), from `cancel()` `runtime.py:1755-1759` and CLI `cli.py:363-365`. |
-| Read by | `PICK_TAKE` `_admission_lua.py:371`; `register` `requests.py:130`; `REREGISTER` `_admission_lua.py:1069`; `_check_cancels` (`MGET`) `runtime.py:1810-1811`. |
+| Written by | `CANCEL` `requests.py:345-356` (`SET ... EX`), from `cancel()` `runtime.py:1759-1763` and CLI `cli.py:363-365`. |
+| Read by | `PICK_TAKE` `_admission_lua.py:371`; `register` `requests.py:130`; `REREGISTER` `_admission_lua.py:1069`; `_check_cancels` (`MGET`) `runtime.py:1814-1815`. |
 | Lifetime (native) | `LLMQ_STATUS_TTL_SECS` (1800 s). |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
 | Count | One per cancelled request. |
@@ -866,7 +874,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Lifetime (native) | `LLMQ_RESULT_TTL_SECS` (300 s), fixed from the write. After the first read of a library-made id: `LLMQ_RESULT_DEDUPE_SECS` when above 0, else 2 s (`TAKE_GRACE_MS`, `requests.py:324,329-334`). An app-supplied id keeps 300 s. An offloaded marker is dropped after the offload read (`RESULT_DROP`, `requests.py:301-312,337`). |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
 | Count | One per request. The reply's size (up to MBs; inline at most 64 MB, `requests.py:44`). |
-| If evicted (`volatile-*`, native mode) | A caller still waiting gets nothing: the job says `done`, so it waits to its deadline and fails `deadline_exceeded` (`runtime.py:2217-2219`). A later call with the same app id gets `result_expired` (`requests.py:118-120`, `runtime.py:1506`). |
+| If evicted (`volatile-*`, native mode) | A caller still waiting gets nothing: the job says `done`, so it waits to its deadline and fails `deadline_exceeded` (`runtime.py:2221-2223`). A later call with the same app id gets `result_expired` (`requests.py:118-120`, `runtime.py:1510`). |
 | If evicted (`allkeys-*`) | Same as volatile. |
 | Deleted by | TTL; `RESULT_DROP` `requests.py:306`; re-run of a failed id `requests.py:126`. |
 
@@ -877,9 +885,9 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | stream |
 | Store | state |
 | Schema | Entries `seq` (int), `att` (owner token of the attempt), `t` (`chunk`, `end`, `error`), `d` (JSON: a list of provider events; `{usage, meta}` for `end`; `{kind, message, partial}` for `error`). |
-| Written by | `ChunkWriter._send` `streaming.py:150-160` (`XADD` + `EXPIRE` on every write); created in `runtime.py:3607-3613`. |
-| Read by | `ChunkReader._xread` `streaming.py:452-466`; `PICK_TAKE` (`XLEN`) `_admission_lua.py:409,823`; `runtime.py:1332,3617`. |
-| Lifetime (native) | `LLMQ_RESULT_TTL_SECS` + the call's timeout (`runtime.py:3613`), set again on each write. After `end`: `END_TTL_SECS` (30 s, `streaming.py:29,194`). |
+| Written by | `ChunkWriter._send` `streaming.py:150-160` (`XADD` + `EXPIRE` on every write); created in `runtime.py:3611-3617`. |
+| Read by | `ChunkReader._xread` `streaming.py:452-466`; `PICK_TAKE` (`XLEN`) `_admission_lua.py:409,823`; `runtime.py:1336,3621`. |
+| Lifetime (native) | `LLMQ_RESULT_TTL_SECS` + the call's timeout (`runtime.py:3617`), set again on each write. After `end`: `END_TTL_SECS` (30 s, `streaming.py:29,194`). |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
 | Count | One per streaming request. At most `stream_max_bytes`. |
 | If evicted (`volatile-*`, native mode) | The reader misses entries and waits for its idle timeout; a resumed attempt reads `XLEN` 0 and streams from the start. Exact caller-side outcome unverified. |
@@ -910,7 +918,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 |---|---|
 | Type | stream |
 | Store | queue |
-| Schema | `NAME` = `QP` + `llm-<alias>` (or the model's `queue.name`) and the same with `-priority` (`runtime.py:984-986`, `registry/resolve.py:179-183`); job queues `QP` + `jobs-<name>` (`jobs.py:206-208`). One field per entry: `body`. Model queue: the message JSON (envelope v2: `v`, `request_id`, `op`, `model`, `params`, `priority`, `caller`, `timeout_secs`, `max_wait_secs`, `allow_fallback`, `allowed_regions`, `allowed_accounts`, `session_id`, `user_id`, `tenant_id`, `app_request_id`, `stream`, `vectors`, `b64`; `envelope.py:97-139`). Job queue: `{id, name, payload, ctx}` (`jobs.py:256`). The entry id (`ms-seq`, store clock) is the call's place in line. |
+| Schema | `NAME` = `QP` + `llm-<alias>` (or the model's `queue.name`) and the same with `-priority` (`runtime.py:988-990`, `registry/resolve.py:179-183`); job queues `QP` + `jobs-<name>` (`jobs.py:206-208`). One field per entry: `body`. Model queue: the message JSON (envelope v2: `v`, `request_id`, `op`, `model`, `params`, `priority`, `caller`, `timeout_secs`, `max_wait_secs`, `allow_fallback`, `allowed_regions`, `allowed_accounts`, `session_id`, `user_id`, `tenant_id`, `app_request_id`, `stream`, `vectors`, `b64`; `envelope.py:97-139`). Job queue: `{id, name, payload, ctx}` (`jobs.py:256`). The entry id (`ms-seq`, store clock) is the call's place in line. |
 | Written by | `send` `queue.py:48-59` (from `SEND` `queue.py:62-68` and `REGISTER_SEND` `requests.py:176`); `REDRIVE` `queue.py:480`. |
 | Read by | `receive` `queue.py:126,140`; replay `queue.py:268`; `FAIL` `queue.py:419`; `DEPTH` `queue.py:436`; `_first_id` `status.py:149-152`. |
 | Lifetime (native) | No TTL. `MINID ~` now minus `queue.retention_secs` (86400 s; at most 14 days, `registry/settings.py:313-319`), applied only when a message is added (`queue.py:52`). A message leaves on ack (`XDEL`). |
@@ -993,7 +1001,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Schema | Dead letters: `body` (the message), `src` (its original id), `fails`. |
 | Written by | `to_dlq` `queue.py:71-81` (from `receive` and `FAIL`). |
 | Read by | `dead_letters` `queue.py:785-799`; `REDRIVE` `queue.py:474`; `DEPTH` `queue.py:436`; replay `queue.py:251`. |
-| Lifetime (native) | No TTL. `MINID ~` now minus `queue.dlq_retention_secs` (86400 s for models; jobs `LLMQ_JOB_DEAD_RETENTION_SECS` 7 days, `jobs.py:68`) on each new dead letter, and on a timer: the sweeper every `sweep_secs` (10 s, `runtime.py:5006-5008`) and each job loop's upkeep (`jobs.py:402`). |
+| Lifetime (native) | No TTL. `MINID ~` now minus `queue.dlq_retention_secs` (86400 s for models; jobs `LLMQ_JOB_DEAD_RETENTION_SECS` 7 days, `jobs.py:68`) on each new dead letter, and on a timer: the sweeper every `sweep_secs` (10 s, `runtime.py:5035-5037`) and each job loop's upkeep (`jobs.py:402`). |
 | Swept mode | No expiry, in both modes. |
 | Count | Bounded by retention. Up to 4 MB an entry. |
 | If evicted (`volatile-*`, native mode) | Not evictable: the key has no TTL. |
@@ -1023,7 +1031,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | string |
 | Store | queue |
 | Schema | The last receive of one worker loop: JSON `{n: nonce, b: queue key base, bell: doorbell key, t: [id, generation, ...] taken, d: [queue index, id, dead-letter id, ...]}`. |
-| Written by | `RECEIVE_FIRST` `queue.py:284-296` (`SET ... PX`); key `queue.py:701-703`, `runtime.py:2521`. |
+| Written by | `RECEIVE_FIRST` `queue.py:284-296` (`SET ... PX`); key `queue.py:701-703`, `runtime.py:2525`. |
 | Read by | `RECEIVE_FIRST` replay `queue.py:243-244`; `RECLAIM` `queue.py:327`. |
 | Lifetime (native) | Fixed: the queue's `visibility_secs` (60 s). |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
@@ -1041,8 +1049,8 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | list |
 | Store | queue |
 | Schema | Tokens `1`, at most 64 (`LTRIM`). One token per send wakes one idle worker. |
-| Written by | `send` `queue.py:54-56`; `RING` `queue.py:500-505` (`ring_again`, `runtime.py:2462`); `RETURN` / `RECLAIM` `ring` `queue.py:193-199`; `REDRIVE` `queue.py:489-493`. |
-| Read by | `BLPOP` in `wait_bell` `queue.py:605-609` (model loops `runtime.py:2477`, job loops `jobs.py:438`). |
+| Written by | `send` `queue.py:54-56`; `RING` `queue.py:500-505` (`ring_again`, `runtime.py:2466`); `RETURN` / `RECLAIM` `ring` `queue.py:193-199`; `REDRIVE` `queue.py:489-493`. |
+| Read by | `BLPOP` in `wait_bell` `queue.py:605-609` (model loops `runtime.py:2481`, job loops `jobs.py:438`). |
 | Lifetime (native) | Fixed 60 s from the last push. |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
 | Count | 1 per queue. |
@@ -1058,7 +1066,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Store | state |
 | Schema | Message = request id whose result is stored. `CALLER` = the waiting process's worker id. |
 | Written by | `PUBLISH` in `RESULT_PUT` `requests.py:249-251` and `SETTLE_DONE` `requests.py:278-280`, to each member of `callers`. |
-| Read by | `_result_reader` subscribes `runtime.py:2383-2390`. Safety net: `_result_sweep` every `poll_secs` (5 s) `runtime.py:2346-2381`. |
+| Read by | `_result_reader` subscribes `runtime.py:2387-2394`. Safety net: `_result_sweep` every `poll_secs` (5 s) `runtime.py:2350-2385`. |
 | Lifetime (native) | Not stored. |
 | Swept mode | Not stored. |
 | Count | 1 channel per caller process. |
@@ -1074,7 +1082,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Store | state |
 | Schema | Message = a request id just cancelled. |
 | Written by | `PUBLISH` in `CANCEL` `requests.py:351`. |
-| Read by | `_cancel_reader` subscribes `runtime.py:1761-1771`. Safety net: `_check_cancels` (an `MGET` of the cancel keys) on resubscribe and every heartbeat (`runtime.py:1772,4811`). |
+| Read by | `_cancel_reader` subscribes `runtime.py:1765-1775`. Safety net: `_check_cancels` (an `MGET` of the cancel keys) on resubscribe and every heartbeat (`runtime.py:1776,4836`). |
 | Lifetime (native) | Not stored. |
 | Swept mode | Not stored. |
 | Count | 1 channel per prefix. |
@@ -1174,11 +1182,11 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Store | state |
 | Schema | `1`: this calling process is alive. `WORKER` = the process's worker id (`runtime.py:624-625`). |
 | Written by | `RENEW` `_admission_lua.py:1049` (every heartbeat, lease / 3 = 20 s); `register` `requests.py:77-80` (every send and attach). |
-| Read by | `PICK_TAKE` caller check `_admission_lua.py:385`; `register` direct-run takeover `requests.py:144`; `_direct_runner_dead` `runtime.py:2258`. |
+| Read by | `PICK_TAKE` caller check `_admission_lua.py:385`; `register` direct-run takeover `requests.py:144`; `_direct_runner_dead` `runtime.py:2262`. |
 | Lifetime (native) | Fixed: `max(LLMQ_CALLER_TTL_SECS (30), ceil(2 x LLMQ_LEASE_SECS / 3) + 5)` = 45 s by default (`runtime.py:584-586`), set again on every beat and send. |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
 | Count | 1 per running process. |
-| If evicted (`volatile-*`, native mode) | A live caller looks gone: at a call's first admission `PICK_TAKE` answers `gone` (`_admission_lua.py:379-388`) and the worker ends the call as `caller_gone` (`runtime.py:3073-3078`). Another caller of a direct run takes it over and runs it again (`requests.py:142-155`). |
+| If evicted (`volatile-*`, native mode) | A live caller looks gone: at a call's first admission `PICK_TAKE` answers `gone` (`_admission_lua.py:379-388`) and the worker ends the call as `caller_gone` (`runtime.py:3077-3082`). Another caller of a direct run takes it over and runs it again (`requests.py:142-155`). |
 | If evicted (`allkeys-*`) | Same as volatile. |
 | Deleted by | TTL. |
 
@@ -1189,13 +1197,13 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | string |
 | Store | state |
 | Schema | The store time (secs) when a process first found it missing. Missing or changed means the store lost its data. |
-| Written by | `SET NX` at start `runtime.py:744` and in `_check_epoch` `runtime.py:4906`. |
-| Read by | `runtime.py:745,4901`; `RENEW` `_admission_lua.py:1050`; `PICK_TAKE` `_admission_lua.py:380`. |
+| Written by | `SET NX` at start `runtime.py:743` and in `_check_epoch` `runtime.py:4931`. |
+| Read by | `runtime.py:744,4926`; `RENEW` `_admission_lua.py:1050`; `PICK_TAKE` `_admission_lua.py:380`. |
 | Lifetime (native) | No TTL. |
 | Swept mode | No expiry, in both modes. |
 | Count | 1 per prefix. |
 | If evicted (`volatile-*`, native mode) | Not evictable: the key has no TTL. |
-| If evicted (`allkeys-*`) | Every pod treats it as a store reset: logs `state_store_reset_detected`, re-registers its running grants and holds fixed windows to the next minute (`runtime.py:4901-4919`). Self-healing, but a burst of work. |
+| If evicted (`allkeys-*`) | Every pod treats it as a store reset: logs `state_store_reset_detected`, re-registers its running grants and holds fixed windows to the next minute (`runtime.py:4926-4948`). Self-healing, but a burst of work. |
 | Deleted by | Never. |
 
 #### `P:lock:sweep`
@@ -1204,13 +1212,29 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 |---|---|
 | Type | string |
 | Store | state |
-| Schema | Worker id of the process running the sweep. |
-| Written by | `_sweeper` `runtime.py:4982-4986` (`SET NX PX sweep_secs`). |
+| Schema | Worker id of the worker running the worker sweep (lapsed leases, dead letters); the expiry index sweep has its own lock, `P:lock:ttlsweep`. |
+| Written by | `_sweeper` `runtime.py:5011-5015` (`SET NX PX sweep_secs`). |
 | Read by | Same (`SET NX`). |
 | Lifetime (native) | Fixed `sweep_secs` (10 s, `runtime.py:228`). |
 | Swept mode | Native (on purpose): keeps its TTL, so a `volatile-*` store may evict it; losing it lets two processes sweep at once (the sweep is idempotent), and the sweep that deletes due keys must not depend on itself. |
 | Count | 1 per prefix. |
 | If evicted (`volatile-*`, native mode) | Two processes may sweep at once. Harmless. |
+| If evicted (`allkeys-*`) | Same as volatile. |
+| Deleted by | TTL. |
+
+#### `P:lock:ttlsweep`
+
+| | |
+|---|---|
+| Type | string |
+| Store | state |
+| Schema | Worker id of the process running the expiry index sweep (`TTL_SWEEP` on each store's `P:ttl`). |
+| Written by | `_ttl_sweeper` `runtime.py:4363-4378` (`SET NX PX sweep_secs`), in every process: workers and callers. |
+| Read by | Same (`SET NX`). |
+| Lifetime (native) | Fixed `sweep_secs` (10 s, `runtime.py:228`). |
+| Swept mode | Native (on purpose): keeps its TTL, so a `volatile-*` store may evict it; losing it lets two processes sweep at once (the sweep is idempotent), and the sweep that deletes due keys must not depend on itself. |
+| Count | 1 per prefix. |
+| If evicted (`volatile-*`, native mode) | Two processes may sweep the index at once. Harmless. |
 | If evicted (`allkeys-*`) | Same as volatile. |
 | Deleted by | TTL. |
 
@@ -1221,7 +1245,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | string |
 | Store | state |
 | Schema | Worker id of the process probing disabled deployments. |
-| Written by | `_prober` `runtime.py:4001` (`SET NX EX 5`), stretched per probe `runtime.py:4033`, back to 5 s `runtime.py:4015`. |
+| Written by | `_prober` `runtime.py:4005` (`SET NX EX 5`), stretched per probe `runtime.py:4037`, back to 5 s `runtime.py:4019`. |
 | Read by | Same (`SET NX`). |
 | Lifetime (native) | Fixed `PROBE_EVERY_SECS` (5 s); 35 s (`PROBE_TIMEOUT_SECS` 30 + 5) while a probe runs (`runtime.py:115-116`). |
 | Swept mode | Native (on purpose): keeps its TTL, so a `volatile-*` store may evict it; losing it lets two processes probe one deployment at once: harmless. |
@@ -1237,8 +1261,8 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | string |
 | Store | state |
 | Schema | Worker id of the process evaluating alerts. |
-| Written by | `_alert_lock` `runtime.py:4487-4499` (`SET NX EX 45`, renewed by the holder). |
-| Read by | `_alert_lock` `runtime.py:4497`. |
+| Written by | `_alert_lock` `runtime.py:4512-4524` (`SET NX EX 45`, renewed by the holder). |
+| Read by | `_alert_lock` `runtime.py:4522`. |
 | Lifetime (native) | Fixed `ALERT_LOCK_SECS` (45 s, `runtime.py:118`), renewed every 30 s tick. |
 | Swept mode | Native (on purpose): keeps its TTL, so a `volatile-*` store may evict it; losing it hands alert evaluation to another process: harmless. |
 | Count | 1 per prefix. |
@@ -1253,7 +1277,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | string |
 | Store | state and queue |
 | Schema | `1`: a write probe (each store's readiness check). |
-| Written by | `_probe_stores` `runtime.py:4269-4277` (`SET ... PX 5000`, every 5 s on each store). |
+| Written by | `_probe_stores` `runtime.py:4273-4281` (`SET ... PX 5000`, every 5 s on each store). |
 | Read by | Nobody (the write itself is the probe). |
 | Lifetime (native) | Fixed 5 s. |
 | Swept mode | Native (on purpose): keeps its TTL, so a `volatile-*` store may evict it; a 5 s write probe; losing it is harmless. |
@@ -1287,7 +1311,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | string |
 | Store | state |
 | Schema | JSON `{request, response}`, each cut to 2000 characters. Only with debug capture, which is refused outside dev (`settings.py:265-269`). |
-| Written by | `_debug` `runtime.py:4207-4219` (`SET ... EX 3600`). |
+| Written by | `_debug` `runtime.py:4211-4223` (`SET ... EX 3600`). |
 | Read by | Nobody in the library (for operators). |
 | Lifetime (native) | Fixed 1 hour. |
 | Swept mode | Native (on purpose): keeps its TTL, so a `volatile-*` store may evict it; debug capture (dev only); losing it is harmless. |
@@ -1305,7 +1329,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | string |
 | Store | state and queue |
 | Schema | `native` or `swept`: the store's key expiry mode. Each store has its own (a separate queue store too). |
-| Written by | `_apply_expiry` `runtime.py:4341-4353` through `Expiry.publish_mode` `expiry.py:151-156` (`SET ... GET`): at `start()` (`runtime.py:743`), every minute (`_read_policies` `runtime.py:4337`) and after a store reset (`_check_epoch` `runtime.py:4917`). |
+| Written by | `_apply_expiry` `runtime.py:4349-4361` through `Expiry.publish_mode` `expiry.py:161-166` (`SET ... GET`): at `start()` (`_publish_expiry_safely`, `runtime.py:748`), every minute (`_read_policies` `runtime.py:4340`) and after a store reset (`_check_epoch` `runtime.py:4946`). Until then a process reports the mode its setting asks for (`native` for `auto`). |
 | Read by | Every script that sets an expiry: `X.swept()` `expiry.py:31-34` (one `GET` per script run). |
 | Lifetime (native) | No TTL. |
 | Swept mode | No expiry, in both modes. |
@@ -1321,14 +1345,14 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | zset |
 | Store | state and queue |
 | Schema | The expiry index: member = a full key name, score = when it expires (store ms). Used only in `swept` mode. |
-| Written by | `X.expire` / `X.set` in every script (`expiry.py:43-68`); `Expiry.expire` / `Expiry.set` from Python (`expiry.py:128-149`). A purge drops the members of the keys it deletes (`purge.py:755-766`, `_TENANT_PURGE` `purge.py:60`). |
-| Read by | `X.pttl` `expiry.py:49-55`; `TTL_SWEEP` `expiry.py:72-80`, run by `_sweep_ttl_index` `runtime.py:4359-4375` under `P:lock:sweep`. |
+| Written by | `X.expire` / `X.set` in every script (`expiry.py:43-70`); `Expiry.expire` / `Expiry.set` from Python (`expiry.py:138-159`). In `native` mode the same helpers also remove the key's member (and in `swept` mode clear the key's native TTL with `PERSIST`), so a key moves to the current mode on its next write. A purge drops the members of the keys it deletes from each store's own index (`_unlink` `purge.py:761-772`, `_TENANT_PURGE` `purge.py:60`). |
+| Read by | `X.pttl` `expiry.py:51-57`; `TTL_SWEEP` `expiry.py:78-89`, run by `_sweep_ttl_index` `runtime.py:4384-4400` under `P:lock:ttlsweep`, in every process (`_ttl_sweeper` `runtime.py:4363`). |
 | Lifetime (native) | No TTL. Members leave when swept or purged. |
 | Swept mode | No expiry, in both modes. |
 | Count | One member per indexed key: about every live key with an expiry (request records, budgets, leases, ...). Rough: key name + about 20 bytes per member (unverified). |
 | If evicted (`volatile-*`, native mode) | Not evictable: the key has no TTL. |
 | If evicted (`allkeys-*`) | Every indexed key loses its expiry and stays until purged or deleted by its own code path: memory grows, nothing is lost. |
-| Deleted by | Never. The sweeper runs in both modes, so keys indexed while `swept` still go after a switch to `native` (`runtime.py:4359-4363`). |
+| Deleted by | Never. The sweep runs in both modes, so keys indexed while `swept` and not written since still go at their due time after a switch to `native` (`_sweep_ttl_index` `runtime.py:4384-4388`). |
 
 #### `P:purge`
 
@@ -1369,7 +1393,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | zset |
 | Store | state |
 | Schema | Only with `LLMQ_TENANT_INDEX=true`. A tenant's calls: member = request id, score = the call's deadline (store ms: now + call time + `caller_margin_secs`). `H` = the tenant hash admission uses (`tf:t:H`). |
-| Written by | `index_call` `purge.py:489-511` from `_index_tenant` `runtime.py:1563-1579` on each new call: `ZADD`, then entries past their deadline are pruned (`ZREMRANGEBYSCORE`). |
+| Written by | `index_call` `purge.py:489-511` from `_index_tenant` `runtime.py:1567-1583` on each new call: `ZADD`, then entries past their deadline are pruned (`ZREMRANGEBYSCORE`). |
 | Read by | Tenant purge `purge.py:636-641` (to cancel `queued` / `running` calls). |
 | Lifetime (native) | The longest call in it + 60 s; a write only lengthens it (`grow=True`, `purge.py:510`). |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
@@ -1387,8 +1411,6 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
   time (the sweep then `UNLINK`s a missing key: harmless). A key deleted and written again
   without an expiry (for example a removed model's `health` hash, written again by `RECORD`)
   is still deleted at the old due time; native TTLs would keep it. From code reading.
-- A purge drops index members from the state store's `P:ttl` only (`purge.py:765`): the
-  members of queue keys it deleted in a separate queue store stay until due. Harmless.
 - `P:ttl` member size is an estimate, not a measurement.
 - Whether a managed service exposes `min-replicas-to-write` is out of scope here (see
   [Storage](../explanation/storage.md#store-requirements)).

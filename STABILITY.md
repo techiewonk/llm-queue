@@ -9,8 +9,9 @@
 - **0.x releases:** a minor release may break the public API; every break is in CHANGELOG.md.
 - **Message format:** queue messages carry a format version `v`. A worker returns a message newer
   than it understands to the queue instead of dropping it. Workers of two releases share a queue
-  only where CHANGELOG.md says so: 0.1.0b1 and 0.1.0b2 do not (drain 0.1.0b1 first; see
-  `docs/how-to/upgrade.md`).
+  only where CHANGELOG.md says so: 0.1.0b1 and 0.1.0b2 do not (drain 0.1.0b1 first);
+  0.1.0b2 and 0.1.0b3 do on a `noeviction` store (on a `volatile-*` store, upgrade every pod).
+  See `docs/how-to/upgrade.md`.
 - **Store schema:** the key layout has a schema number; a change to it ships with a migration note.
 - **Supported versions:** Python 3.12-3.14 (unit and integration tests run on each in CI; 3.11 was dropped in 0.1.0b2); Valkey 8
   and Redis 7.2+ as one primary with replicas (tested on Valkey 8.1 and Redis 7.4). Cluster mode

@@ -90,7 +90,7 @@ same in both [key expiry modes](#key-expiry-modes); only how they are kept diffe
 | `P:done:WORKER`, `P:cancel` | channels | Result wake-ups; cancels | not stored |
 | `P:chunkwake:WORKER` | stream | Wakes the process's shared chunk reader when a new stream opens | `MAXLEN 1`; 60 s from the last wake-up |
 | `P:epoch` | string | Store-reset detector | no expiry |
-| `P:lock:sweep`, `P:lock:probe`, `P:lock:alerts`, `P:lock:purge` | strings | One process at a time sweeps, probes, evaluates alerts, runs auto purges | sweep 10 s (`sweep_secs`); probe 5 s (35 s while a probe runs); alerts 45 s, renewed by the holder; purge 120 s or until released |
+| `P:lock:sweep`, `P:lock:ttlsweep`, `P:lock:probe`, `P:lock:alerts`, `P:lock:purge` | strings | One process at a time runs the worker sweep, sweeps the expiry index, probes, evaluates alerts, runs auto purges | sweep and ttlsweep 10 s (`sweep_secs`); probe 5 s (35 s while a probe runs); alerts 45 s, renewed by the holder; purge 120 s or until released |
 | `P:alert:NAME:LABELS` | string | An alert's last state | 1 day, set again every evaluation |
 | `P:health:WORKER` | string | Readiness write probe (each store) | 5 s |
 | `P:purge` | zset | Auto purges waiting for their grace (target `alias` or `alias/account/name` to due time, store ms) | no expiry; entries until purged or cancelled |
@@ -164,21 +164,24 @@ Example: a call's `P:{r:ID}:status` is written with a lifetime of 1800 s. In `na
 `PEXPIRE 1800000`. In `swept` it gets no TTL and `ZADD P:ttl <now + 1800000> llmq:{r:ID}:status`.
 About 1800 s later the next sweep finds it due, deletes it with `UNLINK` and removes the member.
 
-**The index and the sweep.** One process at a time (the holder of `P:lock:sweep`) runs
-`TTL_SWEEP` every `sweep_secs` (10 s). One run deletes up to `LLMQ_TTL_SWEEP_BATCH` (500) due
-keys; the sweep runs again while a run comes back full, at most `LLMQ_TTL_SWEEP_ROUNDS` (100)
-times. That is up to 50000 keys per 10 s by default (caller-only processes sweep too); a bigger backlog waits for the next sweep.
+**The index and the sweep.** Every process, worker or caller, tries every `sweep_secs` (10 s)
+to take the expiry sweep's own lock, `P:lock:ttlsweep`; the one that gets it runs `TTL_SWEEP`.
+It is a separate lock from the worker sweep's `P:lock:sweep` (lapsed leases, dead letters), so
+the index is swept even in a fleet of callers only, and a slow worker sweep never holds it
+back. One run deletes up to `LLMQ_TTL_SWEEP_BATCH` (500) due keys; the sweep runs again while a
+run comes back full, at most `LLMQ_TTL_SWEEP_ROUNDS` (100) times. That is up to 50000 keys per
+10 s by default; a bigger backlog waits for the next sweep.
 Each deleted key counts in `llmq_ttl_swept_total`. The sweep runs in both modes, so keys indexed
 while `swept` still go after a switch to `native`. A script that asks for a key's time left
 (`PTTL`) reads the index in `swept` mode, so the "only lengthen" and "set when none" rules
 behave the same in both modes.
 
-**What stays native, and why.** Six keys keep a real TTL in both modes. Losing any of them is
-harmless, and the sweep lock must not wait for the sweep:
+**What stays native, and why.** Seven keys keep a real TTL in both modes. Losing any of them is
+harmless, and the sweep locks must not wait for the sweep:
 
 | Key | Why native |
 |---|---|
-| `P:lock:sweep` | The sweep's own lock: it must lapse even when no sweep runs. Lost: two processes sweep at once (idempotent) |
+| `P:lock:ttlsweep`, `P:lock:sweep` | The sweeps' own locks: they must lapse even when no sweep runs. Lost: two processes sweep at once (idempotent) |
 | `P:lock:probe`, `P:lock:alerts`, `P:lock:purge` | Short locks. Lost: duplicate probing, alert evaluation or purge tick; all idempotent |
 | `P:health:WORKER` | The 5 s readiness write probe. Lost: nothing |
 | `P:{r:ID}:debug` | Debug capture, dev only. Lost: nothing |
@@ -193,7 +196,9 @@ example, a caller that died is seen as gone after 45 to 55 s instead of 45 s.
 the store says, and a store that never saw an engine uses native TTLs. A started engine writes
 the mode at `start()`, every minute (when it reads the eviction policy again) and after a store
 reset. A change logs `key_expiry_changed` (warning, with `store`, `policy`, `before` and
-`mode`). With a separate queue store, each store has its own `P:expiry` and `P:ttl`.
+`mode`); a failed write logs `key_expiry_publish_failed` (warning) and is retried a minute later.
+Until a process has published its mode, it reports the mode its setting asks for (`native` for
+`auto`). With a separate queue store, each store has its own `P:expiry` and `P:ttl`.
 
 **`auto` (the default).** The engine reads the store's `maxmemory-policy` (`CONFIG GET`, else
 `INFO memory`, as on ElastiCache) and picks:
@@ -209,11 +214,16 @@ reset. A change logs `key_expiry_changed` (warning, with `store`, `policy`, `bef
 strict-mode process unready. Give every process of one prefix the same setting: the last one to
 write `P:expiry` wins, and each logs `key_expiry_changed` when it flips the mode.
 
-**Switching modes.** From `native` to `swept`, keys that already have a TTL keep it (and stay
-evictable) until they are written again or expire: within a day for the slowest (`ac`, `cb`,
-`rot`). From `swept` to `native`, indexed keys have no TTL until written again; the sweep still
-deletes them on time. Nothing is lost either way. During a rolling upgrade from 0.1.0b2, the old
-pods still set native TTLs; finish the rollout.
+**Switching modes.** In `swept` mode, setting an expiry also clears the key's native TTL
+(`PERSIST`); in `native` mode it also removes the key's `P:ttl` member; reading a key's time
+left counts either. So a switch (an upgrade from 0.1.0b2 on a `volatile-lru` store, or a policy
+change under `auto`) loses nothing: each key moves to the new mode on its next write, and a key
+never written again keeps its old expiry and still goes then. From `native` to `swept`, such a
+key keeps its TTL (and stays evictable) until it is written again or expires: within a day for
+the slowest (`ac`, `cb`, `rot`). From `swept` to `native`, it keeps its index member and the
+sweep, which runs in both modes, deletes it on time. During a rolling upgrade from 0.1.0b2 the
+old pods still set native TTLs and do not read `P:expiry`; finish the rollout (see
+[Upgrade](../how-to/upgrade.md)).
 
 **Seeing it.** `health()["key_expiry"]` is the state store's mode; the gauge
 `llmq_key_expiry_swept{store}` is 1 in `swept`; `ZCARD P:ttl` is the number of keys waiting to

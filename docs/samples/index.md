@@ -1,6 +1,6 @@
 # End-to-end samples
 
-Nine runnable programs, one per way an app uses llm-queue. Each is plain app code: it builds
+Ten runnable programs, one per way an app uses llm-queue. Each is plain app code: it builds
 the queue with `LLMQueue.from_env()` and reads nothing else, so you can copy it into a service
 as is. Every page shows the full code and its output: from fakellm (the fake Bedrock the
 checks run on), and from a live run on Amazon Bedrock where that run's output still matches the
@@ -15,7 +15,8 @@ code.
     Since then samples 02, 03, 06, 07, 08 and 09 show more of the 0.1.0b2 API and have not run
     on real Bedrock yet: their pages show fakellm output from 2026-11-16, and their live output
     will be refreshed on the next live run. Samples 01, 04 and 05 print what they printed then,
-    so their pages keep the live output. All nine pass on fakellm (2026-11-16), as
+    so their pages keep the live output. Sample 10 (purge) is new in 0.1.0b3 and has not run
+    on real Bedrock yet. All ten pass on fakellm (2026-11-16), as
     `python scripts/check.py samples` checks.
 
 ## What a sample run does
@@ -57,6 +58,7 @@ an app pod does. At the end the runner deletes every key under the run's prefix.
 | [07 Status and registry](status-and-registry.md) | `status`, `request_status`, live `registry.set`, audit `log`, `health`; tenant `fairness` set live | Admin pages, runbooks, readiness checks |
 | [08 LangChain](langchain.md) | `QueuedChatBedrockConverse` (with tools and `queue_streaming=True`), `QueuedBedrockEmbeddings` | LangChain / LangGraph chains, agents, RAG |
 | [09 HTTP router](http-router.md) | `http_router` on FastAPI: probes, admin routes, `GET /metrics`, `/drain` | Admin API, Kubernetes probes, the preStop hook |
+| [10 Purge](purge.md) | `llmq.purge`: a tenant purge planned then run, a deployment purge refused then planned with `force`; `PurgeReport.as_dict()` | Admin jobs, tenant offboarding, cleanup after a registry change |
 
 ## The registry they share
 
