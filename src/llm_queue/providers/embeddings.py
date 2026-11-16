@@ -15,11 +15,9 @@ from array import array
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any, Literal, TypeVar, get_args
+from typing import Any, Literal, get_args
 
 from llm_queue.errors import ConfigError
-
-_T = TypeVar("_T")  # PEP 695 syntax needs 3.12; the package supports 3.11
 
 TITAN_MAX_BATCH = 1
 COHERE_MAX_BATCH = 96
@@ -251,7 +249,7 @@ def request_body(
     return body if provider == "openai" else {"body": body}
 
 
-def batches(items: Sequence[_T], size: int) -> Iterator[list[_T]]:
+def batches[T](items: Sequence[T], size: int) -> Iterator[list[T]]:
     """Yield consecutive slices of at most `size` items, preserving order."""
     if size < 1:
         raise ValueError("batch size must be >= 1")

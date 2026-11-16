@@ -1,7 +1,7 @@
 # Release on a tag: `git tag -a v0.1.0b1 -m "llm-queue 0.1.0b1" && git push origin v0.1.0b1`.
 #
 #   verify  -> the tag is v<__version__>, the commit is on main, CHANGELOG has the version
-#   checks  -> every CI job (lint, types, unit tests on 3.11-3.14, integration, ...)
+#   checks  -> every CI job (lint, types, unit tests on 3.12-3.14, integration, ...)
 #   build   -> sdist + wheel once, `twine check`
 #   testpypi -> upload to TestPyPI
 #   smoke   -> install the uploaded wheel from TestPyPI in a clean env (dependencies from PyPI),

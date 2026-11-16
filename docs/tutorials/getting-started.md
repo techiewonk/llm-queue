@@ -3,7 +3,7 @@
 This tutorial installs llm-queue, starts a local store and a fake Bedrock, describes two models
 in a registry and makes a first call. Nothing here calls a real LLM.
 
-You need Python 3.11+ and Docker.
+You need Python 3.12+ and Docker.
 
 ## 1. Install
 

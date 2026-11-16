@@ -11,7 +11,7 @@ import functools
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, ParamSpec, TypeVar
+from typing import Any
 
 from redis.exceptions import ConnectionError as StoreConnectionError
 from redis.exceptions import OutOfMemoryError, ReadOnlyError
@@ -22,14 +22,11 @@ from llm_queue.errors import StoreUnavailable
 
 logger = get_logger(__name__)
 
-P = ParamSpec("P")
-R = TypeVar("R")
-
 # Store trouble an admin path reports as "unavailable" (http.py and the CLI catch it too).
 STORE_DOWN = (StoreConnectionError, StoreTimeoutError, ReadOnlyError, OutOfMemoryError, OSError)
 
 
-def store_op(fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+def store_op[**P, R](fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
     """Wrap an async admin method: store trouble becomes `StoreUnavailable`."""
 
     @functools.wraps(fn)

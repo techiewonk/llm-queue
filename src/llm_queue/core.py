@@ -29,7 +29,7 @@ from collections.abc import (
 )
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import Any, NotRequired, TypedDict, TypeVar, cast, overload
+from typing import Any, NotRequired, TypedDict, cast, overload
 
 import orjson
 
@@ -53,7 +53,6 @@ from llm_queue.registry.store import RegistryStore
 from llm_queue.tuning import Tuning
 
 logger = get_logger(__name__)
-_T = TypeVar("_T")
 # Store connections of the private engine that serves sync calls when no queue is started
 # (Celery workers, scripts): a caller-only engine needs few (D1).
 SYNC_STORE_CONNECTIONS = 20
@@ -734,7 +733,7 @@ class LLMQueue:
 
     # ---------------------------------------------------------------- sync (direct path)
 
-    def _run_sync(self, make: Callable[[Engine], Coroutine[Any, Any, _T]]) -> _T:
+    def _run_sync[T](self, make: Callable[[Engine], Coroutine[Any, Any, T]]) -> T:
         """Run a call from sync code: on the started queue's loop, else on the private loop."""
         self._check(same_loop=False, work=True)
         loop = self._loop
@@ -944,7 +943,7 @@ async def _close_offload(offload: ResultOffload | None) -> None:
             logger.warning("offload_close_failed", error=repr(exc))
 
 
-def _wait_on_loop(future: Future[_T], loop: asyncio.AbstractEventLoop) -> _T:
+def _wait_on_loop[T](future: Future[T], loop: asyncio.AbstractEventLoop) -> T:
     """Wait for a call sent to a started queue's loop, or fail when that loop stops running.
 
     A loop that was stopped (not closed) never runs the call, and `.result()` with no
@@ -993,7 +992,7 @@ class _PrivateLoop:
         )
         self.thread.start()
 
-    def submit(self, coro: Coroutine[Any, Any, _T]) -> Future[_T]:
+    def submit[T](self, coro: Coroutine[Any, Any, T]) -> Future[T]:
         """Run `coro` on the private loop."""
         return asyncio.run_coroutine_threadsafe(coro, self.loop)
 
@@ -1041,7 +1040,7 @@ class _SyncRunner:
 
         self._engine: Engine = self._private.submit(boot()).result()
 
-    def run(self, fn: Callable[[Engine], Coroutine[Any, Any, _T]]) -> _T:
+    def run[T](self, fn: Callable[[Engine], Coroutine[Any, Any, T]]) -> T:
         """Run one call on the private loop and wait for it."""
         # The check and the add are one step under the lock that close() takes: a call
         # submitted after close() took its snapshot ran on the stopped engine (CO-7).

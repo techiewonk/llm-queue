@@ -17,12 +17,11 @@ import os
 import threading
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from typing import Any
 
 from llm_queue._logging import get_logger
 
 logger = get_logger(__name__)
-_T = TypeVar("_T")
 
 # Pool size per client from the concurrency slots routed to its account and region (E5): a
 # floor so a small model still has spare connections. No cap: the slots already bound this
@@ -228,7 +227,7 @@ def client_hub() -> ClientHub:
     return _HUB
 
 
-def run(main: Coroutine[Any, Any, _T], *, use_uvloop: bool | None = None) -> _T:
+def run[T](main: Coroutine[Any, Any, T], *, use_uvloop: bool | None = None) -> T:
     """Run `main` like `asyncio.run`, on uvloop when it is installed (extra `uvloop`, not Windows).
 
     `use_uvloop=None` uses it when importable; `True` raises `MissingExtra` when it is not;
@@ -243,6 +242,6 @@ def run(main: Coroutine[Any, Any, _T], *, use_uvloop: bool | None = None) -> _T:
 
                 raise MissingExtra("run(use_uvloop=True)", "uvloop") from exc
         else:
-            result: _T = uvloop.run(main)
+            result: T = uvloop.run(main)
             return result
     return asyncio.run(main)

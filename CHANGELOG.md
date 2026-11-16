@@ -11,6 +11,10 @@ public API (see STABILITY.md).
 
 - Docs: a reference page listing every log event the library writes, with its level and
   module (`docs/reference/log-events.md`, R3OB-9).
+- `llm-queue registry schema` prints the registry document's JSON Schema (draft 2020-12),
+  generated from the same checks that validate a document; it needs no store and no `LLMQ_*`
+  settings. The schema is published as `docs/reference/registry-schema.json`, next to a new
+  reference page on the document's shape with a complete example (`docs/reference/registry.md`).
 
 ## [0.1.0b2] - 2026-11-15
 
@@ -22,6 +26,9 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 Every change an app pinned to 0.1.0b1 may need, as a checklist; each item is described in full
 below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with tables.
 
+0. **Python 3.12 or newer.** Python 3.11 is no longer supported (`requires-python >=3.12`):
+   CI tests 3.12, 3.13 and 3.14. The integration suite hung on 3.11 only, and 3.12 lets the
+   code use PEP 695 generics.
 1. **Drain every 0.1.0b1 worker before the first 0.1.0b2 pod starts.** Mixed fleets are not
    supported (owner Q32): a message with bytes is written in a form 0.1.0b1 does not decode.
 2. **Environment:** set `LLMQ_ENVIRONMENT=dev` where checks should be relaxed (unset is strict);

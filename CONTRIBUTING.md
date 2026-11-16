@@ -5,7 +5,7 @@ rules below follow from that. Where this file and the house standard disagree, t
 
 ## Setup
 
-You need Python 3.11+, [uv](https://docs.astral.sh/uv/) and Docker.
+You need Python 3.12+, [uv](https://docs.astral.sh/uv/) and Docker.
 
 ```bash
 uv sync --all-extras          # .venv with every extra and the dev group (uv.lock)
@@ -120,9 +120,9 @@ points the samples at the env file's store; the run touches only its own key pre
 deletes it afterwards.
 
 CI (`.github/workflows/ci.yml`) runs ruff, format, mypy and the unit tests on Python
-3.11-3.14, the unit tests on Windows and on the lowest allowed versions
+3.12-3.14, the unit tests on Windows and on the lowest allowed versions
 (`--resolution lowest-direct`), the LangChain 0.3 adapters, and unit plus integration tests
-against the same Docker stack on Python 3.11, 3.12 and 3.14 (with coverage on 3.12). The
+against the same Docker stack on Python 3.12, 3.13 and 3.14 (with coverage on 3.12). The
 nightly workflow (`.github/workflows/nightly.yml`, 02:17 UTC or by hand) runs the slow
 drills CI cannot run on every push: `scenarios.py all --load under`, `gates.py --quick` and
 a 10-minute soak, all on fakellm, and keeps `reports/` for 7 days.

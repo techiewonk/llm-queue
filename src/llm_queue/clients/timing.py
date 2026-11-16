@@ -11,9 +11,6 @@ import asyncio
 import time
 from collections.abc import AsyncIterator, Awaitable
 from dataclasses import dataclass, replace
-from typing import TypeVar
-
-_T = TypeVar("_T")  # PEP 695 syntax needs 3.12; the package supports 3.11
 
 
 class AttemptTimeout(TimeoutError):
@@ -33,7 +30,7 @@ class Timing:
     attempt_secs: float | None = None
 
 
-async def first(awaitable: Awaitable[_T], secs: float, what: str) -> _T:
+async def first[T](awaitable: Awaitable[T], secs: float, what: str) -> T:
     """Await within `secs`, else raise `AttemptTimeout` naming `what`.
 
     `asyncio.timeout`, not `wait_for`: on Python 3.11 `wait_for` lost a cancel that came in the
@@ -56,7 +53,7 @@ def opened(timing: Timing, started: float) -> Timing:
     return replace(timing, first_response_secs=max(0.0, left))
 
 
-async def paced(stream: AsyncIterator[_T], timing: Timing, *, started: bool) -> AsyncIterator[_T]:
+async def paced[T](stream: AsyncIterator[T], timing: Timing, *, started: bool) -> AsyncIterator[T]:
     """Yield a stream's items, each within the idle limit.
 
     The first item gets the first-response limit unless `started` (the response already came).

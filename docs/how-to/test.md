@@ -6,7 +6,7 @@ fakellm. The only path to a real model is `python scripts/samples.py --live`, ru
 
 ## Set up
 
-You need Python 3.11+, [uv](https://docs.astral.sh/uv/) and Docker.
+You need Python 3.12+, [uv](https://docs.astral.sh/uv/) and Docker.
 
 ```bash
 uv sync --all-extras          # .venv with every extra and the dev group
