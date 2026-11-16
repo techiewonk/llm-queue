@@ -1,11 +1,92 @@
-# What's new in 0.1.0b2
+# What's new
+
+## 0.1.0b3
+
+0.1.0b3 lets llm-queue share a cache store that evicts, and deletes the store state of what you
+removed. Pods of 0.1.0b2 and 0.1.0b3 can share a queue on a `noeviction` store; read
+[Upgrade](how-to/upgrade.md#from-010b2-to-010b3) before you deploy it on a `volatile-*` store or
+roll back. The full list is in the [Changelog](project/changelog.md).
+
+### Key expiry modes: run on a shared `volatile-*` cache
+
+ElastiCache's default policy, `volatile-lru`, evicts keys that have a TTL. With key expiry
+`swept`, none of the keys llm-queue needs has one: each expiry is a member of the zset `P:ttl`
+and a sweep in every process deletes due keys (up to 10 s late, 50000 keys per 10 s by
+default). The default `LLMQ_KEY_EXPIRY=auto` picks `swept` on any policy but `noeviction`, and
+the process is ready in strict mode. Switching modes loses nothing: keys move to the new mode on
+their next write.
+
+```bash
+LLMQ_KEY_EXPIRY=auto      # default: native on noeviction, swept on volatile-*
+```
+
+```python
+health = await llmq.health()
+assert health["key_expiry"] == "swept" and health["ready"]
+```
+
+Read [Run on a shared cache store](how-to/shared-cache-store.md) and
+[Key expiry modes](explanation/storage.md#key-expiry-modes).
+
+### Purge removed models, deployments and tenants
+
+`PurgeService` (`llmq.purge`, or `PurgeService.from_env()` without a queue) deletes the store
+state of a removed model, a removed deployment or a tenant, with a dry run first. Every real
+purge is audited. When a publish drops a model or deployment, worker processes purge it
+automatically after `LLMQ_PURGE_GRACE_SECS` (900) unless it comes back (`LLMQ_AUTO_PURGE`, on
+by default).
+
+```python
+plan = await llmq.purge.plan_tenant("acme")                  # what would go
+report = await llmq.purge.tenant("acme", actor="ops@example.com")
+print(report.as_dict())
+```
+
+The same purges from the CLI and HTTP (`POST /purge/tenant` with `allow_writes=True`; `dry_run`
+defaults to true):
+
+```bash
+llm-queue purge deployment gpt20b aws-main/us-east-1 --dry-run
+llm-queue --actor ops purge tenant acme --yes
+llm-queue --actor ops registry gc --yes [--no-wait]      # everything the registry no longer has
+```
+
+A purge that would delete state still in use raises `PurgeRefused` (HTTP 409). Read
+[Purge store state](how-to/purge.md) and the [purge sample](samples/purge.md).
+
+### Store keys reference
+
+Every key, stream and channel llm-queue keeps in the store, with its fields, writers, readers,
+lifetime in each key expiry mode, what is lost if it is evicted under each policy, and code
+references; also as JSON for tooling.
+
+```bash
+python -c "import json; print(len(json.load(open('docs/reference/store-keys.json'))))"
+```
+
+Read [Store keys](reference/store-keys.md).
+
+### Eviction drill
+
+`scripts/evict_drill.py` starts a throwaway Valkey with a small `maxmemory`, fills it with "app
+cache" keys under queue traffic, and checks that with `volatile-lru` every call answers and not
+one llm-queue key is evicted, and that with `noeviction` every call ends by itself.
+
+```bash
+python scripts/evict_drill.py                         # both policies, about 15 minutes
+python scripts/evict_drill.py volatile-lru --calls 500
+```
+
+See [CONTRIBUTING](project/contributing.md).
+
+## 0.1.0b2
 
 0.1.0b2 fixes what three code reviews and a rescan of 0.1.0b1 found, and settles how the queue
 behaves in production. It keeps no backward compatibility with 0.1.0b1 (a beta): read
 [Upgrade from 0.1.0b1](how-to/upgrade.md) before you deploy it, and drain every 0.1.0b1 worker
 first (mixed fleets are not supported). It needs Python 3.12 or newer. The full list is in the [Changelog](project/changelog.md).
 
-## Behaviour you can rely on
+### Behaviour you can rely on
 
 | Topic | What 0.1.0b2 does |
 |---|---|
@@ -17,7 +98,7 @@ first (mixed fleets are not supported). It needs Python 3.12 or newer. The full 
 | Strict mode | `LLMQ_ENVIRONMENT` **unset is strict** (TLS store, a 16-character `LLMQ_ID_HASH_SALT`, an explicit `LLMQ_KEY_PREFIX`, `https` endpoint overrides). Set `dev`, `local`, `test` or `ci` to relax it. An evicting store fails readiness |
 | Replica waits | `LLMQ_QUEUE_WAIT_REPLICAS` covers call sends, job sends and registry live edits, each switchable with `LLMQ_QUEUE_WAIT_SCOPES` (all on by default). Too few replicas: the write goes anyway, with a warning at most once a minute and a metric |
 
-## New features
+### New features
 
 | Feature | Where to read |
 |---|---|
@@ -32,7 +113,7 @@ first (mixed fleets are not supported). It needs Python 3.12 or newer. The full 
 | **Registry JSON Schema**: `llm-queue registry schema`, and a page on the document's shape with a complete example | [Registry document](reference/registry.md) |
 | **Faster transports**: Bedrock over aiohttp by default (measured +78-104 % calls/s against botocore), OpenAI-compatible calls through the SDK's aiohttp client | [Tune](how-to/tune.md), [Clients and connections](explanation/clients.md) |
 
-## Safer configuration
+### Safer configuration
 
 - Every registry number is bounded (at most 2**53 - 1; timeouts and waits at most a day), and
   `NaN`, trailing newlines and malformed role ARNs are refused with their path.

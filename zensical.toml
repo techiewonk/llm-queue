@@ -11,7 +11,7 @@ extra_css = ["stylesheets/extra.css"]
 
 nav = [
   { "Home" = "index.md" },
-  { "What's new in 0.1.0b2" = "whats-new.md" },
+  { "What's new" = "whats-new.md" },
   { "Get started" = [
     { "Getting started" = "tutorials/getting-started.md" },
   ] },
@@ -26,6 +26,7 @@ nav = [
     { "07 Status and registry" = "samples/status-and-registry.md" },
     { "08 LangChain" = "samples/langchain.md" },
     { "09 HTTP router" = "samples/http-router.md" },
+    { "10 Purge" = "samples/purge.md" },
   ] },
   { "How-to guides" = [
     { "Configure" = "how-to/configure.md" },
@@ -41,7 +42,7 @@ nav = [
     { "Many services, one model" = "how-to/share-models.md" },
     { "Secure a deployment" = "how-to/secure.md" },
     { "Test" = "how-to/test.md" },
-    { "Upgrade from 0.1.0b1" = "how-to/upgrade.md" },
+    { "Upgrade" = "how-to/upgrade.md" },
   ] },
   { "Explanation" = [
     { "Architecture overview" = "explanation/architecture.md" },

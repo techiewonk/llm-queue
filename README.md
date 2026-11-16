@@ -39,6 +39,13 @@ with Amazon Bedrock and OpenAI-compatible servers (such as vLLM), and with LangC
   optional token streaming (`queue_streaming=True`).
 - **Observability.** CloudWatch EMF or Prometheus metrics (`GET /metrics`), alerts, a status
   API, health and readiness routes, a CLI, and a documented list of every log event.
+- **Runs on a shared cache store.** With `LLMQ_KEY_EXPIRY=auto` (the default) llm-queue keeps
+  no TTL on the keys it needs when the store's policy is `volatile-*` (ElastiCache's default
+  `volatile-lru`), so it can share one Valkey with your app's cache and none of its keys is
+  evicted. See [Run on a shared cache store](https://techiewonk.github.io/llm-queue/how-to/shared-cache-store/).
+- **Purge as a service.** Delete the store state of removed models, deployments and tenants,
+  with dry runs and an audit, from Python, the CLI or HTTP, and automatically after a registry
+  change. See [Purge store state](https://techiewonk.github.io/llm-queue/how-to/purge/).
 - **A live registry.** Accounts, models and every setting live in one JSON document, validated
   with every problem listed at once, published to the store, edited live with an audit trail
   and rolled back; a JSON Schema is printed by `llm-queue registry schema`.
@@ -139,10 +146,10 @@ one). It is a beta: see [STABILITY](https://github.com/techiewonk/llm-queue/blob
 
 Full documentation: **https://techiewonk.github.io/llm-queue/**
 
-- [What's new in 0.1.0b2](https://techiewonk.github.io/llm-queue/whats-new/) and
-  [Upgrade from 0.1.0b1](https://techiewonk.github.io/llm-queue/how-to/upgrade/)
+- [What's new](https://techiewonk.github.io/llm-queue/whats-new/) and
+  [Upgrade](https://techiewonk.github.io/llm-queue/how-to/upgrade/)
 - [Getting started](https://techiewonk.github.io/llm-queue/tutorials/getting-started/): install, local stack, a registry, the first call
-- [How-to guides](https://techiewonk.github.io/llm-queue/how-to/configure/): configure, Bedrock IAM, tune, call, jobs, large results, operate, monitor, share models across services, secure, test
+- [How-to guides](https://techiewonk.github.io/llm-queue/how-to/configure/): configure, Bedrock IAM, tune, call, jobs, large results, operate, purge, run on a shared cache store, monitor, share models across services, secure, test, upgrade
 - [Explanation](https://techiewonk.github.io/llm-queue/explanation/architecture/): architecture, the life of a call, admission, tenant fairness, failures and recovery
 - [Reference](https://techiewonk.github.io/llm-queue/reference/configuration/): every setting with its default and range, the registry document and its JSON Schema, environment variables, error kinds, log events, CLI and HTTP, the Python API
 
