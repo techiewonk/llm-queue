@@ -57,9 +57,14 @@ def eviction_warning(policy: str, key_expiry: str = "native") -> str | None:
         return None
     if key_expiry == "swept" and policy in VOLATILE_POLICIES:
         return None
+    fix = (
+        "set LLMQ_KEY_EXPIRY=swept (or auto), or set noeviction"
+        if policy in VOLATILE_POLICIES
+        else "set noeviction, or a volatile-* policy with LLMQ_KEY_EXPIRY=swept"
+    )
     return (
         f"the store's maxmemory-policy is {policy}: when it fills it evicts queue messages, "
-        "budgets and results (lost calls, overspent budgets); set noeviction"
+        f"budgets and results (lost calls, overspent budgets); {fix}"
     )
 
 

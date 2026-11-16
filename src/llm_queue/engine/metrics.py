@@ -119,6 +119,7 @@ METRICS: dict[str, MetricSpec] = {
     "llmq_bad_messages_total": _c("model", "Messages that could not be read (dead-lettered)"),
     "llmq_newer_messages_total": _c("model", "Messages from a newer library, given back"),
     "llmq_swept_total": _c("model", "Lapsed leases and in-progress entries the sweep removed"),
+    "llmq_ttl_swept_total": _c("", "Keys the expiry index sweep deleted (swept key expiry)"),
     "llmq_reclaimed_total": _c("model", "Messages taken over from a worker that went quiet"),
     "llmq_stuck_calls_total": _c("model", "Held calls freed because nothing worked on them"),
     "llmq_store_resets_total": _c("", "State store resets (lost keys) this pod detected"),
@@ -193,6 +194,9 @@ METRICS: dict[str, MetricSpec] = {
     "llmq_outage_memo_active": _p("", "1 while this pod remembers a store outage (owner Q11)"),
     "llmq_store_eviction_unsafe": _p(
         "store", "1 when the store's eviction policy may evict queue keys (owner Q10)"
+    ),
+    "llmq_key_expiry_swept": _p(
+        "store", "1 when the store's keys expire through the index (swept), 0 for native TTLs"
     ),
     "llmq_ready": _p("", "1 when this pod is ready (0: draining, no registry, or evicting store)"),
     "llmq_heartbeat_age_seconds": _p(

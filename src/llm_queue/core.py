@@ -186,6 +186,7 @@ class Health(TypedDict):
     stores: dict[str, str | None]
     eviction_policy: str
     queue_eviction_policy: NotRequired[str]
+    key_expiry: str  # `native` or `swept` (LLMQ_KEY_EXPIRY, engine/expiry.py)
 
 
 @dataclass(frozen=True, slots=True)
