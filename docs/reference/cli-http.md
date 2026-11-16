@@ -17,7 +17,10 @@ write (`uid:<n>` when the user has no passwd entry, as in a container run under 
 | `llm-queue registry diff` | What is live but not in this process's config |
 | `llm-queue registry log [--count N] [--path P]` | The audit trail (default 20 entries): publishes, edits and CLI cancels |
 | `llm-queue registry publish [--from-version N]` | Publish `LLMQ_REGISTRY`, or roll back to version N |
-| `llm-queue registry gc --yes\|--dry-run` | Delete the keys and queues of models that no longer exist |
+| `llm-queue registry gc --yes\|--dry-run [--force]` | Purge the store state of every model and deployment the registry no longer has (`PurgeService.removed`); queues only when empty unless `--force`. Prints the purge report |
+| `llm-queue purge model M --yes\|--dry-run [--force]` | Purge a removed model: its keys, queues (empty ones unless `--force`) and doorbells. Refused while the registry has it, unless `--force` |
+| `llm-queue purge deployment M D --yes\|--dry-run [--force] [--no-wait] [--wait-secs S]` | Purge a removed deployment (`account/name`) of model M; waits for its running calls (`LLMQ_PURGE_WAIT`, `LLMQ_PURGE_WAIT_SECS`) |
+| `llm-queue purge tenant T --yes\|--dry-run [--remove keys,queued,running] [--models M1,M2]` | Purge a tenant's fairness state (default `LLMQ_TENANT_PURGE_DEFAULT`); `queued` / `running` cancel its calls and need `LLMQ_TENANT_INDEX` |
 | `llm-queue registry schema` | The registry document's JSON Schema ([Registry document](registry.md#json-schema)); needs no store and no `LLMQ_*` settings |
 | `llm-queue block --region R` / `--account A` | Stop using a region or an account |
 | `llm-queue unblock --region R` / `--account A` | Use it again |
@@ -27,8 +30,8 @@ write (`uid:<n>` when the user has no passwd entry, as in a container run under 
 | `llm-queue dlq list\|show\|redrive\|purge --job J [--count N]` | Dead jobs of a job name (instead of `--model`), kept `LLMQ_JOB_DEAD_RETENTION_SECS` (7 days) |
 | `llm-queue queues list` | The queues |
 
-Commands that delete or move data (`dlq purge`, `dlq redrive`, `registry gc`, `drain`,
-`cancel`) refuse to run without `--yes`; `--dry-run` shows what they would do. The CLI reads the
+Commands that delete or move data (`dlq purge`, `dlq redrive`, `registry gc`, `purge`,
+`drain`, `cancel`) refuse to run without `--yes`; `--dry-run` shows what they would do. The CLI reads the
 store password like the app does. `--actor` is 1-200 characters without control characters.
 
 **`drain` stays until it is undone.** It is a live edit (`enabled: false` on the model), so the
@@ -59,6 +62,12 @@ app.include_router(llmq.http_router(dependencies=[Depends(require_admin)]), pref
 | `GET /registry` | `dependencies` | The live registry (role ARNs and secret references redacted) |
 | `POST /registry?model=M` | `dependencies`, `allow_writes=True`, header `X-LLMQ-Admin` | Live edit: a JSON body of `path: value` (at most 100 paths), audited under `actor(request)` |
 | `POST /registry/block` | `dependencies`, `allow_writes=True`, header `X-LLMQ-Admin` | Block or unblock: a JSON body `{"region": R}` or `{"account": A}`, with `"on": true\|false` (default true), audited |
+| `POST /purge/model` | as above (the purge routes exist only with `allow_writes=True`) | `{"model": M, "force"?: bool, "dry_run"?: bool}`; the purge report. **`dry_run` defaults to true**: send `false` to purge |
+| `POST /purge/deployment` | as above | `{"model": M, "deployment": D, "force"?, "wait"?, "wait_secs"?, "dry_run"?}` |
+| `POST /purge/tenant` | as above | `{"tenant": T, "remove"?: ["keys", "queued", "running"], "models"?: [M], "dry_run"?}` |
+| `POST /registry/gc` | as above | `{"force"?, "dry_run"?}`: everything the registry no longer has |
+| `GET /purge/scheduled` | as above | Auto purges waiting for their grace |
+| `POST /purge/scheduled/cancel` | as above | `{"target": "alias" or "alias/account/name"}`: keep that state |
 
 Status codes of the admin routes (every route except the two health routes):
 
@@ -68,7 +77,7 @@ Status codes of the admin routes (every route except the two health routes):
 | 400 | A refused write: a live edit of a protected or deploy-only field, an invalid value, a bad block body, more than 100 paths, an id or name longer than 256 characters |
 | 403 | A write while `allow_writes` is off, or without the `X-LLMQ-Admin` header |
 | 404 | An unknown model (`/status`), an unknown or expired request id (`/requests/{id}`) |
-| 409 | A write lost the compare-and-set race with other writes on every try; the request is valid, retry after `Retry-After` (1 s) |
+| 409 | A write lost the compare-and-set race with other writes on every try; the request is valid, retry after `Retry-After` (1 s). A purge refused (`PurgeRefused`: still in the registry, or the tenant index is off), with no `Retry-After` |
 | 422 | A write body that is not a JSON object (FastAPI's own validation) |
 | 503 | The state store is unreachable, or the registry is not loaded yet (the router was hit before `start()` finished) |
 

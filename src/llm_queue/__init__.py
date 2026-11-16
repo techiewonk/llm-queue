@@ -29,6 +29,7 @@ from llm_queue.errors import (
     ConfigError,
     LLMQueueError,
     MissingExtra,
+    PurgeRefused,
     StoreUnavailable,
     UnknownModel,
 )
@@ -61,6 +62,7 @@ if TYPE_CHECKING:
     from llm_queue.engine.jobs import JobContext, JobFn, JobSettings, current_job
     from llm_queue.engine.metrics import EmfSink, Metrics, NullSink, PrometheusSink
     from llm_queue.engine.offload import ResultOffload, S3Offload
+    from llm_queue.engine.purge import PurgeReport, PurgeService
     from llm_queue.engine.store_client import Secrets
     from llm_queue.engine.tokens import register_token_estimator
     from llm_queue.providers.embeddings import EmbeddingCodec, register_embedding_family
@@ -113,6 +115,9 @@ _LAZY = {
     "current_job": "llm_queue.engine.jobs",
     "Secrets": "llm_queue.engine.store_client",
     "PublishResult": "llm_queue.registry.store",
+    # Purges of removed models / deployments and tenants (0.1.0b3): `LLMQueue.purge`.
+    "PurgeService": "llm_queue.engine.purge",
+    "PurgeReport": "llm_queue.engine.purge",
 }
 
 __all__ = [
@@ -145,6 +150,9 @@ __all__ = [
     "PrometheusSink",
     "Provider",
     "PublishResult",
+    "PurgeRefused",
+    "PurgeReport",
+    "PurgeService",
     "RateStatus",
     "RegistryConflict",
     "RegistryError",

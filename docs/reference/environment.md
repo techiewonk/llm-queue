@@ -115,6 +115,21 @@ For a store with replicas, also set `min-replicas-to-write` on the primary: a wr
 | `LLMQ_DRAIN_SECS` | 25 | 0 to 3600 | Default `drain_secs` of `stop()` (0 returns held work at once); fits the Kubernetes default grace period of 30 s (see [Operate](../how-to/operate.md#deploys-and-restarts)) |
 | `LLMQ_LOCAL_LIMIT_CAP` | 10 | above 0 to 100000 (whole) | Calls per process and model run without the store under `store_down: static_cap` |
 
+## Purge
+
+What a purge does by default; each method argument overrides its setting. See
+[Purge store state](../how-to/purge.md).
+
+| Variable | Default | Range | Meaning |
+|---|---|---|---|
+| `LLMQ_AUTO_PURGE` | true | true or false (`on` / `off`) | When a registry publish drops a model or deployment, purge its store state after `LLMQ_PURGE_GRACE_SECS` (one pod does it; a rollback within the grace keeps the state) |
+| `LLMQ_PURGE_GRACE_SECS` | 900 | 0 to 604800 | How long an auto purge waits after the drop; longer than the longest call |
+| `LLMQ_PURGE_WAIT` | true | true or false | A deployment purge waits for the deployment's running calls to end first |
+| `LLMQ_PURGE_WAIT_SECS` | 300 | 0 to 86400 | ... for at most this long; still running then, nothing is deleted and the report says why |
+| `LLMQ_PURGE_BATCH` | 500 | 1 to 10000 (whole) | Keys per pipelined `UNLINK` batch |
+| `LLMQ_TENANT_PURGE_DEFAULT` | `keys` | comma list of `keys`, `queued`, `running` | What a tenant purge removes: its fairness keys, its calls still waiting (cancelled), all its calls (cancelled). `queued` / `running` need `LLMQ_TENANT_INDEX` |
+| `LLMQ_TENANT_INDEX` | false | true or false | Keep a per-tenant index of calls (`P:tenant:<hash>:reqs`, one extra write per call) so a tenant purge can cancel them; off, asking for `queued` / `running` raises `PurgeRefused` |
+
 ## Endpoint overrides
 
 | Variable | Default | Range | Meaning |

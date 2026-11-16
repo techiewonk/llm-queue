@@ -37,6 +37,14 @@ class StoreUnavailable(LLMQueueError, ConnectionError):  # named for what it is
     """
 
 
+class PurgeRefused(LLMQueueError):
+    """A purge that would delete state still in use, or that needs a setting that is off.
+
+    E.g. a model still in the registry without `force`, or a tenant purge of queued / running
+    calls while `LLMQ_TENANT_INDEX` is off. Nothing was deleted.
+    """
+
+
 class MissingExtra(ConfigError, ImportError):  # named for what it is
     """An optional feature's dependencies are not installed; names the extra to install.
 

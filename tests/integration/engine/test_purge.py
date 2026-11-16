@@ -1,0 +1,308 @@
+"""Purge of removed models, deployments and tenants, and auto purge (0.1.0b3, owner K1-K5).
+
+Against the real stores (Valkey and Redis): each purge kind as a dry run, for real and again
+(idempotent), the refusals, the tenant `~sum` fix, the wait timeout and the auto purge grace.
+"""
+
+from __future__ import annotations
+
+import copy
+import dataclasses
+import json
+from typing import Any
+
+import pytest
+import redis.asyncio
+from engine_testkit import CHAT, Make, registry
+
+from llm_queue.engine.cli import amain
+from llm_queue.engine.purge import PurgeService, PurgeSettings, keyed_hash
+from llm_queue.errors import PurgeRefused
+from llm_queue.registry.store import RegistryStore
+
+pytestmark = pytest.mark.integration
+SALT = "purge-test-salt"
+
+
+async def _service(
+    store: redis.asyncio.Redis, prefix: str, doc: dict[str, Any] | None = None, **kw: Any
+) -> PurgeService:
+    reg = RegistryStore(store, prefix)
+    await reg.publish(doc or registry(), actor="test")
+    return PurgeService(store, reg, settings=PurgeSettings(**kw), salt=SALT)
+
+
+def _without(doc: dict[str, Any], version: int, *, model: str | None = None) -> dict[str, Any]:
+    """`doc` at `version`, without `model`, or without deployment aws-a/r2 of `big`."""
+    out = copy.deepcopy(doc)
+    out["registry_version"] = version
+    if model:
+        del out["models"][model]
+    else:
+        out["models"]["big"]["deployments"]["aws-a"]["confirmed"] = ["r1"]
+    return out
+
+
+async def _exists(store: redis.asyncio.Redis, keys: list[str]) -> list[int]:
+    return [int(await store.exists(k)) for k in keys]
+
+
+async def _last_audit(store: redis.asyncio.Redis, prefix: str) -> dict[bytes, bytes]:
+    entries = await store.xrevrange(f"{prefix}:{{reg}}:audit", count=1)
+    return dict(entries[0][1])
+
+
+async def test_model_purge_dry_run_real_and_again(store: redis.asyncio.Redis, prefix: str) -> None:
+    svc = await _service(store, prefix)
+    model = [f"{prefix}:{{m:ghost}}:cfg", f"{prefix}:{{m:ghost}}:rate:aws-a/r1"]
+    for key in model:
+        await store.hset(key, "x", "1")
+    await store.zadd(f"{prefix}:{{m:ghost}}:inprog", {"o": 1})
+    model.append(f"{prefix}:{{m:ghost}}:inprog")
+    dlq, bell = f"{prefix}:{{q:llm-ghost}}:dlq", f"{prefix}:bell:llm-ghost"
+    await store.xadd(dlq, {"body": "x"})
+    await store.rpush(bell, "1")
+    await store.zadd(f"{prefix}:ttl", {model[0]: 1})
+    keep = f"{prefix}:{{m:big}}:cfg"  # written by the publish
+    assert await store.exists(keep)
+
+    plan = await svc.plan_model("ghost")
+    assert (plan.deleted_keys, plan.queues, plan.dry_run) == (5, ("llm-ghost",), True)
+    assert await _exists(store, [*model, dlq, bell]) == [1] * 5
+
+    done = await svc.model("ghost", actor="ops")
+    assert (done.deleted_keys, done.queues, done.actor) == (5, ("llm-ghost",), "ops")
+    assert await _exists(store, [*model, dlq, bell, keep]) == [0] * 5 + [1]
+    assert await store.zscore(f"{prefix}:ttl", model[0]) is None
+    audit = await _last_audit(store, prefix)
+    assert (audit[b"op"], audit[b"actor"]) == (b"purge_model", b"ops")
+    assert done.as_dict()["queues"] == ["llm-ghost"]
+
+    again = await svc.model("ghost", actor="ops")
+    assert (again.deleted_keys, again.queues) == (0, ())
+
+
+async def test_model_purge_refusals_and_busy_queue(store: redis.asyncio.Redis, prefix: str) -> None:
+    svc = await _service(store, prefix)
+    with pytest.raises(PurgeRefused, match="still in the registry"):
+        await svc.model("big", actor="ops")
+    stream = f"{prefix}:{{q:llm-ghost}}:s"
+    await store.xadd(stream, {"body": "x"})
+    report = await svc.model("ghost", actor="ops")
+    assert report.queues == ()
+    assert report.skipped[0][0] == "llm-ghost"
+    assert "force" in report.skipped[0][1]
+    assert await store.exists(stream)
+    forced = await svc.model("ghost", actor="ops", force=True)
+    assert forced.queues == ("llm-ghost",)
+    assert not await store.exists(stream)
+
+
+async def _seed_deployment(store: redis.asyncio.Redis, prefix: str) -> tuple[list[str], list[str]]:
+    """State of big's aws-a/r2 (gone) and aws-a/r1 (kept): (r2 keys, r1 keys)."""
+    m = f"{prefix}:{{m:big}}:"
+    gone = [f"{m}{n}:aws-a/r2" for n in ("rate", "ac", "cb", "terr")]
+    gone += [f"{m}lease:aws-a/r2:p", f"{m}thr:aws-a/r2:123", f"{m}sticky:s1"]
+    kept = [f"{m}rate:aws-a/r1", f"{m}sticky:s2", f"{m}thr:aws-a/r1:123"]
+    for key in gone + kept:
+        if "sticky" in key:
+            await store.set(key, "aws-a/r2" if key in gone else "aws-a/r1")
+        else:
+            await store.hset(key, "x", "1")
+    await store.hset(f"{m}health", mapping={"aws-a/r2|until": 1, "aws-a/r1|until": 2})
+    await store.hset(f"{m}rot", mapping={"rr|aws-a/r2": 1, "cw|aws-a/r1": 2})
+    return gone, kept
+
+
+async def test_deployment_purge(store: redis.asyncio.Redis, prefix: str) -> None:
+    doc = registry()
+    svc = await _service(store, prefix, doc)
+    gone, kept = await _seed_deployment(store, prefix)
+    with pytest.raises(PurgeRefused):
+        await svc.deployment("big", "aws-a/r2", actor="ops")
+    await svc.registry.publish(_without(doc, 2), actor="test")
+
+    plan = await svc.plan_deployment("big", "aws-a/r2")
+    assert (plan.deleted_keys, plan.deleted_fields, plan.target) == (7, 2, "big/aws-a/r2")
+    done = await svc.deployment("big", "aws-a/r2", actor="ops")
+    assert (done.deleted_keys, done.deleted_fields) == (7, 2)
+    assert await _exists(store, gone) == [0] * 7
+    assert await _exists(store, kept) == [1] * 3
+    m = f"{prefix}:{{m:big}}:"
+    assert await store.hkeys(f"{m}health") == [b"aws-a/r1|until"]
+    assert await store.hkeys(f"{m}rot") == [b"cw|aws-a/r1"]
+    assert (await _last_audit(store, prefix))[b"op"] == b"purge_deployment"
+    again = await svc.deployment("big", "aws-a/r2", actor="ops")
+    assert (again.deleted_keys, again.deleted_fields) == (0, 0)
+
+
+async def test_deployment_purge_wait_timeout_skips(store: redis.asyncio.Redis, prefix: str) -> None:
+    doc = registry()
+    svc = await _service(store, prefix, doc, wait_secs=0.2)
+    await svc.registry.publish(_without(doc, 2), actor="test")
+    gone, _ = await _seed_deployment(store, prefix)
+    await store.hset(f"{prefix}:{{m:big}}:inprog:r-1", mapping={"dep": "aws-a/r2"})
+    waited = await svc.deployment("big", "aws-a/r2", actor="ops")  # wait=True by default
+    assert waited.deleted_keys == 0
+    assert "still running" in waited.skipped[0][1]
+    assert await _exists(store, gone) == [1] * 7
+    now = await svc.deployment("big", "aws-a/r2", actor="ops", wait=False)
+    assert now.deleted_keys == 7
+
+
+async def test_tenant_purge_fixes_the_weight_sum(store: redis.asyncio.Redis, prefix: str) -> None:
+    svc = await _service(store, prefix)
+    h, other = keyed_hash(SALT, "acme"), keyed_hash(SALT, "beta")
+    m = f"{prefix}:{{m:big}}:"
+    await store.hset(f"{m}tf:w", mapping={h: "2", other: "1", "~sum": "3"})
+    await store.zadd(f"{m}tf:act", {h: 1, other: 1})
+    await store.hset(f"{m}tf:t:{h}", "r_tat", 1)
+    await store.zadd(f"{m}tf:s:{h}", {"o": 1})
+
+    plan = await svc.plan_tenant("acme")
+    assert (plan.deleted_keys, plan.deleted_fields, plan.target) == (2, 2, f"tenant:{h}")
+    done = await svc.tenant("acme", actor="ops")
+    assert (done.deleted_keys, done.deleted_fields) == (2, 2)
+    assert await store.hgetall(f"{m}tf:w") == {other.encode(): b"1", b"~sum": b"1"}
+    assert await store.zrange(f"{m}tf:act", 0, -1) == [other.encode()]
+    assert await _exists(store, [f"{m}tf:t:{h}", f"{m}tf:s:{h}"]) == [0, 0]
+    assert b"acme" not in str(await _last_audit(store, prefix)).encode()  # only the hash
+    again = await svc.tenant("acme", actor="ops")
+    assert (again.deleted_keys, again.deleted_fields) == (0, 0)
+    await svc.tenant("beta", actor="ops", models=["big"])
+    assert not await store.exists(f"{m}tf:w")  # the last tenant: the hash goes
+
+
+async def test_tenant_calls_need_the_index(store: redis.asyncio.Redis, prefix: str) -> None:
+    svc = await _service(store, prefix)
+    with pytest.raises(PurgeRefused, match="LLMQ_TENANT_INDEX"):
+        await svc.tenant("acme", actor="ops", remove={"keys", "queued"})
+    indexed = await _service(store, prefix, tenant_index=True)
+    for rid, state in (("q1", "queued"), ("r1", "running")):
+        await indexed.index_call("acme", None, rid, now_ms=0, keep_ms=10**15)
+        await store.hset(f"{prefix}:{{r:{rid}}}:job", "state", state)
+    plan = await indexed.plan_tenant("acme", remove={"queued"})
+    assert plan.cancelled == 1
+    done = await indexed.tenant("acme", actor="ops", remove={"queued"})
+    assert done.cancelled == 1
+    assert await _exists(store, [f"{prefix}:{{r:q1}}:cancel", f"{prefix}:{{r:r1}}:cancel"]) == [
+        1,
+        0,
+    ]
+    everything = await indexed.tenant("acme", actor="ops", remove={"running", "keys"})
+    assert everything.cancelled == 2  # every indexed call (the cancel API counts a repeat)
+    h = keyed_hash(SALT, "acme")
+    assert not await store.exists(f"{prefix}:tenant:{h}:reqs")
+
+
+async def test_removed_purges_models_and_deployments(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    doc = registry()
+    svc = await _service(store, prefix, doc)
+    gone, kept = await _seed_deployment(store, prefix)
+    await store.hset(f"{prefix}:{{m:ghost}}:cfg", "x", 1)
+    await svc.registry.publish(_without(doc, 2), actor="test")
+    plan = await svc.removed(actor="ops", dry_run=True)
+    assert plan.deleted_keys == 8
+    assert plan.kind == "removed"
+    done = await svc.removed(actor="ops")
+    assert done.deleted_keys == 8
+    assert await _exists(store, [*gone, f"{prefix}:{{m:ghost}}:cfg"]) == [0] * 8
+    assert await _exists(store, kept) == [1] * 3
+    assert (await svc.removed(actor="ops")).deleted_keys == 0
+
+
+async def test_auto_purge_grace_rollback_and_due(store: redis.asyncio.Redis, prefix: str) -> None:
+    doc = registry()
+    svc = await _service(store, prefix, doc, grace_secs=600)
+    v1 = await svc.registry.load()
+    assert v1 is not None
+    await svc.tick(v1)  # first sight: nothing dropped yet
+    assert await svc.scheduled() == []
+    gone, _ = await _seed_deployment(store, prefix)
+    await store.hset(f"{prefix}:{{m:small}}:cfg", "x", 1)
+    v2_doc = _without(_without(doc, 2), 2, model="small")
+    await svc.registry.publish(v2_doc, actor="test")
+    v2 = await svc.registry.load()
+    assert v2 is not None
+    await svc.tick(v2)
+    pending = {row["target"]: row["kind"] for row in await svc.scheduled()}
+    assert pending == {"small": "model", "big/aws-a/r2": "deployment"}
+    await svc.tick(v2)  # within the grace: nothing purged
+    assert await _exists(store, gone) == [1] * 7
+
+    # Rollback within the grace: the entry goes when due, the state stays.
+    await store.zadd(f"{prefix}:purge", {"small": 0})
+    rolled = copy.deepcopy(doc)
+    rolled["registry_version"] = 3
+    rolled["models"]["big"]["deployments"]["aws-a"]["confirmed"] = ["r1"]
+    await svc.registry.publish(rolled, actor="test")
+    v3 = await svc.registry.load()
+    assert v3 is not None
+    await svc.tick(v3)
+    assert [r["target"] for r in await svc.scheduled()] == ["big/aws-a/r2"]
+    assert await store.exists(f"{prefix}:{{m:small}}:cfg")
+
+    # Due and still absent: purged, entry removed, audited as `auto`.
+    await store.zadd(f"{prefix}:purge", {"big/aws-a/r2": 0})
+    await svc.tick(v3)
+    assert await svc.scheduled() == []
+    assert await _exists(store, gone) == [0] * 7
+    assert (await _last_audit(store, prefix))[b"actor"] == b"auto"
+    assert not await svc.cancel_scheduled("big/aws-a/r2")
+
+
+async def test_auto_purge_off_schedules_nothing(store: redis.asyncio.Redis, prefix: str) -> None:
+    doc = registry()
+    svc = await _service(store, prefix, doc, auto=False)
+    v1 = await svc.registry.load()
+    assert v1 is not None
+    await svc.tick(v1)
+    await svc.registry.publish(_without(doc, 2, model="small"), actor="test")
+    v2 = await svc.registry.load()
+    assert v2 is not None
+    await svc.tick(v2)
+    assert await svc.scheduled() == []
+
+
+async def test_engine_has_the_service(make: Make) -> None:
+    engine, _ = await make(worker=False)
+    assert isinstance(engine.purge, PurgeService)
+    assert engine.purge.keys.prefix == engine.keys.prefix
+    assert engine.purge._hash("acme") == engine.hash_id("acme")
+
+
+async def test_cli_purge_dry_run_and_refusal(store: redis.asyncio.Redis, prefix: str) -> None:
+    doc = registry()
+    port = store.connection_pool.connection_kwargs["port"]
+    env = {
+        "LLMQ_STORE_URL": f"redis://:localdev@127.0.0.1:{port}/0",
+        "LLMQ_ENVIRONMENT": "test",
+        "LLMQ_KEY_PREFIX": prefix,
+        "LLMQ_REGISTRY": json.dumps(doc),
+    }
+    await amain(["registry", "publish"], env)
+    await store.hset(f"{prefix}:{{m:ghost}}:cfg", "x", 1)
+    dry = await amain(["purge", "model", "ghost", "--dry-run"], env)
+    assert (dry["deleted_keys"], dry["dry_run"]) == (1, True)
+    assert await store.exists(f"{prefix}:{{m:ghost}}:cfg")
+    with pytest.raises(PurgeRefused):
+        await amain(["purge", "tenant", "acme", "--remove", "queued", "--dry-run"], env)
+    done = await amain(["--actor", "ops", "registry", "gc", "--yes"], env)
+    assert (done["deleted_keys"], done["actor"]) == (1, "ops")
+
+
+async def test_engine_indexes_calls_by_tenant_when_asked(make: Make) -> None:
+    """`LLMQ_TENANT_INDEX`: each new call goes into its tenant's index (off: none is written)."""
+    engine, _ = await make()
+    assert (await engine.call("small", CHAT, tenant_id="acme")).ok
+    h = engine.hash_id("acme")
+    key = f"{engine.keys.prefix}:tenant:{h}:reqs"
+    assert not await engine.state.exists(key)
+    on = PurgeSettings(tenant_index=True)
+    engine.settings = dataclasses.replace(engine.settings, purge=on)
+    engine.purge.settings = on
+    reply = await engine.call("small", CHAT, tenant_id="acme")
+    assert reply.ok
+    assert await engine.state.zcard(key) == 1
