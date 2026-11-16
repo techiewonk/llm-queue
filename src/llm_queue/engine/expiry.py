@@ -125,11 +125,14 @@ class Expiry:
         """`script` with the helpers in front (for `register_script`)."""
         return prelude(self.prefix) + script
 
-    def expire(self, pipe: Any, key: str, secs: float) -> None:
-        """Queue an expiry of `secs` for `key` on a pipeline (or call it on a client)."""
+    def expire(self, pipe: Any, key: str, secs: float, *, grow: bool = False) -> None:
+        """Queue an expiry of `secs` for `key` on a pipeline; `grow`: never shorten it."""
         ms = max(1, int(secs * 1000))
         if self.swept:
-            pipe.zadd(self.index, {key: int(self._clock() * 1000) + ms})
+            pipe.zadd(self.index, {key: int(self._clock() * 1000) + ms}, gt=grow)
+        elif grow:  # GT alone never sets a first TTL (a key without one counts as endless)
+            pipe.pexpire(key, ms, nx=True)
+            pipe.pexpire(key, ms, gt=True)
         else:
             pipe.pexpire(key, ms)
 

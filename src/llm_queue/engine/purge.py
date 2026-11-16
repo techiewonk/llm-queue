@@ -22,6 +22,7 @@ import orjson
 
 from llm_queue._logging import get_logger
 from llm_queue.engine._codec import text as _text
+from llm_queue.engine.expiry import native
 from llm_queue.engine.fairness import tenant_of
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import StreamQueues
@@ -178,6 +179,7 @@ class PurgeService:
         self.registry = registry
         self.keys = Keys(registry.prefix)
         self.queue_prefix = queue_prefix
+        self.expiry = native(self.keys.prefix)  # the store's mode, set by the runtime
         self.settings = settings or PurgeSettings()
         self._hash = hash_id or (lambda value: keyed_hash(salt, value))
         self._metrics = metrics
@@ -505,8 +507,7 @@ class PurgeService:
             pipe.zadd(key, {request_id: now_ms + keep_ms})
             pipe.zremrangebyscore(key, "-inf", now_ms)
             # Lives as long as its longest call: set when none, else only lengthened.
-            pipe.pexpire(key, keep_ms + 60_000, nx=True)
-            pipe.pexpire(key, keep_ms + 60_000, gt=True)
+            self.expiry.expire(pipe, key, (keep_ms + 60_000) / 1000, grow=True)
             await pipe.execute()
 
     # ---------------------------------------------------------------- the purges

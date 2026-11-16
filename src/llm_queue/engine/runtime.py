@@ -683,7 +683,7 @@ class Engine:
         self.status_reader = StatusReader(state, self.keys, self.queues, self.settings.queue_prefix)
         self.alerts = AlertEvaluator(state, self.keys)
         # Each part writes expiries in its store's mode (owner K4; set again at start).
-        self.requests.expiry = self.alerts.expiry = self.expiry
+        self.requests.expiry = self.alerts.expiry = self.purge.expiry = self.expiry
         self.queues.expiry = self.queue_expiry
         # Gauges this process sets for the cluster while it holds the alert lock; cleared when
         # another process holds it, so no pod's /metrics keeps a stale value (R3OB-1).
