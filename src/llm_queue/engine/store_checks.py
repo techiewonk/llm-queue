@@ -1,9 +1,10 @@
 """Checks of a store's own setup, run once at start (plan C4, RESCAN A14).
 
-Two settings break the queue in ways that show only under load: an eviction policy other than
-`noeviction` lets the store drop queue messages, budgets and results when it fills (a lost call,
-an overspent budget), and cluster mode spreads one call's keys over shards, where the Lua
-scripts fail on their first call. `check_store` warns on the first and refuses the second.
+Two settings break the queue in ways that show only under load: an eviction policy that can
+evict the library's keys (`allkeys-*`, or `volatile-*` with native key expiry) lets the store
+drop queue messages, budgets and results when it fills (a lost call, an overspent budget), and
+cluster mode spreads one call's keys over shards, where the Lua scripts fail on their first
+call. `check_store` warns on the first and refuses the second.
 """
 
 from __future__ import annotations

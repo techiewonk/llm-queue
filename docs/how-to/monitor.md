@@ -159,6 +159,7 @@ from 0.1 s to 600 s. Alert gauges are named `llmq_alert_<name>`, labels `model` 
 | `llmq_bad_messages_total` | counter | model | Count | worker | Messages that could not be read (dead-lettered) |
 | `llmq_newer_messages_total` | counter | model | Count | worker | Messages from a newer library, given back |
 | `llmq_swept_total` | counter | model | Count | worker | Lapsed leases and in-progress entries the sweep removed |
+| `llmq_ttl_swept_total` | counter | - | Count | worker | Keys deleted by the expiry index sweep (`LLMQ_KEY_EXPIRY` swept: the expiries Valkey would have run) |
 | `llmq_reclaimed_total` | counter | model | Count | worker | Messages taken over from a worker that went quiet |
 | `llmq_stuck_calls_total` | counter | model | Count | worker | Held calls freed because nothing worked on them |
 | `llmq_store_resets_total` | counter | - | Count | worker | State store resets (lost keys) this pod detected |
@@ -205,6 +206,7 @@ from 0.1 s to 600 s. Alert gauges are named `llmq_alert_<name>`, labels `model` 
 | `llmq_store_up` | gauge | store | None | every pod | 1 when the store takes writes, 0 when down or read-only |
 | `llmq_held_calls` | gauge | - | Count | every pod | Calls this pod holds (waiting for budget or running) |
 | `llmq_outage_memo_active` | gauge | - | None | every pod | 1 while this pod remembers a store outage (owner Q11) |
-| `llmq_store_eviction_unsafe` | gauge | store | None | every pod | 1 when the store's eviction policy may evict queue keys (owner Q10) |
+| `llmq_store_eviction_unsafe` | gauge | store | None | every pod | 1 when the store's eviction policy may evict the library's keys in its key expiry mode (owner Q10): `allkeys-*`, or `volatile-*` with native TTLs |
+| `llmq_key_expiry_swept` | gauge | store | None | every pod | 1 when the store's keys expire through the index `P:ttl` (swept), 0 with native TTLs; see [Shared cache store](shared-cache-store.md) |
 | `llmq_ready` | gauge | - | None | every pod | 1 when this pod is ready (0: draining, no registry, or evicting store) |
 | `llmq_heartbeat_age_seconds` | gauge | - | Seconds | every pod | Seconds since this pod's heartbeat last made progress |

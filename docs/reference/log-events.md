@@ -71,6 +71,8 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `job_returned` | warning | engine/jobs.py |
 | `job_task_failed` | warning | engine/jobs.py |
 | `job_upkeep_failed` | warning | engine/jobs.py |
+| `key_expiry_changed` | warning | engine/runtime.py |
+| `key_expiry_publish_failed` | debug | engine/runtime.py |
 | `llmq_call_finished` | info | engine/runtime.py |
 | `llmq_purge` | info | engine/purge.py |
 | `llmq_registry_audit` | info | registry/store.py |
@@ -151,6 +153,7 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `sync_call_on_event_loop` | warning | core.py |
 | `sync_engine_close_failed` | warning | core.py |
 | `tenant_index_failed` | warning | engine/runtime.py |
+| `ttl_sweep_failed` | warning | engine/runtime.py |
 | `undo_skipped` | warning | engine/admission.py |
 | `waiting_calls_lost` | warning | engine/runtime.py |
 | `warm_clients_failed` | warning | engine/runtime.py |
