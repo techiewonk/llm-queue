@@ -2,12 +2,21 @@
 
 Nine runnable programs, one per way an app uses llm-queue. Each is plain app code: it builds
 the queue with `LLMQueue.from_env()` and reads nothing else, so you can copy it into a service
-as is. Every page shows the full code and the **real output of a live run** on Amazon Bedrock.
+as is. Every page shows the full code and its output: from fakellm (the fake Bedrock the
+checks run on), and from a live run on Amazon Bedrock where that run's output still matches the
+code.
 
-!!! success "Last live run: 2026-11-14, code `v0.1.0b2`"
-    All nine samples passed on real Bedrock in `us-east-1`, with an ElastiCache Valkey 8.2 (TLS)
-    as the store, in strict mode (`LLMQ_ENVIRONMENT` unset): `python scripts/samples.py --live
-    --store env`. The run used its own key prefix and left no keys behind.
+!!! note "Last live run: 2026-11-14; samples changed since"
+    On 2026-11-14 all nine samples, as they were then, passed on real Bedrock in `us-east-1`,
+    with an ElastiCache Valkey 8.2 (TLS) as the store, in strict mode (`LLMQ_ENVIRONMENT`
+    unset): `python scripts/samples.py --live --store env`. The run used its own key prefix and
+    left no keys behind.
+
+    Since then samples 02, 03, 06, 07, 08 and 09 show more of the 0.1.0b2 API and have not run
+    on real Bedrock yet: their pages show fakellm output from 2026-11-16, and their live output
+    will be refreshed on the next live run. Samples 01, 04 and 05 print what they printed then,
+    so their pages keep the live output. All nine pass on fakellm (2026-11-16), as
+    `python scripts/check.py samples` checks.
 
 ## What a sample run does
 
@@ -40,14 +49,14 @@ an app pod does. At the end the runner deletes every key under the run's prefix.
 | Sample | Shows | Use it in |
 |---|---|---|
 | [01 Converse](converse.md) | `converse` with `request_context`; reply text and `meta` | Async request handlers, agent steps, anything user-facing |
-| [02 Stream](stream.md) | `converse_stream` events as they arrive; `partial_text` on a cut | Chat UIs and server-sent events |
-| [03 Embed](embed.md) | `embed` on Titan (1 text per request) and Cohere (96, `input_type`) | Indexing documents and search queries |
+| [02 Stream](stream.md) | `converse_stream` events as they arrive; `meta_event=True`; `partial_text` on a cut; `chat_stream` for OpenAI-compatible models | Chat UIs and server-sent events |
+| [03 Embed](embed.md) | `embed` on Titan (1 text per request) and Cohere (96, `input_type`); `EmbedResult` usage; `register_embedding_family` | Indexing documents and search queries |
 | [04 Sync](sync.md) | `converse_sync` / `embed_sync` on the direct path | Scripts, Celery tasks, sync libraries |
-| [05 Errors and fallback](errors-and-fallback.md) | Model fallback; `CallFailed.kind` to branch on | Every caller |
-| [06 Jobs](jobs.md) | `register_job` / `send_job`, LLM calls inside a job | Ingestion, nightly re-embedding, batch work |
-| [07 Status and registry](status-and-registry.md) | `status`, `request_status`, live `registry.set`, audit `log`, `health` | Admin pages, runbooks, readiness checks |
-| [08 LangChain](langchain.md) | `QueuedChatBedrockConverse` (with tools), `QueuedBedrockEmbeddings` | LangChain / LangGraph chains, agents, RAG |
-| [09 HTTP router](http-router.md) | `http_router` on FastAPI: probes, admin routes, `/drain` | Admin API, Kubernetes probes, the preStop hook |
+| [05 Errors and fallback](errors-and-fallback.md) | Model fallback; `CallFailed.kind`, typed `Kind`, to branch on | Every caller |
+| [06 Jobs](jobs.md) | `register_job(concurrency=)` / `send_job`, LLM calls inside a job; dead letters and `redrive_jobs` | Ingestion, nightly re-embedding, batch work |
+| [07 Status and registry](status-and-registry.md) | `status`, `request_status`, live `registry.set`, audit `log`, `health`; tenant `fairness` set live | Admin pages, runbooks, readiness checks |
+| [08 LangChain](langchain.md) | `QueuedChatBedrockConverse` (with tools and `queue_streaming=True`), `QueuedBedrockEmbeddings` | LangChain / LangGraph chains, agents, RAG |
+| [09 HTTP router](http-router.md) | `http_router` on FastAPI: probes, admin routes, `GET /metrics`, `/drain` | Admin API, Kubernetes probes, the preStop hook |
 
 ## The registry they share
 

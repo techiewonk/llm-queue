@@ -10,6 +10,12 @@ runbooks and readiness checks.
 - `request_status(id)` follows a single call.
 - `registry.set` changes a safe setting live in every pod. Each change is audited, and
   `registry.log` lists the changes.
+- Per-tenant fairness (`fairness` in the registry, off by default) is a live setting too:
+  `quota` caps each tenant's rpm / tpm, `share` splits the budget by weight and lends what is
+  unused, `fair_queue` serves waiting tenants round robin. A call's tenant is its `tenant_id`,
+  else its `user_id`, from `request_context`. While it is on, `status(model)` has a `fairness`
+  entry with counts only, never a tenant id. Setting it to `None` deletes the model's own
+  value, back to the default. See [Tenant fairness](../explanation/fairness.md).
 - The same views are on the CLI (`llm-queue`) and the [HTTP router](http-router.md).
 
 ## Code
@@ -18,21 +24,26 @@ runbooks and readiness checks.
 --8<-- "samples/07_status_and_registry.py"
 ```
 
-## Output (live, 2026-11-14)
+## Output (fakellm, 2026-11-16)
 
 ```text
-request 01a1d83ea22470e1acb8721297d2277b: state=done
-aws-main/us-east-1: rpm 1/60 tpm 143/100000 healthy=True breaker=closed
+request 01a1e2cf4564776bbda5902ad4967f38: state=done
+aws-main/us-east-1: rpm 3/60 tpm 36/100000 healthy=True breaker=closed
 waiting={'priority': 0, 'normal': 0} in_progress=0
 gpt20b rpm 60 -> 45 (live)
-  audit: {'actor': 'sample', 'op': 'edit', 'diff': [{'path': 'models.gpt20b.rpm', 'before': 60, 'after': 45}], ...}
-  audit: {'actor': 'sample', 'op': 'edit', 'diff': [{'path': 'models.gpt20b.deployments.aws-main.overrides.us-east-1.enabled', 'before': False, 'after': None}], ...}
-  audit: {'actor': 'sample', 'op': 'edit', 'diff': [{'path': 'models.gpt120b.deployments.aws-main.overrides.us-east-1.enabled', 'before': False, 'after': None}], ...}
-health: {'live': True, 'ready': True, 'stores': {'state': 'ok', 'queue': 'ok'}}
+  audit: {'id': '1794806598887-0', 'actor': 'sample', 'op': 'edit', 'version': '1', 'diff': [{'path': 'models.gpt20b.rpm', 'before': 60, 'after': 45}], 'ts': '1794806598.8877'}
+  audit: {'id': '1794806590436-0', 'actor': 'sample', 'op': 'edit', 'version': '1', 'diff': [{'path': 'models.gpt20b.deployments.aws-main.overrides.us-east-1.enabled', 'before': False, 'after': None}], 'ts': '1794806590.4367'}
+  audit: {'id': '1794806590427-0', 'actor': 'sample', 'op': 'edit', 'version': '1', 'diff': [{'path': 'models.gpt120b.deployments.aws-main.overrides.us-east-1.enabled', 'before': False, 'after': None}], 'ts': '1794806590.4278'}
+fairness on: {'mode': 'quota', 'active_tenants': 1, 'waiting_within_share': 0}
+fairness off: in status: False
+health: {'live': True, 'ready': True, 'worker': '404211cf7799fd', 'version': '0.1.0b2', 'registry_version': 1, 'held': 0, 'heartbeat_age_secs': 2.4, 'stores': {'state': 'ok', 'queue': 'ok'}, 'eviction_policy': 'noeviction'}
 ```
 
-The last two audit entries come from [sample 05](errors-and-fallback.md) turning its
+The second and third audit entries come from [sample 05](errors-and-fallback.md) turning its
 deployments back on. The registry and its audit log are shared by every process using the same
 prefix.
+
+The live output will be refreshed on the next live run (`python scripts/samples.py --live`); the
+last one, on 2026-11-14, ran this sample before its current code.
 
 See also: [Operate](../how-to/operate.md), [CLI and HTTP](../reference/cli-http.md).

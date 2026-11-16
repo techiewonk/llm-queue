@@ -22,3 +22,10 @@ use `converse` / `embed` instead.
 gpt20b (sync): 'ready' via aws-main/us-east-1
 titan (sync): 1 vector of 1024 dims
 ```
+
+## Output (fakellm, 2026-11-16)
+
+```text
+gpt20b (sync): 'fakellm reply 2ad96802551ebd6c' via aws-main/us-east-1
+titan (sync): 1 vector of 1024 dims
+```

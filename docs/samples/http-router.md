@@ -7,6 +7,7 @@ API, Kubernetes probes and the preStop hook.
 flowchart LR
   k8s["Kubernetes probes"] -- "no auth" --> h["/llm-queue/health/live<br/>/llm-queue/health/ready"]
   admin["Admin user"] -- "app's admin dependency" --> r["/llm-queue/status<br/>/llm-queue/requests/{id}<br/>/llm-queue/registry"]
+  prom["Prometheus"] -- "no auth" --> m["/llm-queue/metrics"]
   pre["preStop hook"] --> d["/drain → pause_receiving()"]
   d -. "ready → 503" .-> h
 ```
@@ -18,6 +19,9 @@ flowchart LR
   Every other route runs the app's admin dependencies.
 - Writes (live registry edits, region and account blocks) stay off unless `allow_writes=True`.
   Each write is audited under the `actor` you return.
+- `metrics_route=True` adds `GET /metrics`: the Prometheus exposition of a Prometheus sink
+  (`LLMQ_METRICS_SINK=prometheus`, or `metrics=PrometheusSink()` as in the sample; install the
+  `metrics` extra). It is open like the probes, so a scraper needs no admin credentials.
 - A preStop hook calls `pause_receiving()`. Readiness then fails and no new queued work starts,
   while running calls finish. `/drain` is the app's own route (the router has none) and answers
   GET, which is what Kubernetes' `preStop: httpGet` sends; a POST-only route answers it 405 and
@@ -31,19 +35,22 @@ flowchart LR
 --8<-- "samples/09_http_router.py"
 ```
 
-## Output (live, 2026-11-14)
+## Output (fakellm, 2026-11-16)
 
 ```text
-GET /health/ready -> 200 {'live': True, 'ready': True, 'stores': {'state': 'ok', 'queue': 'ok'}}
+GET /health/ready -> 200 {'live': True, 'ready': True, 'worker': '4beb9df1d0551a', 'version': '0.1.0b2', 'registry_version': 1, 'held': 0, 'heartbeat_age_secs': 0.0, 'stores': {'state': 'ok', 'queue': 'ok'}, 'eviction_policy': 'noeviction'}
 GET /status without the admin header -> 401
 GET /requests/{id} -> done
-  aws-main/us-east-1: rpm 2/60
+GET /metrics -> 200, 76 llmq_ series
+  aws-main/us-east-1: rpm 5/60
+POST /registry without X-LLMQ-Admin -> 403
 POST /registry rpm=50 -> [{'path': 'models.gpt20b.rpm', 'before': 60, 'after': 50}]
+POST /registry/block us-east-1 on=True -> 200
+POST /registry/block us-east-1 on=False -> 200
 after /drain: GET /health/ready -> 503
 ```
 
-Since this run the health body also carries `eviction_policy` (the state store's
-`maxmemory-policy`, `unknown` when unreadable) and, with a separate queue store,
-`queue_eviction_policy`; `/drain` is called with GET.
+The live output will be refreshed on the next live run (`python scripts/samples.py --live`); the
+last one, on 2026-11-14, ran this sample before its current code.
 
 See also: [CLI and HTTP](../reference/cli-http.md), [Operate](../how-to/operate.md).

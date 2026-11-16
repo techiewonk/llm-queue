@@ -35,10 +35,17 @@ LangChain / LangGraph chains, agents and RAG pipelines.
 --8<-- "samples/08_langchain.py"
 ```
 
-## Output (live, 2026-11-14)
+## Output (fakellm, 2026-11-16)
 
 ```text
-chat: 'An index fund is a passively managed mutual fund or ETF that seeks to replicate the performance of a specific market ind' via aws-main/us-east-1
-tool calls: [('stock_price', {'symbol': 'RELIANCE'})]
+chat: 'fakellm reply 1e23b81a404afcd9' via aws-main/us-east-1
+tool calls: [('stock_price', {'symbol': 'Use the stock_price tool to get the price of RELIANCE.'})]
+streamed: 5 chunks, 'fakellm reply 305b7948f2bb67e3', finish_reason=stop, output_tokens=8
 embeddings: 2 docs, query of 1024 dims
 ```
+
+fakellm answers with a fixed text and fills a tool's arguments with the prompt, so the replies
+mean nothing; the lines show what the code prints. On real Bedrock (2026-11-14) the tool call
+came back as `stock_price({'symbol': 'RELIANCE'})`. The live output will be refreshed on the
+next live run (`python scripts/samples.py --live`); the last one, on 2026-11-14, ran this sample
+before its current code.

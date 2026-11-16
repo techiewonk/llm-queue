@@ -45,4 +45,13 @@ gpt20b: 'Nifty 50.'
   served by gpt20b on aws-main/us-east-1, tokens 73/87, queue wait 48 ms
 ```
 
+## Output (fakellm, 2026-11-16)
+
+```text
+gpt120b: 'fakellm reply 06b36e2b0725d0c4'
+  served by gpt120b on aws-main/us-east-1, tokens 7/8, queue wait 703 ms
+gpt20b: 'fakellm reply 06b36e2b0725d0c4'
+  served by gpt20b on aws-main/us-east-1, tokens 7/8, queue wait 2 ms
+```
+
 See also: [Make calls](../how-to/call.md), [The life of a call](../explanation/call-lifecycle.md).

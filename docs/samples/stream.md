@@ -26,6 +26,14 @@ sequenceDiagram
 
 - `converse_stream` yields Bedrock ConverseStream events in order: `contentBlockDelta` carries
   the text, and `metadata` carries usage at the end.
+- `meta_event=True` ends a complete stream with one event of the library's own,
+  `{"llmq": {"usage": ..., "meta": ...}}`: tokens, and the model, deployment, fallback and
+  attempts that served it. A streaming caller never gets a `Reply`, so this is where it learns
+  them. Do not forward that event to the client.
+- `chat_stream` is the same call under the OpenAI name: an OpenAI-compatible model (provider
+  `openai`, such as vLLM) yields chat completion chunks, text in
+  `chunk["choices"][0]["delta"]["content"]`. The sample registry has only Bedrock models, so
+  that part runs only when the registry names one.
 - If the stream breaks after some text was sent, `CallFailed` carries `partial_text`, and the
   call is **not** retried, so the user never sees the answer start over.
 - Waits are capped by the call's deadline, so a stream never runs past its timeout.
@@ -36,11 +44,15 @@ sequenceDiagram
 --8<-- "samples/02_stream.py"
 ```
 
-## Output (live, 2026-11-14)
+## Output (fakellm, 2026-11-16)
 
 ```text
-A P/E ratio is the price of a stock divided by its earnings per share, showing how much investors are willing to pay for each dollar of earnings. It's used to gauge valuation: a low P/E may suggest a stock is cheap or undervalued, while a high P/E can signal overvaluation or high growth expectations.
-  [10 events, tokens 76/142]
+fakellm reply 56ea7996fa5ea4c8
+  [5 events, tokens 9/8]
+  served by gpt20b on aws-main/us-east-1, attempts 1, fallback=None
 ```
+
+The live output will be refreshed on the next live run (`python scripts/samples.py --live`); the
+last one, on 2026-11-14, ran this sample before its current code.
 
 See also: [Streaming](../explanation/streaming.md).

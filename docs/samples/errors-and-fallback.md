@@ -24,6 +24,10 @@ flowchart LR
     - `rate_limited` and `queue_full` mean busy: retry later.
     - `model_unavailable`, `model_disabled` and `no_deployment` mean nothing can serve the
       model now.
+- `exc.kind` is typed as the public `Kind` (`from llm_queue import Kind`), a `Literal` of every
+  kind a caller can get. Type your sets of kinds with it (`frozenset[Kind]`), and a type checker
+  flags a misspelt kind in a set or in `exc.kind == "..."`. The full list is in
+  [Errors](../reference/errors.md).
 
 ## Code
 
@@ -32,6 +36,13 @@ flowchart LR
 ```
 
 ## Output (live, 2026-11-14)
+
+```text
+gpt120b off -> served by gpt20b (fallback=model)
+gpt20b off -> CallFailed kind='model_unavailable' retry_after=60.0
+```
+
+## Output (fakellm, 2026-11-16)
 
 ```text
 gpt120b off -> served by gpt20b (fallback=model)
