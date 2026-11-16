@@ -7,14 +7,14 @@ the environment.
 | Sample | Shows | Use it in |
 |---|---|---|
 | `01_converse.py` | `converse` with `request_context` (priority, session, user); reply text and `meta` | Async request handlers (FastAPI routes), agent steps, anything user-facing |
-| `02_stream.py` | `converse_stream`: events as they arrive; `CallFailed.partial_text` on a cut | Chat UIs and server-sent events, where the first words should show at once |
-| `03_embed.py` | `embed` on Titan (1 text per request) and Cohere (96 per request, `input_type`) | Indexing documents (`search_document`) and search queries (`search_query`) |
+| `02_stream.py` | `converse_stream`: events as they arrive, `meta_event=True` (usage and how it was served, last); `CallFailed.partial_text` on a cut; `chat_stream` for an OpenAI-compatible model | Chat UIs and server-sent events, where the first words should show at once |
+| `03_embed.py` | `embed` on Titan (1 text per request) and Cohere (96 per request, `input_type`); `EmbedResult` tokens, batches, request ids; `register_embedding_family` | Indexing documents (`search_document`) and search queries (`search_query`) |
 | `04_sync.py` | `converse_sync` / `embed_sync` on the direct path, `close_sync()` | Sync code only: scripts, Celery tasks, sync libraries. Async code uses 01/03 |
-| `05_errors_and_fallback.py` | Model fallback when a model is off; `CallFailed.kind` to branch on | Every caller: map `kind` to a user message or a retry |
-| `06_jobs.py` | `register_job` / `send_job`: work that runs at least once, LLM calls inside | Ingestion, nightly re-embedding, any batch work that should not block a request |
-| `07_status_and_registry.py` | `status`, `request_status`, live `registry.set`, audit `log`, `health` | Admin pages, runbooks, readiness checks |
+| `05_errors_and_fallback.py` | Model fallback when a model is off; `CallFailed.kind`, typed as the public `Kind`, to branch on | Every caller: map `kind` to a user message or a retry |
+| `06_jobs.py` | `register_job(concurrency=)` / `send_job`: work that runs at least once, LLM calls inside; a failing job dead-lettered, `job_dead_letters`, `redrive_jobs` | Ingestion, nightly re-embedding, any batch work that should not block a request |
+| `07_status_and_registry.py` | `status`, `request_status`, live `registry.set`, audit `log`, `health`; tenant `fairness` turned on live and read from `status` | Admin pages, runbooks, readiness checks |
 | `08_langchain.py` | `QueuedChatBedrockConverse` (with tools) and `QueuedBedrockEmbeddings` | LangChain / LangGraph chains, agents, RAG: drop-in for `ChatBedrockConverse` / `BedrockEmbeddings` |
-| `09_http_router.py` | `http_router` on FastAPI: health without auth, status / registry behind the app's admin check, audited writes (`actor=`), `/drain` with `pause_receiving()` | Admin API and Kubernetes probes; the preStop hook |
+| `09_http_router.py` | `http_router` on FastAPI: health without auth, status / registry behind the app's admin check, audited writes (`actor=`), `GET /metrics` (`metrics_route=True`), `/drain` with `pause_receiving()` | Admin API and Kubernetes probes; the preStop hook |
 
 `registry.json` defines the four models the samples use: chat `gpt120b` (falls back to `gpt20b`)
 and `gpt20b`, and embeddings `titan` and `cohere`, all on one AWS account. The quotas are

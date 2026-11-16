@@ -5,6 +5,8 @@ take no auth (Kubernetes probes); every other route runs the app's admin depende
 (live registry edits, region / account blocks) stay off unless `allow_writes=True`; they take a
 JSON body and need the `X-LLMQ-Admin` header (a browser cannot send it cross-site). A preStop
 hook calls `llmq.pause_receiving()`: readiness fails and no new queued work starts.
+`metrics_route=True` adds `GET /metrics`, the Prometheus exposition of a Prometheus sink (extra
+`metrics`), open like the probes so a scraper can read it.
 
 Here the app is called in process (httpx's ASGI transport), so no port is opened; in the app
 the same router is served by uvicorn.
@@ -21,9 +23,10 @@ from collections.abc import AsyncIterator
 import httpx
 from fastapi import FastAPI, Header, HTTPException
 
-from llm_queue import LLMQueue
+from llm_queue import LLMQueue, PrometheusSink
 
-llmq = LLMQueue.from_env()
+# Prometheus metrics for /metrics; in an app `LLMQ_METRICS_SINK=prometheus` does the same.
+llmq = LLMQueue.from_env(metrics=PrometheusSink())
 
 
 def admin_only(x_admin_token: str = Header(default="")) -> None:
@@ -45,6 +48,7 @@ app.include_router(
         dependencies=[admin_only],
         allow_writes=True,
         actor=lambda request: "sample-admin",  # the authenticated user's name in an app
+        metrics_route=True,
     ),
     prefix="/llm-queue",
 )
@@ -83,6 +87,12 @@ async def main() -> None:
         found = await client.get(f"/llm-queue/requests/{reply.request_id}", headers=admin)
         print(f"GET /requests/{{id}} -> {found.json()['state']}")
         assert found.json()["state"] == "done"
+
+        metrics = await client.get("/llm-queue/metrics")  # no admin header: a scraper's GET
+        series = [line for line in metrics.text.splitlines() if line.startswith("llmq_")]
+        print(f"GET /metrics -> {metrics.status_code}, {len(series)} llmq_ series")
+        assert metrics.status_code == 200
+        assert series
 
         status = (await client.get("/llm-queue/status?model=gpt20b", headers=admin)).json()
         for dep in status["deployments"]:
