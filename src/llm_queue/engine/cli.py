@@ -1,4 +1,4 @@
-"""The `llm-queue` command line for 0.3 (plan §3.12, §3.18): registry, status, operations.
+"""The `llm-queue` command line: registry, status, purge and operations.
 
 Every command but `registry schema` reads `LLMQ_*` from the environment
 (`InfraSettings.from_env`) and talks to the stores directly; writes go through the registry
