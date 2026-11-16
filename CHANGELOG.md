@@ -7,6 +7,17 @@ public API (see STABILITY.md).
 
 ## [Unreleased]
 
+## [0.1.1] - UNRELEASED
+
+The first release that installs without `--pre`: `pip install llm-queue` (or
+`llm-queue==0.1.1`). The code is 0.1.0b3's plus the changes below; the 0.1.0b3 upgrade notes
+apply when coming from 0.1.0b2 or earlier.
+
+### Documentation
+
+- In-depth architecture, call flows for every path and failure mode, and the list of tested
+  scenarios, gates and drills with what each proves.
+
 ## [0.1.0b3] - 2026-11-16
 
 Key expiry modes, so llm-queue can share a `volatile-*` cache store (ElastiCache's default
@@ -1121,7 +1132,8 @@ First beta, for test runs (`pip install --pre llm-queue`).
 - **Docs site** (Zensical on GitHub Pages): tutorial, how-to guides, explanation with
   diagrams, an API reference from the docstrings.
 
-[Unreleased]: https://github.com/techiewonk/llm-queue/compare/v0.1.0b3...HEAD
+[Unreleased]: https://github.com/techiewonk/llm-queue/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/techiewonk/llm-queue/compare/v0.1.0b3...v0.1.1
 [0.1.0b3]: https://github.com/techiewonk/llm-queue/compare/v0.1.0b2...v0.1.0b3
 [0.1.0b2]: https://github.com/techiewonk/llm-queue/compare/v0.1.0b1...v0.1.0b2
 [0.1.0b1]: https://github.com/techiewonk/llm-queue/releases/tag/v0.1.0b1
