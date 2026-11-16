@@ -45,9 +45,10 @@ Errors are `LLMQueueError`s: `PurgeRefused` when a purge would delete state stil
 (nothing is deleted), `StoreUnavailable` when the store cannot serve it, `ConfigError` for a
 bad argument.
 
-## From your own API
+## Use it from your own API
 
-Put the purge behind your own route and your own auth; the library needs nothing else:
+Put the purge behind your own route and your own auth; the library needs nothing else. A dry
+run by default, as the built-in routes do:
 
 ```python
 from fastapi import Depends, FastAPI, HTTPException
@@ -106,15 +107,28 @@ logged `call_cancel` with `source=purge`.
 ## Automatic purge
 
 With `LLMQ_AUTO_PURGE=true` (the default), when a publish or reload drops a model or a
-deployment, one pod (lock `P:lock:purge`) records it in `P:purge` with a due time of now plus
-`LLMQ_PURGE_GRACE_SECS` (900). The sweep loop then purges each due target **that is still
-absent** from the registry; a rollback within the grace keeps the state (the entry is dropped,
-logged `purge_unscheduled`). A dropped model's purge covers its deployments. Auto purges are
-audited with the actor `auto`.
+deployment, one worker (lock `P:lock:purge`) records it in `P:purge` with a due time of now
+plus `LLMQ_PURGE_GRACE_SECS` (900). The worker sweep loop then purges each due target **that is
+still absent** from the registry; a rollback within the grace keeps the state (the entry is
+dropped, logged `purge_unscheduled`). A dropped model's purge covers its deployments. Auto
+purges are audited with the actor `auto`.
 
-Each pod compares the registry it sees with the one it saw before, so a drop is noticed while
-pods run; a drop made while no worker ran is cleaned by `llm-queue registry gc` (or
-`purge.removed()`). Set `LLMQ_AUTO_PURGE=false` to purge only by hand.
+- **Workers only.** Auto purge runs in worker processes; a caller-only process (`workers=0`)
+  never schedules or runs one.
+- **The first tick is a baseline.** Each worker compares the registry with the one it saw at
+  its previous tick. Its first tick after start only records what it sees, so starting a pod
+  never schedules a purge. A drop made while no worker ran is not noticed: clean it with
+  `llm-queue registry gc` (or `purge.removed()`).
+- **Strict registry read.** Before it schedules or runs a purge, the worker reads the registry
+  as stored (not its own cached copy). If that read fails or the document is refused (for
+  example it does not validate), it skips the purge and tries again next tick: a stale or
+  fallback copy never deletes a live model's state.
+- **No wait for running calls.** An auto deployment purge does not wait for running calls
+  (`wait=False`). The grace covers them: by default `LLMQ_PURGE_GRACE_SECS` (900) is as long as
+  the longest call the registry allows (`timeout_max_secs`, 900), and a dropped deployment gets
+  no new calls. If you raise `timeout_max_secs`, raise the grace to at least the same.
+
+Set `LLMQ_AUTO_PURGE=false` to purge only by hand (the 0.1.0b2 behaviour).
 
 ## CLI
 
@@ -123,10 +137,12 @@ llm-queue purge model old-model --dry-run
 llm-queue --actor ops purge model old-model --yes [--force]
 llm-queue --actor ops purge deployment gpt20b aws-main/us-east-1 --yes [--no-wait] [--wait-secs 60]
 llm-queue --actor ops purge tenant acme --yes [--remove keys,queued] [--models gpt20b,gpt120b]
-llm-queue --actor ops registry gc --yes [--force]   # every removed model and deployment
+llm-queue --actor ops registry gc --yes [--force] [--no-wait]   # every removed model and deployment
 ```
 
-Each needs `--yes` or `--dry-run` and prints the report. See [CLI and HTTP](../reference/cli-http.md).
+Each needs `--yes` or `--dry-run` and prints the report. `--no-wait` (on `purge deployment`
+and `registry gc`) deletes a deployment's state without waiting for its running calls. See
+[CLI and HTTP](../reference/cli-http.md).
 
 ## HTTP
 
@@ -143,6 +159,11 @@ curl -X POST https://app/llmq/purge/tenant -H 'X-LLMQ-Admin: 1' \
 
 A refused purge answers 409 (no `Retry-After`), a bad body 400, a store outage 503.
 
+An HTTP request should not hang for minutes, so a purge over HTTP that waits for running calls
+(`/purge/deployment`, `/registry/gc`) waits at most `LLMQ_HTTP_PURGE_WAIT_SECS` (60): a larger
+or omitted `wait_secs` is capped to it. Calls still running then are reported in `skipped` and
+nothing of that deployment is deleted; purge again later, or send `"wait": false`.
+
 ## Settings
 
 | Variable | Default | Meaning |
@@ -151,6 +172,7 @@ A refused purge answers 409 (no `Retry-After`), a bad body 400, a store outage 5
 | `LLMQ_PURGE_GRACE_SECS` | 900 | Grace before an auto purge |
 | `LLMQ_PURGE_WAIT` | true | A deployment purge waits for its running calls |
 | `LLMQ_PURGE_WAIT_SECS` | 300 | ... at most this long |
+| `LLMQ_HTTP_PURGE_WAIT_SECS` | 60 | The longest an HTTP purge (deployment, gc) waits for running calls |
 | `LLMQ_PURGE_BATCH` | 500 | Keys per `UNLINK` batch |
 | `LLMQ_TENANT_PURGE_DEFAULT` | `keys` | What a tenant purge removes |
 | `LLMQ_TENANT_INDEX` | false | Index each call by tenant (needed for `queued` / `running`) |

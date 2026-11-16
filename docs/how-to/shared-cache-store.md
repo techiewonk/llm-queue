@@ -43,10 +43,11 @@ Raise them only if `ZCARD P:ttl` keeps growing while the load is steady (see ste
 ## 2. What changes
 
 - Keys expire up to 10 s late (one sweep). Lifetimes are otherwise the same.
-- Six short-lived keys keep a real TTL on purpose (locks, the readiness probe, debug capture).
+- Seven short-lived keys keep a real TTL on purpose (locks, the readiness probe, debug capture).
   The store may evict them; the cost is duplicate work at most. See
   [Key expiry modes](../explanation/storage.md#key-expiry-modes).
-- One extra `ZADD` per expiry write, and one sweep script every 10 s on one process.
+- One extra `ZADD` per expiry write, and one sweep every 10 s: every process (worker or
+  caller) tries, and the one holding the lock `P:lock:ttlsweep` runs it.
 
 Example: a call's status record lives 1800 s. With `swept` it has no TTL; the zset `P:ttl`
 holds `llmq:{r:ID}:status` with score "now + 1800 s", and the sweep after that time deletes it.
@@ -120,16 +121,20 @@ valkey-cli -u "$LLMQ_STORE_URL" ZRANGE llmq:ttl 0 0 WITHSCORES   # the next one 
 ```
 
 `llmq` is the default `LLMQ_KEY_PREFIX`. `ZCARD llmq:ttl` should go up and down with traffic.
-If it only grows while the load is steady, the sweep is behind: check that a worker process is
-running (callers alone do not sweep) and that `llmq_ttl_swept_total` rises; then raise
-`LLMQ_TTL_SWEEP_ROUNDS`.
+If it only grows while the load is steady, the sweep is behind: check that `llmq_ttl_swept_total`
+rises (any running process sweeps, worker or caller) and that no `ttl_sweep_failed` warnings are
+logged; then raise `LLMQ_TTL_SWEEP_ROUNDS`.
 
 ## Moving an existing deployment
 
-1. Upgrade every process to 0.1.0b3 (older ones set native TTLs).
+1. Upgrade every process to 0.1.0b3 (0.1.0b2 pods do not read the store's mode and set native
+   TTLs).
 2. Keep `LLMQ_KEY_EXPIRY=auto` (or set `swept`).
 3. Point it at the shared store, or change the store's policy to `volatile-lru`.
 
-Keys written before the switch keep their native TTL until they are written again or expire
-(at most a day, for the slowest); until then they can still be evicted. Nothing else is needed.
+The switch loses nothing. In `swept` mode, setting an expiry also clears the key's native TTL
+(`PERSIST`), so each key moves to the index on its next write. A key written before the switch
+and not since keeps its native TTL and still expires then (at most a day, for the slowest);
+until then it can still be evicted. Nothing else is needed. To go back to 0.1.0b2, drain the
+index first: see [Upgrade](upgrade.md#3-rolling-back-to-010b2-after-running-swept).
 See [Store keys](../reference/store-keys.md) for what each key does in each mode.
