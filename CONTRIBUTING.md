@@ -44,6 +44,7 @@ python scripts/check.py all --release  # before a release: every scenario x ever
 python scripts/check.py soak3       # 3-minute soak: smoke test while fixing
 python scripts/check.py soak10      # 10 minutes: after a change to the engine
 python scripts/check.py soak20      # 20 minutes: before a release
+python scripts/check.py evict       # eviction drill (Docker), ~15 min: after a key expiry change
 ```
 
 **Logs.** Every check writes its whole output, live, to
@@ -91,6 +92,29 @@ Shorter runs catch broken recovery, leftovers and deadline bugs as well as long 
 time shows slow leaks and drift (more calls, more growth above the noise). Run
 `all --release` and `soak20` before a release.
 
+**Eviction drill.** `python scripts/evict_drill.py` proves that llm-queue survives a store that
+fills up and evicts, as a shared cache does. It starts a throwaway Valkey in Docker with a small
+`maxmemory` (`--maxmemory`, 64 MB), its own fakellm, and an "app cache" filler that writes keys
+with a TTL until the store is full and beyond, while it sends `--calls` calls (2000) through the
+queue with `LLMQ_KEY_EXPIRY=auto`:
+
+- `volatile-lru` (the queue runs `swept`): passes when every call answers, the store evicted
+  app keys, and not one key of the queue's prefix was evicted (keyspace `evicted` events; the
+  locks, health probe and debug keys kept on native TTLs on purpose may go).
+- `noeviction` (the queue runs `native`): passes when nothing is evicted and every call ends by
+  itself (an answer, or a `CallFailed` once the full store refuses writes), none hanging past
+  its deadline (`--call-timeout`, 20 s).
+
+Both policies take about 15 minutes; one policy, or fewer calls, is quicker. It needs Docker
+but not the stack, and saves its numbers in `reports/evict-<time>.json`. Run it after a change
+to key expiry or to anything that writes a key with a lifetime. It is also the check step
+`evict` (not in `all`; `--quick` sends 500 calls).
+
+```bash
+python scripts/evict_drill.py                          # both policies (~15 min)
+python scripts/evict_drill.py volatile-lru --calls 500 # one policy, fewer calls
+```
+
 Each step runs `ruff check`, `ruff format --check` and `mypy` on its source paths, then
 `pytest` on its tests, then any extra script. `all` instead lints and type-checks the union of
 every step's paths once, runs the unit tests once and the stack tests once, then each step's
@@ -111,6 +135,7 @@ that need the stack fail at once if a service does not answer; they never skip s
 | `gates` | `scripts/gates.py`: the plan's load and chaos gates on worker processes (~20 min) |
 | `soak3` / `soak10` / `soak20` (not in `all`) | `scripts/soak.py --minutes N`: 8 worker processes, chaos (kill, store block, live edit, restart), leak and drift checks; `soak20` before a release |
 | `samples` | `scripts/samples.py`: every file in `samples/` run as app code on fakellm |
+| `evict` (not in `all`) | `scripts/evict_drill.py`: the eviction drill on a throwaway Docker Valkey (`volatile-lru` and `noeviction`) |
 | `bench` (not gating, not in `all`) | `scripts/bench.py`: prints its numbers; a failure never fails the run |
 
 **No test calls a real LLM.** Unit tests use fakes, stack tests and drills use fakellm. The
@@ -125,7 +150,9 @@ CI (`.github/workflows/ci.yml`) runs ruff, format, mypy and the unit tests on Py
 against the same Docker stack on Python 3.12, 3.13 and 3.14 (with coverage on 3.12). The
 nightly workflow (`.github/workflows/nightly.yml`, 02:17 UTC or by hand) runs the slow
 drills CI cannot run on every push: `scenarios.py all --load under`, `gates.py --quick` and
-a 10-minute soak, all on fakellm, and keeps `reports/` for 7 days.
+a 10-minute soak, all on fakellm, and keeps `reports/` for 7 days. It also runs the engine
+integration tests with `LLMQ_TEST_KEY_EXPIRY=swept` (CI runs them with `auto`, which is
+`native` on the stack's `noeviction` stores).
 
 ### Adding a check step
 

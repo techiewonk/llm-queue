@@ -1,4 +1,5 @@
-# Nightly: the slow drills CI cannot run on every push (scenarios, gates, a 10-minute soak).
+# Nightly: the slow drills CI cannot run on every push (scenarios, gates, a 10-minute soak),
+# and the engine integration tests with key expiry `swept` (CI runs them with `auto`).
 # All on fakellm and the Docker stack; no real LLM and no secrets.
 name: nightly
 
@@ -47,5 +48,28 @@ jobs:
           path: reports/
           if-no-files-found: ignore
           retention-days: 7
+      - if: always()
+        run: docker compose -f docker/compose.yaml down
+
+  swept:
+    # The engine integration tests with no native TTLs: every expiry in the index `P:ttl`
+    # (LLMQ_KEY_EXPIRY=swept, as on a shared volatile-* store). Same stack as CI's integration.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        with:
+          python-version: "3.12"
+          enable-cache: false  # scheduled runs never restore a cache (cache poisoning)
+      - run: uv sync --all-extras --locked
+      - run: docker compose -f docker/compose.yaml up -d --wait
+      - run: uv run pytest tests/integration/engine -q
+        env:
+          LLMQ_TEST_KEY_EXPIRY: swept
+      - if: failure()
+        run: docker compose -f docker/compose.yaml logs --no-color
       - if: always()
         run: docker compose -f docker/compose.yaml down
