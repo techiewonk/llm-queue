@@ -35,6 +35,7 @@ from llm_queue.clients import (
     route_for,
 )
 from llm_queue.clients import pool as pool_module
+from llm_queue.clients.timing import AttemptTimeout
 from llm_queue.errors import ErrorKind
 from llm_queue.providers import classify_bedrock, is_auth_error
 from llm_queue.providers.classify import is_transport_error
@@ -302,6 +303,11 @@ async def test_a_slow_refresh_is_not_cancelled_by_the_attempt_timer(
                 await bedrock.call("converse", CHAT, _route(view), tight)
             except CredentialsUnavailable as exc:
                 messages.append(str(exc))
+                continue
+            except AttemptTimeout:
+                # Only once the refresh has landed: the call itself outlasted the tight 0.3 s
+                # timer on a slow runner (GitHub CI); before that a cut must be credentials.
+                assert len(asked) >= 2, "cut before the refresh landed: must be credentials"
                 continue
             ok = True
             break

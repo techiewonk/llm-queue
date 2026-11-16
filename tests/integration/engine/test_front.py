@@ -213,7 +213,8 @@ async def test_langchain_queue_streaming(llmq: LLMQueue) -> None:
         assert len(chunks) > 2  # the provider's events, not one whole message
         assert [n for n, c in enumerate(chunks) if c.usage_metadata] == [len(chunks) - 1]
         whole = functools.reduce(operator.add, chunks)
-        assert whole.text.startswith("fakellm")
+        text: Any = whole.text  # a method on langchain-core 0.3, a property on 1.x
+        assert str(text if isinstance(text, str) else text()).startswith("fakellm")
         assert whole.response_metadata["finish_reason"] == "stop"
         assert whole.response_metadata["served_model"] in ("big", "local")
         assert whole.usage_metadata is not None
