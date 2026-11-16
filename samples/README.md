@@ -15,6 +15,7 @@ the environment.
 | `07_status_and_registry.py` | `status`, `request_status`, live `registry.set`, audit `log`, `health`; tenant `fairness` turned on live and read from `status` | Admin pages, runbooks, readiness checks |
 | `08_langchain.py` | `QueuedChatBedrockConverse` (with tools) and `QueuedBedrockEmbeddings` | LangChain / LangGraph chains, agents, RAG: drop-in for `ChatBedrockConverse` / `BedrockEmbeddings` |
 | `09_http_router.py` | `http_router` on FastAPI: health without auth, status / registry behind the app's admin check, audited writes (`actor=`), `GET /metrics` (`metrics_route=True`), `/drain` with `pause_receiving()` | Admin API and Kubernetes probes; the preStop hook |
+| `10_purge.py` | `llmq.purge`: `plan_tenant` (dry run) then a real tenant purge, a deployment purge refused (`PurgeRefused`) then planned with `force=True`; `PurgeReport.as_dict()` | Admin jobs, tenant offboarding, cleanup after a model or deployment leaves the registry |
 
 `registry.json` defines the four models the samples use: chat `gpt120b` (falls back to `gpt20b`)
 and `gpt20b`, and embeddings `titan` and `cohere`, all on one AWS account. The quotas are
