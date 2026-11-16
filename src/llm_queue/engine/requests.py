@@ -27,6 +27,7 @@ from llm_queue.engine._admission_lua import _COMMON, _SETTLE
 from llm_queue.engine._codec import text as _text
 from llm_queue.engine.envelope import Reply
 from llm_queue.engine.errors import CallFailed
+from llm_queue.engine.expiry import native, prelude
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.offload import MARKER, ResultOffload
 from llm_queue.engine.queue import SEND_FN, QueueFull
@@ -75,25 +76,25 @@ local cancel_key = string.sub(KEYS[1], 1, -4) .. 'cancel'
 -- heartbeat was late was taken for gone and its queued calls dropped (R3FM-1, R3RC-3).
 if tonumber(caller_ttl or '') and tonumber(caller_ttl) > 0 then
   local prefix = string.match(KEYS[1], '^(.*):{r:')
-  redis.call('SET', prefix .. ':caller:' .. ARGV[3], '1', 'EX', tonumber(caller_ttl))
+  X.set(prefix .. ':caller:' .. ARGV[3], '1', tonumber(caller_ttl) * 1000)
 end
 -- The callers set lives as long as the record: an attach made it a set with no TTL (S9).
 local function keep_callers()
-  local ttl = redis.call('TTL', KEYS[1])
-  if ttl > 0 then redis.call('EXPIRE', KEYS[2], ttl) end
+  local ttl = X.pttl(KEYS[1])
+  if ttl > 0 then X.expire(KEYS[2], ttl) end
 end
 local function create()
   redis.call('HSET', KEYS[1], 'state', 'queued', 'user', ARGV[1], 'params', ARGV[2],
     'caller', ARGV[3], 'confirmed', '0', 'created', now)
   if ARGV[9] == '1' then redis.call('HSET', KEYS[1], 'app', '1') end
-  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
+  X.expire(KEYS[1], tonumber(ARGV[4]) * 1000)
   redis.call('SADD', KEYS[2], ARGV[3])
-  redis.call('EXPIRE', KEYS[2], tonumber(ARGV[4]))
+  X.expire(KEYS[2], tonumber(ARGV[4]) * 1000)
   if redis.call('HGET', KEYS[3], 'state') == false then
     local t = redis.call('TIME')
     redis.call('HSET', KEYS[3], 'state', 'waiting', 'model', ARGV[6], 'priority', ARGV[7],
       'enqueued_at', t[1] .. '.' .. string.format('%06d', tonumber(t[2])))
-    redis.call('EXPIRE', KEYS[3], tonumber(ARGV[5]))
+    X.expire(KEYS[3], tonumber(ARGV[5]) * 1000)
   end
   return 'new'
 end
@@ -183,8 +184,8 @@ if sent[1] == 'full' then
   return sent
 end
 redis.call('HSET', KEYS[1], 'confirmed', '1')
-redis.call('EXPIRE', KEYS[1], tonumber(ARGV[14]))
-redis.call('EXPIRE', KEYS[2], tonumber(ARGV[14]))
+X.expire(KEYS[1], tonumber(ARGV[14]) * 1000)
+X.expire(KEYS[2], tonumber(ARGV[14]) * 1000)
 return {outcome, sent[2]}
 """
 )
@@ -195,8 +196,8 @@ return {outcome, sent[2]}
 CONFIRM = """
 redis.call('HSET', KEYS[1], 'confirmed', '1')
 if ARGV[2] == '1' then redis.call('HSET', KEYS[1], 'direct', '1') end
-redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
-redis.call('EXPIRE', KEYS[2], tonumber(ARGV[1]))
+X.expire(KEYS[1], tonumber(ARGV[1]) * 1000)
+X.expire(KEYS[2], tonumber(ARGV[1]) * 1000)
 return 1
 """
 
@@ -227,7 +228,7 @@ local function set_status(key, state, ttl, from)
     table.insert(args, ARGV[i + 1])
   end
   redis.call(unpack(args))
-  if redis.call('TTL', key) < ttl then redis.call('EXPIRE', key, ttl) end
+  if X.pttl(key) < ttl * 1000 then X.expire(key, ttl * 1000) end
   return 1
 end
 """
@@ -240,15 +241,15 @@ end
 RESULT_PUT = (
     _STATUS_FN
     + """
-local written = redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', tonumber(ARGV[2]))
+local written = X.set(KEYS[1], ARGV[1], tonumber(ARGV[2]) * 1000, true)
 if redis.call('EXISTS', KEYS[2]) == 1 then
   redis.call('HSET', KEYS[2], 'state', ARGV[3])
-  redis.call('EXPIRE', KEYS[2], tonumber(ARGV[4]))
+  X.expire(KEYS[2], tonumber(ARGV[4]) * 1000)
 end
 for _, caller in ipairs(redis.call('SMEMBERS', KEYS[3])) do
   redis.call('PUBLISH', ARGV[5] .. caller, ARGV[6])
 end
-redis.call('EXPIRE', KEYS[3], tonumber(ARGV[4]))  -- (S9) no-op when the set is gone
+X.expire(KEYS[3], tonumber(ARGV[4]) * 1000)  -- (S9) no-op when the set is gone
 if ARGV[7] == '1' then set_status(KEYS[4], ARGV[3], tonumber(ARGV[8]), 9) end
 if written then return 1 end
 return 0
@@ -269,15 +270,15 @@ SETTLE_DONE = (
     + _SETTLE
     + _STATUS_FN
     + """
-local written = redis.call('SET', KEYS[1], ARGV[4], 'NX', 'EX', tonumber(ARGV[5]))
+local written = X.set(KEYS[1], ARGV[4], tonumber(ARGV[5]) * 1000, true)
 if redis.call('EXISTS', KEYS[2]) == 1 then
   redis.call('HSET', KEYS[2], 'state', ARGV[6])
-  redis.call('EXPIRE', KEYS[2], tonumber(ARGV[7]))
+  X.expire(KEYS[2], tonumber(ARGV[7]) * 1000)
 end
 for _, caller in ipairs(redis.call('SMEMBERS', KEYS[3])) do
   redis.call('PUBLISH', ARGV[8] .. caller, ARGV[9])
 end
-redis.call('EXPIRE', KEYS[3], tonumber(ARGV[7]))
+X.expire(KEYS[3], tonumber(ARGV[7]) * 1000)
 set_status(KEYS[4], ARGV[6], tonumber(ARGV[10]), 13)
 local acked = 0
 if redis.call('HGET', KEYS[7], ARGV[11]) == ARGV[12] then
@@ -304,8 +305,8 @@ if redis.call('HGET', KEYS[2], 'app') ~= '1' then
   if tonumber(ARGV[1]) <= 0 then
     redis.call('DEL', KEYS[1])
   else
-    local ttl = redis.call('TTL', KEYS[1])
-    if ttl > tonumber(ARGV[1]) then redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1])) end
+    local ttl = X.pttl(KEYS[1])
+    if ttl > tonumber(ARGV[1]) * 1000 then X.expire(KEYS[1], tonumber(ARGV[1]) * 1000) end
   end
 end
 """
@@ -328,8 +329,8 @@ if ARGV[2] ~= '' and string.sub(value, 1, #ARGV[2]) == ARGV[2] then return value
 if redis.call('HGET', KEYS[2], 'app') ~= '1' then
   local keep_ms = tonumber(ARGV[3])
   if tonumber(ARGV[1]) > 0 then keep_ms = tonumber(ARGV[1]) * 1000 end
-  local ttl = redis.call('PTTL', KEYS[1])
-  if ttl < 0 or ttl > keep_ms then redis.call('PEXPIRE', KEYS[1], keep_ms) end
+  local ttl = X.pttl(KEYS[1])
+  if ttl < 0 or ttl > keep_ms then X.expire(KEYS[1], keep_ms) end
 end
 return value
 """
@@ -346,7 +347,7 @@ local n = 0
 for i = 1, #KEYS / 2 do
   local state = redis.call('HGET', KEYS[2 * i - 1], 'state')
   if state ~= 'done' and state ~= 'failed' and state ~= 'expired' and state ~= 'cancelled' then
-    redis.call('SET', KEYS[2 * i], '1', 'EX', tonumber(ARGV[1]))
+    X.set(KEYS[2 * i], '1', tonumber(ARGV[1]) * 1000)
     redis.call('PUBLISH', ARGV[2], ARGV[2 + i])
     n = n + 1
   end
@@ -414,16 +415,18 @@ class RequestStore:
         self.offload = offload
         self.offload_bytes = offload_bytes
         self._unsent: dict[str, tuple[Reply, bytes]] = {}
-        self._register = client.register_script(REGISTER)
-        self._register_send = client.register_script(REGISTER_SEND)
-        self._confirm = client.register_script(CONFIRM)
-        self._abandon = client.register_script(ABANDON)
-        self._put = client.register_script(RESULT_PUT)
-        self._take = client.register_script(RESULT_TAKE)
-        self._drop_read = client.register_script(RESULT_DROP)
-        self._status = client.register_script(STATUS_SET)
-        self._cancel = client.register_script(CANCEL)
-        self._settle_done = client.register_script(SETTLE_DONE)
+        self.expiry = native(keys.prefix)  # the store's mode, set by the runtime at start
+        pre = prelude(keys.prefix)  # X.expire / X.pttl / X.set (engine/expiry.py)
+        self._register = client.register_script(pre + REGISTER)
+        self._register_send = client.register_script(pre + REGISTER_SEND)
+        self._confirm = client.register_script(pre + CONFIRM)
+        self._abandon = client.register_script(pre + ABANDON)
+        self._put = client.register_script(pre + RESULT_PUT)
+        self._take = client.register_script(pre + RESULT_TAKE)
+        self._drop_read = client.register_script(pre + RESULT_DROP)
+        self._status = client.register_script(pre + STATUS_SET)
+        self._cancel = client.register_script(pre + CANCEL)
+        self._settle_done = client.register_script(pre + SETTLE_DONE)
 
     def _req(self, request_id: str) -> tuple[str, str, str, str]:
         k = self.keys
@@ -639,7 +642,7 @@ class RequestStore:
         last offloading process wrote).
         """
         if self.offload is not None:
-            await self._client.set(self._flag_key(), b"1", ex=OFFLOAD_FLAG_SECS)
+            await self.expiry.set(self._client, self._flag_key(), b"1", OFFLOAD_FLAG_SECS)
             return
         if await self._client.exists(self._flag_key()):
             raise ConfigError(
@@ -687,7 +690,7 @@ class RequestStore:
             )
         else:
             with contextlib.suppress(Exception):  # only keeps the fleet flag fresh (Q24)
-                await self._client.set(self._flag_key(), b"1", ex=OFFLOAD_FLAG_SECS)
+                await self.expiry.set(self._client, self._flag_key(), b"1", OFFLOAD_FLAG_SECS)
             return MARKER + ref.encode()
         if len(data) <= _INLINE_MAX_BYTES:
             return data

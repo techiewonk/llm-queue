@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from llm_queue._logging import get_logger
 from llm_queue.engine._codec import text as _text
+from llm_queue.engine.expiry import native
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import StreamQueues
 from llm_queue.registry.settings import ALERT_DEFAULTS
@@ -295,6 +296,7 @@ class AlertEvaluator:
         """Keep the client for the change markers."""
         self._client = client
         self.keys = keys
+        self.expiry = native(keys.prefix)  # the store's mode, set by the runtime at start
         self._clear_runs: dict[str, int] = {}  # steady alert marker -> clear samples in a row
         self._on: dict[str, Alert] = {}  # alerts on at the last `changed()`, by marker
 
@@ -423,8 +425,9 @@ class AlertEvaluator:
         for start in range(0, len(alerts), _ALERT_BATCH):
             async with self._client.pipeline(transaction=False) as pipe:
                 for alert in alerts[start : start + _ALERT_BATCH]:
-                    pipe.set(_marker(self.keys, alert), _state(alert), ex=86_400, get=True)
-                previous += await pipe.execute()
+                    pipe.set(_marker(self.keys, alert), _state(alert), get=True)
+                    self.expiry.expire(pipe, _marker(self.keys, alert), 86_400)
+                previous += (await pipe.execute())[::2]  # the SET replies
         for alert, before in zip(alerts, previous, strict=True):
             state = _state(alert)
             if (_text(before) if before is not None else "0") != state:

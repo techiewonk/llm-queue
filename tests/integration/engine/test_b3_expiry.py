@@ -50,13 +50,13 @@ async def test_swept_mode_leaves_no_native_ttl(store: redis.asyncio.Redis, prefi
     assert await store.zcard(f"{prefix}:ttl") == 2
 
 
-async def test_missing_mode_key_means_swept(store: redis.asyncio.Redis, prefix: str) -> None:
-    """A store that lost `P:expiry` (reset) writes no native TTL: safe on every policy."""
+async def test_missing_mode_key_means_native(store: redis.asyncio.Redis, prefix: str) -> None:
+    """No `P:expiry` (no engine started yet): native TTLs, so keys expire without a sweeper."""
     expiry = Expiry(prefix, time.time)
     probe = store.register_script(expiry.lua("X.expire(KEYS[1], 60000) return 1"))
     await store.set(f"{prefix}:a", "1")
     await probe(keys=[f"{prefix}:a"])
-    assert await store.pttl(f"{prefix}:a") == -1
+    assert await store.pttl(f"{prefix}:a") > 0
 
 
 async def test_sweep_deletes_only_due_keys(store: redis.asyncio.Redis, prefix: str) -> None:

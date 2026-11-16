@@ -287,7 +287,8 @@ class JobRunner:
         claim = self.queues.keys.queue(queue, f"id:{ident}") if dedupe else ""
         # Claimed first for a short time, kept for the window only once the send worked: a
         # sender that dies between the two leaves a claim that lapses, not a lost job.
-        if dedupe and not await self.queues.client.set(claim, b"1", nx=True, ex=_CLAIM_SECS):
+        expiry = self.queues.expiry
+        if dedupe and not await expiry.set(self.queues.client, claim, b"1", _CLAIM_SECS, nx=True):
             logger.info("job_duplicate_send", job=name, id=ident)
             return ident
         try:
@@ -307,7 +308,7 @@ class JobRunner:
             raise
         if dedupe:
             try:
-                await self.queues.client.set(claim, b"1", ex=self.limits.dedupe_secs)
+                await expiry.set(self.queues.client, claim, b"1", self.limits.dedupe_secs)
             except Exception as exc:  # the job is queued; only the window is shorter
                 logger.warning("job_dedupe_not_kept", job=name, id=ident, error=str(exc))
         await self._check_consumer(name)
@@ -394,8 +395,10 @@ class JobRunner:
         queue = self.queue(name)
         await self.queues.mark_consumer(queue, CONSUMER_TTL_SECS)
         client = self.queues.client
-        await client.sadd(self.names_key, name)
-        await client.expire(self.names_key, self.settings.dlq_retention_secs)
+        async with client.pipeline(transaction=False) as pipe:
+            pipe.sadd(self.names_key, name)
+            self.queues.expiry.expire(pipe, self.names_key, self.settings.dlq_retention_secs)
+            await pipe.execute()
         await self.queues.trim_dead(queue, self.settings.dlq_retention_secs)
 
     async def _loop(self, name: str) -> None:
@@ -555,7 +558,9 @@ class JobRunner:
         key = self.queues.keys.queue(message.queue, "returns")
         try:
             returns = int(await self.queues.client.hincrby(key, message.id, 1))
-            await self.queues.client.expire(key, self.settings.retention_secs)
+            async with self.queues.client.pipeline(transaction=False) as pipe:
+                self.queues.expiry.expire(pipe, key, self.settings.retention_secs)
+                await pipe.execute()
         except Exception as exc:  # not counted: the job still goes back
             logger.warning("job_return_not_counted", job=name, id=ident, error=str(exc))
             returns = 0

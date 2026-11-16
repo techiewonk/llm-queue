@@ -21,6 +21,7 @@ from redis.exceptions import TimeoutError as StoreTimeoutError
 
 from llm_queue._logging import get_logger
 from llm_queue.engine import _admission_lua as lua
+from llm_queue.engine.expiry import prelude
 from llm_queue.engine.fairness import Fairness
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.metrics import Metrics, NullSink
@@ -165,13 +166,14 @@ class Admission:
             "slow_stale_ms": pace.slow_stale_ms,
             "job_ttl_ms": pace.job_ttl_ms,
         }
-        self._pick = client.register_script(lua.PICK_TAKE)
-        self._finish = client.register_script(lua.FINISH)
-        self._undo = client.register_script(lua.UNDO)
-        self._renew = client.register_script(lua.RENEW)
-        self._sweep = client.register_script(lua.SWEEP)
-        self._reregister = client.register_script(lua.REREGISTER)
-        self._release = client.register_script(lua.RELEASE)
+        pre = prelude(keys.prefix)  # X.expire / X.pttl / X.set (engine/expiry.py)
+        self._pick = client.register_script(pre + lua.PICK_TAKE)
+        self._finish = client.register_script(pre + lua.FINISH)
+        self._undo = client.register_script(pre + lua.UNDO)
+        self._renew = client.register_script(pre + lua.RENEW)
+        self._sweep = client.register_script(pre + lua.SWEEP)
+        self._reregister = client.register_script(pre + lua.REREGISTER)
+        self._release = client.register_script(pre + lua.RELEASE)
 
     async def _call(self, script: Any, body: dict[str, Any]) -> Any:
         args: list[Any] = [self.keys.prefix, orjson.dumps({**body, "t": self._t})]

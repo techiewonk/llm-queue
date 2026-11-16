@@ -24,6 +24,7 @@ from redis.exceptions import NoScriptError
 from llm_queue._logging import get_logger
 from llm_queue.engine._codec import as_bytes as _bytes
 from llm_queue.engine._codec import text as _text
+from llm_queue.engine.expiry import native, prelude
 from llm_queue.engine.keys import Keys
 
 if TYPE_CHECKING:
@@ -52,7 +53,7 @@ local function send(stream, body, limit, retention_ms, bell)
     'body', body)
   redis.call('RPUSH', bell, '1')
   redis.call('LTRIM', bell, -64, -1)
-  redis.call('PEXPIRE', bell, 60000)
+  X.expire(bell, 60000)
   return {'ok', id}
 end
 """
@@ -194,7 +195,7 @@ local function ring(bell)
   if not bell or bell == '' then return end
   redis.call('RPUSH', bell, '1')
   redis.call('LTRIM', bell, -64, -1)
-  redis.call('PEXPIRE', bell, 60000)
+  X.expire(bell, 60000)
 end
 """
 
@@ -291,8 +292,7 @@ local function record(q, taken)
     base = string.sub(KEYS[(q - 1) * 7 + 1], 1, -2)
     bell = ARGV[6 + q] or ''
   end
-  redis.call('SET', claim, cjson.encode({n = nonce, b = base, bell = bell, t = t, d = dead_at}),
-    'PX', vis_ms)
+  X.set(claim, cjson.encode({n = nonce, b = base, bell = bell, t = t, d = dead_at}), vis_ms)
 end
 for q = 1, nq do
   local K = keys_of(q)
@@ -489,7 +489,7 @@ end
 if moved > 0 then
   redis.call('RPUSH', ARGV[3], '1')
   redis.call('LTRIM', ARGV[3], -64, -1)
-  redis.call('PEXPIRE', ARGV[3], 60000)
+  X.expire(ARGV[3], 60000)
 end
 return {moved, dropped, redis.call('XLEN', KEYS[6])}
 """
@@ -500,7 +500,7 @@ return {moved, dropped, redis.call('XLEN', KEYS[6])}
 RING = """
 redis.call('RPUSH', ARGV[1], '1')
 redis.call('LTRIM', ARGV[1], -64, -1)
-redis.call('PEXPIRE', ARGV[1], 60000)
+X.expire(ARGV[1], 60000)
 return 1
 """
 
@@ -566,20 +566,22 @@ class StreamQueues:
         """Register the scripts; no I/O until the first call."""
         self._client = client
         self.keys = keys
-        self._send = client.register_script(SEND)
-        self._receive = client.register_script(RECEIVE)
-        self._receive_first = client.register_script(RECEIVE_FIRST)
-        self._extend_many = client.register_script(EXTEND_MANY)
-        self._ack = client.register_script(ACK)
-        self._return = client.register_script(RETURN)
-        self._extend = client.register_script(EXTEND)
-        self._fail = client.register_script(FAIL)
-        self._depth = client.register_script(DEPTH)
-        self._redrive = client.register_script(REDRIVE)
-        self._trim_dead = client.register_script(TRIM_DEAD)
-        self._trim_dead_many = client.register_script(TRIM_DEAD_MANY)
-        self._ring = client.register_script(RING)
-        self._reclaim = client.register_script(RECLAIM)
+        self.expiry = native(keys.prefix)  # the store's mode, set by the runtime at start
+        pre = prelude(keys.prefix)  # X.expire / X.pttl / X.set (engine/expiry.py)
+        self._send = client.register_script(pre + SEND)
+        self._receive = client.register_script(pre + RECEIVE)
+        self._receive_first = client.register_script(pre + RECEIVE_FIRST)
+        self._extend_many = client.register_script(pre + EXTEND_MANY)
+        self._ack = client.register_script(pre + ACK)
+        self._return = client.register_script(pre + RETURN)
+        self._extend = client.register_script(pre + EXTEND)
+        self._fail = client.register_script(pre + FAIL)
+        self._depth = client.register_script(pre + DEPTH)
+        self._redrive = client.register_script(pre + REDRIVE)
+        self._trim_dead = client.register_script(pre + TRIM_DEAD)
+        self._trim_dead_many = client.register_script(pre + TRIM_DEAD_MANY)
+        self._ring = client.register_script(pre + RING)
+        self._reclaim = client.register_script(pre + RECLAIM)
 
     async def _send_and_wait(
         self, queue: str, args: list[bytes | int | str], replicas: int, wait_ms: int
@@ -644,7 +646,7 @@ class StreamQueues:
                 # A first send, or a failover to a node without the script cached: load it and
                 # run once more. Exactly once, like redis-py's own reload for plain script
                 # calls: a second NOSCRIPT means the cache was flushed again mid-call.
-                await self._client.script_load(SEND)
+                await self._client.script_load(self._send.script)  # with the prelude
                 reply, acked = await self._send_and_wait(queue, args, wait_replicas, wait_ms)
         if _text(reply[0]) == "full":
             raise QueueFull(queue, int(reply[1]))
@@ -842,7 +844,7 @@ class StreamQueues:
 
     async def mark_consumer(self, queue: str, ttl_secs: int) -> None:
         """Say a process consumes this queue; the mark lapses `ttl_secs` after the last one."""
-        await self._client.set(self.keys.queue(queue, "consumer"), b"1", ex=ttl_secs)
+        await self.expiry.set(self._client, self.keys.queue(queue, "consumer"), b"1", ttl_secs)
 
     async def has_consumer(self, queue: str) -> bool:
         """True while some process marks itself as this queue's consumer."""

@@ -669,6 +669,9 @@ class Engine:
         self.health = Health(state, self.keys)
         self.status_reader = StatusReader(state, self.keys, self.queues, self.settings.queue_prefix)
         self.alerts = AlertEvaluator(state, self.keys)
+        # Each part writes expiries in its store's mode (owner K4; set again at start).
+        self.requests.expiry = self.alerts.expiry = self.expiry
+        self.queues.expiry = self.queue_expiry
         # Gauges this process sets for the cluster while it holds the alert lock; cleared when
         # another process holds it, so no pod's /metrics keeps a stale value (R3OB-1).
         self._cluster = GaugeSet(self.metrics)
@@ -686,6 +689,7 @@ class Engine:
             state,
             block_ms=self.settings.timings.stream_read_block_ms,
             wake_key=f"{self.keys.prefix}:chunkwake:{self.worker_id}",
+            expiry=self.expiry,
         )
         # Call tasks of streams already read to their `end`: they finish here (result read,
         # cleanup) while the caller has moved on.
@@ -3485,7 +3489,7 @@ class Engine:
         async with self.state.pipeline(transaction=False) as pipe:
             pipe.hincrby(key, "retries", 1)
             pipe.hget(key, "first")
-            pipe.expire(key, 180)
+            self.expiry.expire(pipe, key, 180)
             pipe.hmget(self.keys.model(alias, f"retries:{minute - 1}"), ["retries", "first"])
             retries, first, _, (old_retries, old_first) = await pipe.execute()
         used = int(retries) + int(old_retries or 0) * weight
@@ -3574,6 +3578,7 @@ class Engine:
                 flush_ms=int(view.value(alias, "stream_flush_ms", dep_key)),
                 max_bytes=int(view.value(alias, "stream_max_bytes")),
                 ttl_secs=self.settings.result_ttl_secs + int(env.timeout_secs),
+                expiry=self.expiry,
             )
             if streamed is None:
                 streamed = await self.state.xlen(writer.key)
@@ -4866,8 +4871,8 @@ class Engine:
             logger.error("state_store_reset_detected")
             self.metrics.count("llmq_store_resets_total")
             await self.state.set(self.keys.epoch, str(self.clock.now()), nx=True)
-            await self.state.set(
-                f"{self.keys.prefix}:reset_minute", int(self.clock.now() // 60), ex=120
+            await self.expiry.set(
+                self.state, f"{self.keys.prefix}:reset_minute", int(self.clock.now() // 60), 120
             )
             value = await self.state.get(self.keys.epoch)
         seen, self._epoch = self._epoch, None if value is None else text(value)
@@ -4876,6 +4881,7 @@ class Engine:
                 logger.error("state_store_reset_detected", by="epoch_changed")
                 self.metrics.count("llmq_store_resets_total")
             self._sweep_now.set()  # waiting callers check their records now (R3RC-2)
+            await self._apply_expiry()  # the reset lost `P:expiry` too (owner K4)
             await self._reregister()
 
     async def _check_replication(self) -> None:

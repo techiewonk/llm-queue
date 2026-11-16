@@ -6,11 +6,13 @@ store time in ms) and `TTL_SWEEP` deletes the due keys. The same keys go at the 
 with native TTLs (late by at most one sweep), and none can be evicted (owner decisions K1-K5).
 
 The mode is the store's, not a process's: `P:expiry` holds `native` or `swept` (no TTL) and
-every script reads it; a missing key means `swept`, safe on every policy.
+every script reads it. A missing key means `native` (a part used without a started engine,
+which runs no sweeper); the engine publishes the mode at start, each minute and after a reset.
 """
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -27,7 +29,7 @@ VOLATILE_POLICIES = ("volatile-lru", "volatile-lfu", "volatile-ttl", "volatile-r
 _PRELUDE = """
 local X = {idx = '{P}:ttl', mode = '{P}:expiry'}
 function X.swept()
-  if X.s == nil then X.s = redis.call('GET', X.mode) ~= 'native' end
+  if X.s == nil then X.s = redis.call('GET', X.mode) == 'swept' end
   return X.s
 end
 function X.now()
@@ -92,6 +94,11 @@ def decide(setting: str, policy: str) -> str:
     if setting in (NATIVE, SWEPT):
         return setting
     return NATIVE if policy == "noeviction" else SWEPT
+
+
+def native(prefix: str) -> Expiry:
+    """Native TTLs: what an engine part uses until the runtime gives it the store's mode."""
+    return Expiry(prefix, time.time, NATIVE)
 
 
 class Expiry:

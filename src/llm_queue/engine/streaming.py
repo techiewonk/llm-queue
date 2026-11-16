@@ -20,6 +20,7 @@ import orjson
 from llm_queue._logging import get_logger
 from llm_queue.engine._codec import text as _text
 from llm_queue.engine.envelope import decode_bytes, json_default
+from llm_queue.engine.expiry import Expiry, native
 
 if TYPE_CHECKING:
     import redis.asyncio
@@ -58,9 +59,11 @@ class ChunkWriter:
         flush_ms: int,
         max_bytes: int,
         ttl_secs: int,
+        expiry: Expiry | None = None,
     ) -> None:
         """Keep the target; nothing is written until the first event."""
         self._client = client
+        self._expiry = expiry or native("")
         self.key = key
         self.attempt_id = attempt_id
         self._flush_secs = flush_ms / 1000
@@ -150,9 +153,8 @@ class ChunkWriter:
         seq, kind, payload, ttl_secs = self._doubt
         async with self._client.pipeline(transaction=False) as pipe:
             pipe.xadd(self.key, {"seq": seq, "att": self.attempt_id, "t": kind, "d": payload})
-            pipe.expire(
-                self.key, ttl_secs or self._ttl_secs
-            )  # every write: the first may have failed
+            # Every write: the first may have failed.
+            self._expiry.expire(pipe, self.key, ttl_secs or self._ttl_secs)
             await pipe.execute()
         self._doubt = None
         self._last = time.monotonic()
@@ -325,7 +327,12 @@ class ChunkReader:
     """One per caller process: one blocking read over every open chunk stream."""
 
     def __init__(
-        self, client: redis.asyncio.Redis, *, block_ms: int = 100, wake_key: str | None = None
+        self,
+        client: redis.asyncio.Redis,
+        *,
+        block_ms: int = 100,
+        wake_key: str | None = None,
+        expiry: Expiry | None = None,
     ) -> None:
         """Keep the client; the read task starts with the first open stream.
 
@@ -335,6 +342,7 @@ class ChunkReader:
         it, the new stream joins when the read ends: up to `block_ms` later).
         """
         self._client = client
+        self._expiry = expiry or native("")
         self._block_ms = block_ms
         self._wake_key = wake_key
         # Per open stream: its queue, the last entry id read (bytes, in a list to update in
@@ -375,7 +383,7 @@ class ChunkReader:
         try:
             async with self._client.pipeline(transaction=False) as pipe:
                 pipe.xadd(self._wake_key, {"w": "1"}, maxlen=1, approximate=False)
-                pipe.pexpire(self._wake_key, 60_000)
+                self._expiry.expire(pipe, self._wake_key, 60)
                 await pipe.execute()
         except Exception as exc:  # the new stream still joins when the read ends
             logger.warning("chunk_reader_wake_failed", error=str(exc))

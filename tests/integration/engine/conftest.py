@@ -27,6 +27,11 @@ PASSWORD = os.environ.get("LLMQ_TEST_REDIS_PASSWORD", "localdev")
 ENGINES = {"valkey": 6379, "redis": 6380}
 # The Bedrock transport the engine tests run on (`BedrockOptions.transport`).
 TRANSPORT = os.environ.get("LLMQ_TEST_BEDROCK_TRANSPORT", "botocore")
+# The key expiry the engine tests run in (0.1.0b3): `swept` runs the suite with no native TTLs.
+KEY_EXPIRY = os.environ.get("LLMQ_TEST_KEY_EXPIRY", "auto")
+# Keys allowed a native TTL in `swept` mode: locks (losing one runs an idempotent pass twice),
+# the health write probe and debug capture (engine/expiry.py, plan 4.0).
+NATIVE_OK = (":lock:", ":health:", ":debug")
 
 
 @pytest.fixture(params=sorted(ENGINES))
@@ -46,6 +51,14 @@ async def prefix(store: redis.asyncio.Redis) -> AsyncIterator[str]:
     """Unique key prefix; every key under it is deleted at teardown."""
     value = f"llmqtest:eng:{uuid7().hex[-12:]}"
     yield value
+    # Judged only when the store ran swept (a test may build its own native engine).
+    if KEY_EXPIRY == "swept" and await store.get(f"{value}:expiry") == b"swept":
+        leaked = []
+        async for key in store.scan_iter(match=f"{value}*", count=500):
+            name = key.decode() if isinstance(key, bytes) else key
+            if not any(part in name for part in NATIVE_OK) and await store.pttl(key) > 0:
+                leaked.append(name)
+        assert not leaked, f"native TTLs in swept mode: {sorted(leaked)[:20]}"
     # Every key that starts with the prefix: some rigs build sibling prefixes such as
     # f"{prefix}s" or f"{prefix}w", which f"{value}:*" missed (FT-5: 612 keys leaked per store).
     keys = [k async for k in store.scan_iter(match=f"{value}*", count=500)]
@@ -82,7 +95,9 @@ async def make(store: redis.asyncio.Redis, prefix: str) -> AsyncIterator[Make]:
             store,
             reg,
             Providers(pool),
-            settings=EngineSettings(lease_secs=3, poll_secs=0.2, sweep_secs=1),
+            settings=EngineSettings(
+                lease_secs=3, poll_secs=0.2, sweep_secs=1, key_expiry=KEY_EXPIRY
+            ),
         )
         await engine.start(worker=worker)
         engines.append(engine)

@@ -204,7 +204,9 @@ async def test_cancel_key_is_checked_by_the_heartbeat(make: Make) -> None:
     engine, _ = await make(LONG, {"models": {f"{SMALL}@r1": SLOW}})
     task = asyncio.create_task(engine.call("small", CHAT, request_id="cx"))
     await _running(engine, "cx")
-    await engine.state.set(engine.keys.request("cx", "cancel"), "1", ex=60)  # no publish
+    await engine.expiry.set(
+        engine.state, engine.keys.request("cx", "cancel"), "1", 60
+    )  # no publish
     with pytest.raises(CallFailed) as info:
         await asyncio.wait_for(task, 2.5)
     assert info.value.kind == "cancelled"
@@ -238,8 +240,9 @@ async def test_retry_keys_expire_under_the_served_model(
     await engine.call("small", CHAT)
     keys = [k async for k in store.scan_iter(match=f"{engine.keys.prefix}:{{m:small}}:retries:*")]
     assert keys
-    for key in keys:
-        assert await store.ttl(key) > 0
+    for key in keys:  # a native TTL, or an expiry in the index (swept)
+        ttl = await store.ttl(key)
+        assert ttl > 0 or await store.zscore(engine.expiry.index, key) is not None
 
 
 async def test_bad_message_uses_the_models_queue_settings(

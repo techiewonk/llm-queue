@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 import orjson
 
 from llm_queue.engine._codec import text as _text
+from llm_queue.engine.expiry import prelude
 from llm_queue.engine.keys import Keys
 
 if TYPE_CHECKING:
@@ -36,7 +37,7 @@ RECORD = (
     + """
 redis.call('ZADD', KEYS[2], now, req.request_id)
 redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now - req.window_ms)
-redis.call('PEXPIRE', KEYS[2], req.window_ms)
+X.expire(KEYS[2], req.window_ms)
 if redis.call('ZCARD', KEYS[2]) < req.needed then return 'counted' end
 local usable_left = 0
 for _, other in ipairs(req.others) do
@@ -79,8 +80,9 @@ class Health:
         """Register the scripts; no I/O until the first call."""
         self._client = client
         self.keys = keys
-        self._record = client.register_script(RECORD)
-        self._probed = client.register_script(PROBED)
+        pre = prelude(keys.prefix)  # X.expire / X.pttl / X.set (engine/expiry.py)
+        self._record = client.register_script(pre + RECORD)
+        self._probed = client.register_script(pre + PROBED)
 
     def _terr(self, alias: str, dep: str) -> str:
         return self.keys.model(alias, f"terr:{dep}")

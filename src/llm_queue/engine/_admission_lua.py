@@ -37,7 +37,7 @@ KEY_MS = num(T.budget_key_ms, 180000)  -- budget and limiter keys live this long
 -- Every key a script writes has an expiry, sliding on each write (FL-7): a removed model's or
 -- deployment's breaker, limiter, health, rotation, leases and waiters stayed in the store for good.
 local DAY_MS = 86400000
-local function slide(key, ms) redis.call('PEXPIRE', key, ms) end
+local function slide(key, ms) X.expire(key, ms) end  -- native TTL or index (expiry.py)
 local function held_ms() return math.max(KEY_MS, 2 * num(req.lease_ms, 60000)) end
 
 -- Budget hashes read once per script into a table (FL-11: each budget read the same fields with
@@ -98,7 +98,7 @@ local function write(key, f, mode, value)
   else
     redis.call('HSET', key, f .. '_tat', tostring(value))
   end
-  redis.call('PEXPIRE', key, KEY_MS)
+  X.expire(key, KEY_MS)
 end
 
 -- Give back g units (negative g charges more). Fixed counters only inside the grant's minute.
@@ -110,12 +110,12 @@ local function give(key, f, L, g, mode, granted_minute)
       -- The minute turned: an overrun (g < 0) is charged to the new minute, not dropped.
       if g < 0 then
         redis.call('HSET', key, f .. '_win', minute, f .. '_n', -g)
-        redis.call('PEXPIRE', key, KEY_MS)
+        X.expire(key, KEY_MS)
       end
       return
     end
     redis.call('HSET', key, f .. '_n', math.max(0, hnum(key, f .. '_n', 0) - g))
-    redis.call('PEXPIRE', key, KEY_MS)
+    X.expire(key, KEY_MS)
     return
   end
   local per = 60000 / L
@@ -123,7 +123,7 @@ local function give(key, f, L, g, mode, granted_minute)
   local value = tat - g * per
   if g > 0 then value = math.max(value, now) end
   redis.call('HSET', key, f .. '_tat', tostring(value))
-  redis.call('PEXPIRE', key, KEY_MS)  -- the key may have expired since the grant
+  X.expire(key, KEY_MS)  -- the key may have expired since the grant
 end
 
 -- The budgets of a deployment row for class cls: {key, field, limit, cost kind}.
@@ -749,7 +749,7 @@ if not chosen then
   slide(wait_keys[cls], held_ms())
   slide(info_key, held_ms())
   redis.call('ZADD', exp_key, exp, cls .. '|' .. rid)
-  redis.call('PEXPIRE', exp_key, KEY_MS)
+  X.expire(exp_key, KEY_MS)
   local reply = {r = 'wait', ms = math.max(1, math.floor(best_wait or num(T.wait_ms, 100))),
     reason = best_reason or 'slot'}
   if tf_st then tf_refused(alias, tf_st, rid, exp, reply) end
@@ -763,7 +763,7 @@ for _, s in ipairs(res.states) do write(s[1], s[2], s[3], s[4]) end
 local rkey = mk(alias, 'rate:' .. chosen.key)
 if hnum(rkey, 'seen_win', -1) ~= minute then
   redis.call('HSET', rkey, 'seen_win', minute, 'seen_calls', 0, 'seen_tokens', 0, 'seen_n', 0)
-  redis.call('PEXPIRE', rkey, KEY_MS)
+  X.expire(rkey, KEY_MS)
 end
 redis.call('HINCRBY', rkey, 'seen_calls', cost_r)
 redis.call('HINCRBY', rkey, 'seen_tokens', cost_t)
@@ -778,7 +778,7 @@ redis.call('HSET', entry_key, 'owner', req.owner, 'worker', req.worker, 'dep', c
   'cls', cls, 'minute', minute, 'cost_r', cost_r, 'cost_t', cost_t, 'account', row.account,
   'started', now, 'request', rid, 'served', alias, 'mode', row.rate_window or 'smooth',
   'bud', cjson.encode(res.taken), 'job_owner', job_owner)
-redis.call('PEXPIRE', entry_key, lease_ms * 2)
+X.expire(entry_key, lease_ms * 2)
 if res.probe then
   local cb = mk(alias, 'cb:' .. chosen.key)
   redis.call('HSET', cb, 'probe', req.owner, 'probe_at', now)
@@ -789,7 +789,7 @@ end
 if req.claim or redis.call('EXISTS', job_key) == 1 then
   redis.call('HSET', job_key, 'state', 'running', 'owner', job_owner, 'hb', now)
   -- A claim made here (the caller's record was gone) had no TTL and stayed for good.
-  if redis.call('PTTL', job_key) < 0 then redis.call('PEXPIRE', job_key, num(T.job_ttl_ms, 3600000)) end
+  if X.pttl(job_key) < 0 then X.expire(job_key, num(T.job_ttl_ms, 3600000)) end
 end
 redis.call('ZREM', wait_keys[cls], rid)
 redis.call('HDEL', info_key, rid)
@@ -804,10 +804,10 @@ end
 if present(req.count_first) then
   local retries = mk(alias, 'retries:' .. req.count_first)
   redis.call('HINCRBY', retries, 'first', 1)
-  redis.call('EXPIRE', retries, 180)
+  X.expire(retries, 180000)
 end
 if sticky_key then
-  redis.call('SET', sticky_key, chosen.key, 'PX', num(req.sticky.ttl_ms, 1800000))
+  X.set(sticky_key, chosen.key, num(req.sticky.ttl_ms, 1800000))
 end
 if req.strategy == 'round_robin' then
   local rot = mk(alias, 'rot')
@@ -883,7 +883,7 @@ local function settle(alias, owner, rid, refund_r, refund_t, learn, outcome, lat
     if outcome == 'throttle' then
       local thr = mk(alias, 'thr:' .. dep .. ':' .. minute)
       redis.call('INCR', thr)
-      redis.call('PEXPIRE', thr, KEY_MS)
+      X.expire(thr, KEY_MS)
       if hnum(ac, 'cut_at', 0) < now - num(T.limiter_cut_ms, 1000) then
         redis.call('HSET', ac, 'limit', tostring(math.max(1, math.floor(limit * num(T.limiter_cut_factor, 0.7)))), 'cut_at', now)
       end
@@ -1014,8 +1014,8 @@ local function beat(rid, jo)
   local job = P .. ':{r:' .. rid .. '}:job'
   if not jo or redis.call('HGET', job, 'owner') ~= jo then return end
   redis.call('HSET', job, 'hb', now)
-  local ttl = redis.call('PTTL', job)
-  if ttl >= 0 and ttl < lease_ms * 2 then redis.call('PEXPIRE', job, num(T.job_ttl_ms, 3600000)) end
+  local ttl = X.pttl(job)
+  if ttl >= 0 and ttl < lease_ms * 2 then X.expire(job, num(T.job_ttl_ms, 3600000)) end
 end
 for _, item in ipairs(req.jobs or {}) do beat(item.request_id, item.owner) end
 for _, item in ipairs(req.items) do
@@ -1030,7 +1030,7 @@ for _, item in ipairs(req.items) do
     redis.call('ZADD', mk(item.alias, 'inprog'), 'XX', until_, item.owner)
     slide(mk(item.alias, 'lease:' .. dep .. ':' .. cls), held_ms())
     slide(mk(item.alias, 'inprog'), held_ms())
-    redis.call('PEXPIRE', entry_key, num(req.lease_ms, 60000) * 2)
+    X.expire(entry_key, num(req.lease_ms, 60000) * 2)
     -- A tenant's slot (fairness share) lives as long as the grant's lease.
     local tf_slot = redis.call('HGET', entry_key, 'tf_slot')
     if tf_slot then
@@ -1046,7 +1046,7 @@ for _, item in ipairs(req.items) do
 end
 -- Folded in (FL-21), both optional: the process's caller key (a SET of its own before) and the
 -- store's epoch (a GET of its own), so a beat needs fewer round trips.
-if present(req.caller) then redis.call('SET', req.caller.key, '1', 'EX', req.caller.ttl) end
+if present(req.caller) then X.set(req.caller.key, '1', req.caller.ttl * 1000) end
 return cjson.encode({n = renewed, lost = lost, epoch = redis.call('GET', P .. ':epoch') or ''})
 """
 )
@@ -1097,10 +1097,10 @@ for _, item in ipairs(req.items) do
       local state = redis.call('HGET', job, 'state')
       if not state or state == 'queued' or state == 'running' then
         redis.call('HSET', job, 'state', 'running', 'owner', jo, 'hb', now)
-        if redis.call('PTTL', job) < 0 then redis.call('PEXPIRE', job, num(T.job_ttl_ms, 3600000)) end
+        if X.pttl(job) < 0 then X.expire(job, num(T.job_ttl_ms, 3600000)) end
       end
     end
-    redis.call('PEXPIRE', entry_key, num(req.lease_ms, 60000) * 2)
+    X.expire(entry_key, num(req.lease_ms, 60000) * 2)
     done = done + 1
   end
 end
