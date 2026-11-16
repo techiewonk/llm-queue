@@ -698,6 +698,12 @@ class PurgeService:
         """Run one due auto purge (the grace was the wait); failures are logged."""
         alias, _, dep = target.partition("/")
         try:
+            # The registry as stored now, not this pod's copy: a stale or fallback copy could
+            # purge a model that was live again (review B3).
+            view = await self._view()
+            if target in self._targets(view):
+                logger.info("purge_unscheduled", target=target, reason="back_in_registry")
+                return
             if dep:
                 report = await self._deployment(
                     alias, dep, actor=AUTO_ACTOR, wait=False, wait_secs=0, dry_run=False
@@ -762,7 +768,7 @@ class PurgeService:
                 for key in chunk:
                     pipe.unlink(key)
                 done += sum(int(n) for n in await pipe.execute())
-            await self._state.zrem(self._ttl_key, *chunk)
+            await client.zrem(self._ttl_key, *chunk)  # that store's own index (review B3-4)
         return done
 
     async def _aliases_in_store(self) -> set[str]:

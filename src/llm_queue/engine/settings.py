@@ -171,7 +171,7 @@ class InfraSettings:
     # expiry index on a `volatile-*` one (owner decision K4, 0.1.0b3); engine/expiry.py.
     key_expiry: str = "auto"
     ttl_sweep_batch: int = 500  # LLMQ_TTL_SWEEP_BATCH: keys per sweep script run
-    ttl_sweep_rounds: int = 20  # LLMQ_TTL_SWEEP_ROUNDS: full batches per sweep, at most
+    ttl_sweep_rounds: int = 100  # LLMQ_TTL_SWEEP_ROUNDS: full batches per sweep, at most
     # Purge of removed models / deployments and tenants (0.1.0b3, owner K1-K3): see `PurgeSettings`.
     auto_purge: bool = True
     purge_grace_secs: float = 900.0
@@ -389,8 +389,8 @@ class InfraSettings:
             queue_wait_scopes=scopes,
             debug_capture_from_config=capture,
             key_expiry=key_expiry,
-            ttl_sweep_batch=number("TTL_SWEEP_BATCH", 500, int, lo=1, hi=10_000),
-            ttl_sweep_rounds=number("TTL_SWEEP_ROUNDS", 20, int, lo=1, hi=10_000),
+            ttl_sweep_batch=number("TTL_SWEEP_BATCH", 500, int, lo=1, hi=5_000),
+            ttl_sweep_rounds=number("TTL_SWEEP_ROUNDS", 100, int, lo=1, hi=10_000),
             **purge,
         )
         if problems:

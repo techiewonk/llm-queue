@@ -243,7 +243,7 @@ class EngineSettings:
     debug_capture_allowed: bool = False  # LLMQ_DEBUG_CAPTURE_FROM_CONFIG (never in prod)
     key_expiry: str = "auto"  # LLMQ_KEY_EXPIRY: auto | native | swept (engine/expiry.py)
     ttl_sweep_batch: int = 500  # LLMQ_TTL_SWEEP_BATCH
-    ttl_sweep_rounds: int = 20  # LLMQ_TTL_SWEEP_ROUNDS
+    ttl_sweep_rounds: int = 100  # LLMQ_TTL_SWEEP_ROUNDS
     # A store outage seen by a call is remembered this long (owner Q11, R3FM-3): `fail_fast` and
     # `static_cap` then answer at once instead of re-trying the store (1.5-21.5 s per call).
     outage_memo_secs: float = 3.0
@@ -740,10 +740,12 @@ class Engine:
                 self._eviction["state"] = await check_store(self.state, "state", setting)
                 if self._queue_store is not None:
                     self._eviction["queue"] = await check_store(self._queue_store, "queue", setting)
-                await self._apply_expiry()
                 await self.state.set(self.keys.epoch, str(self.clock.now()), nx=True)
                 self._epoch = text(await self.state.get(self.keys.epoch))
                 await self.requests.check_offload()  # `ConfigError` without it (Q24)
+                # Last and on its own: a queue store down at start must not skip the steps
+                # above (review B3-2); the minute re-read publishes the mode later.
+                await self._publish_expiry_safely()
         except (*STORE_ERRORS, RedisError) as exc:  # the timeout is a TimeoutError (OSError)
             # Start anyway (plan §3.18): calls follow each model's `store_down` rule and
             # the background loops keep retrying until the store answers.
@@ -754,6 +756,8 @@ class Engine:
             self._pubsub = self.state.pubsub()
             self._loop(self._result_reader(), "result_reader")
             self._loop(self._result_sweep(), "result_sweep")
+            if not worker:  # callers write indexed keys too: a fleet of callers must drain it
+                self._loop(self._ttl_sweeper(), "ttl_sweeper")
         if worker:
             self._worker = True
             self._sync_model_loops()
@@ -4333,10 +4337,14 @@ class Engine:
                 continue
             if policy != UNKNOWN_POLICY:
                 self._eviction[name] = policy
-        try:  # a policy change, or a store reset that lost `P:expiry` (R3FM-8, owner K4)
+        await self._publish_expiry_safely()  # a policy change, or a reset (R3FM-8, owner K4)
+
+    async def _publish_expiry_safely(self) -> None:
+        """`_apply_expiry`, logged instead of raised: retried by the minute policy re-read."""
+        try:
             await self._apply_expiry()
         except Exception as exc:
-            logger.debug("key_expiry_publish_failed", error=str(exc))
+            logger.warning("key_expiry_publish_failed", error=str(exc))
 
     async def _apply_expiry(self) -> None:
         """Set each store's key expiry mode from `LLMQ_KEY_EXPIRY` and its eviction policy."""
@@ -4351,6 +4359,23 @@ class Engine:
                 logger.warning(
                     "key_expiry_changed", store=name, policy=policy, before=replaced, mode=mode
                 )
+
+    async def _ttl_sweeper(self) -> None:
+        """Caller-only processes: the expiry index sweep alone, under the sweep lock."""
+        while True:
+            await asyncio.sleep(self.settings.sweep_secs)
+            try:
+                lock = await self.state.set(
+                    f"{self.keys.prefix}:lock:sweep",
+                    self.worker_id,
+                    nx=True,
+                    px=max(1, int(self.settings.sweep_secs * 1000)),
+                )
+            except Exception as exc:
+                logger.warning("ttl_sweep_failed", error=str(exc))
+                continue
+            if lock:
+                await self._sweep_ttl_index()
 
     def _expiry_of(self, store: str) -> Expiry:
         """The key expiry of the `state` or `queue` store."""
@@ -4904,6 +4929,7 @@ class Engine:
             logger.error("state_store_reset_detected")
             self.metrics.count("llmq_store_resets_total")
             await self.state.set(self.keys.epoch, str(self.clock.now()), nx=True)
+            await self._publish_expiry_safely()  # before any write that sets an expiry
             await self.expiry.set(
                 self.state, f"{self.keys.prefix}:reset_minute", int(self.clock.now() // 60), 120
             )
@@ -4914,7 +4940,10 @@ class Engine:
                 logger.error("state_store_reset_detected", by="epoch_changed")
                 self.metrics.count("llmq_store_resets_total")
             self._sweep_now.set()  # waiting callers check their records now (R3RC-2)
-            await self._apply_expiry()  # the reset lost `P:expiry` too (owner K4)
+            # The reset lost `P:expiry` too: publish it before the grants are written again
+            # (else they get native TTLs), and never raising: a failed write here skipped the
+            # re-registration for good (the epoch is already the new one; review B3-1).
+            await self._publish_expiry_safely()
             await self._reregister()
 
     async def _check_replication(self) -> None:

@@ -79,7 +79,7 @@ async def test_python_helpers_follow_the_mode(store: redis.asyncio.Redis, prefix
     expiry = Expiry(prefix, time.time, NATIVE)
     assert await expiry.set(store, f"{prefix}:n", "1", 30, nx=True)
     assert await store.pttl(f"{prefix}:n") > 0
-    expiry.mode = SWEPT
+    await expiry.publish_mode(store, SWEPT)  # `set` runs X.set: the store's mode
     assert await expiry.set(store, f"{prefix}:s", "1", 30, nx=True)
     assert not await expiry.set(store, f"{prefix}:s", "2", 30, nx=True)
     async with store.pipeline(transaction=False) as pipe:
@@ -108,3 +108,27 @@ def test_decide_and_readiness_rule() -> None:
     assert eviction_warning("volatile-lru", NATIVE)
     assert eviction_warning("allkeys-lru", SWEPT)
     assert eviction_warning("noeviction", NATIVE) is None
+
+
+async def test_sweep_unpacks_large_batches_in_chunks(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """Review B3-3: one batch of 2,500 due keys (Lua unpack refuses about 8,000 at once)."""
+    expiry = Expiry(prefix, time.time, SWEPT)
+    past = int(time.time() * 1000) - 1_000
+    keys = [f"{prefix}:big{i}" for i in range(2_500)]
+    await store.mset(dict.fromkeys(keys, "1"))
+    await store.zadd(expiry.index, dict.fromkeys(keys, past))
+    script = store.register_script(TTL_SWEEP)
+    assert await expiry.sweep(script, batch=2_500) == 2_500
+    assert await store.zcard(expiry.index) == 0
+    assert await store.exists(*keys[:100]) == 0
+
+
+async def test_swept_expire_skips_a_missing_key(store: redis.asyncio.Redis, prefix: str) -> None:
+    """As PEXPIRE: no index entry for a key that is not there (it would expire a later one)."""
+    expiry = Expiry(prefix, time.time)
+    await expiry.publish_mode(store, SWEPT)
+    probe = store.register_script(expiry.lua("X.expire(KEYS[1], 60000) return 1"))
+    await probe(keys=[f"{prefix}:gone"])
+    assert await store.zscore(expiry.index, f"{prefix}:gone") is None

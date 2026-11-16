@@ -74,10 +74,9 @@ flowchart LR
 | `LLMQ_QUEUE_WAIT_REPLICAS` | 0 | 0 to 16 (whole) | A write waits for this many replicas to acknowledge it (0: off). With fewer replicas a write is sent anyway, warned about at most once a minute and counted (`llmq_send_not_replicated_total`); a store with no replica connected skips the wait ... |
 | `LLMQ_QUEUE_WAIT_MS` | 100 | above 0 to 60000 (whole) | ... for at most this long (it must stay below the store read timeout, see [Tune](../how-to/tune.md)) |
 | `LLMQ_QUEUE_WAIT_SCOPES` | `all` | `all`, `none` or a comma list of `calls`, `jobs`, `registry` | Which writes wait for replicas: call sends, job sends, registry live edits. Every scope is on by default when `LLMQ_QUEUE_WAIT_REPLICAS` is set |
-
 | `LLMQ_KEY_EXPIRY` | `auto` | `auto`, `native`, `swept` | How keys expire. `native`: Valkey TTLs (needs `maxmemory-policy noeviction`). `swept`: no key the library needs has a TTL; expiries live in the index `P:ttl` and the sweeper deletes due keys, so a `volatile-*` store (a shared cache) cannot evict them. `auto`: `native` on a `noeviction` store, else `swept` (`volatile-*`, `allkeys-*` or an unreadable policy). The mode is the store's: a started engine writes it to `P:expiry` at start, every minute and after a store reset, and every script follows that key; a missing key means `native`. `allkeys-*` stays not ready in strict mode either way. See [Key expiry modes](../explanation/storage.md#key-expiry-modes) |
-| `LLMQ_TTL_SWEEP_BATCH` | 500 | 1 to 10000 (whole) | Keys deleted per sweep script run (index `P:ttl`). The sweep runs in both modes |
-| `LLMQ_TTL_SWEEP_ROUNDS` | 20 | 1 to 10000 (whole) | Full batches per sweep (every 10 s), at most: 500 x 20 = 10000 keys per sweep by default; more wait for the next one |
+| `LLMQ_TTL_SWEEP_BATCH` | 500 | 1 to 5000 (whole) | Keys deleted per sweep script run (index `P:ttl`). The sweep runs in both modes |
+| `LLMQ_TTL_SWEEP_ROUNDS` | 100 | 1 to 10000 (whole) | Full batches per sweep (every 10 s), at most: 500 x 100 = 50000 keys per sweep (5000 a second) by default; more wait for the next one. Caller-only processes sweep too |
 
 For a store with replicas, also set `min-replicas-to-write` on the primary: a write it refuses
 (`NOREPLICAS`), like `OOM`, `MISCONF` and `BUSY`, is treated as the store being down.

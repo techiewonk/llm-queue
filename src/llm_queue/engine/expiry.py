@@ -19,7 +19,7 @@ from typing import Any
 KEY_EXPIRY_MODES = ("auto", "native", "swept")
 NATIVE, SWEPT = "native", "swept"
 SWEEP_BATCH = 500  # keys per TTL_SWEEP run (LLMQ_TTL_SWEEP_BATCH)
-SWEEP_ROUNDS = 20  # full batches per sweep, at most (LLMQ_TTL_SWEEP_ROUNDS)
+SWEEP_ROUNDS = 100  # full batches per sweep, at most (LLMQ_TTL_SWEEP_ROUNDS)
 # Policies that evict only keys with a TTL: safe in `swept` mode.
 VOLATILE_POLICIES = ("volatile-lru", "volatile-lfu", "volatile-ttl", "volatile-random")
 
@@ -42,7 +42,9 @@ end
 -- PEXPIRE, or the key's expire-at in the index (swept).
 function X.expire(key, ms)
   ms = math.floor(tonumber(ms))
-  if X.swept() then redis.call('ZADD', X.idx, X.now() + ms, key)
+  if X.swept() then
+    -- As PEXPIRE: nothing for a missing key (an entry would expire a later key of that name).
+    if redis.call('EXISTS', key) == 1 then redis.call('ZADD', X.idx, X.now() + ms, key) end
   else redis.call('PEXPIRE', key, ms) end
 end
 -- PTTL: ms left, -1 with no expiry, -2 when the key is missing.
@@ -68,14 +70,21 @@ function X.set(key, value, ms, nx)
 end
 """
 
+# KEYS[1]: the key. ARGV: value, ms, '1' for NX. `X.set` in one script: a SET then a separate
+# ZADD left a key with no expiry at all when the ZADD failed (review B3).
+_SET = "return X.set(KEYS[1], ARGV[1], tonumber(ARGV[2]), ARGV[3] == '1') and 1 or 0"
+
 # KEYS: the index. ARGV: batch. Deletes the due keys of one batch; returns how many.
 TTL_SWEEP = """
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now, 'LIMIT', 0, tonumber(ARGV[1]))
-if #due == 0 then return 0 end
-redis.call('UNLINK', unpack(due))
-redis.call('ZREM', KEYS[1], unpack(due))
+-- In chunks: Lua's unpack refuses about 8000 values (review B3-3).
+for i = 1, #due, 1000 do
+  local part = {unpack(due, i, math.min(i + 999, #due))}
+  redis.call('UNLINK', unpack(part))
+  redis.call('ZREM', KEYS[1], unpack(part))
+end
 return #due
 """
 
@@ -115,6 +124,7 @@ class Expiry:
         self.mode_key = f"{prefix}:expiry"
         self.mode = mode
         self._clock = clock
+        self._set_scripts: dict[int, Any] = {}  # per client: `X.set` as one script
 
     @property
     def swept(self) -> bool:
@@ -143,10 +153,10 @@ class Expiry:
         ms = max(1, int(secs * 1000))
         if not self.swept:
             return bool(await client.set(key, value, px=ms, nx=nx))
-        if not await client.set(key, value, nx=nx):
-            return False
-        await client.zadd(self.index, {key: int(self._clock() * 1000) + ms})
-        return True
+        script = self._set_scripts.get(id(client))
+        if script is None:
+            script = self._set_scripts[id(client)] = client.register_script(self.lua(_SET))
+        return bool(await script(keys=[key], args=[value, ms, "1" if nx else "0"]))
 
     async def publish_mode(self, client: Any, mode: str) -> str | None:
         """Make `mode` the store's; returns the mode it replaced when it was another one."""

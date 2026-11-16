@@ -52,6 +52,7 @@ def _too_long(*values: str | None) -> bool:
     return any(v is not None and len(v) > MAX_ID_CHARS for v in values)
 
 
+MAX_PURGE_WAIT_SECS = 60  # a deployment purge over HTTP waits at most this for running calls
 # Purge bodies: field -> accepted types. `dry_run` defaults to true (a plan): send false to purge.
 _PURGE_FIELDS: dict[str, dict[str, tuple[type, ...]]] = {
     "model": {"model": (str,), "force": (bool,), "dry_run": (bool,)},
@@ -79,6 +80,10 @@ def _purge_body(kind: str, body: Any) -> str | None:
     if not isinstance(body, Mapping):
         return "the body must be a JSON object"
     wrong = [k for k, v in body.items() if k not in fields or not isinstance(v, fields[k])]
+    # `true` is an int in Python; and a wait longer than an HTTP client waits is a hung request.
+    secs = body.get("wait_secs")
+    if secs is not None and (isinstance(secs, bool) or not 0 <= secs <= MAX_PURGE_WAIT_SECS):
+        wrong.append("wait_secs")
     wrong += [k for k in _PURGE_REQUIRED.get(kind, ()) if k not in body]
     lists = [v for k, v in body.items() if k in ("remove", "models") and isinstance(v, list)]
     if wrong or any(not all(isinstance(x, str) for x in v) for v in lists):
