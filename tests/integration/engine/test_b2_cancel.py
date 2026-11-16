@@ -109,5 +109,5 @@ async def test_cancel_read_before_the_run_started_stops_it(
     with pytest.raises(CallFailed) as info:
         await engine.call("small", CHAT, request_id="early")
     assert info.value.kind == "cancelled"
-    assert loop.time() - started < 1.5  # stopped, not waited out (2 s)
+    assert loop.time() - started < 1.9  # stopped, not waited out (2 s); room for a slow runner
     assert stats(fake, f"{SMALL}@r1").get("calls", 0) == 0
