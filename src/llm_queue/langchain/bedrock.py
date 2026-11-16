@@ -339,14 +339,18 @@ class QueuedBedrockEmbeddings(BedrockEmbeddings):
     """`BedrockEmbeddings` whose calls go through the queue's `embed` op (batched per provider).
 
     `model_alias` is the queue alias (defaults to `model_id`; the queue builds the provider
-    body). Queries use `input_type="search_query"`, documents `"search_document"`; the provider
-    ignores it where the model has no such field. `normalize` is applied locally.
+    body). Queries use `query_input_type` (`"search_query"`), documents `document_input_type`
+    (`"search_document"`); the provider ignores it where the model has no such field. An index
+    built with `embed_query` for its documents keeps matching with
+    `document_input_type="search_query"`. `normalize` is applied locally.
     """
 
     llmq: Any = Field(default=None, exclude=True)
     model_alias: str | None = None
     priority: bool | None = None
     queue_timeout_secs: float | None = None
+    query_input_type: str = "search_query"
+    document_input_type: str = "search_document"
 
     @model_validator(mode="before")
     @classmethod
@@ -385,16 +389,16 @@ class QueuedBedrockEmbeddings(BedrockEmbeddings):
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         """Embed documents on the sync path (`embed_sync`)."""
-        return self._sync(texts, "search_document")
+        return self._sync(texts, self.document_input_type)
 
     def embed_query(self, text: str) -> list[float]:
         """Embed one query on the sync path (`embed_sync`)."""
-        return self._sync([text], "search_query")[0]
+        return self._sync([text], self.query_input_type)[0]
 
     async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
         """Embed documents through the queue as one call (the parent fans out per text)."""
-        return await self._async(texts, "search_document")
+        return await self._async(texts, self.document_input_type)
 
     async def aembed_query(self, text: str) -> list[float]:
         """Embed one query through the queue."""
-        return (await self._async([text], "search_query"))[0]
+        return (await self._async([text], self.query_input_type))[0]

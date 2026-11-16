@@ -13,6 +13,14 @@ The first release that installs without `--pre`: `pip install llm-queue` (or
 `llm-queue==0.1.1`). The code is 0.1.0b3's plus the changes below; the 0.1.0b3 upgrade notes
 apply when coming from 0.1.0b2 or earlier.
 
+### Added
+
+- `QueuedBedrockEmbeddings(query_input_type=..., document_input_type=...)`: the Cohere
+  `input_type` of queries and documents (defaults `search_query` / `search_document`, as
+  before). An index whose documents were embedded with `embed_query` keeps matching with
+  `document_input_type="search_query"`; before, `embed_documents` always sent
+  `search_document` and changed the vectors.
+
 ### Documentation
 
 - In-depth architecture, call flows for every path and failure mode, and the list of tested
