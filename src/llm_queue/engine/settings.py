@@ -81,6 +81,42 @@ def _store_url(name: str, url: str, strict: bool) -> tuple[str, list[str]]:
     return urlunsplit(parts._replace(query=urlencode(query))), []
 
 
+TENANT_PURGE_PARTS = ("keys", "queued", "running")
+_TRUE, _FALSE = ("true", "1", "yes", "on"), ("false", "0", "no", "off")
+
+
+def _purge_settings(
+    get: Callable[..., Any], number: Callable[..., Any], problems: list[str]
+) -> dict[str, Any]:
+    """The purge settings (`LLMQ_AUTO_PURGE` ... `LLMQ_TENANT_INDEX`) as `InfraSettings` fields.
+
+    Kept apart from `from_env`'s body so the purge feature reads as one block.
+    """
+    out: dict[str, Any] = {}
+    for name, field_name, default in (
+        ("AUTO_PURGE", "auto_purge", "true"),
+        ("PURGE_WAIT", "purge_wait", "true"),
+        ("TENANT_INDEX", "tenant_index", "false"),
+    ):
+        raw = str(get(name, default)).strip().lower()
+        if raw not in _TRUE + _FALSE:
+            problems.append(f"LLMQ_{name} must be true or false (on / off)")
+            raw = default
+        out[field_name] = raw in _TRUE
+    out["purge_grace_secs"] = number("PURGE_GRACE_SECS", 900.0, zero=True, hi=604_800)
+    out["purge_wait_secs"] = number("PURGE_WAIT_SECS", 300.0, zero=True, hi=86_400)
+    out["purge_batch"] = number("PURGE_BATCH", 500, int, lo=1, hi=10_000)
+    parts = {p.strip().lower() for p in str(get("TENANT_PURGE_DEFAULT", "keys")).split(",")}
+    parts.discard("")
+    if not parts or parts - set(TENANT_PURGE_PARTS):
+        problems.append(
+            "LLMQ_TENANT_PURGE_DEFAULT must be a comma list of " + ", ".join(TENANT_PURGE_PARTS)
+        )
+        parts = {"keys"}
+    out["tenant_purge_default"] = ",".join(p for p in TENANT_PURGE_PARTS if p in parts)
+    return out
+
+
 def _read_document(registry: str | None, registry_file: str | None) -> str:
     """The registry JSON from the variable or the file, refused when it repeats a key."""
     if registry:
@@ -130,6 +166,14 @@ class InfraSettings:
     # What the replica wait covers (owner Q8 / Q51), LLMQ_QUEUE_WAIT_SCOPES: all by default.
     queue_wait_scopes: frozenset[str] = frozenset(WAIT_SCOPES)
     debug_capture_from_config: bool = False
+    # Purge of removed models / deployments and tenants (0.1.0b3, owner K1-K3): see `PurgeSettings`.
+    auto_purge: bool = True
+    purge_grace_secs: float = 900.0
+    purge_wait: bool = True
+    purge_wait_secs: float = 300.0
+    purge_batch: int = 500
+    tenant_purge_default: str = "keys"  # comma list of TENANT_PURGE_PARTS
+    tenant_index: bool = False
 
     @property
     def strict(self) -> bool:
@@ -301,6 +345,7 @@ class InfraSettings:
                 f"{math.ceil(beat + max(5.0, beat / 2))}: the heartbeat renews it every "
                 f"LLMQ_LEASE_SECS / 3 ({beat:g} s), plus a margin"
             )
+        purge = _purge_settings(get, number, problems)
         settings = cls(
             store_url=urls["STORE_URL"] or str(store or ""),
             queue_store_url=urls["QUEUE_STORE_URL"],
@@ -334,6 +379,7 @@ class InfraSettings:
             queue_wait_ms=number("QUEUE_WAIT_MS", 100, int, hi=60_000),
             queue_wait_scopes=scopes,
             debug_capture_from_config=capture,
+            **purge,
         )
         if problems:
             raise ConfigError("invalid LLMQ settings:\n  " + "\n  ".join(problems))

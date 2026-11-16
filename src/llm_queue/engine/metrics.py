@@ -143,6 +143,11 @@ METRICS: dict[str, MetricSpec] = {
     ),
     "llmq_store_pool_busy_total": _c("model", "Calls refused because the store pool was full"),
     "llmq_pubsub_resubscribes_total": _c("reader", "Stale subscribers reset", "every pod"),
+    "llmq_purged_keys_total": _c(
+        "kind",
+        "Store keys deleted by purges, by kind: model, deployment, tenant, removed",
+        "every pod",
+    ),
     "llmq_stale_acks_total": _c("model", "Acks refused: another worker took the message over"),
     "llmq_jobs_total": _c("job outcome", "Jobs finished by outcome (ok, failed, dead, ...)"),
     "llmq_hook_failed_total": _c("kind hook", "App hooks that raised", "every pod"),
