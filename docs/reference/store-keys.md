@@ -33,9 +33,9 @@ runs after that time deletes it.
   plus a random tail, `runtime.py:624-625`), `MINUTE` a Unix minute on the store clock.
 - **Store**: `state` is `LLMQ_STORE_URL`. `queue` is `LLMQ_QUEUE_STORE_URL` when set, else the
   same store (`runtime.py:594`).
-- **Citations** are `file:line` at commit `21fe9b0` (branch `dev/0.1.0b3`). Files are under `src/llm_queue/engine/`
-  unless they start with `registry/` (under `src/llm_queue/registry/`) or are `tuning.py`
-  (`src/llm_queue/tuning.py`). A bare `:123` repeats the file named last in the same cell.
+- **Citations** are `file:line` in the source this page ships with (`dev/0.1.0b3` after
+  `21fe9b0`). Files are under `src/llm_queue/engine/` unless they start with `registry/` (under
+  `src/llm_queue/registry/`) or are `tuning.py` (`src/llm_queue/tuning.py`). A bare `:123` repeats the file named last in the same cell.
 - Defaults: `budget_key_ms` = 180 s (`tuning.py:104`); lease = `LLMQ_LEASE_SECS` = 60 s;
   "held" lifetime = `max(budget_key_ms, 2 x lease)` = 180 s (`_admission_lua.py:41`);
   `DAY_MS` = 1 day, a constant (`_admission_lua.py:39`).
@@ -228,15 +228,15 @@ What the library checks:
 
 | Check | When | What happens |
 |---|---|---|
-| Cluster mode (`INFO cluster`) | `start()` | `ConfigError`: refused (`store_checks.py:66-93`, `runtime.py:740-742`) |
-| `maxmemory-policy` (`CONFIG GET`, else `INFO memory`; `unknown` if neither works) | `start()`, then every 12 store probes (about 1 minute) | Logs `store_eviction_policy` when `eviction_warning(policy, mode)` warns (`store_checks.py:50-63,89-93`): `allkeys-*` always; `volatile-*` only with native TTLs. Re-read by `_read_policies` (`runtime.py:4322-4339`, `POLICY_EVERY_ROUNDS` = 12, `HEALTH_PROBE_EVERY_SECS` = 5 s, `runtime.py:110,119`) |
+| Cluster mode (`INFO cluster`) | `start()` | `ConfigError`: refused (`store_checks.py:67-94`, `runtime.py:740-742`) |
+| `maxmemory-policy` (`CONFIG GET`, else `INFO memory`; `unknown` if neither works) | `start()`, then every 12 store probes (about 1 minute) | Logs `store_eviction_policy` when `eviction_warning(policy, mode)` warns (`store_checks.py:51-64,90-94`): `allkeys-*` always; `volatile-*` only with native TTLs. Re-read by `_read_policies` (`runtime.py:4322-4339`, `POLICY_EVERY_ROUNDS` = 12, `HEALTH_PROBE_EVERY_SECS` = 5 s, `runtime.py:110,119`) |
 | Key expiry mode | `start()`, every minute, after a store reset | `_apply_expiry` (`runtime.py:4341-4353`) writes `decide(LLMQ_KEY_EXPIRY, policy)` (`expiry.py:86-94`) to each store's `P:expiry`; a change logs `key_expiry_changed` (warning) |
 | Readiness, strict (`LLMQ_ENVIRONMENT` not `dev`/`local`/`test`/`ci`; unset is strict) | each `health_check()` | `_evicting()` returns a reason: `ready: false` with `not_ready_reason` (`runtime.py:4248-4253,4297-4305`); gauge `llmq_ready` 0 (`runtime.py:4477-4485`) |
 | Readiness, dev | each `health_check()` | Ready; warning at start only; `eviction_policy` and `key_expiry` in `health()` (`runtime.py:4263-4266`) |
 | Gauges | each metrics tick | `llmq_store_eviction_unsafe{store}` 1 when unsafe in the store's mode; `llmq_key_expiry_swept{store}` 1 in `swept` (`runtime.py:4478-4482`) |
 | Expiry sweep | every `sweep_secs` (10 s), one process (`P:lock:sweep`) | `TTL_SWEEP` deletes due keys, `LLMQ_TTL_SWEEP_BATCH` (500) per run, at most `LLMQ_TTL_SWEEP_ROUNDS` (20) runs per sweep (`runtime.py:4359-4375`); counted in `llmq_ttl_swept_total`. It runs in both modes |
 
-An unreadable policy (`unknown`) never fails readiness (`store_checks.py:56`); with `auto` it
+An unreadable policy (`unknown`) never fails readiness (`store_checks.py:57`); with `auto` it
 gets `swept`.
 
 ## Settings that change key lifetimes
