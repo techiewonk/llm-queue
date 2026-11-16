@@ -22,6 +22,7 @@ only its own key prefix and deletes it at the end, so a shared store is safe.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import subprocess
@@ -136,6 +137,13 @@ def main() -> int:
     parser.add_argument(
         "--store", choices=("local", "env"), default="local", help="local Valkey or the env file's"
     )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="folder for each sample's output and a summary (default: reports/samples-...)",
+    )
+    parser.add_argument("--no-save", action="store_true", help="print only; write no files")
     args = parser.parse_args()
     found = sorted(p.stem for p in SAMPLES.glob("[0-9]*.py"))
     names = args.names or found
@@ -146,6 +154,13 @@ def main() -> int:
     prefix = f"llmqsample:{uuid7().hex[-8:]}"  # a v7 starts with the time: take its tail
     store = store_url(args.store, args.env_file)
     env = environment(args.live, args.env_file, prefix, store)
+    target = "live" if args.live else "fakellm"
+    out_dir = None
+    if not args.no_save:  # every run keeps its results (reports/ is git-ignored)
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_dir = args.out or ROOT / "reports" / f"samples-{target}-{stamp}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+    results: list[dict[str, object]] = []
     failed = []
     try:
         for name in names:
@@ -162,7 +177,14 @@ def main() -> int:
                     check=False,
                 )
             ok = proc.returncode == 0
-            print(f"{'PASS' if ok else 'FAIL'}  {name} ({time.monotonic() - started:.1f}s)")
+            secs = time.monotonic() - started
+            print(f"{'PASS' if ok else 'FAIL'}  {name} ({secs:.1f}s)")
+            results.append({"sample": name, "ok": ok, "secs": round(secs, 1)})
+            if out_dir is not None:  # the full output, stderr included (no secrets: never printed)
+                (out_dir / f"{name}.log").write_text(
+                    proc.stdout + ("\n--- stderr ---\n" + proc.stderr if proc.stderr else ""),
+                    encoding="utf-8",
+                )
             out = proc.stdout.rstrip() if ok else (proc.stdout + proc.stderr).rstrip()[-4000:]
             if out:
                 print("    " + out.replace("\n", "\n    "))
@@ -171,6 +193,21 @@ def main() -> int:
     finally:
         cleanup(prefix, store)
     print("ALL PASS" if not failed else f"FAILED: {', '.join(failed)}")
+    if out_dir is not None:
+        summary = {
+            "target": target,
+            "store": "local" if store == LOCAL_STORE_URL else "env file",
+            "when": datetime.datetime.now().isoformat(timespec="seconds"),
+            "all_pass": not failed,
+            "samples": results,
+        }
+        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        lines = [f"# Samples on {target}, {summary['when']}", "", "| Sample | Result | Secs |"]
+        lines += ["|---|---|---|"] + [
+            f"| {r['sample']} | {'PASS' if r['ok'] else 'FAIL'} | {r['secs']} |" for r in results
+        ]
+        (out_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"results saved in {out_dir}")
     return 1 if failed else 0
 
 

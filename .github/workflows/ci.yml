@@ -132,7 +132,14 @@ jobs:
       - if: matrix.python != '3.12'
         run: uv run pytest tests/unit tests/integration -q
       # The usage samples as an app runs them, then a short load drill with a throughput floor.
-      - run: uv run python scripts/samples.py
+      - run: uv run python scripts/samples.py --out reports/samples-ci
+      # Every sample's output and a summary, kept with the run (Actions > run > Artifacts).
+      - if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: samples-${{ matrix.python }}
+          path: reports/samples-ci/
+          if-no-files-found: ignore
       - run: uv run python scripts/load.py throughput --calls 500 --min-rate 20
       - if: failure()
         run: docker compose -f docker/compose.yaml logs --no-color

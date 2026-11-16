@@ -88,7 +88,12 @@ python scripts/samples.py --live --store env --env-file ../../.env  # and that f
 - **Cost:** a full live run makes about 20 small calls, well under a cent.
 - **`--store env`:** uses the env file's `LLMQ_STORE_URL`. Only the run's own prefix is touched
   and deleted, so a shared store (ElastiCache) is safe.
-- **In CI:** `python scripts/check.py samples` runs the fakellm pass with lint and type checks.
+- **In CI:** `python scripts/check.py samples` runs the fakellm pass with lint and type checks;
+  the integration jobs run every sample and attach the results as the `samples-<python>`
+  artifact of the run.
+- **Results:** each run prints every sample's output and saves it, with `summary.md` and
+  `summary.json`, under `reports/samples-<fakellm|live>-<time>/` (`--out` picks the folder,
+  `--no-save` writes nothing). Live runs are not part of CI: they need AWS keys.
 
 ## Use them in an app
 
