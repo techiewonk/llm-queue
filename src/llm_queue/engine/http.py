@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from llm_queue._logging import get_logger
 from llm_queue.engine.store_guard import STORE_DOWN
-from llm_queue.errors import ConfigError, MissingExtra, UnknownModel
+from llm_queue.errors import ConfigError, MissingExtra, PurgeRefused, UnknownModel
 from llm_queue.registry.store import (
     _SECRET_FIELDS,  # one set for the audit and this view, so a new secret is hidden in both
     LiveEditRefused,
@@ -50,6 +50,44 @@ def redacted(doc: Any) -> Any:
 
 def _too_long(*values: str | None) -> bool:
     return any(v is not None and len(v) > MAX_ID_CHARS for v in values)
+
+
+# Purge bodies: field -> accepted types. `dry_run` defaults to true (a plan): send false to purge.
+_PURGE_FIELDS: dict[str, dict[str, tuple[type, ...]]] = {
+    "model": {"model": (str,), "force": (bool,), "dry_run": (bool,)},
+    "deployment": {
+        "model": (str,),
+        "deployment": (str,),
+        "force": (bool,),
+        "wait": (bool,),
+        "wait_secs": (int, float),
+        "dry_run": (bool,),
+    },
+    "tenant": {"tenant": (str,), "remove": (list,), "models": (list,), "dry_run": (bool,)},
+    "gc": {"force": (bool,), "dry_run": (bool,)},
+}
+_PURGE_REQUIRED = {
+    "model": ("model",),
+    "deployment": ("model", "deployment"),
+    "tenant": ("tenant",),
+}
+
+
+def _purge_body(kind: str, body: Any) -> str | None:
+    """What is wrong with a purge body, or None."""
+    fields = _PURGE_FIELDS[kind]
+    if not isinstance(body, Mapping):
+        return "the body must be a JSON object"
+    wrong = [k for k, v in body.items() if k not in fields or not isinstance(v, fields[k])]
+    wrong += [k for k in _PURGE_REQUIRED.get(kind, ()) if k not in body]
+    lists = [v for k, v in body.items() if k in ("remove", "models") and isinstance(v, list)]
+    if wrong or any(not all(isinstance(x, str) for x in v) for v in lists):
+        names = ", ".join(fields)
+        return f"the body is an object of {names} ({kind}); bad or missing: {sorted(set(wrong))}"
+    texts = [v for v in body.values() if isinstance(v, str)] + [x for v in lists for x in v]
+    if _too_long(*texts) or any(len(v) > MAX_EDIT_PATHS for v in lists):
+        return f"names have at most {MAX_ID_CHARS} characters, lists {MAX_EDIT_PATHS} items"
+    return None
 
 
 class Handlers:
@@ -177,6 +215,83 @@ class Handlers:
         }
 
 
+class PurgeHandlers:
+    """The purge routes (only with `allow_writes`): thin calls into `engine.purge`."""
+
+    def __init__(self, engine: Engine, *, allow_writes: bool = False) -> None:
+        """Purges stay refused unless `allow_writes`."""
+        self.engine = engine
+        self.allow_writes = allow_writes
+
+    async def purge(self, kind: str, body: Any, *, actor: str) -> Response:
+        """`kind` is model, deployment, tenant or gc; `body` a JSON object; returns the report."""
+        if not self.allow_writes:
+            return 403, {"error": "writes are off"}
+        problem = _purge_body(kind, body)
+        if problem:
+            return 400, {"error": problem}
+        service = self.engine.purge
+        who = f"http:{actor}"
+        dry = body.get("dry_run", True)
+        try:
+            if kind == "model":
+                report = await service.model(
+                    body["model"], actor=who, force=body.get("force", False), dry_run=dry
+                )
+            elif kind == "deployment":
+                report = await service.deployment(
+                    body["model"],
+                    body["deployment"],
+                    actor=who,
+                    force=body.get("force", False),
+                    wait=body.get("wait"),
+                    wait_secs=body.get("wait_secs"),
+                    dry_run=dry,
+                )
+            elif kind == "tenant":
+                report = await service.tenant(
+                    body["tenant"],
+                    actor=who,
+                    remove=body.get("remove"),
+                    models=body.get("models"),
+                    dry_run=dry,
+                )
+            else:
+                report = await service.removed(
+                    actor=who, force=body.get("force", False), dry_run=dry
+                )
+        except PurgeRefused as exc:
+            return 409, {"error": str(exc)}
+        except ConfigError as exc:
+            return 400, {"error": str(exc)}
+        except STORE_DOWN:
+            return _UNAVAILABLE
+        return 200, report.as_dict()
+
+    async def scheduled(self) -> Response:
+        """Auto purges waiting for their grace."""
+        if not self.allow_writes:
+            return 403, {"error": "writes are off"}
+        try:
+            return 200, {"scheduled": await self.engine.purge.scheduled()}
+        except STORE_DOWN:
+            return _UNAVAILABLE
+
+    async def cancel_scheduled(self, body: Any, *, actor: str) -> Response:
+        """Drop one scheduled auto purge: body `{"target": ...}`."""
+        if not self.allow_writes:
+            return 403, {"error": "writes are off"}
+        target = body.get("target") if isinstance(body, Mapping) else None
+        if not isinstance(target, str) or _too_long(target) or len(body) != 1:
+            return 400, {"error": "the body is an object with only `target`"}
+        try:
+            removed = await self.engine.purge.cancel_scheduled(target)
+        except STORE_DOWN:
+            return _UNAVAILABLE
+        logger.info("purge_unscheduled", target=target, by=f"http:{actor}")
+        return 200, {"target": target, "cancelled": removed}
+
+
 def status_router(
     engine: Engine,
     *,
@@ -198,6 +313,8 @@ def status_router(
     browser cannot send either cross-site without a CORS preflight, so a page an admin visits
     cannot post a block or an edit with the admin's cookies. With no `dependencies` the read
     routes (`/status`, `/requests/{id}`, `/registry`) are open; a warning is logged (FO-14).
+    With `allow_writes` the purge routes (`/purge/*`, `/registry/gc`) are mounted too, under
+    the same rules; their `dry_run` defaults to true.
     """
     try:
         from fastapi import APIRouter, Body, Depends, Request
@@ -237,7 +354,8 @@ def status_router(
 
     def reply(result: Response) -> Any:
         code, body = result
-        headers = {"Retry-After": str(RETRY_AFTER_SECS)} if code == 409 else None
+        retry = code == 409 and "retry_after_secs" in body  # a refused purge is not retryable
+        headers = {"Retry-After": str(RETRY_AFTER_SECS)} if retry else None
         return JSONResponse(body, status_code=code, headers=headers)
 
     @router.get("/health/live")
@@ -295,5 +413,37 @@ def status_router(
         return reply(
             await handlers.block(actor=who(request), region=region, account=account, on=on)
         )
+
+    if allow_writes:
+        purges = PurgeHandlers(engine, allow_writes=True)
+
+        async def purge_route(kind: str, request: Request, body: Any) -> Any:
+            refused = admin_header(request)
+            return reply(refused or await purges.purge(kind, body, actor=who(request)))
+
+        @router.post("/purge/model", dependencies=guarded)
+        async def purge_model(request: Request, body: Any = Body(...)) -> Any:  # noqa: B008
+            return await purge_route("model", request, body)
+
+        @router.post("/purge/deployment", dependencies=guarded)
+        async def purge_deployment(request: Request, body: Any = Body(...)) -> Any:  # noqa: B008
+            return await purge_route("deployment", request, body)
+
+        @router.post("/purge/tenant", dependencies=guarded)
+        async def purge_tenant(request: Request, body: Any = Body(...)) -> Any:  # noqa: B008
+            return await purge_route("tenant", request, body)
+
+        @router.post("/registry/gc", dependencies=guarded)
+        async def registry_gc(request: Request, body: Any = Body(...)) -> Any:  # noqa: B008
+            return await purge_route("gc", request, body)
+
+        @router.get("/purge/scheduled", dependencies=guarded)
+        async def purge_scheduled(request: Request) -> Any:
+            return reply(admin_header(request) or await purges.scheduled())
+
+        @router.post("/purge/scheduled/cancel", dependencies=guarded)
+        async def purge_unschedule(request: Request, body: Any = Body(...)) -> Any:  # noqa: B008
+            refused = admin_header(request)
+            return reply(refused or await purges.cancel_scheduled(body, actor=who(request)))
 
     return router

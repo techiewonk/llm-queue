@@ -4,7 +4,7 @@ Every command but `registry schema` reads `LLMQ_*` from the environment
 (`InfraSettings.from_env`) and talks to the stores directly; writes go through the registry
 store (validated, protected fields, audited with `--actor`, default the OS user). Output is
 JSON, one document per command. Commands that delete or move data (`dlq purge`,
-`dlq redrive`, `registry gc`, `drain`, `cancel`) need `--yes`; `--dry-run` shows what they
+`dlq redrive`, `registry gc`, `purge`, `drain`, `cancel`) need `--yes`; `--dry-run` shows what they
 would do.
 
 Exit codes: 0 done, 1 an error (bad input, unknown or expired request, store outage), 3 a
@@ -32,6 +32,8 @@ from llm_queue._logging import get_logger
 from llm_queue.engine._codec import text as _text
 from llm_queue.engine.http import redacted
 from llm_queue.engine.keys import Keys
+from llm_queue.engine.purge import PurgeService, PurgeSettings
+from llm_queue.engine.purge import _glob_escape as _glob_escape  # kept importable here (EN-30)
 from llm_queue.engine.queue import RETENTION_SECS, StreamQueues
 from llm_queue.engine.requests import RequestStore
 from llm_queue.engine.settings import InfraSettings
@@ -44,7 +46,6 @@ from llm_queue.registry.store import RegistryStore
 from llm_queue.tuning import Tuning
 
 logger = get_logger(__name__)
-_GC_BATCH = 500  # keys per UNLINK pipeline in `registry gc`
 EXIT_DRAIN_TIMEOUT = 3  # `drain --wait` ran out of time with calls still waiting (FO-8)
 MAX_CANCEL_IDS = 1000  # one `cancel` command at most
 
@@ -63,11 +64,6 @@ def default_actor() -> str:
         if getuid is not None:
             return f"uid:{getuid()}"
         raise ConfigError("cannot tell who you are: pass --actor NAME") from None
-
-
-def _glob_escape(text: str) -> str:
-    """`text` matched literally in a SCAN pattern (glob characters and backslash escaped)."""
-    return "".join(f"\\{c}" if c in "*?[]\\" else c for c in text)
 
 
 def _value(text: str) -> Any:
@@ -118,7 +114,28 @@ def _parser() -> argparse.ArgumentParser:
     log.add_argument("--path", default="")
     pub = reg.add_parser("publish", help="publish LLMQ_REGISTRY, or roll back")
     pub.add_argument("--from-version", type=int, dest="from_version")
-    _confirm(reg.add_parser("gc", help="delete keys and queues of models that no longer exist"))
+    gc = reg.add_parser("gc", help="purge models and deployments that no longer exist")
+    gc.add_argument("--force", action="store_true", help="also queues that still hold messages")
+    _confirm(gc)
+
+    purge = sub.add_parser("purge", help="delete store state (audited)").add_subparsers(
+        dest="action", required=True
+    )
+    pm = purge.add_parser("model", help="a removed model: keys, queues, doorbells")
+    pm.add_argument("model")
+    pm.add_argument("--force", action="store_true", help="even if in the registry / queued")
+    pd = purge.add_parser("deployment", help="a removed deployment (account/name) of a model")
+    pd.add_argument("model")
+    pd.add_argument("deployment")
+    pd.add_argument("--force", action="store_true", help="even if still in the registry")
+    pd.add_argument("--no-wait", action="store_false", dest="wait", default=None)
+    pd.add_argument("--wait-secs", type=float, dest="wait_secs")
+    pt = purge.add_parser("tenant", help="a tenant's fairness state (and calls)")
+    pt.add_argument("tenant")
+    pt.add_argument("--remove", help="comma list of keys, queued, running")
+    pt.add_argument("--models", help="comma list of model aliases (default: all)")
+    for p in (pm, pd, pt):
+        _confirm(p)
 
     settings = sub.add_parser("settings").add_subparsers(dest="action", required=True)
     sget = settings.add_parser("get")
@@ -198,6 +215,15 @@ class Cli:
             audit_retention_days=settings.audit_retention_days,
         )
         self.queues = StreamQueues(queue_client or client, self.keys)
+        self.purger = PurgeService(
+            client,
+            self.registry,
+            queue_client=queue_client,
+            queue_prefix=settings.queue_prefix,
+            settings=PurgeSettings.from_infra(settings),
+            salt=settings.id_hash_salt or "",
+            status_ttl_secs=settings.status_ttl_secs,
+        )
 
     @property
     def actor(self) -> str:
@@ -258,58 +284,36 @@ class Cli:
             )
             return {"model": args.model, "deployment": args.deployment, action: True}
         if action == "gc":
-            return await self._gc(view, _confirmed(args, "registry gc deletes keys"))
+            go = _confirmed(args, "registry gc deletes keys")
+            report = await self.purger.removed(actor=self.actor, force=args.force, dry_run=not go)
+            return report.as_dict()
         raise ConfigError(f"unknown registry action {action}")
 
-    async def _gc(self, view: Any, go: bool) -> dict[str, Any]:
-        """Delete the keys and queues of models that are not in the registry any more.
-
-        A removed model's queues are found by name: `llm-<alias>` or the `queue.name` an older
-        published version (kept for rollback) gave it. Job queues (`jobs-*`) and queues of other
-        prefixes are never touched.
-        """
-        known = set(view.registry.models)
-        prefix = self.keys.prefix
-        doomed: list[tuple[Any, str]] = []
-        removed: set[str] = set()
-        # The prefix is escaped: a `[`, `*` or `?` in LLMQ_KEY_PREFIX widened the match (EN-30).
-        glob = _glob_escape(prefix)
-        async for key in self.client.scan_iter(match=f"{glob}:{{m:*", count=500):
-            alias = _text(key).split("{m:", 1)[1].split("}", 1)[0]
-            if alias not in known:
-                doomed.append((self.client, _text(key)))
-                removed.add(alias)
-        names = {f"llm-{alias}" for alias in removed}
-        for raw in (await self.client.hgetall(self.registry.history_key)).values():
-            models = orjson.loads(raw).get("models") or {}
-            for alias, body in models.items():
-                if alias not in known:
-                    queue = (
-                        (body.get("queue") or {}).get("name") if isinstance(body, dict) else None
-                    )
-                    names.add(str(queue) if queue else f"llm-{alias}")
-        live = {view.queue_name(alias) for alias in known}
-        gone = {self.settings.queue_prefix + name for name in names - live}
-        gone |= {f"{name}-priority" for name in gone}
-        queue_client = self.queue_client or self.client
-        async for key in queue_client.scan_iter(match=f"{glob}:{{q:*", count=500):
-            if _text(key).split("{q:", 1)[1].split("}", 1)[0] in gone:
-                doomed.append((queue_client, _text(key)))
-        for name in sorted(gone):
-            bell = self.queues.bell(name)
-            if await queue_client.exists(bell):
-                doomed.append((queue_client, bell))
-        if go:  # UNLINK in pipelined batches: one DEL round trip per key before (EN-30)
-            for client in {id(c): c for c, _ in doomed}.values():
-                mine = [key for c, key in doomed if c is client]
-                for start in range(0, len(mine), _GC_BATCH):
-                    async with client.pipeline(transaction=False) as pipe:
-                        for key in mine[start : start + _GC_BATCH]:
-                            pipe.unlink(key)
-                        await pipe.execute()
-        out: dict[str, Any] = {"deleted_keys" if go else "would_delete": len(doomed)}
-        out["queues"] = sorted(gone)
-        return out
+    async def _purge(self, args: argparse.Namespace) -> Any:
+        """`purge model|deployment|tenant`: the service does it; this only maps the flags."""
+        go = _confirmed(args, f"purge {args.action} deletes keys")
+        actor = self.actor if go else "plan"
+        if args.action == "model":
+            report = await self.purger.model(
+                args.model, actor=actor, force=args.force, dry_run=not go
+            )
+        elif args.action == "deployment":
+            report = await self.purger.deployment(
+                args.model,
+                args.deployment,
+                actor=actor,
+                force=args.force,
+                wait=args.wait,
+                wait_secs=args.wait_secs,
+                dry_run=not go,
+            )
+        else:
+            remove = args.remove.split(",") if args.remove else None
+            models = args.models.split(",") if args.models else None
+            report = await self.purger.tenant(
+                args.tenant, actor=actor, remove=remove, models=models, dry_run=not go
+            )
+        return report.as_dict()
 
     async def _settings(self, args: argparse.Namespace) -> Any:
         view = await self.loaded()
