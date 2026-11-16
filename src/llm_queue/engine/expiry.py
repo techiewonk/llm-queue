@@ -39,18 +39,26 @@ function X.now()
   end
   return X.t
 end
--- PEXPIRE, or the key's expire-at in the index (swept).
+-- PEXPIRE, or the key's expire-at in the index (swept). Each mode also drops the other's
+-- expiry: a key written before a mode switch kept its native TTL (it fired mid-call, and stayed
+-- evictable) or its old index entry (the sweep deleted it early) (rescan B3-R1).
 function X.expire(key, ms)
   ms = math.floor(tonumber(ms))
   if X.swept() then
     -- As PEXPIRE: nothing for a missing key (an entry would expire a later key of that name).
-    if redis.call('EXISTS', key) == 1 then redis.call('ZADD', X.idx, X.now() + ms, key) end
-  else redis.call('PEXPIRE', key, ms) end
+    if redis.call('EXISTS', key) == 1 then
+      redis.call('PERSIST', key)
+      redis.call('ZADD', X.idx, X.now() + ms, key)
+    end
+  else
+    redis.call('PEXPIRE', key, ms)
+    redis.call('ZREM', X.idx, key)
+  end
 end
--- PTTL: ms left, -1 with no expiry, -2 when the key is missing.
+-- PTTL: ms left, -1 with no expiry, -2 when the key is missing; either kind of expiry counts.
 function X.pttl(key)
-  if not X.swept() then return redis.call('PTTL', key) end
-  if redis.call('EXISTS', key) == 0 then return -2 end
+  local p = redis.call('PTTL', key)
+  if p ~= -1 then return p end
   local at = redis.call('ZSCORE', X.idx, key)
   if not at then return -1 end
   return math.max(0, tonumber(at) - X.now())
@@ -61,10 +69,13 @@ function X.set(key, value, ms, nx)
   if X.swept() then
     if nx then r = redis.call('SET', key, value, 'NX') else r = redis.call('SET', key, value) end
     if r then X.expire(key, ms) end
-  elseif nx then
-    r = redis.call('SET', key, value, 'NX', 'PX', math.floor(tonumber(ms)))
   else
-    r = redis.call('SET', key, value, 'PX', math.floor(tonumber(ms)))
+    if nx then
+      r = redis.call('SET', key, value, 'NX', 'PX', math.floor(tonumber(ms)))
+    else
+      r = redis.call('SET', key, value, 'PX', math.floor(tonumber(ms)))
+    end
+    if r then redis.call('ZREM', X.idx, key) end
   end
   return r
 end
@@ -135,16 +146,25 @@ class Expiry:
         """`script` with the helpers in front (for `register_script`)."""
         return prelude(self.prefix) + script
 
-    def expire(self, pipe: Any, key: str, secs: float, *, grow: bool = False) -> None:
-        """Queue an expiry of `secs` for `key` on a pipeline; `grow`: never shorten it."""
+    def expire(self, pipe: Any, key: str, secs: float, *, grow: bool = False) -> int:
+        """Queue an expiry of `secs` for `key` on a pipeline; how many commands it queued.
+
+        Two (three with `grow`, never shorten): each mode also drops the other's expiry, as
+        `X.expire` does (rescan B3-R1). Callers that read the pipeline's replies skip them.
+        """
         ms = max(1, int(secs * 1000))
         if self.swept:
+            pipe.persist(key)
             pipe.zadd(self.index, {key: int(self._clock() * 1000) + ms}, gt=grow)
-        elif grow:  # GT alone never sets a first TTL (a key without one counts as endless)
+            return 2
+        if grow:  # GT alone never sets a first TTL (a key without one counts as endless)
             pipe.pexpire(key, ms, nx=True)
             pipe.pexpire(key, ms, gt=True)
-        else:
-            pipe.pexpire(key, ms)
+            pipe.zrem(self.index, key)
+            return 3
+        pipe.pexpire(key, ms)
+        pipe.zrem(self.index, key)
+        return 2
 
     async def set(
         self, client: Any, key: str, value: Any, secs: float, *, nx: bool = False
@@ -152,7 +172,10 @@ class Expiry:
         """`SET key value [NX]` that expires in `secs`; True when written."""
         ms = max(1, int(secs * 1000))
         if not self.swept:
-            return bool(await client.set(key, value, px=ms, nx=nx))
+            written = bool(await client.set(key, value, px=ms, nx=nx))
+            if written:  # an entry from a swept period would delete it early (rescan B3-R1)
+                await client.zrem(self.index, key)
+            return written
         script = self._set_scripts.get(id(client))
         if script is None:
             script = self._set_scripts[id(client)] = client.register_script(self.lua(_SET))

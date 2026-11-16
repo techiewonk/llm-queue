@@ -17,6 +17,7 @@ import pytest
 
 from llm_queue import LLMQueue
 from llm_queue.engine.errors import CallFailed
+from llm_queue.engine.expiry import native
 from llm_queue.engine.jobs import JobRunner, JobSettings, current_job
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import Message, NotReplicated, QueueSettings
@@ -46,14 +47,26 @@ class FakeClient:
         self.ttl: dict[str, float] = {}
 
     async def set(
-        self, key: str, value: bytes, *, nx: bool = False, ex: float | None = None
+        self,
+        key: str,
+        value: bytes,
+        *,
+        nx: bool = False,
+        ex: float | None = None,
+        px: int | None = None,
     ) -> bool:
         if nx and key in self.data:
             return False
         self.data[key] = value
-        if ex is not None:
-            self.ttl[key] = ex
+        if ex is not None or px is not None:
+            self.ttl[key] = ex if ex is not None else (px or 0) / 1000
         return True
+
+    async def zrem(self, *_: Any) -> int:
+        return 0
+
+    def pipeline(self, **_: Any) -> _FakePipe:
+        return _FakePipe(self)
 
     async def delete(self, key: str) -> int:
         return int(self.data.pop(key, None) is not None)
@@ -75,12 +88,39 @@ class FakeClient:
         return int(row[field])
 
 
+class _FakePipe:
+    """The pipeline commands the job runner queues: SADD and an expiry (native mode)."""
+
+    def __init__(self, client: FakeClient) -> None:
+        self.client = client
+        self.ops: list[Any] = []
+
+    async def __aenter__(self) -> _FakePipe:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+    def sadd(self, key: str, member: str) -> None:
+        self.ops.append(self.client.sadd(key, member))
+
+    def pexpire(self, key: str, ms: int, **_: Any) -> None:
+        self.ops.append(self.client.expire(key, ms / 1000))
+
+    def zrem(self, *_: Any) -> None:
+        return None
+
+    async def execute(self) -> list[Any]:
+        return [await op for op in self.ops]
+
+
 class FakeQueues:
     """The parts of `StreamQueues` the job runner uses; `pending` messages are handed out."""
 
     def __init__(self, *, receive_secs: float = 0.0, return_secs: float = 0.0) -> None:
         self.client = FakeClient()
         self.keys = Keys("t")
+        self.expiry = native("t")
         self.fails: dict[str, int] = {}
         self.failed: list[tuple[float, int]] = []  # (delay, max_receives) of each fail
         self.pending: list[Message] = []

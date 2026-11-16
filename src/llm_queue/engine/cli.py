@@ -116,6 +116,11 @@ def _parser() -> argparse.ArgumentParser:
     pub.add_argument("--from-version", type=int, dest="from_version")
     gc = reg.add_parser("gc", help="purge models and deployments that no longer exist")
     gc.add_argument("--force", action="store_true", help="also queues that still hold messages")
+    gc.add_argument(
+        "--no-wait", action="store_false", dest="wait", default=None,
+        help="do not wait for calls still running on removed deployments",
+    )  # fmt: skip
+    gc.add_argument("--wait-secs", type=float, dest="wait_secs")
     _confirm(gc)
 
     purge = sub.add_parser("purge", help="delete store state (audited)").add_subparsers(
@@ -285,7 +290,13 @@ class Cli:
             return {"model": args.model, "deployment": args.deployment, action: True}
         if action == "gc":
             go = _confirmed(args, "registry gc deletes keys")
-            report = await self.purger.removed(actor=self.actor, force=args.force, dry_run=not go)
+            report = await self.purger.removed(
+                actor=self.actor,
+                force=args.force,
+                wait=args.wait,
+                wait_secs=args.wait_secs,
+                dry_run=not go,
+            )
             return report.as_dict()
         raise ConfigError(f"unknown registry action {action}")
 

@@ -41,6 +41,18 @@ class Store:
         def xadd(self, key: str, fields: dict[str, Any], **_: Any) -> None:
             self.adds.append(fields)
 
+        def pexpire(self, key: str, ms: int, **_: Any) -> None:
+            self.expire(key, ms // 1000)
+
+        def zrem(self, *_: Any) -> None:
+            return None
+
+        def persist(self, *_: Any) -> None:
+            return None
+
+        def zadd(self, *_: Any, **__: Any) -> None:
+            return None
+
         def expire(self, key: str, ttl: int) -> None:
             return None
 

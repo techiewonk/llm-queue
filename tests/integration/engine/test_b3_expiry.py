@@ -6,9 +6,11 @@ Swept mode must leave no native TTL on what it writes (a `volatile-*` store cann
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import redis.asyncio
+from engine_testkit import Make
 
 from llm_queue.engine.expiry import NATIVE, SWEPT, TTL_SWEEP, Expiry, decide
 from llm_queue.engine.store_checks import eviction_warning
@@ -132,3 +134,48 @@ async def test_swept_expire_skips_a_missing_key(store: redis.asyncio.Redis, pref
     probe = store.register_script(expiry.lua("X.expire(KEYS[1], 60000) return 1"))
     await probe(keys=[f"{prefix}:gone"])
     assert await store.zscore(expiry.index, f"{prefix}:gone") is None
+
+
+async def test_switching_modes_moves_a_key_to_the_new_expiry(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """Rescan B3-R1: after a switch a key kept the old mode's expiry (fired early, evictable)."""
+    expiry = Expiry(prefix, time.time)
+    key = f"{prefix}:k"
+    probe = store.register_script(expiry.lua("X.expire(KEYS[1], 60000) return X.pttl(KEYS[1])"))
+    await store.set(key, "1")
+    await expiry.publish_mode(store, NATIVE)
+    await probe(keys=[key])
+    assert await store.pttl(key) > 0
+    await expiry.publish_mode(store, SWEPT)  # native -> swept: the TTL goes, the index has it
+    assert 0 < int(await probe(keys=[key])) <= 60_000
+    assert await store.pttl(key) == -1
+    assert await store.zscore(expiry.index, key) is not None
+    await expiry.publish_mode(store, NATIVE)  # swept -> native: the entry goes
+    await probe(keys=[key])
+    assert await store.pttl(key) > 0
+    assert await store.zscore(expiry.index, key) is None
+
+
+async def test_native_pttl_reads_an_indexed_expiry(store: redis.asyncio.Redis, prefix: str) -> None:
+    """A key indexed while swept still shows its time left in native mode (claim refresh)."""
+    expiry = Expiry(prefix, time.time)
+    await expiry.publish_mode(store, NATIVE)
+    await store.set(f"{prefix}:j", "1")
+    await store.zadd(expiry.index, {f"{prefix}:j": int(time.time() * 1000) + 30_000})
+    probe = store.register_script(expiry.lua("return X.pttl(KEYS[1])"))
+    assert 0 < int(await probe(keys=[f"{prefix}:j"])) <= 30_000
+
+
+async def test_a_caller_only_process_sweeps_with_its_own_lock(make: Make) -> None:
+    """Callers write indexed keys too, and must not take the worker sweep's lock (B3-R2)."""
+    engine, _ = await make(worker=False)
+    key = f"{engine.keys.prefix}:due"
+    await engine.state.set(key, "1")
+    await engine.state.zadd(engine.expiry.index, {key: int(time.time() * 1000) - 1_000})
+    for _ in range(40):
+        if not await engine.state.exists(key):
+            break
+        await asyncio.sleep(0.1)
+    assert not await engine.state.exists(key)
+    assert not await engine.state.exists(f"{engine.keys.prefix}:lock:sweep")

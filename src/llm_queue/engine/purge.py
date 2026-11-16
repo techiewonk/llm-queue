@@ -110,6 +110,7 @@ class PurgeSettings:
     grace_secs: float = 900.0
     wait: bool = True
     wait_secs: float = 300.0
+    http_wait_secs: float = 60.0  # LLMQ_HTTP_PURGE_WAIT_SECS: the most an HTTP purge waits
     batch: int = 500
     tenant_default: frozenset[str] = frozenset({"keys"})
     tenant_index: bool = False
@@ -122,6 +123,7 @@ class PurgeSettings:
             grace_secs=float(settings.purge_grace_secs),
             wait=settings.purge_wait,
             wait_secs=float(settings.purge_wait_secs),
+            http_wait_secs=float(settings.http_purge_wait_secs),
             batch=int(settings.purge_batch),
             tenant_default=frozenset(settings.tenant_purge_default.split(",")),
             tenant_index=settings.tenant_index,
@@ -351,12 +353,14 @@ class PurgeService:
         actor: str,
         force: bool = False,
         wait: bool | None = None,
+        wait_secs: float | None = None,
         dry_run: bool = False,
     ) -> PurgeReport:
         """Purge every model and deployment the store has state of and the registry has not.
 
         What `registry gc` runs. Queues of removed models go only when empty unless `force`;
-        `wait` as in `deployment` (its wait is `LLMQ_PURGE_WAIT_SECS`).
+        `wait` / `wait_secs` as in `deployment` (defaults `LLMQ_PURGE_WAIT[_SECS]`), per
+        deployment.
         """
         view = await self._view()
         known = set(view.registry.models)
@@ -375,7 +379,7 @@ class PurgeService:
                         dep,
                         actor=actor,
                         wait=self.settings.wait if wait is None else wait,
-                        wait_secs=self.settings.wait_secs,
+                        wait_secs=self.settings.wait_secs if wait_secs is None else wait_secs,
                         dry_run=dry_run,
                     )
                 )
@@ -476,10 +480,10 @@ class PurgeService:
             due_now = await self._state.zrangebyscore(self._schedule_key, "-inf", now_ms)
             for raw in due_now:
                 target = _text(raw)
-                if target not in targets:
-                    await self._auto(view, target)
-                else:
+                if target in targets:
                     logger.info("purge_unscheduled", target=target, reason="back_in_registry")
+                elif not await self._auto(target):
+                    continue  # kept: tried again at the next tick
                 await self._state.zrem(self._schedule_key, target)
         finally:
             await self._unlock([lock], [self._owner])
@@ -694,16 +698,23 @@ class PurgeService:
             self._metrics.count("llmq_cancels_total", float(len(chosen)), source="admin")
         return done
 
-    async def _auto(self, view: ResolvedRegistry, target: str) -> None:
-        """Run one due auto purge (the grace was the wait); failures are logged."""
+    async def _auto(self, target: str) -> bool:
+        """Run one due auto purge (the grace was the wait); False keeps it for the next tick.
+
+        Decided on the registry as stored now, read strictly: a store error, no stored
+        registry, a stored one this library refuses, or a process on its own config skips the
+        purge (a stale or fallback copy could purge a model that was live again; rescan B3).
+        """
         alias, _, dep = target.partition("/")
         try:
-            # The registry as stored now, not this pod's copy: a stale or fallback copy could
-            # purge a model that was live again (review B3).
-            view = await self._view()
+            doc, _meta = await self.registry._read()  # raises on a store error
+            view = await self._view() if doc is not None else None
+            if view is None or self.registry.stored_refused or self.registry.on_own_config:
+                logger.warning("purge_deferred", target=target, reason="registry_not_readable")
+                return False
             if target in self._targets(view):
                 logger.info("purge_unscheduled", target=target, reason="back_in_registry")
-                return
+                return True
             if dep:
                 report = await self._deployment(
                     alias, dep, actor=AUTO_ACTOR, wait=False, wait_secs=0, dry_run=False
@@ -715,6 +726,8 @@ class PurgeService:
             await self._done(report)
         except Exception as exc:
             logger.warning("purge_failed", target=target, error=repr(exc))
+            return False
+        return True
 
     # ---------------------------------------------------------------- helpers
 

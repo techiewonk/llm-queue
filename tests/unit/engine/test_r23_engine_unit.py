@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from llm_queue.engine.expiry import native
 from llm_queue.engine.jobs import JobRunner
 from llm_queue.engine.queue import NotReplicated
 from llm_queue.engine.runtime import StoreClock, _api_kwargs, _by_deployment, _call_timeout_secs
@@ -113,6 +114,7 @@ class _Queues:
     def __init__(self, short: bool) -> None:
         self.short = short
         self.waits: list[int] = []
+        self.expiry = native("t")
 
     async def send(self, queue: str, body: bytes, settings: Any, **kwargs: Any) -> str:
         self.waits.append(int(kwargs.get("wait_replicas", 0)))

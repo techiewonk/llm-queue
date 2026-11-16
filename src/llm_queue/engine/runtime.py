@@ -670,10 +670,13 @@ class Engine:
         self._unclaimed: dict[str, tuple[str, str]] = {}
         self._results_exist = state.register_script(_RESULTS_EXIST)
         # Key expiry of each store (owner K4): native TTLs or the index, set at start.
-        self.expiry = Expiry(self.keys.prefix, self.clock.now)
-        self.queue_expiry = (
-            Expiry(self.keys.prefix, self.clock.now) if queue_store is not None else self.expiry
-        )
+        # Until a publish succeeds: what the setting asks for, native for `auto` (a process
+        # reported `swept` and ready while forced native on a volatile store; rescan B3).
+        first = self.settings.key_expiry if self.settings.key_expiry != "auto" else "native"
+        self.expiry = Expiry(self.keys.prefix, self.clock.now, first)
+        self.queue_expiry = self.expiry
+        if queue_store is not None:
+            self.queue_expiry = Expiry(self.keys.prefix, self.clock.now, first)
         self._ttl_sweeps = [(self.expiry, state.register_script(TTL_SWEEP))]
         if queue_store is not None:
             self._ttl_sweeps.append((self.queue_expiry, queue_store.register_script(TTL_SWEEP)))
@@ -738,26 +741,35 @@ class Engine:
                 # Cluster mode is refused (`ConfigError`); an evicting store is a warning (C4).
                 setting = self.settings.key_expiry
                 self._eviction["state"] = await check_store(self.state, "state", setting)
-                if self._queue_store is not None:
-                    self._eviction["queue"] = await check_store(self._queue_store, "queue", setting)
                 await self.state.set(self.keys.epoch, str(self.clock.now()), nx=True)
                 self._epoch = text(await self.state.get(self.keys.epoch))
                 await self.requests.check_offload()  # `ConfigError` without it (Q24)
-                # Last and on its own: a queue store down at start must not skip the steps
-                # above (review B3-2); the minute re-read publishes the mode later.
-                await self._publish_expiry_safely()
         except (*STORE_ERRORS, RedisError) as exc:  # the timeout is a TimeoutError (OSError)
             # Start anyway (plan §3.18): calls follow each model's `store_down` rule and
             # the background loops keep retrying until the store answers.
             logger.error(
                 "state_store_unreachable_at_start", error=str(exc), error_type=type(exc).__name__
             )
+        if self._queue_store is not None:
+            # After the state steps, with its own time limit: a queue store that hung at start
+            # skipped the epoch and offload checks above (review B3-2, rescan).
+            try:
+                async with asyncio.timeout(START_PROBE_SECS):
+                    self._eviction["queue"] = await check_store(
+                        self._queue_store, "queue", self.settings.key_expiry
+                    )
+            except (*STORE_ERRORS, RedisError) as exc:
+                logger.error(
+                    "queue_store_unreachable_at_start",
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+        # Last and never raising: the minute re-read publishes the mode when this one fails.
+        await self._publish_expiry_safely()
         if caller:
             self._pubsub = self.state.pubsub()
             self._loop(self._result_reader(), "result_reader")
             self._loop(self._result_sweep(), "result_sweep")
-            if not worker:  # callers write indexed keys too: a fleet of callers must drain it
-                self._loop(self._ttl_sweeper(), "ttl_sweeper")
         if worker:
             self._worker = True
             self._sync_model_loops()
@@ -768,6 +780,9 @@ class Engine:
             self._loop(self._cancel_reader(), "cancel_reader")
             self._loop(self._warm_clients(), "warm_clients")
         self._loop(self._heartbeat(), "heartbeat")
+        # Every process, its own lock: callers write indexed keys too, and sharing the worker
+        # sweep's lock let callers starve the dead-owner and lease sweep (rescan B3-R2).
+        self._loop(self._ttl_sweeper(), "ttl_sweeper")
         self._loop(self._store_prober(), "store_prober")
         self._loop(self.requests.check_lifecycle(), "offload_lifecycle")  # Q23
         self._loop(self.registry.run(self.settings.cfg_reload_secs), "registry_reload")
@@ -3526,9 +3541,9 @@ class Engine:
         async with self.state.pipeline(transaction=False) as pipe:
             pipe.hincrby(key, "retries", 1)
             pipe.hget(key, "first")
-            self.expiry.expire(pipe, key, 180)
             pipe.hmget(self.keys.model(alias, f"retries:{minute - 1}"), ["retries", "first"])
-            retries, first, _, (old_retries, old_first) = await pipe.execute()
+            self.expiry.expire(pipe, key, 180)  # last: its replies are not read
+            retries, first, (old_retries, old_first) = (await pipe.execute())[:3]
         used = int(retries) + int(old_retries or 0) * weight
         first_n = int(first or 0) + int(old_first or 0) * weight
         allowed = max(
@@ -4361,12 +4376,12 @@ class Engine:
                 )
 
     async def _ttl_sweeper(self) -> None:
-        """Caller-only processes: the expiry index sweep alone, under the sweep lock."""
+        """The expiry index sweep: one process at a time (`P:lock:ttlsweep`), every sweep."""
         while True:
             await asyncio.sleep(self.settings.sweep_secs)
             try:
                 lock = await self.state.set(
-                    f"{self.keys.prefix}:lock:sweep",
+                    f"{self.keys.prefix}:lock:ttlsweep",
                     self.worker_id,
                     nx=True,
                     px=max(1, int(self.settings.sweep_secs * 1000)),
@@ -4944,7 +4959,11 @@ class Engine:
             # (else they get native TTLs), and never raising: a failed write here skipped the
             # re-registration for good (the epoch is already the new one; review B3-1).
             await self._publish_expiry_safely()
-            await self._reregister()
+            try:
+                await self._reregister()
+            except Exception:
+                self._epoch = seen  # still "changed" at the next beat: re-registered then
+                raise
 
     async def _check_replication(self) -> None:
         """Read the state store's replication: replicas connected, and a promotion.
@@ -5019,7 +5038,6 @@ class Engine:
                 continue
             if not lock:
                 continue
-            await self._sweep_ttl_index()
             view = self.registry.current
             for alias in view.registry.models:
                 # One model that fails skips only itself: one `try` around the loop stopped the

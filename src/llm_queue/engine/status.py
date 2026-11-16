@@ -424,10 +424,11 @@ class AlertEvaluator:
         previous: list[Any] = []
         for start in range(0, len(alerts), _ALERT_BATCH):
             async with self._client.pipeline(transaction=False) as pipe:
+                step = 1
                 for alert in alerts[start : start + _ALERT_BATCH]:
                     pipe.set(_marker(self.keys, alert), _state(alert), get=True)
-                    self.expiry.expire(pipe, _marker(self.keys, alert), 86_400)
-                previous += (await pipe.execute())[::2]  # the SET replies
+                    step = 1 + self.expiry.expire(pipe, _marker(self.keys, alert), 86_400)
+                previous += (await pipe.execute())[::step]  # the SET replies
         for alert, before in zip(alerts, previous, strict=True):
             state = _state(alert)
             if (_text(before) if before is not None else "0") != state:

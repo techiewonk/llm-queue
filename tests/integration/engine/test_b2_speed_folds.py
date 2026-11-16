@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import dataclasses
 import hashlib
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -170,15 +171,20 @@ async def test_result_put_writes_the_final_status(store: redis.asyncio.Redis, pr
     assert (await requests.status("r"))["state"] == "done"  # a final status is never replaced
 
 
-def _scripts() -> dict[str, str]:
-    """SHA1 -> name of every engine script, to tell the hot path from background loops."""
+def _scripts(prefix: str | None = None) -> dict[str, str]:
+    """SHA1 -> name of every engine script, to tell the hot path from background loops.
+
+    With `prefix`: also each script as registered, behind the key expiry prelude (0.1.0b3).
+    """
     from llm_queue.engine import _admission_lua, queue, requests, runtime
+    from llm_queue.engine.expiry import prelude
 
     out = {}
     for module in (_admission_lua, queue, requests, runtime):
         for name, value in vars(module).items():
             if name.lstrip("_").isupper() and isinstance(value, str) and "redis.call" in value:
-                out[hashlib.sha1(value.encode()).hexdigest()] = name.lstrip("_")
+                for text in (value, prelude(prefix) + value) if prefix else (value,):
+                    out[hashlib.sha1(text.encode()).hexdigest()] = name.lstrip("_")
     return out
 
 
@@ -232,7 +238,11 @@ def sends(monkeypatch: pytest.MonkeyPatch) -> _Sends:
 async def test_one_converse_costs_few_round_trips(make: Make, sends: _Sends) -> None:
     """B3-B5: one converse (caller and worker in one process) took ~19 store round trips."""
     engine, _ = await make()
+    SCRIPTS.update(_scripts(engine.keys.prefix))  # the scripts as this engine registered them
     await engine.call("small", CHAT)  # warm: scripts loaded, clients built
+    # The sweep loops (worker sweep, auto purge, expiry index sweep: 0.1.0b3) run every second
+    # in this rig; their locks and scripts landed in the window. Park them for the count.
+    engine.settings = dataclasses.replace(engine.settings, sweep_secs=3600)
     await asyncio.sleep(1.5)  # the loop idles on the doorbell (1 s pauses after 20 empty polls)
     with sends.window():
         await engine.call("small", CHAT, priority=True)

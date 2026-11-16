@@ -27,6 +27,7 @@ class _Purge:
     def __init__(self, error: Exception | None = None) -> None:
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
         self.error = error
+        self.settings = PurgeSettings()
 
     def _report(self, name: str, *args: Any, **kw: Any) -> PurgeReport:
         self.calls.append((name, args, kw))
@@ -174,3 +175,33 @@ def test_report_as_dict() -> None:
         "deleted_fields": 0,
         "cancelled": 0,
     }
+
+
+async def test_http_purge_waits_are_always_capped() -> None:
+    """Rescan B3-R3: an omitted wait waited LLMQ_PURGE_WAIT_SECS (300 s) per deployment."""
+    purge = _Purge()
+    handlers = PurgeHandlers(_Engine(purge), allow_writes=True)  # type: ignore[arg-type]
+    dep = {"model": "m", "deployment": "a/r"}
+    for body, want in (({}, 60.0), ({"wait_secs": 500}, 60.0), ({"wait_secs": 5}, 5.0)):
+        assert (await handlers.purge("deployment", {**dep, **body}, actor="a"))[0] == 200
+        assert purge.calls[-1][2]["wait_secs"] == want
+    assert (await handlers.purge("gc", {}, actor="a"))[0] == 200
+    assert purge.calls[-1][2]["wait_secs"] == 60.0
+    for bad in (True, -1):
+        assert (await handlers.purge("deployment", {**dep, "wait_secs": bad}, actor="a"))[0] == 400
+
+
+def test_key_expiry_and_purge_switches_are_validated() -> None:
+    """Each new setting has a default and refuses a bad value (owner: default + configurable)."""
+    settings = InfraSettings.from_env(DEV)
+    assert (settings.key_expiry, settings.http_purge_wait_secs) == ("auto", 60.0)
+    assert (settings.ttl_sweep_batch, settings.ttl_sweep_rounds) == (500, 100)
+    for name, value in (
+        ("LLMQ_KEY_EXPIRY", "sometimes"),
+        ("LLMQ_HTTP_PURGE_WAIT_SECS", "4000"),
+        ("LLMQ_PURGE_WAIT", "maybe"),
+        ("LLMQ_TENANT_INDEX", "maybe"),
+        ("LLMQ_TTL_SWEEP_BATCH", "6000"),
+    ):
+        with pytest.raises(ConfigError, match=name):
+            InfraSettings.from_env({**DEV, name: value})

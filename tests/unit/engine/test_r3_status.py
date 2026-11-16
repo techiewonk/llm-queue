@@ -33,9 +33,14 @@ class _Pipe:
     async def __aexit__(self, *exc: object) -> None:
         return None
 
-    def set(self, key: str, value: str, ex: int, get: bool) -> None:
+    def set(self, key: str, value: str, ex: int | None = None, get: bool = False) -> None:
         self.out.append(self.data.get(key))
         self.data[key] = value
+
+    def _reply(self, *_: Any, **__: Any) -> None:  # expiry commands: one reply each
+        self.out.append(None)
+
+    pexpire = zrem = persist = zadd = _reply
 
     async def execute(self) -> list[Any]:
         return self.out

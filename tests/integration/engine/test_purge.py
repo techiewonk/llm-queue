@@ -48,7 +48,7 @@ async def _exists(store: redis.asyncio.Redis, keys: list[str]) -> list[int]:
 
 
 async def _last_audit(store: redis.asyncio.Redis, prefix: str) -> dict[bytes, bytes]:
-    entries = await store.xrevrange(f"{prefix}:{{reg}}:audit", count=1)
+    entries: Any = await store.xrevrange(f"{prefix}:{{reg}}:audit", count=1)
     return dict(entries[0][1])
 
 
@@ -306,3 +306,23 @@ async def test_engine_indexes_calls_by_tenant_when_asked(make: Make) -> None:
     reply = await engine.call("small", CHAT, tenant_id="acme")
     assert reply.ok
     assert await engine.state.zcard(key) == 1
+
+
+async def test_auto_purge_waits_when_the_registry_cannot_be_read(
+    store: redis.asyncio.Redis, prefix: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rescan B3: a store error fell back to the pod's copy; now the due purge waits."""
+    doc = registry()
+    svc = await _service(store, prefix, doc)
+    view = await svc.registry.load()
+    assert view is not None
+    await store.hset(f"{prefix}:{{m:ghost}}:cfg", "x", 1)
+    await store.zadd(f"{prefix}:purge", {"ghost": 0})
+
+    async def broken() -> Any:
+        raise ConnectionError("store blip")
+
+    monkeypatch.setattr(svc.registry, "_read", broken)
+    await svc.tick(view)
+    assert [r["target"] for r in await svc.scheduled()] == ["ghost"]
+    assert await store.exists(f"{prefix}:{{m:ghost}}:cfg")

@@ -52,7 +52,6 @@ def _too_long(*values: str | None) -> bool:
     return any(v is not None and len(v) > MAX_ID_CHARS for v in values)
 
 
-MAX_PURGE_WAIT_SECS = 60  # a deployment purge over HTTP waits at most this for running calls
 # Purge bodies: field -> accepted types. `dry_run` defaults to true (a plan): send false to purge.
 _PURGE_FIELDS: dict[str, dict[str, tuple[type, ...]]] = {
     "model": {"model": (str,), "force": (bool,), "dry_run": (bool,)},
@@ -65,7 +64,7 @@ _PURGE_FIELDS: dict[str, dict[str, tuple[type, ...]]] = {
         "dry_run": (bool,),
     },
     "tenant": {"tenant": (str,), "remove": (list,), "models": (list,), "dry_run": (bool,)},
-    "gc": {"force": (bool,), "dry_run": (bool,)},
+    "gc": {"force": (bool,), "wait_secs": (int, float), "dry_run": (bool,)},
 }
 _PURGE_REQUIRED = {
     "model": ("model",),
@@ -82,7 +81,7 @@ def _purge_body(kind: str, body: Any) -> str | None:
     wrong = [k for k, v in body.items() if k not in fields or not isinstance(v, fields[k])]
     # `true` is an int in Python; and a wait longer than an HTTP client waits is a hung request.
     secs = body.get("wait_secs")
-    if secs is not None and (isinstance(secs, bool) or not 0 <= secs <= MAX_PURGE_WAIT_SECS):
+    if secs is not None and (isinstance(secs, bool) or secs < 0):
         wrong.append("wait_secs")
     wrong += [k for k in _PURGE_REQUIRED.get(kind, ()) if k not in body]
     lists = [v for k, v in body.items() if k in ("remove", "models") and isinstance(v, list)]
@@ -238,6 +237,10 @@ class PurgeHandlers:
         service = self.engine.purge
         who = f"http:{actor}"
         dry = body.get("dry_run", True)
+        # Always capped (LLMQ_HTTP_PURGE_WAIT_SECS): an omitted `wait_secs` waited the full
+        # LLMQ_PURGE_WAIT_SECS (300 s) per deployment, past any HTTP client's patience.
+        cap = service.settings.http_wait_secs
+        wait_secs = min(float(body.get("wait_secs", cap)), cap)
         try:
             if kind == "model":
                 report = await service.model(
@@ -250,7 +253,7 @@ class PurgeHandlers:
                     actor=who,
                     force=body.get("force", False),
                     wait=body.get("wait"),
-                    wait_secs=body.get("wait_secs"),
+                    wait_secs=wait_secs,
                     dry_run=dry,
                 )
             elif kind == "tenant":
@@ -263,7 +266,7 @@ class PurgeHandlers:
                 )
             else:
                 report = await service.removed(
-                    actor=who, force=body.get("force", False), dry_run=dry
+                    actor=who, force=body.get("force", False), wait_secs=wait_secs, dry_run=dry
                 )
         except PurgeRefused as exc:
             return 409, {"error": str(exc)}

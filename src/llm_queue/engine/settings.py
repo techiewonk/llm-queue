@@ -106,6 +106,7 @@ def _purge_settings(
         out[field_name] = raw in _TRUE
     out["purge_grace_secs"] = number("PURGE_GRACE_SECS", 900.0, zero=True, hi=604_800)
     out["purge_wait_secs"] = number("PURGE_WAIT_SECS", 300.0, zero=True, hi=86_400)
+    out["http_purge_wait_secs"] = number("HTTP_PURGE_WAIT_SECS", 60.0, zero=True, hi=3_600)
     out["purge_batch"] = number("PURGE_BATCH", 500, int, lo=1, hi=10_000)
     parts = {p.strip().lower() for p in str(get("TENANT_PURGE_DEFAULT", "keys")).split(",")}
     parts.discard("")
@@ -177,6 +178,7 @@ class InfraSettings:
     purge_grace_secs: float = 900.0
     purge_wait: bool = True
     purge_wait_secs: float = 300.0
+    http_purge_wait_secs: float = 60.0  # LLMQ_HTTP_PURGE_WAIT_SECS
     purge_batch: int = 500
     tenant_purge_default: str = "keys"  # comma list of TENANT_PURGE_PARTS
     tenant_index: bool = False
