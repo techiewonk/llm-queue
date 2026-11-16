@@ -100,4 +100,20 @@ __all__ = [
     "create_app",
     "registry",
     "stats",
+    "ttl_of",
 ]
+
+
+async def ttl_of(engine: Any, key: str) -> float:
+    """Seconds left on `key` in either key expiry mode: its TTL, else its index expiry.
+
+    -1 with no expiry, -2 when missing, like TTL (tests run native or swept, 0.1.0b3).
+    """
+    ms = int(await engine.state.pttl(key))
+    if ms != -1:
+        return ms / 1000 if ms >= 0 else ms
+    at = await engine.state.zscore(engine.expiry.index, key)
+    if at is None:
+        return -1
+    secs, micros = await engine.state.time()
+    return max(0.0, (float(at) - (int(secs) * 1000 + int(micros) // 1000)) / 1000)

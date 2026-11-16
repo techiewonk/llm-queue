@@ -13,7 +13,7 @@ import math
 from typing import Any
 
 import pytest
-from engine_testkit import CHAT, Make, away_from_minute_end
+from engine_testkit import CHAT, Make, away_from_minute_end, ttl_of
 from redis.exceptions import ConnectionError as StoreConnectionError
 from redis.exceptions import OutOfMemoryError, ReadOnlyError, ResponseError
 from redis.exceptions import TimeoutError as StoreTimeoutError
@@ -339,7 +339,7 @@ async def test_q4_send_refreshes_the_caller_key_for_two_beats(make: Make) -> Non
     await engine.state.delete(key)
     task = asyncio.create_task(engine.call("small", CHAT, timeout_secs=3))
     await _until_async(lambda: engine.state.exists(key), what="the key set by the send")
-    ttl = await engine.state.ttl(key)
+    ttl = await ttl_of(engine, key)
     assert ttl >= math.ceil(2 * engine.settings.lease_secs / 3)
     await _cancel(task)
 
@@ -669,7 +669,7 @@ async def test_rvn6_the_probe_lock_goes_back_to_its_spacing(
     task = asyncio.create_task(engine._prober())
     await _until(lambda: len(probed) >= 4, secs=4, what="one probe pass")
     await asyncio.sleep(0.2)
-    assert await engine.state.ttl(key) <= 1  # 35 s before
+    assert await ttl_of(engine, key) <= 1  # 35 s before
     await _cancel(task)
 
 
@@ -796,7 +796,7 @@ async def test_fl21_the_heartbeat_keeps_the_caller_key_in_its_renew(make: Make) 
     key = engine.keys.caller(engine.worker_id)
     await engine.state.delete(key)
     await _until_async(lambda: engine.state.exists(key), secs=3, what="the key renewed")
-    assert await engine.state.ttl(key) >= math.ceil(2 * engine.settings.lease_secs / 3)
+    assert await ttl_of(engine, key) >= math.ceil(2 * engine.settings.lease_secs / 3)
 
 
 async def test_q27_a_send_uses_its_queues_retention(

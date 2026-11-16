@@ -32,6 +32,12 @@ function X.swept()
   if X.s == nil then X.s = redis.call('GET', X.mode) == 'swept' end
   return X.s
 end
+-- Whether the index exists, read once per script: a native-only store has none, so the
+-- per-key clean-up below costs one EXISTS a script instead of a ZREM per key (gate B91).
+function X.indexed()
+  if X.i == nil then X.i = redis.call('EXISTS', X.idx) == 1 end
+  return X.i
+end
 function X.now()
   if X.t == nil then
     local t = redis.call('TIME')
@@ -52,13 +58,13 @@ function X.expire(key, ms)
     end
   else
     redis.call('PEXPIRE', key, ms)
-    redis.call('ZREM', X.idx, key)
+    if X.indexed() then redis.call('ZREM', X.idx, key) end
   end
 end
 -- PTTL: ms left, -1 with no expiry, -2 when the key is missing; either kind of expiry counts.
 function X.pttl(key)
   local p = redis.call('PTTL', key)
-  if p ~= -1 then return p end
+  if p ~= -1 or not X.indexed() then return p end
   local at = redis.call('ZSCORE', X.idx, key)
   if not at then return -1 end
   return math.max(0, tonumber(at) - X.now())
@@ -75,7 +81,7 @@ function X.set(key, value, ms, nx)
     else
       r = redis.call('SET', key, value, 'PX', math.floor(tonumber(ms)))
     end
-    if r then redis.call('ZREM', X.idx, key) end
+    if r and X.indexed() then redis.call('ZREM', X.idx, key) end
   end
   return r
 end

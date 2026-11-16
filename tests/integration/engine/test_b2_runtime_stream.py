@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 import redis.asyncio
-from engine_testkit import CHAT, Make
+from engine_testkit import CHAT, Make, ttl_of
 
 from llm_queue.engine.envelope import Meta, Reply
 from llm_queue.engine.errors import CallFailed
@@ -55,7 +55,7 @@ async def test_stream_end_shortens_its_life(make: Make, store: redis.asyncio.Red
     engine, _ = await make()
     async for _ in engine.stream("small", CHAT, request_id="s3"):
         pass
-    assert 0 < await store.ttl(engine.keys.request("s3", "chunks")) <= 30
+    assert 0 < await ttl_of(engine, engine.keys.request("s3", "chunks")) <= 30
 
 
 async def test_stream_keeps_the_app_id_and_refuses_embeddings(make: Make) -> None:
