@@ -15,8 +15,9 @@
 - **Supported versions:** Python 3.12-3.14 (unit and integration tests run on each in CI; 3.11 was dropped in 0.1.0b2); Valkey 8
   and Redis 7.2+ as one primary with replicas (tested on Valkey 8.1 and Redis 7.4). Cluster mode
   is not supported (one admission touches keys of several hash tags) and `start()` refuses it;
-  `maxmemory-policy noeviction` is recommended (a warning at start otherwise, and in strict mode
-  readiness fails). The client is
+  `maxmemory-policy noeviction` is recommended; a `volatile-*` policy works with key expiry
+  `swept` (the default `LLMQ_KEY_EXPIRY=auto` picks it). Any other policy logs a warning at
+  start, and in strict mode readiness fails. The client is
   redis-py 6 or later (`redis>=6,<9`). The store must allow Lua scripts, pub/sub and blocking
   list reads (`BLPOP`, the queue doorbell); ElastiCache for Valkey / Redis OSS does.
 - **Dependencies:** ranges with upper bounds in `pyproject.toml` (`aiobotocore<4`, `redis<9`,

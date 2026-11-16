@@ -78,7 +78,7 @@ Measured: 4 rolling restarts, 0 calls lost (gate B33).
 | Route / call | Answers |
 |---|---|
 | `GET /health/live` | 200 while the library's background loops run and the heartbeat makes progress; **503** when a loop died or the heartbeat stalled for a lease. Once `stop()` begins it stays 200, so a draining pod is not restarted. It reads the process's own state only, never the store |
-| `GET /health/ready` | 200 when the registry is loaded and the process is not draining, else 503. In strict mode a store whose eviction policy is not `noeviction` also answers 503, with the reason |
+| `GET /health/ready` | 200 when the registry is loaded and the process is not draining, else 503. In strict mode a store whose eviction policy can evict the library's keys (`allkeys-*`, or `volatile-*` with native key expiry) also answers 503, with the reason |
 | `await llmq.health()` | `live`, `ready`, `stores` (`state`, `queue`), `eviction_policy`, `worker`, `version`, `registry_version`, `held`, `heartbeat_age_secs`; plus `live_reason` when not live, `not_ready_reason` when not ready (strict mode and an evicting store) and `queue_eviction_policy` with a separate queue store |
 
 A liveness probe on `/health/live` restarts a pod whose loops died (0.1.0b1 always answered
@@ -95,8 +95,9 @@ turns the readiness route into a 500. Liveness is false when one of the library'
 loops died or the heartbeat made no progress for a lease (`LLMQ_LEASE_SECS`).
 
 At `start()` the store's own setup is checked: a cluster-mode store is refused (`ConfigError`),
-and a `maxmemory-policy` other than `noeviction` logs `store_eviction_policy` with a warning and,
-when strict, fails readiness (see
+and a `maxmemory-policy` that can evict the library's keys (`allkeys-*`, or `volatile-*` with
+`LLMQ_KEY_EXPIRY=native`) logs `store_eviction_policy` with a warning and, when strict, fails
+readiness (see
 [Store requirements](../explanation/storage.md#store-requirements)).
 
 ## Status
@@ -210,7 +211,8 @@ named events, for example:
 | `registry_older_ignored` | This process's registry is older than the stored one, which is used |
 | `registry_invalid_replaced`, `registry_needs_newer_library` | The stored registry was invalid and replaced; or it needs a newer library and this pod keeps its own |
 | `second_llm_queue_started` | A second `LLMQueue` was started in one process |
-| `store_eviction_policy` | The store may evict keys (not `noeviction`) |
+| `store_eviction_policy` | The store may evict the library's keys (`allkeys-*`, or `volatile-*` with native key expiry) |
+| `key_expiry_changed` | A store's key expiry mode changed (`native` / `swept`): a policy change, or processes with different `LLMQ_KEY_EXPIRY` |
 | `job_no_consumer` | A job was sent to a name no running process consumes |
 | `store_down` | The state store failed before a call was sent; the `store_down` rule applies |
 | `deployment_disabled`, `deployment_recovered` | Health checks turned a deployment off or back on |

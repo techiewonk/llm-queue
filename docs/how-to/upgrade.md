@@ -69,7 +69,7 @@ sends it to Bedrock as is. Before the first 0.1.0b2 pod starts:
 | Change | What to do |
 |---|---|
 | `GET /health/live` answers 503 when a background loop died or the heartbeat stalled (was always 200) | Keep the liveness probe's `failureThreshold` at 3 or more |
-| In strict mode an evicting `maxmemory-policy` fails readiness | Set `noeviction`. ElastiCache's default parameter group uses `volatile-lru`: create a custom parameter group with `maxmemory-policy noeviction` and attach it, or pods start but never report ready |
+| In strict mode an evicting `maxmemory-policy` fails readiness | Use `noeviction`, or keep `volatile-*` with key expiry `swept` (0.1.0b3; the default `LLMQ_KEY_EXPIRY=auto` picks it on a `volatile-*` store). ElastiCache's default parameter group uses `volatile-lru`: from 0.1.0b3 pods are ready on it as they are; on 0.1.0b2, create a custom parameter group with `maxmemory-policy noeviction` and attach it, or pods start but never report ready. See [Shared cache store](shared-cache-store.md). `allkeys-*` is never accepted |
 | `http_router(allow_writes=True)` needs `dependencies=`; writes take JSON bodies and the `X-LLMQ-Admin` header | Update admin clients |
 | A lost write race answers 409 (was 400); routes hit before the registry loads answer 503 (was 500) | Retry on 409 after `Retry-After` |
 | `dlq purge`, `dlq redrive`, `drain`, `registry gc`, `cancel` need `--yes` or `--dry-run` | Add `--yes` to scripts |
