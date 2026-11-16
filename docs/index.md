@@ -47,9 +47,10 @@ flowchart LR
 
     ---
 
-    How a call flows, how admission decides, what happens when things fail.
+    How the parts fit, how every kind of call flows, how admission decides, what happens when
+    things fail, and what the tests prove.
 
-    [Architecture](explanation/architecture.md) · [Life of a call](explanation/call-lifecycle.md)
+    [Architecture](explanation/architecture.md) · [Life of a call](explanation/call-lifecycle.md) · [Tested scenarios](explanation/tested-scenarios.md)
 
 -   **Reference**
 

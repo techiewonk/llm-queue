@@ -151,6 +151,9 @@ Full documentation: **https://techiewonk.github.io/llm-queue/**
 - [Getting started](https://techiewonk.github.io/llm-queue/tutorials/getting-started/): install, local stack, a registry, the first call
 - [How-to guides](https://techiewonk.github.io/llm-queue/how-to/configure/): configure, Bedrock IAM, tune, call, jobs, large results, operate, purge, run on a shared cache store, monitor, share models across services, secure, test, upgrade
 - [Explanation](https://techiewonk.github.io/llm-queue/explanation/architecture/): architecture, the life of a call, admission, tenant fairness, failures and recovery
+  - [Architecture overview](https://techiewonk.github.io/llm-queue/explanation/architecture/): the parts, caller and worker roles, background loops, state and queue stores
+  - [The life of a call](https://techiewonk.github.io/llm-queue/explanation/call-lifecycle/): every flow (queued, stream, embed, direct, fallback, cancel, duplicates, outages, purge, key expiry) with the store keys each step touches
+  - [Tested scenarios](https://techiewonk.github.io/llm-queue/explanation/tested-scenarios/): every scenario, gate and drill, what it proves, and the latest measured numbers
 - [Reference](https://techiewonk.github.io/llm-queue/reference/configuration/): every setting with its default and range, the registry document and its JSON Schema, environment variables, error kinds, log events, CLI and HTTP, the Python API
 
 Project: [CHANGELOG](https://github.com/techiewonk/llm-queue/blob/main/CHANGELOG.md),
