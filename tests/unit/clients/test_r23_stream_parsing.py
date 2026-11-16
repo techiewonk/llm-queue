@@ -51,7 +51,7 @@ def _best_secs(fn: Callable[[], Any], reps: int = 3) -> float:
 def test_streamed_text_is_joined_in_linear_time() -> None:
     """R3PF-1: each delta built a new string (`text + delta`): quadratic in the answer.
 
-    Parts are joined once now: 8x the deltas take about 8x the time, not 40x or more.
+    Parts are joined once now: 8x the deltas take about 8x the time, not about 64x.
     """
     small, large = _text_events(4_000), _text_events(32_000)
     assert (
@@ -59,7 +59,9 @@ def test_streamed_text_is_joined_in_linear_time() -> None:
         == "abcdefghijklmnop" * 32_000
     )
     ratio = _best_secs(lambda: _converse_body(large)) / _best_secs(lambda: _converse_body(small))
-    assert ratio < 20, f"32,000 deltas took {ratio:.1f}x the time of 4,000"
+    # Linear is about 8x, the old quadratic join 64x; 40 keeps it caught with room for a
+    # noisy shared runner (GitHub CI measured 25x once).
+    assert ratio < 40, f"32,000 deltas took {ratio:.1f}x the time of 4,000"
 
 
 class _Event(dict[str, Any]):
