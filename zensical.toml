@@ -6,6 +6,8 @@ repo_url = "https://github.com/techiewonk/llm-queue"
 repo_name = "techiewonk/llm-queue"
 docs_dir = "docs"
 site_dir = "site"
+# Wider pages on large monitors, readable prose (docs/stylesheets/extra.css).
+extra_css = ["stylesheets/extra.css"]
 
 nav = [
   { "Home" = "index.md" },
