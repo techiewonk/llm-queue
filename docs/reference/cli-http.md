@@ -18,6 +18,7 @@ write (`uid:<n>` when the user has no passwd entry, as in a container run under 
 | `llm-queue registry log [--count N] [--path P]` | The audit trail (default 20 entries): publishes, edits and CLI cancels |
 | `llm-queue registry publish [--from-version N]` | Publish `LLMQ_REGISTRY`, or roll back to version N |
 | `llm-queue registry gc --yes\|--dry-run` | Delete the keys and queues of models that no longer exist |
+| `llm-queue registry schema` | The registry document's JSON Schema ([Registry document](registry.md#json-schema)); needs no store and no `LLMQ_*` settings |
 | `llm-queue block --region R` / `--account A` | Stop using a region or an account |
 | `llm-queue unblock --region R` / `--account A` | Use it again |
 | `llm-queue cancel ID [ID ...] --yes\|--dry-run` | Cancel calls for every caller of each id (at most 1000 ids). Anyone with store access may cancel any id; each cancel is logged (`call_cancel`, `source=cli`) and written to the audit trail with the actor |

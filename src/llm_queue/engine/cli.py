@@ -1,10 +1,11 @@
 """The `llm-queue` command line for 0.3 (plan §3.12, §3.18): registry, status, operations.
 
-Every command reads `LLMQ_*` from the environment (`InfraSettings.from_env`) and talks to the
-stores directly; writes go through the registry store (validated, protected fields, audited
-with `--actor`, default the OS user). Output is JSON, one document per command. Commands that
-delete or move data (`dlq purge`, `dlq redrive`, `registry gc`, `drain`, `cancel`) need
-`--yes`; `--dry-run` shows what they would do.
+Every command but `registry schema` reads `LLMQ_*` from the environment
+(`InfraSettings.from_env`) and talks to the stores directly; writes go through the registry
+store (validated, protected fields, audited with `--actor`, default the OS user). Output is
+JSON, one document per command. Commands that delete or move data (`dlq purge`,
+`dlq redrive`, `registry gc`, `drain`, `cancel`) need `--yes`; `--dry-run` shows what they
+would do.
 
 Exit codes: 0 done, 1 an error (bad input, unknown or expired request, store outage), 3 a
 `drain --wait` that timed out with calls still waiting (FO-8).
@@ -38,6 +39,7 @@ from llm_queue.engine.status import StatusReader
 from llm_queue.engine.store_client import secret_store_client
 from llm_queue.errors import ConfigError, LLMQueueError
 from llm_queue.registry._lua import AUDIT_MAX_ENTRIES
+from llm_queue.registry.json_schema import registry_schema
 from llm_queue.registry.store import RegistryStore
 from llm_queue.tuning import Tuning
 
@@ -110,6 +112,7 @@ def _parser() -> argparse.ArgumentParser:
         p.add_argument("model")
         p.add_argument("deployment")
     reg.add_parser("diff", help="what is live but not in this config")
+    reg.add_parser("schema", help="print the registry document's JSON Schema (no store needed)")
     log = reg.add_parser("log")
     log.add_argument("--count", type=int, default=20)
     log.add_argument("--path", default="")
@@ -460,6 +463,8 @@ def exit_code(result: Any) -> int:
 async def amain(argv: Sequence[str], environ: Mapping[str, str] | None = None) -> Any:
     """Parse and run one command; returns its JSON-able result."""
     args = _parser().parse_args(list(argv))
+    if args.command == "registry" and args.action == "schema":
+        return registry_schema()  # needs no settings and no store: editors and CI use it
     env = dict(os.environ if environ is None else environ)
     settings = InfraSettings.from_env(env)
     # The same clients as the queue's: the password variable wins over one in the URL and is

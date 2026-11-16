@@ -38,45 +38,64 @@ def _shown(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else f"{value:g}"
 
 
-def number(
-    lo: float | None = None,
-    hi: float | None = None,
-    *,
-    integer: bool = False,
-    lo_open: bool = False,
-) -> Check:
+class Number:
     """A finite number (a whole number when `integer`) inside [lo, hi].
 
     `lo_open` makes the low end strict. With no `hi` the bound is `MAX_NUMBER` (2**53 - 1),
     and with no `lo` it is `-MAX_NUMBER` (R3CF-2). `NaN` and infinities are refused first:
-    they passed every range check, since every comparison with `NaN` is false (R3CF-1).
+    they passed every range check, since every comparison with `NaN` is false (R3CF-1). A
+    class, not a closure, so `registry.json_schema` can read the bounds.
     """
-    top = MAX_NUMBER if hi is None else hi
-    bottom = -MAX_NUMBER if lo is None else lo
 
-    def check(value: Any) -> str | None:
+    def __init__(self, lo: float | None, hi: float | None, integer: bool, lo_open: bool) -> None:
+        """Keep the bounds; `None` means the widest bound (`-MAX_NUMBER` or `MAX_NUMBER`)."""
+        self.lo = -MAX_NUMBER if lo is None else lo
+        self.hi = MAX_NUMBER if hi is None else hi
+        self.integer = integer
+        self.lo_open = lo_open
+
+    def __call__(self, value: Any) -> str | None:
+        """What is wrong with `value`, or None."""
+        integer, bottom, top = self.integer, self.lo, self.hi
         if not _is_number(value):
             return "must be a whole number (an integer)" if integer else "must be a number"
         if not math.isfinite(value):
             return "must be a finite number"
         if integer and not isinstance(value, int):
             return "must be a whole number (an integer, no decimal point)"
-        if value <= bottom if lo_open else value < bottom:
-            return f"must be {'above' if lo_open else 'at least'} {_shown(bottom)}"
+        if value <= bottom if self.lo_open else value < bottom:
+            return f"must be {'above' if self.lo_open else 'at least'} {_shown(bottom)}"
         if value > top:
             return f"must be at most {_shown(top)}"
         return None
 
-    return check
+
+def number(
+    lo: float | None = None,
+    hi: float | None = None,
+    *,
+    integer: bool = False,
+    lo_open: bool = False,
+) -> Number:
+    """A number check (see `Number`)."""
+    return Number(lo, hi, integer, lo_open)
 
 
-def one_of(*values: str) -> Check:
+class OneOf:
+    """One of the given words (a class so `registry.json_schema` can list them)."""
+
+    def __init__(self, values: tuple[str, ...]) -> None:
+        """Keep the allowed words, in order."""
+        self.values = values
+
+    def __call__(self, value: Any) -> str | None:
+        """What is wrong with `value`, or None."""
+        return None if value in self.values else f"must be one of {', '.join(self.values)}"
+
+
+def one_of(*values: str) -> OneOf:
     """One of the given words."""
-
-    def check(value: Any) -> str | None:
-        return None if value in values else f"must be one of {', '.join(values)}"
-
-    return check
+    return OneOf(values)
 
 
 def boolean(value: Any) -> str | None:
@@ -326,32 +345,35 @@ MAX_TENANT_ID_CHARS = 256
 MAX_WEIGHT = 1_000_000
 
 
-def _tenant_map(item: Check) -> Check:
+class TenantMap:
     """An object of tenant id -> `item`; ids are non-empty and at most 256 characters."""
 
-    def check(value: Any) -> str | None:
+    def __init__(self, item: Check) -> None:
+        """`item` checks each value."""
+        self.item = item
+
+    def __call__(self, value: Any) -> str | None:
+        """What is wrong with `value`, or None."""
         if not isinstance(value, dict):
             return "must be an object of tenant id -> value"
         for key, sub in value.items():
             if not key or len(key) > MAX_TENANT_ID_CHARS:
                 return f"tenant ids must be 1-{MAX_TENANT_ID_CHARS} characters"
-            problem = item(sub)
+            problem = self.item(sub)
             if problem:
                 return f"`{key}` {problem}"
         return None
-
-    return check
 
 
 _TENANT_CAPS = obj({"rpm": number(1, integer=True), "tpm": number(1, integer=True)})
 _FAIRNESS = obj(
     {
         "mode": one_of(*FAIRNESS_MODES),
-        "weights": _tenant_map(number(0, MAX_WEIGHT, lo_open=True)),
+        "weights": TenantMap(number(0, MAX_WEIGHT, lo_open=True)),
         "default_weight": number(0, MAX_WEIGHT, lo_open=True),
         "rpm": number(1, integer=True),
         "tpm": number(1, integer=True),
-        "quotas": _tenant_map(_TENANT_CAPS),
+        "quotas": TenantMap(_TENANT_CAPS),
         "active_secs": number(1, DAY_SECS),
     }
 )
