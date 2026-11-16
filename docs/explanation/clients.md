@@ -88,8 +88,8 @@ tasks:
 | No started queue | One private event loop per process, in a daemon thread, shared by every queue. A caller-only engine with a small store pool (20 connections); clients are built lazily, so a Celery worker builds only what it calls |
 
 A sync call on the thread that runs the queue's own loop would deadlock and is refused with an
-`LLMQueueError`; await the async method there. A sync call from any other running event loop
-blocks that loop and logs `sync_call_on_event_loop` once.
+`LLMQueueError`; await the async method there. Without a started queue, a sync call from a
+running event loop blocks that loop and logs `sync_call_on_event_loop` once.
 
 ### Celery
 

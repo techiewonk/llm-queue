@@ -40,4 +40,4 @@ flowchart TB
 | `_result_sweep` | caller | 5 s | one script finds results of all waiting callers |
 | `RegistryStore.run` | both | `LLMQ_CFG_RELOAD_SECS` (30) | reload; republish when the stored registry was lost or older |
 | `ChunkReader` | caller | while streams are open, `XREAD` block 100 ms | deliver chunks |
-| `JobRunner._loop` (one per job name) | worker | receive polls 20 ms to 500 ms | run jobs, keep them visible, fail with 5 s delay |
+| `JobRunner._loop` (one per job name) | worker | sleeps on the queue's doorbell, up to 0.5 s | run jobs, keep them visible; a failed job is retried after 5 s doubling to 300 s, for about an hour, then dead-lettered |

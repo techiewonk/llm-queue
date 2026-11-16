@@ -19,7 +19,7 @@ sends it to Bedrock as is. Before the first 0.1.0b2 pod starts:
 | Change | What to do |
 |---|---|
 | `LLMQ_ENVIRONMENT` unset is strict (was dev) | Set `LLMQ_ENVIRONMENT=dev` on laptops and in CI |
-| Strict mode requires `LLMQ_KEY_PREFIX` | Set one per app and environment (`myapp-prod`): 1-64 letters, digits, `_`, `.`, `-` |
+| Strict mode requires `LLMQ_KEY_PREFIX` | Set one per app and environment (`myapp-prod`): 1-64 letters, digits, `_`, `.`, `:`, `-` |
 | Strict mode requires `LLMQ_ID_HASH_SALT` of at least 16 characters | Use a random secret of 32 characters or more |
 | Strict mode requires `https` for `LLMQ_BEDROCK_ENDPOINT_URL` / `LLMQ_STS_ENDPOINT_URL` | Use `https` overrides, or none |
 | `LLMQ_BASE_URL_ALLOWED_HOSTS` takes bare host names | Drop schemes, ports and paths (`api.openai.com`) |
@@ -58,6 +58,11 @@ sends it to Bedrock as is. Before the first 0.1.0b2 pod starts:
 | `LLMQueue.engine` / `.jobs` are deprecated (warn until 0.2) | Use the public methods |
 | `RegistryStore.boot(actor=None)`: a boot publish is audited as `boot@<host>:<pid>` (was `boot`) | Pass `actor=` to name it yourself |
 | A custom `Provider.call` gets `converse_api=` only when its signature accepts it | Nothing for 0.1.0b1 providers |
+| Delivery is at least once: a call whose record the store lost is sent again | Make side effects of calls and jobs idempotent |
+| A `request_id` whose last run failed, expired or was cancelled runs again (only a success is replayed) | Use a new id when a retry must not run the call twice |
+| Cancel wins: any caller's `cancel()` stops the call for every caller of that id | Do not share an id between callers that must not cancel each other |
+| An app's `worker_id` is a prefix; a random part is always added | Match worker ids by prefix in dashboards |
+| `register_job` refuses a function that is not async; `send_job(job_id=X)` is deduplicated for 24 h; failed jobs retry for about an hour, then are dead-lettered for 7 days | Make job functions `async def`; see [Run background jobs](jobs.md) |
 
 ## 5. HTTP, CLI and operations
 
@@ -94,6 +99,7 @@ LangChain `with_retry` and fallbacks keyed on exception classes behave according
   serves `/chat/completions` and `/embeddings` only.
 - Every adapter checks `llmq=` at construction, and `allow_fallback` is `"all"`, `"regions"` or
   `"none"`.
-- The adapters do not stream: `astream()` yields the whole answer as one chunk. Use
-  `LLMQueue.converse_stream` for tokens as they arrive.
+- The adapters stream only with `queue_streaming=True` (off by default): then `astream()`
+  goes through `converse_stream` and yields text and tool-call deltas. Off, `astream()`
+  yields the whole answer as one chunk, as in 0.1.0b1.
 - The first started queue stays the LangChain default (0.1.0b1: the last one).

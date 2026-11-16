@@ -15,8 +15,8 @@ metric the library emits is in the [table at the end](#every-metric); the names 
   apart, and the plain fields `pod` and `version`: searchable in Logs Insights, never
   dimensions, so a pod costs no metric.
 - `prometheus` (needs the `metrics` extra): `prometheus_client` metrics in the default
-  registry. Serve them with `status_router(engine, metrics_route=True)` (`GET /metrics`, open
-  like the health routes) or `llm_queue.engine.metrics.prometheus_text(sink)` in your own route.
+  registry. Serve them with `llmq.http_router(metrics_route=True)` (`GET /metrics`, open
+  like the health routes; `metrics_route` is off by default) or `llm_queue.engine.metrics.prometheus_text(sink)` in your own route.
   Under a forking server each worker process has its own registry: scrape each process, or use
   `prometheus_client`'s multiprocess mode (gauges then need a `multiprocess_mode`).
 - `none`: nothing.
@@ -128,7 +128,7 @@ Store-outage lines (`receive_failed`, `heartbeat_failed`, `store_down`, `hold_fa
 | Credentials | `llmq_credentials_failed_total` by account, region | `account_credentials_failed` lines carry `error_type` and the message |
 | Dead loop | `llmq_loop_died_total` by loop | `/health/live` body names it (`reason`); `background_loop_died` line |
 | Slow provider | `llmq_provider_seconds` p95 by region | `llmq_breaker_open`, `deployment_disabled` |
-| Dead letters | `llmq_dead_letters`, `llmq_job_dead_letters` | `llm-queue dlq list --model M` (and `--priority`) |
+| Dead letters | `llmq_dead_letters`, `llmq_job_dead_letters` | `llm-queue dlq list --model M` (and `--priority`), `--job J` for dead jobs |
 | Cancels | `llmq_cancels_total` by source | `call_cancel` lines carry `source` and the request id |
 
 ## Every metric

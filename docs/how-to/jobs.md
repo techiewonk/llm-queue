@@ -11,7 +11,8 @@ async def index_documents(payload: dict) -> None:
     result = await llmq.embed("cohere", payload["texts"], input_type="search_document")
     await save_vectors(job.job_id, payload["ids"], result.vectors)   # upsert by job id
 
-llmq.register_job("index_documents", index_documents, timeout_secs=600)   # before start()
+llmq.register_job("index_documents", index_documents, timeout_secs=600)   # before start();
+# timeout_secs: default none (no limit); concurrency: default LLMQ_JOB_CONCURRENCY (4)
 await llmq.start()
 job_id = await llmq.send_job("index_documents", {"ids": ids, "texts": texts}, job_id=batch_id)
 ```
@@ -30,7 +31,7 @@ job_id = await llmq.send_job("index_documents", {"ids": ids, "texts": texts}, jo
 | Order | Not kept: up to 4 jobs of a name run at once per process, and a retried job goes back in later |
 | Concurrency | 4 per job name per process (`register_job(..., concurrency=N)` or `LLMQ_JOB_CONCURRENCY`), 32 per process over all names (`LLMQ_JOB_PROCESS_CONCURRENCY`) |
 | Waiting | At most 10,000 waiting jobs per name (`CallFailed("queue_full")`, `retry_after_secs` 5); a job waits at most the queue retention (1 day) before it is trimmed |
-| Durability | With `LLMQ_QUEUE_WAIT_REPLICAS` (scope `jobs` in `LLMQ_QUEUE_WAIT_SCOPES`), a send waits for the replicas like a call does; with too few it is sent anyway, warned (`replicas_short`) and counted |
+| Durability | With `LLMQ_QUEUE_WAIT_REPLICAS` (default 0, off; scope `jobs` in `LLMQ_QUEUE_WAIT_SCOPES`, default `all`), a send waits for the replicas like a call does; with too few it is sent anyway, warned (`replicas_short`) and counted |
 | Context | A job's LLM calls run at normal priority with the sender's `user_id` and `tenant_id` (from `request_context` at `send_job`), not with the context of the process that called `start()` |
 | LLM budget | Jobs take none of their own; their LLM calls do |
 

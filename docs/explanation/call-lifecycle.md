@@ -42,14 +42,17 @@ sequenceDiagram
    id's hash falls outside `queue_pct`; users in `routing.allow_users` (HMAC hashes) always queue.
 3. **Register** (`REGISTER`, one script): creates `P:{r:ID}:job` (`state=queued`, user and params
    hashes, `confirmed=0`), adds this process to `P:{r:ID}:callers`, writes the status `waiting`. A
-   repeated id returns `attached` (wait for the first run), `done`, `expired` (`result_expired`),
-   `conflict` (other params or user: `request_id_conflict`) or `takeover` (an unconfirmed record older
-   than 5 s: its sender died).
+   repeated id returns `attached` (wait for the first run), `done` (the stored answer is
+   replayed), `expired` (`result_expired`), `cancelled` (a cancel is pending: cancel wins for
+   every caller), `conflict` (other params or user: `request_id_conflict`) or `takeover` (an
+   unconfirmed record older than 5 s: its sender died). An id whose last run failed, expired or
+   was cancelled registers as new and **runs again**: only a success is replayed.
 4. **Send** (`SEND`, queue store): `XADD` to `<queue_prefix>llm-<alias>` or `...-priority` (the
    stream id is the store's clock: it is the call's queue position and the start of its deadline),
    refused with `queue_full` above `max_waiting` (50,000), and one token pushed on the queue's
    doorbell list `P:bell:<queue>`. With `LLMQ_QUEUE_WAIT_REPLICAS` the send and a `WAIT` go down one
-   pipeline; too few acknowledgements make the call run direct under the same record.
+   pipeline; too few acknowledgements never fail the send (it is on the primary): it is warned
+   about at most once a minute and counted (`llmq_send_not_replicated_total`).
 5. **Confirm** (`CONFIRM`): the record lives until the deadline plus the status TTL.
 6. **Wait**: no read right after sending. The caller waits for the pub/sub wake-up on
    `P:done:<worker id>`, then reads with `RESULT_TAKE`. A per-process sweep (`_RESULTS_EXIST`, every
@@ -93,8 +96,8 @@ the store keeps a marker. One `llmq_call_finished` log record per call (ids hash
 
 Used for sync calls (`converse_sync`, `embed_sync`: on the started queue's loop, else on one private
 loop per process with a caller-only engine; see [Clients and connections](clients.md#sync-calls)),
-the kill switch, `queue_pct`, a separate queue store that failed for `LLMQ_QUEUE_FAILOVER_SECS` (5),
-and an unreplicated send. It registers and confirms the same record, then admits with the same
+the kill switch, `queue_pct`, and a separate queue store that failed for
+`LLMQ_QUEUE_FAILOVER_SECS` (5). It registers and confirms the same record, then admits with the same
 `PICK_TAKE` and waiter order (position = the store's time at registration; one registered waiter per
 process, model and class, the rest wait on a local lock) and runs the same attempts. Only the queue
 send and receive are skipped. Measured: 2,000 direct calls waiting cost 16 store scripts per process

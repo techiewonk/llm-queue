@@ -73,7 +73,8 @@ registry:
 ```
 
 - Drop `bedrock:InvokeModelWithResponseStream` only if no model uses `converse_api: "stream"`
-  and no code calls `converse_stream` (the LangChain adapters never stream).
+  and no code calls `converse_stream` (the LangChain adapters stream only with
+  `queue_streaming=True`).
 - Narrow `Resource` to the model ids and regions in your registry. Cross-region inference
   profiles need both the profile ARN and the foundation models it routes to.
 - For accounts with `role_arn`, the pods' own role needs `sts:AssumeRole` on that role (with the

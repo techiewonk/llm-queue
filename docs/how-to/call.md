@@ -43,8 +43,8 @@ Each takes these keyword arguments (keyword only; an unknown name raises `TypeEr
 |---|---|
 | `priority` | Priority calls are read before normal ones (default from `request_context`, else normal). Only trusted code should set it |
 | `timeout_secs` | The call's time budget (default the model's `timeout_secs`, 120; capped by `timeout_max_secs`, 900) |
-| `max_wait_secs` | The longest the call may wait for budget before it fails `rate_limited` |
-| `request_id` | Your own id; a repeat while it runs attaches to the same call, and a repeat after a success returns the same answer |
+| `max_wait_secs` | The longest the call may wait for budget before it fails `rate_limited` (default the model's `max_wait_secs`; none: until the deadline) |
+| `request_id` | Your own id; a repeat while it runs attaches to the same call, a repeat after a success returns the same answer, and a repeat after a failure runs the call again |
 | `session_id`, `user_id`, `tenant_id` | Ids of the caller (default from `request_context`); user and session ids are stored only as a keyed hash (`LLMQ_ID_HASH_SALT`) |
 | `allow_fallback` | `"all"` (default): fallback regions and fallback models (also when the model is disabled); `"regions"`: fallback regions only; `"none"`: neither |
 | `allowed_regions`, `allowed_accounts` | Limit the deployments this call may use |
@@ -198,9 +198,11 @@ llmq.close_sync()       # in sync-only processes; stop() does it too
 Sync calls run on the direct path: same budgets and order, no queue. When the queue is started,
 they run on its event loop (from your thread), with its clients and connections. Otherwise they
 run on one private event loop per process, with a caller-only engine and a small store pool.
-Async code should use `converse` / `embed`: a sync call on the queue's own loop thread is refused
-(it would deadlock), and one from any other running loop blocks it and logs
-`sync_call_on_event_loop` once. Celery: see
+Async code should use `converse` / `embed`: a sync call on the queue's own loop thread is
+**refused** with an `LLMQueueError` that names the fix (`await llmq.converse(...)`, in
+LangChain `await chat.ainvoke(...)`), since it would deadlock. Without a started queue, a
+sync call from a running event loop blocks that loop and logs `sync_call_on_event_loop`
+once. Celery: see
 [Clients and connections](../explanation/clients.md#celery).
 
 ## Jobs: `register_job`, `send_job`
@@ -277,5 +279,13 @@ stream cut mid-answer) and `request_id`. Every kind and what to do is in
 await llmq.cancel(request_id)           # waiting: never starts; running: the attempt is cancelled
 await llmq.request_status(request_id)   # status of one call
 ```
+
+**Cancel wins:** a cancel stops the call for every caller waiting on that id, and a caller
+that attaches to the id afterwards gets `cancelled` too. Any code (or `llm-queue cancel ID
+--yes`, audited) may cancel any id; each cancel is logged and counted with its source.
+
+**Request ids:** a call sent again with the id of a call that **succeeded** gets the same
+answer without running again (while the result is kept). An id whose last run failed,
+expired or was cancelled **runs again**.
 
 Both raise `StoreUnavailable` when the store cannot serve them.

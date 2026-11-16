@@ -24,6 +24,7 @@ write (`uid:<n>` when the user has no passwd entry, as in a container run under 
 | `llm-queue cancel ID [ID ...] --yes\|--dry-run` | Cancel calls for every caller of each id (at most 1000 ids). Anyone with store access may cancel any id; each cancel is logged (`call_cancel`, `source=cli`) and written to the audit trail with the actor |
 | `llm-queue drain M --yes\|--dry-run [--wait] [--timeout S]` | Disable a model for new calls; serve waiting ones (`--wait` until its queues are empty, default timeout 600 s; exit 3 when it times out) |
 | `llm-queue dlq list\|show\|redrive\|purge --model M [--priority] [--count N]` | Dead letters of a model's queue (`show --unsafe` prints message bodies; `redrive` and `purge` need `--yes` or `--dry-run`) |
+| `llm-queue dlq list\|show\|redrive\|purge --job J [--count N]` | Dead jobs of a job name (instead of `--model`), kept `LLMQ_JOB_DEAD_RETENTION_SECS` (7 days) |
 | `llm-queue queues list` | The queues |
 
 Commands that delete or move data (`dlq purge`, `dlq redrive`, `registry gc`, `drain`,
@@ -51,7 +52,8 @@ app.include_router(llmq.http_router(dependencies=[Depends(require_admin)]), pref
 | Route | Auth | Answers |
 |---|---|---|
 | `GET /health/live` | none | 200 while the library's background loops run and the heartbeat makes progress; 503 when a loop died or the heartbeat stalled for a lease (stays 200 once `stop()` begins). Reads the process's own state, never the store |
-| `GET /health/ready` | none | 200 when the registry is loaded and not draining, else 503; each store as `ok`, `read_only` or `down` (from a probe cached every 5 s; never a 500) |
+| `GET /health/ready` | none | 200 when the registry is loaded and not draining, else 503 (also 503 in strict mode with an evicting store, with `not_ready_reason`); each store as `ok`, `read_only` or `down` (from a probe cached every 5 s; never a 500) |
+| `GET /metrics` | none (`metrics_route=True`, off by default) | The Prometheus exposition of a `LLMQ_METRICS_SINK=prometheus` process (extra `metrics`) |
 | `GET /status?model=M` | `dependencies` | Status of every model or one |
 | `GET /requests/{id}` | `dependencies` | Status of one call |
 | `GET /registry` | `dependencies` | The live registry (role ARNs and secret references redacted) |

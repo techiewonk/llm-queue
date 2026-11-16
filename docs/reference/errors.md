@@ -33,12 +33,12 @@ class CallFailed(LLMQueueError):
 
 | Kind | Meaning | What a caller should do |
 |---|---|---|
-| `rate_limited` | No budget before `max_wait_secs` or the deadline, the provider kept throttling past `throttle_retry_attempts` (or the retry budget ran out with no untried deployment left), or a fallback model was busy | Retry after `retry_after_secs`, or tell the user to wait |
+| `rate_limited` | No budget before `max_wait_secs` or the deadline, the provider kept throttling past `throttle_retry_attempts` (or the retry budget ran out with no untried deployment left), a fallback model was busy, the tenant's `fairness` quota is used up, or the store connection pool is full (`retry_after_secs` 1) | Retry after `retry_after_secs`, or tell the user to wait |
 | `queue_full` | The model's queue already holds `max_waiting` (50,000) calls, or `send_job` found 10,000 jobs of that name waiting; `retry_after_secs` is 5 | Retry later; shed load |
 | `deadline_exceeded` | No reply within the call's timeout (also: the store did not answer in time, or retries ran out of time) | Retry once, or raise `timeout_secs` for long answers |
-| `invalid_request` | The request itself is wrong: an embedding text is empty, the provider refused the request as invalid, a `max_tokens` / `max_completion_tokens` is not a whole number on a model with a cap, or `on_exceed: reject` refused its inference values | Fix the request; retrying will not help |
+| `invalid_request` | The request itself is wrong: an embedding text is empty, not a string or longer than `embed_max_chars` (with its index), a bad Cohere `input_type`, the provider refused the request as invalid, a `max_tokens` / `max_completion_tokens` is not a whole number on a model with a cap, `on_exceed: reject` refused its inference values, OpenAI `params` / `extra_body` / `extra_headers` touch a protected field (`model`, `max_tokens`, `stream`, `Authorization`, ...), a second `stream()` on the same id, a streaming call to an embedding model, or a `send_job` payload that is not JSON | Fix the request; retrying will not help |
 | `context_length_exceeded` | The input does not fit the model's context window | Shorten the input |
-| `request_too_large` | The call is too big: its input estimate is above every candidate deployment's `tpm`, or its message is above the model's `max_message_bytes` (4 MB) | Shorten the input or split it, or raise `max_message_bytes`; retrying will not help |
+| `request_too_large` | The call is too big: its input estimate is above every candidate deployment's `tpm`, or its message is above the model's `max_message_bytes` (4 MB), or a `send_job` payload is above `LLMQ_JOB_MAX_PAYLOAD_BYTES` (1 MB) | Shorten the input or split it, or raise `max_message_bytes`; retrying will not help |
 | `no_deployment` | The call's own filters (`allowed_regions`, `allowed_accounts`) leave no deployment | Fix the filters or the registry |
 | `model_unavailable` | No usable deployment: all disabled, blocked, unhealthy or outside residency; `retry_after_secs` is the time to the next probe | Use another feature or model, or retry after `retry_after_secs` |
 | `model_disabled` | The model is disabled and has no fallback model to use | Use another model; an operator turned it off |
@@ -51,7 +51,7 @@ class CallFailed(LLMQueueError):
 | `dead_lettered` | The call failed `max_receives` (10) times (workers died holding it) and went to the dead-letter queue | Report it; see `llm-queue dlq list` |
 | `worker_lost` | A stream ended without its end entry or had a gap (its worker was lost) | Retry; `partial_text` holds the text so far |
 | `worker_shutdown` | A stream had already sent chunks when its worker's drain ran out (a call that has sent nothing is given back to the queue instead and does not fail) | Retry; `partial_text` holds the text so far |
-| `cancelled` | The call was cancelled (`cancel()`, or its caller process was gone) | Nothing, unless you did not cancel it |
+| `cancelled` | The call was cancelled: `cancel()` by any caller of its id (cancel wins for every caller, and an attach after a cancel is cancelled too), `llm-queue cancel`, or its caller process was gone | Nothing, unless you did not cancel it |
 | `rejected` | The app's `admission` hook rejected the call before it was sent, or the hook raised, or the registry names one this process has not registered (fails closed) | Handle as your hook intends; for a failing hook, check `llmq_hook_failed_total` |
 
 The set of kinds is `llm_queue.KINDS`. Over the OpenAI-compatible HTTP transport the LangChain
@@ -85,9 +85,8 @@ call; retrying will not help. The message lists every problem at once. It is rai
 - by `start()`: an invalid registry, a store in cluster mode;
 - by an admin action: a refused registry edit or publish, `http_router(allow_writes=True)`
   without `dependencies`, an empty or malformed audit `actor`;
-- by a call, before anything is queued: a model name not in the registry (`UnknownModel`), a
-  streaming call to an embedding model, a feature whose extra is missing
-  (`MissingExtra`).
+- by a call, before anything is queued: a model name not in the registry (`UnknownModel`) or a
+  feature whose extra is missing (`MissingExtra`).
 
 A call that was accepted never ends in a `ConfigError`; whatever goes wrong after that is a
 `CallFailed`.

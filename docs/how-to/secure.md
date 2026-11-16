@@ -8,8 +8,13 @@ strict mode.
 
 Leave `LLMQ_ENVIRONMENT` unset or set it to your environment's name (`prod`, `staging`); only
 `dev`, `local`, `test` and `ci` relax the checks. Strict mode requires TLS stores with
-certificate and host-name checks, `LLMQ_ID_HASH_SALT`, allowed `base_url` hosts, and refuses
-debug capture. See [Environment variables](../reference/environment.md#llmq_environment-strict-or-dev).
+certificate and host-name checks, an `LLMQ_ID_HASH_SALT` of 16 characters or more, an explicit
+`LLMQ_KEY_PREFIX` (so two environments on one store never share queues), allowed `base_url`
+hosts and `https` for `LLMQ_BEDROCK_ENDPOINT_URL` / `LLMQ_STS_ENDPOINT_URL` (any host), and it
+refuses debug capture. See [Environment variables](../reference/environment.md#llmq_environment-strict-or-dev).
+
+`verify=False` (or `use_ssl=False`) in an account's `credentials=` is allowed in every mode, with a
+`bedrock_tls_verify_off` warning: use it only against a local fake.
 
 ## 2. Keep account secrets out of the registry
 
@@ -85,7 +90,19 @@ provider), account `kind` / `base_url` / secrets, region lists and deployment `p
 process. `inference.extra` accepts only plain lowercase names and refuses SDK arguments and
 request fields such as `extra_body`, `store`, `metadata` and `user`.
 
-## 6. Prompt text
+The stored document's protected fields (`role_arn`, `model_id`, residency, `live_edit`, ...) must
+also match each pod's own deploy config: a stored document that differs is refused by that pod
+(logged and counted), so whoever can write the store key cannot redirect prompts.
+
+## 6. Who may set priority and cancel
+
+- `priority=True` calls are served before every tenant's fair share. Only trusted code should set
+  it; do not pass it through from a client request.
+- Anyone who can call the queue (or reach the store) may cancel any request id, and a cancel
+  stops the call for every caller of that id. Every cancel is logged (`call_cancel`) and counted
+  (`llmq_cancels_total{source}`); `llm-queue cancel ID --yes` also writes the audit trail.
+
+## 7. Prompt text
 
 - No prompt text is logged; ids are hashed (user, session, and tenant in logs).
 - `debug_capture` (prompt text in the store for an hour) needs

@@ -29,7 +29,7 @@ The settings you set in most deployments:
 | `LLMQ_STORE_URL` | The state store (`redis://` or `rediss://`). Required |
 | `LLMQ_ENVIRONMENT` | `dev`, `local`, `test` or `ci` relax the checks; anything else, **unset included**, is strict: TLS stores, `LLMQ_ID_HASH_SALT`, allowed `base_url` hosts, no debug capture |
 | `LLMQ_ID_HASH_SALT` | Key of the user / session id hash (HMAC); required when strict |
-| `LLMQ_KEY_PREFIX`, `LLMQ_QUEUE_PREFIX` | Names of this environment's keys and queues |
+| `LLMQ_KEY_PREFIX`, `LLMQ_QUEUE_PREFIX` | Names of this environment's keys and queues. The key prefix defaults to `llmq` in dev and is **required** in strict mode (name it per app and environment); the queue prefix defaults to empty |
 | `LLMQ_REGISTRY` or `LLMQ_REGISTRY_FILE` | The registry document, inline or as a file (set one, not both) |
 | `LLMQ_MODE` | `both` (default), `caller`, `worker` |
 | `LLMQ_METRICS_SINK` | `emf` (CloudWatch, default), `prometheus`, `none` |
@@ -110,9 +110,9 @@ A setting may be allowed at several levels. The most specific one wins:
 **deployment > model > account > defaults**
 
 Some settings exist at only some levels (for example `shared_rpm` / `shared_tpm` only on an
-account, `model_fallback` only on a model). Every setting, its levels, type, range and default
-are in the design plan (maintainers' notes in docs/internal, not published),
-sections 3.9 and 3.19.
+account, `model_fallback` only on a model). Every setting, its levels, range and default are
+in [Configuration](../reference/configuration.md#registry-settings); the document's shape and
+its JSON Schema are in [Registry document](../reference/registry.md).
 
 To see the effective value of each setting for a model and the level it came from:
 

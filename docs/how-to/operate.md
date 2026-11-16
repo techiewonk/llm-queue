@@ -68,8 +68,8 @@ spec:
 The preStop hook's time counts against the grace period, so keep the `/drain` handler instant
 (it only flips a flag). If you raise `LLMQ_DRAIN_SECS` for long answers, raise
 `terminationGracePeriodSeconds` with it (drain + 5 s or more); a pod killed before its drain ends
-loses nothing either, its calls reappear after `visibility_secs`, but they then count one
-failure each.
+loses nothing either, its calls reappear after `queue.visibility_secs` (default 60 s), but
+they then count one failure each.
 
 Measured: 4 rolling restarts, 0 calls lost (gate B33).
 
@@ -78,8 +78,8 @@ Measured: 4 rolling restarts, 0 calls lost (gate B33).
 | Route / call | Answers |
 |---|---|
 | `GET /health/live` | 200 while the library's background loops run and the heartbeat makes progress; **503** when a loop died or the heartbeat stalled for a lease. Once `stop()` begins it stays 200, so a draining pod is not restarted. It reads the process's own state only, never the store |
-| `GET /health/ready` | 200 when the registry is loaded and the process is not draining, else 503 |
-| `await llmq.health()` | `{"live", "ready", "stores": {"state", "queue"}, "eviction_policy"}`, plus `queue_eviction_policy` with a separate queue store |
+| `GET /health/ready` | 200 when the registry is loaded and the process is not draining, else 503. In strict mode a store whose eviction policy is not `noeviction` also answers 503, with the reason |
+| `await llmq.health()` | `live`, `ready`, `stores` (`state`, `queue`), `eviction_policy`, `worker`, `version`, `registry_version`, `held`, `heartbeat_age_secs`; plus `live_reason` when not live, `not_ready_reason` when not ready (strict mode and an evicting store) and `queue_eviction_policy` with a separate queue store |
 
 A liveness probe on `/health/live` restarts a pod whose loops died (0.1.0b1 always answered
 200): keep its `failureThreshold` at 3 or more so one slow beat does not restart a healthy pod.
@@ -141,8 +141,9 @@ llm-queue drain M --yes --wait              # disable a model for new calls; ser
 llm-queue dlq list --model M                # dead letters; also show, redrive, purge
 ```
 
-Commands that delete or move data (`drain`, `dlq redrive`, `dlq purge`, `registry gc`) need
-`--yes`; `--dry-run` shows what they would do.
+Commands that delete or move data (`drain`, `dlq redrive`, `dlq purge`, `registry gc`,
+`cancel`) need `--yes`; `--dry-run` shows what they would do. `llm-queue dlq list --job J`
+lists dead jobs.
 
 `--actor NAME` records who made a change. Live edits and their limits are in
 [Configure](configure.md#live-edits). Every command is in [CLI and HTTP](../reference/cli-http.md).
@@ -173,13 +174,17 @@ The store is one primary with replicas (cluster mode is not supported).
 - Clients reconnect on `READONLY` after a failover. The failover drill (`scripts/failover.py`)
   loses no call on `failover` and `restart`; with DNS lagging 6 s, at most 5 % of calls in
   flight may fail.
-- `LLMQ_QUEUE_WAIT_REPLICAS` / `LLMQ_QUEUE_WAIT_MS`: a send waits for this many replicas to
-  acknowledge it. Too few acknowledgements make the call run direct under the same record.
+- `LLMQ_QUEUE_WAIT_REPLICAS` (default 0, off) / `LLMQ_QUEUE_WAIT_MS` (default 100): a write
+  waits for this many replicas to acknowledge it, for call sends, job sends and registry live
+  edits (each switchable with `LLMQ_QUEUE_WAIT_SCOPES`, default `all`). Too few
+  acknowledgements never fail a write: it was sent, so it goes on, with a `replicas_short`
+  warning at most once a minute and `llmq_send_not_replicated_total`. Also set
+  `min-replicas-to-write` on the primary: its `NOREPLICAS` refusal counts as the store down.
 - With a separate queue store (`LLMQ_QUEUE_STORE_URL`), errors for `LLMQ_QUEUE_FAILOVER_SECS`
   (5) make calls run direct under the same budgets. Each send try is bounded by that time (a
   store that never answers fails over then, not after the client's ~21 s budget), and the
-  process remembers the outage for `outage_memo_secs` (3 s, cleared by a good store probe):
-  calls in that time skip the queue store and run direct at once.
+  process remembers the outage for a few seconds (cleared by a good store probe): calls in
+  that time skip the queue store and run direct at once.
 - A state store outage: callers already waiting keep waiting until their deadline; new calls
   follow the model's `store_down` rule (`pause`, the default; `static_cap`; `fail_fast`).
   Measured: a 45 s outage with 500 calls waiting dropped none.
@@ -211,8 +216,8 @@ named events, for example:
 | `deployment_disabled`, `deployment_recovered` | Health checks turned a deployment off or back on |
 
 Metrics go to `LLMQ_METRICS_SINK`: `emf` (CloudWatch embedded metrics, default, with the
-`environment` dimension), `prometheus` (needs the `metrics` extra; `status_router(...,
-metrics_route=True)` serves `GET /metrics`) or `none`; one sink per process. Per call: calls by
+`environment` dimension), `prometheus` (needs the `metrics` extra;
+`llmq.http_router(metrics_route=True)` serves `GET /metrics`) or `none`; one sink per process. Per call: calls by
 outcome and by caller-seen failure, attempts by result, tokens, and histograms of the queue
 wait, the wait for a grant, the call and each provider attempt. Every 30 s the alert-lock
 holder sets the cluster gauges (queues, held calls, oldest call, budgets and their limits,
