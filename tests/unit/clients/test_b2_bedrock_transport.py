@@ -189,8 +189,11 @@ async def test_a_cut_stream_fails_the_same_after_the_same_text(both: Any, cut_wi
         for e in seen["aiohttp"]
         if "contentBlockDelta" in e
     )
-    # An abrupt close can lose the buffered chunks; a body cut gets no quick retry (CL-9).
-    assert len(text) == (0 if cut_with == "close" else 64)  # the partial text the caller gets
+    # An abrupt close may lose the buffered chunks (Windows TCP drops them, Linux delivers them
+    # first): either way both transports saw the same events, checked above. A body cut gets
+    # no quick retry (CL-9), so the caller keeps the partial text.
+    expected = {0, 64} if cut_with == "close" else {64}
+    assert len(text) in expected  # the partial text the caller gets
     assert decisions["aiohttp"][:3] == decisions["botocore"][:3]
 
 
