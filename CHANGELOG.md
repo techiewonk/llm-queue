@@ -36,8 +36,37 @@ public API (see STABILITY.md).
 - Settings `LLMQ_AUTO_PURGE`, `LLMQ_PURGE_GRACE_SECS`, `LLMQ_PURGE_WAIT`,
   `LLMQ_PURGE_WAIT_SECS`, `LLMQ_PURGE_BATCH`, `LLMQ_TENANT_PURGE_DEFAULT` and
   `LLMQ_TENANT_INDEX` (off: the per-tenant call index costs one write per call).
+- Key expiry modes (`LLMQ_KEY_EXPIRY=auto|native|swept`, default `auto`): llm-queue can share a
+  store whose `maxmemory-policy` is `volatile-*` (ElastiCache's default `volatile-lru`, an app
+  cache). In `swept` no key the library needs has a TTL: each expiry is a member of the zset
+  `P:ttl` and the sweeper deletes due keys (up to `sweep_secs`, 10 s, late), so a `volatile-*`
+  policy cannot evict them. `auto` picks `native` on `noeviction` and `swept` otherwise. The mode
+  is the store's (`P:expiry`; missing means `native`), written at start, every minute and after
+  a store reset. New settings `LLMQ_TTL_SWEEP_BATCH` (500) and `LLMQ_TTL_SWEEP_ROUNDS` (20);
+  `health()["key_expiry"]`; gauge `llmq_key_expiry_swept{store}`; counter
+  `llmq_ttl_swept_total`; log events `key_expiry_changed`, `key_expiry_publish_failed`,
+  `ttl_sweep_failed`. How-to: `docs/how-to/shared-cache-store.md`.
+- Docs: a reference page listing every key, stream and channel the library keeps in the store,
+  with its fields, writers, readers, lifetime in each key expiry mode, what is lost if it is
+  evicted under each policy, and code references (`docs/reference/store-keys.md`, with a JSON
+  copy `store-keys.json`).
 
 ### Changed
+
+- Readiness and the start check accept a `volatile-*` store when key expiry is `swept`
+  (`eviction_warning(policy, mode)`): in strict mode such a process is now ready.
+  `allkeys-*` still fails readiness in either mode, and `volatile-*` with `native` still does.
+  `llmq_store_eviction_unsafe` follows the same rule.
+- Docs: the key table in `docs/explanation/storage.md` was out of date and is corrected: the
+  limiter, breaker, leases and in-progress keys have sliding TTLs (1 day; `max(budget_key_ms,
+  2 x lease)`), rotation slides 1 day, waiter keys slide 180 s (a waiter counts for 2 s), the
+  `health` hash has a 1-day TTL only after a latency sample, the breaker's `fail_at`, `thr_n`,
+  `thr_until` fields, the tenant fairness, receive claim, offload, job and reset keys, the
+  caller TTL (45 s by default, not 30), lock lifetimes (10 s, 5 / 35 s, 45 s), stream and
+  dead-letter trimming, the audit's `MAXLEN`, what `PUBLISH` deletes, the result's TTL after
+  its first read (cut to 2 s, not deleted), the request record's lifetimes, what the queue
+  store holds, and readiness in strict mode. New section "Key expiry modes"; the store
+  requirements now read `noeviction` **or** `volatile-*` with `swept`.
 
 - `llm-queue registry gc` now purges removed deployments of live models too, and keeps a
   removed model's queue that still holds messages unless `--force` (it deleted it before). Its
