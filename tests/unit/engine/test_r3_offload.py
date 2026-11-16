@@ -56,6 +56,9 @@ class Client:
         self.data[key] = value
         return True
 
+    async def zrem(self, *_: Any) -> int:  # native key expiry drops an old index entry
+        return 0
+
     async def exists(self, key: str) -> int:
         return int(key in self.data)
 
