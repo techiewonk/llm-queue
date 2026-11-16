@@ -17,6 +17,31 @@ public API (see STABILITY.md).
   reference page on the document's shape with a complete example (`docs/reference/registry.md`).
 - `LLMQueue.http_router(metrics_route=True)` serves `GET /metrics` (off by default); the option
   existed only on `status_router(engine, ...)`, which needs the now private engine.
+- Purge controls (`docs/how-to/purge.md`): `PurgeService` (`llmq.purge`, or
+  `PurgeService.from_env()` standalone) deletes the store state of a removed model
+  (`model`), a removed deployment (`deployment`, waiting for its running calls first), a tenant
+  (`tenant`, fairness keys with the weight sum corrected; optionally cancelling its queued or
+  running calls) or everything the registry no longer has (`removed`), with dry runs
+  (`plan_*`). Each returns a `PurgeReport`; real purges are audited (`purge_<kind>` in the
+  registry audit), logged `llmq_purge` and counted `llmq_purged_keys_total{kind}`. New error
+  `PurgeRefused` (a model or deployment still in the registry without `force`; a tenant purge of
+  calls without the tenant index).
+- Auto purge: when a publish drops a model or deployment, it is purged after
+  `LLMQ_PURGE_GRACE_SECS` (900) unless it came back meanwhile (`LLMQ_AUTO_PURGE`, default on);
+  `purge.scheduled()` / `cancel_scheduled()` list and keep pending ones.
+- CLI `llm-queue purge model|deployment|tenant --yes|--dry-run`; HTTP routes `POST
+  /purge/model`, `/purge/deployment`, `/purge/tenant`, `/registry/gc`, `GET /purge/scheduled`,
+  `POST /purge/scheduled/cancel` (only with `allow_writes=True`, `X-LLMQ-Admin`; `dry_run`
+  defaults to true).
+- Settings `LLMQ_AUTO_PURGE`, `LLMQ_PURGE_GRACE_SECS`, `LLMQ_PURGE_WAIT`,
+  `LLMQ_PURGE_WAIT_SECS`, `LLMQ_PURGE_BATCH`, `LLMQ_TENANT_PURGE_DEFAULT` and
+  `LLMQ_TENANT_INDEX` (off: the per-tenant call index costs one write per call).
+
+### Changed
+
+- `llm-queue registry gc` now purges removed deployments of live models too, and keeps a
+  removed model's queue that still holds messages unless `--force` (it deleted it before). Its
+  output is the purge report: `deleted_keys` with `dry_run`, instead of `would_delete`.
 
 ## [0.1.0b2] - 2026-11-15
 

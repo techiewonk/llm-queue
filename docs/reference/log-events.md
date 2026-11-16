@@ -16,7 +16,7 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `bad_dead_letter` | warning | engine/runtime.py |
 | `bad_message` | warning | engine/runtime.py |
 | `bell_failed` | warning | engine/runtime.py |
-| `call_cancel` | info | engine/cli.py, engine/runtime.py |
+| `call_cancel` | info | engine/cli.py, engine/purge.py, engine/runtime.py |
 | `caller_gone` | warning | engine/runtime.py |
 | `cancel_after_stop` | warning | engine/runtime.py |
 | `cancel_cleanup_failed` | warning | engine/runtime.py |
@@ -72,6 +72,7 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `job_task_failed` | warning | engine/jobs.py |
 | `job_upkeep_failed` | warning | engine/jobs.py |
 | `llmq_call_finished` | info | engine/runtime.py |
+| `llmq_purge` | info | engine/purge.py |
 | `llmq_registry_audit` | info | registry/store.py |
 | `message_needs_newer_library` | warning | engine/runtime.py |
 | `metric_dropped` | warning | engine/metrics.py |
@@ -89,6 +90,9 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `pool_replan_failed` | warning | engine/runtime.py |
 | `prober_failed` | warning | engine/runtime.py |
 | `pubsub_stale` | warning | engine/runtime.py |
+| `purge_failed` | warning | engine/purge.py, engine/runtime.py |
+| `purge_scheduled` | info | engine/purge.py |
+| `purge_unscheduled` | info | engine/purge.py, engine/http.py |
 | `queue_store_down` | warning | engine/runtime.py |
 | `receive_reclaimed` | warning | engine/runtime.py |
 | `redelivered_while_held` | warning | engine/runtime.py |
@@ -146,6 +150,7 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `sweep_failed` | warning | engine/runtime.py |
 | `sync_call_on_event_loop` | warning | core.py |
 | `sync_engine_close_failed` | warning | core.py |
+| `tenant_index_failed` | warning | engine/runtime.py |
 | `undo_skipped` | warning | engine/admission.py |
 | `waiting_calls_lost` | warning | engine/runtime.py |
 | `warm_clients_failed` | warning | engine/runtime.py |

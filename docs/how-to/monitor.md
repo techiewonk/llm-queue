@@ -173,6 +173,7 @@ from 0.1 s to 600 s. Alert gauges are named `llmq_alert_<name>`, labels `model` 
 | `llmq_outage_memo_set_total` | counter | - | Count | every pod | Times this pod started remembering a store outage (owner Q11) |
 | `llmq_store_pool_busy_total` | counter | model | Count | worker | Calls refused because the store pool was full |
 | `llmq_pubsub_resubscribes_total` | counter | reader | Count | every pod | Stale subscribers reset |
+| `llmq_purged_keys_total` | counter | kind | Count | every pod | Store keys deleted by purges, by kind: model, deployment, tenant, removed |
 | `llmq_stale_acks_total` | counter | model | Count | worker | Acks refused: another worker took the message over |
 | `llmq_jobs_total` | counter | job, outcome | Count | worker | Jobs finished by outcome (ok, failed, dead, ...) |
 | `llmq_hook_failed_total` | counter | kind, hook | Count | every pod | App hooks that raised |

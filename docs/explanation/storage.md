@@ -44,7 +44,7 @@ model's `queue.name`) and `...-priority`; jobs use `jobs-<name>`. Hash tags grou
 | Keys | Type | Holds | Lifetime |
 |---|---|---|---|
 | `P:{reg}:doc`, `:meta`, `:audit`, `:history` | string, hash, stream, hash | Registry JSON; `version`, `config_hash`, `changes`, `published`; one audit entry per publish / edit (`actor, op, version, diff, ts`); the last 20 published versions | audit trimmed to `LLMQ_AUDIT_RETENTION_DAYS` (90) |
-| `P:{m:A}:cfg` | hash | `numbers` (resolved admission settings per deployment), `changes` | until `registry gc` |
+| `P:{m:A}:cfg` | hash | `numbers` (resolved admission settings per deployment), `changes` | until the model is purged (auto, `registry gc`, see [Purge](../how-to/purge.md)) |
 | `P:{m:A}:rate:DEP` | hash | `rpm_tat`, `tpm_tat`, class clocks `p_/n_rpm_tat`, `p_/n_tpm_tat` (or `*_win` / `*_n` when fixed); `seen_win`, `seen_calls`, `seen_tokens`, `seen_n` | 180 s, refreshed on write |
 | `P:{a:ACCT}:rate` | hash | Account budget clocks / counters | 180 s |
 | `P:{m:A}:wait:p`, `:wait:n`, `:waitinfo`, `:waitexp` | zset, zset, hash, zset | Waiters by queue position; their cost, usable deployments, expiry; waiters by expiry (so `PICK_TAKE` touches only expired ones) | entries expire after 2 s unless refreshed |
@@ -56,6 +56,8 @@ model's `queue.name`) and `...-priority`; jobs use `jobs-<name>`. Hash tags grou
 | `P:{q:NAME}:s`, `:vis`, `:gen`, `:fails`, `:st`, `:dlq`, `:meta` | stream, zset, hashes, stream, hash | Messages; hidden until; generation; failures; held / returned; dead letters (`body, src, fails`); the receive cursor | stream `MINID` 1 day (`retention_secs`); DLQ 1 day |
 | `P:bell:NAME` | list | Doorbell tokens (at most 64) | 60 s |
 | `P:caller:WORKER`, `P:done:WORKER`, `P:cancel`, `P:chunkwake:WORKER` | string, channel, channel, stream | Process liveness; result wake-ups; cancels; wakes the process's shared chunk reader when a new stream opens | `LLMQ_CALLER_TTL_SECS` (30); chunkwake trimmed |
+| `P:purge`, `P:lock:purge` | zset, string | Auto purges waiting for their grace (target `alias` or `alias/account/name` to due time, store ms); the pod that records and runs them | entries until purged or cancelled; lock 120 s |
+| `P:tenant:H:reqs` | zset | With `LLMQ_TENANT_INDEX`: a tenant's calls (request id to deadline, store ms), for a tenant purge | longest call + 60 s |
 | `P:epoch`, `P:reset_minute`, `P:lock:{sweep,alerts,probe}`, `P:alert:*`, `P:health:WORKER` | strings | Store-reset detector; locks for one-process tasks; alert state; readiness probe | locks 5-25 s; alerts 1 day; probe 5 s |
 
 ## Store usage
