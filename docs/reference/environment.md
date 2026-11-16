@@ -50,8 +50,10 @@ seconds, the longest `EXPIRE` takes.
 - `https://` in `LLMQ_BEDROCK_ENDPOINT_URL` and `LLMQ_STS_ENDPOINT_URL` (any host);
 - `LLMQ_DEBUG_CAPTURE_FROM_CONFIG` off (it stores prompt text).
 
-A store whose eviction policy can drop keys (anything but `noeviction`) fails readiness in strict
-mode, with the reason (the process still starts).
+A store whose eviction policy can drop the library's keys fails readiness in strict mode, with
+the reason (the process still starts): `allkeys-*` always, and `volatile-*` when keys expire
+natively (`LLMQ_KEY_EXPIRY=native`). With `auto` (the default) a `volatile-*` store gets
+`swept` and stays ready.
 
 ```mermaid
 flowchart LR
@@ -73,9 +75,9 @@ flowchart LR
 | `LLMQ_QUEUE_WAIT_MS` | 100 | above 0 to 60000 (whole) | ... for at most this long (it must stay below the store read timeout, see [Tune](../how-to/tune.md)) |
 | `LLMQ_QUEUE_WAIT_SCOPES` | `all` | `all`, `none` or a comma list of `calls`, `jobs`, `registry` | Which writes wait for replicas: call sends, job sends, registry live edits. Every scope is on by default when `LLMQ_QUEUE_WAIT_REPLICAS` is set |
 
-| `LLMQ_KEY_EXPIRY` | `auto` | `auto`, `native`, `swept` | How keys expire. `native`: Valkey TTLs (needs `maxmemory-policy noeviction`). `swept`: no key the library needs has a TTL; expiries live in the index `P:ttl` and the sweeper deletes due keys, so a `volatile-*` store (a shared cache) cannot evict them. `auto`: `native` on a `noeviction` store, else `swept`. `allkeys-*` stays not ready in strict mode either way |
-| `LLMQ_TTL_SWEEP_BATCH` | 500 | 1 to 10000 (whole) | Keys deleted per sweep script run (index `P:ttl`) |
-| `LLMQ_TTL_SWEEP_ROUNDS` | 20 | 1 to 10000 (whole) | Full batches per sweep (every sweep interval), at most |
+| `LLMQ_KEY_EXPIRY` | `auto` | `auto`, `native`, `swept` | How keys expire. `native`: Valkey TTLs (needs `maxmemory-policy noeviction`). `swept`: no key the library needs has a TTL; expiries live in the index `P:ttl` and the sweeper deletes due keys, so a `volatile-*` store (a shared cache) cannot evict them. `auto`: `native` on a `noeviction` store, else `swept` (`volatile-*`, `allkeys-*` or an unreadable policy). The mode is the store's: a started engine writes it to `P:expiry` at start, every minute and after a store reset, and every script follows that key; a missing key means `native`. `allkeys-*` stays not ready in strict mode either way. See [Key expiry modes](../explanation/storage.md#key-expiry-modes) |
+| `LLMQ_TTL_SWEEP_BATCH` | 500 | 1 to 10000 (whole) | Keys deleted per sweep script run (index `P:ttl`). The sweep runs in both modes |
+| `LLMQ_TTL_SWEEP_ROUNDS` | 20 | 1 to 10000 (whole) | Full batches per sweep (every 10 s), at most: 500 x 20 = 10000 keys per sweep by default; more wait for the next one |
 
 For a store with replicas, also set `min-replicas-to-write` on the primary: a write it refuses
 (`NOREPLICAS`), like `OOM`, `MISCONF` and `BUSY`, is treated as the store being down.

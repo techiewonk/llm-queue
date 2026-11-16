@@ -33,7 +33,8 @@ python scripts/stack.py status    # which services answer
 | fakellm | 8080 | a fake Bedrock / OpenAI-compatible server |
 
 Any Valkey 8 or Redis 7.2+ works as the store, as one primary (not cluster mode), ideally with
-`maxmemory-policy noeviction`. It must allow Lua scripts, pub/sub and blocking
+`maxmemory-policy noeviction` (a `volatile-*` policy works too, see
+[Shared cache store](../how-to/shared-cache-store.md)). It must allow Lua scripts, pub/sub and blocking
 list reads; cluster mode is not supported.
 
 ## 3. Write a registry
