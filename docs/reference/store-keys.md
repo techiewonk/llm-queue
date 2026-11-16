@@ -234,7 +234,7 @@ What the library checks:
 | Readiness, strict (`LLMQ_ENVIRONMENT` not `dev`/`local`/`test`/`ci`; unset is strict) | each `health_check()` | `_evicting()` returns a reason: `ready: false` with `not_ready_reason` (`runtime.py:4248-4253,4297-4305`); gauge `llmq_ready` 0 (`runtime.py:4477-4485`) |
 | Readiness, dev | each `health_check()` | Ready; warning at start only; `eviction_policy` and `key_expiry` in `health()` (`runtime.py:4263-4266`) |
 | Gauges | each metrics tick | `llmq_store_eviction_unsafe{store}` 1 when unsafe in the store's mode; `llmq_key_expiry_swept{store}` 1 in `swept` (`runtime.py:4478-4482`) |
-| Expiry sweep | every `sweep_secs` (10 s), one process (`P:lock:sweep`) | `TTL_SWEEP` deletes due keys, `LLMQ_TTL_SWEEP_BATCH` (500) per run, at most `LLMQ_TTL_SWEEP_ROUNDS` (20) runs per sweep (`runtime.py:4359-4375`); counted in `llmq_ttl_swept_total`. It runs in both modes |
+| Expiry sweep | every `sweep_secs` (10 s), one process (`P:lock:sweep`) | `TTL_SWEEP` deletes due keys, `LLMQ_TTL_SWEEP_BATCH` (500) per run, at most `LLMQ_TTL_SWEEP_ROUNDS` (100) runs per sweep (`runtime.py:4359-4375`); counted in `llmq_ttl_swept_total`. It runs in both modes |
 
 An unreadable policy (`unknown`) never fails readiness (`store_checks.py:57`); with `auto` it
 gets `swept`.

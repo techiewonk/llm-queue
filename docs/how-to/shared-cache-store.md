@@ -36,7 +36,7 @@ Two settings tune the sweep that deletes expired keys; the defaults suit most lo
 | Setting | Default | What it does |
 |---|---|---|
 | `LLMQ_TTL_SWEEP_BATCH` | 500 | Keys deleted per sweep script run |
-| `LLMQ_TTL_SWEEP_ROUNDS` | 20 | Runs per sweep (every 10 s), at most: 10000 keys per 10 s by default |
+| `LLMQ_TTL_SWEEP_ROUNDS` | 100 | Runs per sweep (every 10 s), at most: 50000 keys per 10 s by default |
 
 Raise them only if `ZCARD P:ttl` keeps growing while the load is steady (see step 4).
 

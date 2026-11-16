@@ -166,8 +166,8 @@ About 1800 s later the next sweep finds it due, deletes it with `UNLINK` and rem
 
 **The index and the sweep.** One process at a time (the holder of `P:lock:sweep`) runs
 `TTL_SWEEP` every `sweep_secs` (10 s). One run deletes up to `LLMQ_TTL_SWEEP_BATCH` (500) due
-keys; the sweep runs again while a run comes back full, at most `LLMQ_TTL_SWEEP_ROUNDS` (20)
-times. That is up to 10000 keys per 10 s by default; a bigger backlog waits for the next sweep.
+keys; the sweep runs again while a run comes back full, at most `LLMQ_TTL_SWEEP_ROUNDS` (100)
+times. That is up to 50000 keys per 10 s by default (caller-only processes sweep too); a bigger backlog waits for the next sweep.
 Each deleted key counts in `llmq_ttl_swept_total`. The sweep runs in both modes, so keys indexed
 while `swept` still go after a switch to `native`. A script that asks for a key's time left
 (`PTTL`) reads the index in `swept` mode, so the "only lengthen" and "set when none" rules

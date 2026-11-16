@@ -42,7 +42,7 @@ public API (see STABILITY.md).
   `P:ttl` and the sweeper deletes due keys (up to `sweep_secs`, 10 s, late), so a `volatile-*`
   policy cannot evict them. `auto` picks `native` on `noeviction` and `swept` otherwise. The mode
   is the store's (`P:expiry`; missing means `native`), written at start, every minute and after
-  a store reset. New settings `LLMQ_TTL_SWEEP_BATCH` (500) and `LLMQ_TTL_SWEEP_ROUNDS` (20);
+  a store reset. New settings `LLMQ_TTL_SWEEP_BATCH` (500) and `LLMQ_TTL_SWEEP_ROUNDS` (100);
   `health()["key_expiry"]`; gauge `llmq_key_expiry_swept{store}`; counter
   `llmq_ttl_swept_total`; log events `key_expiry_changed`, `key_expiry_publish_failed`,
   `ttl_sweep_failed`. How-to: `docs/how-to/shared-cache-store.md`.
