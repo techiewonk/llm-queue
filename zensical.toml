@@ -59,6 +59,7 @@ nav = [
     { "Environment variables" = "reference/environment.md" },
     { "Configuration" = "reference/configuration.md" },
     { "Registry document" = "reference/registry.md" },
+    { "Store keys" = "reference/store-keys.md" },
     { "Errors" = "reference/errors.md" },
     { "Log events" = "reference/log-events.md" },
     { "CLI and HTTP" = "reference/cli-http.md" },
