@@ -74,6 +74,7 @@ result; the caller wakes up and reads it. There is no separate service to run: o
 pip install "llm-queue[langchain-aws]"            # Bedrock (+ LangChain)
 pip install "llm-queue[openai,langchain-openai]"  # OpenAI-compatible servers (+ LangChain)
 pip install "llm-queue[http,metrics]"             # FastAPI routes, Prometheus metrics
+pip install "llm-queue[langchain-aws]==0.1.1"     # pinned (no --pre since 0.1.1)
 ```
 
 Python 3.12 or newer, and Valkey 8 or Redis 7.2+ (one primary, replicas allowed; cluster mode is
