@@ -68,8 +68,11 @@ async def test_gc_removes_queues_of_removed_models(
         f"{prefix}:{{q:llm-embed-cohere-priority}}:s",
         f"{prefix}:bell:llm-embed-cohere",
     ]
-    for key in keep + drop:
-        await valkey.set(key, b"x")
+    for key in keep + drop:  # real types: gc reads a queue's depth (0.1.0b3)
+        if "bell:" in key:
+            await valkey.rpush(key, b"1")
+        else:
+            await valkey.xadd(key, {"body": b"x"})
     v2 = copy.deepcopy(full)
     v2["registry_version"] = 2
     for alias in ("embed-titan", "embed-cohere"):
@@ -77,12 +80,16 @@ async def test_gc_removes_queues_of_removed_models(
     await RegistryStore(valkey, prefix).publish(v2, actor="deploy")
     # The publish itself deletes the removed models' numbers keys (CO-20); gc does the rest.
     assert not [k async for k in valkey.scan_iter(match=f"{prefix}:{{m:embed-*")]
-    dry = await amain(["registry", "gc", "--dry-run"], env)
+    # A queue still holding messages is kept unless --force (0.1.0b3 purge service).
+    kept = await amain(["registry", "gc", "--dry-run"], env)
+    assert "llm-embed-cohere-priority" in [row["thing"] for row in kept["skipped"]]
+    dry = await amain(["registry", "gc", "--dry-run", "--force"], env)
     assert "llm-embed-titan" in dry["queues"]
-    assert dry["would_delete"] >= len(drop)
+    assert dry["deleted_keys"] >= len(drop)
+    assert dry["dry_run"] is True
     assert all([await valkey.exists(key) for key in drop])
-    done = await amain(["registry", "gc", "--yes"], env)
-    assert done["deleted_keys"] == dry["would_delete"]
+    done = await amain(["registry", "gc", "--yes", "--force"], env)
+    assert done["deleted_keys"] == dry["deleted_keys"]
     assert [await valkey.exists(key) for key in drop] == [0, 0, 0]
     assert [await valkey.exists(key) for key in keep] == [1, 1]
     assert not [k async for k in valkey.scan_iter(match=f"{prefix}:{{m:embed-*")]
