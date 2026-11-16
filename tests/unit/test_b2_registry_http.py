@@ -67,3 +67,19 @@ async def test_block_takes_a_json_body_and_the_admin_header() -> None:
         ]
         edit = await client.post("/registry", json={"rpm": 5})
         assert edit.status_code == 403
+
+
+def test_queue_router_passes_metrics_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`LLMQueue.http_router(metrics_route=True)` serves /metrics without the private engine.
+
+    The option existed only on `status_router(engine, ...)`, and `LLMQueue.engine` is private
+    (deprecated), so the documented way to expose /metrics had no public form.
+    """
+    import llm_queue.engine.http as http
+    from llm_queue import LLMQueue
+
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(http, "status_router", lambda engine, **kw: seen.update(kw))
+    queue: Any = SimpleNamespace(_engine=object())
+    LLMQueue.http_router(queue, metrics_route=True)
+    assert seen["metrics_route"] is True

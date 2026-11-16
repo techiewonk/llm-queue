@@ -15,6 +15,8 @@ public API (see STABILITY.md).
   generated from the same checks that validate a document; it needs no store and no `LLMQ_*`
   settings. The schema is published as `docs/reference/registry-schema.json`, next to a new
   reference page on the document's shape with a complete example (`docs/reference/registry.md`).
+- `LLMQueue.http_router(metrics_route=True)` serves `GET /metrics` (off by default); the option
+  existed only on `status_router(engine, ...)`, which needs the now private engine.
 
 ## [0.1.0b2] - 2026-11-15
 
@@ -24,7 +26,7 @@ behaviour decisions for production. No backward compatibility is kept with 0.1.0
 ### Upgrading from 0.1.0b1
 
 Every change an app pinned to 0.1.0b1 may need, as a checklist; each item is described in full
-below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with tables.
+below, and [Upgrade from 0.1.0b1](https://techiewonk.github.io/llm-queue/how-to/upgrade/) has the same list with tables.
 
 0. **Python 3.12 or newer.** Python 3.11 is no longer supported (`requires-python >=3.12`):
    CI tests 3.12, 3.13 and 3.14. The integration suite hung on 3.11 only, and 3.12 lets the
@@ -52,8 +54,8 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
    `cancel` in scripts and check the new exit codes; retry registry writes on 409.
 6. **OpenAI transport and LangChain:** `retry_budget_exhausted`, `provider_error`,
    `no_deployment` and `worker_shutdown` are now 5xx (`InternalServerError`, not
-   `RateLimitError` / `BadRequestError`); the adapters refuse the Responses API and do not
-   stream.
+   `RateLimitError` / `BadRequestError`); the adapters refuse the Responses API, and stream
+   tokens only with `queue_streaming=True` (off by default).
 
 ### Changed (behaviour)
 
@@ -124,14 +126,14 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
   `waiting_age_secs` stopped the pod from starting.
 - **The registry's `queue.retention_secs` defaults to one day** (owner Q27; was four days).
 - **Process settings have ranges** (R3CF-14): `LLMQ_CFG_RELOAD_SECS` 1-3600,
-  `LLMQ_STORE_MAX_CONNECTIONS` 4-100000, `LLMQ_STATUS_TTL_SECS` at least 60,
+  `LLMQ_STORE_MAX_CONNECTIONS` 4-100000, `LLMQ_STATUS_TTL_SECS` at least 1,
   `LLMQ_QUEUE_WAIT_REPLICAS` at most 16, TTLs within 2147483647 s, and others listed in
   `docs/reference/environment.md`; an empty value counts as unset; `LLMQ_DRAIN_SECS=0` is valid.
   Whole-number variables say "must be a whole number" for `200.0` (R3CF-17).
 - **Strict mode wants an `LLMQ_ID_HASH_SALT` of at least 16 characters** (FO-13): a
   one-character key does not stop brute-forcing hashed phone numbers.
 - **`LLMQ_KEY_PREFIX` and `LLMQ_QUEUE_PREFIX` are plain names** (FO-20): letters, digits, `_`,
-  `.`, `-` (`registry gc` split keys on `{m:` / `{q:` and mis-attributed them). Entries of
+  `.`, `-`, and `:` in the key prefix (`registry gc` split keys on `{m:` / `{q:` and mis-attributed them). Entries of
   `LLMQ_BASE_URL_ALLOWED_HOSTS` with a scheme, port or path are refused by name (R3CF-13).
 - **Registry checks added** (R3CF-10, R3CF-12): a fallback `after_secs` that could never fire
   inside `timeout_secs` is an error; the weight-0 check covers `balance_priority` and counts
@@ -373,7 +375,7 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
   `partial_text` on a mid-stream failure, and the queued call cancelled when the consumer stops
   (aclosing). Sync `stream()` still yields one whole message; a sync call on the queue's own
   loop keeps the queue's `LLMQueueError` (Q1), which `QueuedChatOpenAI` now raises as such
-  instead of the SDK's `InternalServerError`. See [LangChain](docs/samples/langchain.md).
+  instead of the SDK's `InternalServerError`. See [LangChain](https://techiewonk.github.io/llm-queue/samples/langchain/).
 - **Per-tenant fairness** (owner Q28, Q29, Q50): registry setting `fairness` (defaults or per
   model, *merged*), **off by default** (admission is unchanged when off). The tenant is the
   call's `tenant_id`, else its `user_id` (calls with neither share one tenant); the store keys
@@ -386,7 +388,7 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
   scripts stay not cluster-safe like the rest of admission. New metric
   `llmq_tenant_refusals_total{model, mode}`, refusal reason `tenant`, `status()` field
   `fairness` (counts only), registry checks. See
-  [Tenant fairness](docs/explanation/fairness.md).
+  [Tenant fairness](https://techiewonk.github.io/llm-queue/explanation/fairness/).
   Measured 2026-11-15 on the local Valkey 8.1 (6,000 PICK_TAKE + FINISH cycles per variant,
   interleaved, 100 tenants; server time per script call from `INFO commandstats`): before the
   feature 287.0 us, **off 288.0 us (+0.3 %, within noise)**, `fair_queue` 312.2 us (+9 %),
@@ -397,7 +399,7 @@ below, and [Upgrade from 0.1.0b1](docs/how-to/upgrade.md) has the same list with
   name, and its id patterns are tried before the built-in ones. Register it in every process
   before the registry loads (see docs/how-to/call.md, "Embedding families").
 - **Monitoring** (R3OB-2, -3, -4, -5, -14, -15, -16, -17, -19, -20; owner Q5, Q9, Q10, Q11,
-  Q15, Q25): [Monitor](docs/how-to/monitor.md) lists every metric with kind, labels, unit and
+  Q15, Q25): [Monitor](https://techiewonk.github.io/llm-queue/how-to/monitor/) lists every metric with kind, labels, unit and
   emitter (from `llm_queue.engine.metrics.METRICS`; a test fails on an unlisted name), with
   CloudWatch and Prometheus alarms, Logs Insights queries and a page per incident. New:
   histograms `llmq_call_seconds`, `llmq_provider_seconds`, `llmq_first_token_seconds`,

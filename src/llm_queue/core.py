@@ -899,15 +899,22 @@ class LLMQueue:
         dependencies: Sequence[Any] = (),
         allow_writes: bool = False,
         actor: Callable[[Any], str] | None = None,
+        metrics_route: bool = False,
     ) -> Any:
         """A FastAPI router with status, requests, registry and health (extra `http`).
 
         Writes need `actor(request) -> str`, the authenticated name recorded in the audit.
+        `metrics_route=True` adds `GET /metrics` (Prometheus exposition, open like the health
+        routes); it was reachable only through the private engine.
         """
         from llm_queue.engine.http import status_router
 
         return status_router(
-            self._engine, dependencies=dependencies, allow_writes=allow_writes, actor=actor
+            self._engine,
+            dependencies=dependencies,
+            allow_writes=allow_writes,
+            actor=actor,
+            metrics_route=metrics_route,
         )
 
 
