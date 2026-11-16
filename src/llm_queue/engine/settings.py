@@ -18,6 +18,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import orjson
 from redis.connection import parse_url, to_bool
 
+from llm_queue.engine.expiry import KEY_EXPIRY_MODES
 from llm_queue.engine.store_guard import WAIT_SCOPES, parse_scopes
 from llm_queue.errors import ConfigError
 from llm_queue.registry.validate import parse_document
@@ -130,6 +131,11 @@ class InfraSettings:
     # What the replica wait covers (owner Q8 / Q51), LLMQ_QUEUE_WAIT_SCOPES: all by default.
     queue_wait_scopes: frozenset[str] = frozenset(WAIT_SCOPES)
     debug_capture_from_config: bool = False
+    # How keys expire (LLMQ_KEY_EXPIRY): `auto` picks native TTLs on a `noeviction` store and the
+    # expiry index on a `volatile-*` one (owner decision K4, 0.1.0b3); engine/expiry.py.
+    key_expiry: str = "auto"
+    ttl_sweep_batch: int = 500  # LLMQ_TTL_SWEEP_BATCH: keys per sweep script run
+    ttl_sweep_rounds: int = 20  # LLMQ_TTL_SWEEP_ROUNDS: full batches per sweep, at most
 
     @property
     def strict(self) -> bool:
@@ -228,6 +234,9 @@ class InfraSettings:
         mode = str(get("MODE", "both"))
         if mode not in ("both", "caller", "worker"):
             problems.append("LLMQ_MODE must be both, caller or worker")
+        key_expiry = str(get("KEY_EXPIRY", "auto")).strip().lower()
+        if key_expiry not in KEY_EXPIRY_MODES:
+            problems.append("LLMQ_KEY_EXPIRY must be auto, native or swept")
         key_prefix = get("KEY_PREFIX")
         if strict and not key_prefix:
             # Owner decision Q26 (R3SE-9): two environments on one store that both left the
@@ -334,6 +343,9 @@ class InfraSettings:
             queue_wait_ms=number("QUEUE_WAIT_MS", 100, int, hi=60_000),
             queue_wait_scopes=scopes,
             debug_capture_from_config=capture,
+            key_expiry=key_expiry,
+            ttl_sweep_batch=number("TTL_SWEEP_BATCH", 500, int, lo=1, hi=10_000),
+            ttl_sweep_rounds=number("TTL_SWEEP_ROUNDS", 20, int, lo=1, hi=10_000),
         )
         if problems:
             raise ConfigError("invalid LLMQ settings:\n  " + "\n  ".join(problems))

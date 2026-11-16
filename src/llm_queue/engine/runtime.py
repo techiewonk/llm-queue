@@ -60,6 +60,7 @@ from llm_queue.engine.envelope import (
     parse,
 )
 from llm_queue.engine.errors import CallFailed
+from llm_queue.engine.expiry import TTL_SWEEP, Expiry, decide
 from llm_queue.engine.fairness import Fairness, fairness_for
 from llm_queue.engine.health import Health
 from llm_queue.engine.keys import Keys
@@ -239,6 +240,9 @@ class EngineSettings:
     # Strict mode (outside dev / test): an evicting store fails readiness (owner Q10).
     strict: bool = False
     debug_capture_allowed: bool = False  # LLMQ_DEBUG_CAPTURE_FROM_CONFIG (never in prod)
+    key_expiry: str = "auto"  # LLMQ_KEY_EXPIRY: auto | native | swept (engine/expiry.py)
+    ttl_sweep_batch: int = 500  # LLMQ_TTL_SWEEP_BATCH
+    ttl_sweep_rounds: int = 20  # LLMQ_TTL_SWEEP_ROUNDS
     # A store outage seen by a call is remembered this long (owner Q11, R3FM-3): `fail_fast` and
     # `static_cap` then answer at once instead of re-trying the store (1.5-21.5 s per call).
     outage_memo_secs: float = 3.0
@@ -652,6 +656,14 @@ class Engine:
         # Per model: the claim (key, nonce) of a receive whose reply was lost (S11).
         self._unclaimed: dict[str, tuple[str, str]] = {}
         self._results_exist = state.register_script(_RESULTS_EXIST)
+        # Key expiry of each store (owner K4): native TTLs or the index, set at start.
+        self.expiry = Expiry(self.keys.prefix, self.clock.now)
+        self.queue_expiry = (
+            Expiry(self.keys.prefix, self.clock.now) if queue_store is not None else self.expiry
+        )
+        self._ttl_sweeps = [(self.expiry, state.register_script(TTL_SWEEP))]
+        if queue_store is not None:
+            self._ttl_sweeps.append((self.queue_expiry, queue_store.register_script(TTL_SWEEP)))
         self.ready = False
         self._direct_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.health = Health(state, self.keys)
@@ -707,9 +719,11 @@ class Engine:
             async with asyncio.timeout(START_PROBE_SECS):
                 await self.clock.sync(self.state)
                 # Cluster mode is refused (`ConfigError`); an evicting store is a warning (C4).
-                self._eviction["state"] = await check_store(self.state, "state")
+                setting = self.settings.key_expiry
+                self._eviction["state"] = await check_store(self.state, "state", setting)
                 if self._queue_store is not None:
-                    self._eviction["queue"] = await check_store(self._queue_store, "queue")
+                    self._eviction["queue"] = await check_store(self._queue_store, "queue", setting)
+                await self._apply_expiry()
                 await self.state.set(self.keys.epoch, str(self.clock.now()), nx=True)
                 self._epoch = text(await self.state.get(self.keys.epoch))
                 await self.requests.check_offload()  # `ConfigError` without it (Q24)
@@ -4209,6 +4223,7 @@ class Engine:
         out["heartbeat_age_secs"] = round(time.monotonic() - self._beat_ran_mono, 1)
         out["stores"] = stores
         out["eviction_policy"] = self._eviction.get("state", UNKNOWN_POLICY)
+        out["key_expiry"] = self.expiry.mode
         if "queue" in self._eviction:
             out["queue_eviction_policy"] = self._eviction["queue"]
         return out
@@ -4246,7 +4261,7 @@ class Engine:
         if not self.settings.strict:
             return None
         for name, policy in self._eviction.items():
-            warning = eviction_warning(policy)
+            warning = eviction_warning(policy, self._expiry_of(name).mode)
             if warning:
                 return f"{name} store: {warning}"
         return None
@@ -4280,6 +4295,46 @@ class Engine:
                 continue
             if policy != UNKNOWN_POLICY:
                 self._eviction[name] = policy
+        try:  # a policy change, or a store reset that lost `P:expiry` (R3FM-8, owner K4)
+            await self._apply_expiry()
+        except Exception as exc:
+            logger.debug("key_expiry_publish_failed", error=str(exc))
+
+    async def _apply_expiry(self) -> None:
+        """Set each store's key expiry mode from `LLMQ_KEY_EXPIRY` and its eviction policy."""
+        stores = [("state", self.state, self.expiry)]
+        if self._queue_store is not None:
+            stores.append(("queue", self._queue_store, self.queue_expiry))
+        for name, client, expiry in stores:
+            policy = self._eviction.get(name, UNKNOWN_POLICY)
+            mode = decide(self.settings.key_expiry, policy)
+            replaced = await expiry.publish_mode(client, mode)
+            if replaced:
+                logger.warning(
+                    "key_expiry_changed", store=name, policy=policy, before=replaced, mode=mode
+                )
+
+    def _expiry_of(self, store: str) -> Expiry:
+        """The key expiry of the `state` or `queue` store."""
+        return self.queue_expiry if store == "queue" else self.expiry
+
+    async def _sweep_ttl_index(self) -> None:
+        """Delete the keys whose expiry in `P:ttl` is due, on each store.
+
+        In any mode: keys indexed while `swept` still go after a switch back to `native`.
+        """
+        for expiry, script in self._ttl_sweeps:
+            try:
+                deleted = await expiry.sweep(
+                    script,
+                    batch=self.settings.ttl_sweep_batch,
+                    rounds=self.settings.ttl_sweep_rounds,
+                )
+            except Exception as exc:
+                logger.warning("ttl_sweep_failed", error=str(exc))
+                continue
+            if deleted:
+                self.metrics.count("llmq_ttl_swept_total", float(deleted))
 
     def _not_live_reason(self) -> str:
         """Why `_live()` is false: the loops that died, or the stalled heartbeat (R3OB-20)."""
@@ -4383,8 +4438,10 @@ class Engine:
         gauge("llmq_outage_memo_active", 1.0 if self._outage_remembered() else 0.0)
         evicting = self._evicting()
         for name, policy in self._eviction.items():
-            unsafe = 1.0 if eviction_warning(policy) else 0.0
+            expiry = self._expiry_of(name)
+            unsafe = 1.0 if eviction_warning(policy, expiry.mode) else 0.0
             gauge("llmq_store_eviction_unsafe", unsafe, store=name)
+            gauge("llmq_key_expiry_swept", 1.0 if expiry.swept else 0.0, store=name)
         loaded = self.registry._current is not None
         ready = self.ready and loaded and not evicting
         gauge("llmq_ready", 1.0 if ready else 0.0)
@@ -4886,6 +4943,7 @@ class Engine:
                 continue
             if not lock:
                 continue
+            await self._sweep_ttl_index()
             view = self.registry.current
             for alias in view.registry.models:
                 # One model that fails skips only itself: one `try` around the loop stopped the
