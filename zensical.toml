@@ -9,6 +9,7 @@ site_dir = "site"
 
 nav = [
   { "Home" = "index.md" },
+  { "What's new in 0.1.0b2" = "whats-new.md" },
   { "Get started" = [
     { "Getting started" = "tutorials/getting-started.md" },
   ] },

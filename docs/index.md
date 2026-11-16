@@ -19,6 +19,12 @@ flowchart LR
   Q -->|"reply"| APP
 ```
 
+!!! tip "New in 0.1.0b2"
+    At-least-once delivery, per-tenant fairness, background jobs with dead letters, embedding
+    codecs, LangChain streaming and a registry JSON Schema. See
+    [What's new in 0.1.0b2](whats-new.md), and [Upgrade from 0.1.0b1](how-to/upgrade.md)
+    before you deploy it.
+
 <div class="grid cards" markdown>
 
 -   **Get started**
