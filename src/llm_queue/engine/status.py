@@ -98,12 +98,11 @@ class StatusReader:
     ) -> dict[str, Any]:
         """One model: queues, calls in progress, and every deployment's numbers.
 
-        All deployment reads are one script (one command per model): read one by one, 20
-        models x 30 deployments took 6.5 s (plan B91 asks for 200 ms; now 47 ms). `tenants`
-        counts the tenants with calls in flight and their indexed calls (0.2.0 T4, hashes
-        never shown); with `tenant_hash` (`-`: calls with no tenant) a `tenant` block adds
-        that tenant's calls by stage and its fairness numbers.
+        All deployment reads are one script (20 x 30 took 6.5 s one by one; now 47 ms, B91).
+        With `tenant_hash` (`-`: no tenant) a `tenant` block adds that tenant's calls.
         """
+        # `tenants` counts the tenants with calls in flight and their indexed calls (0.2.0 T4,
+        # hashes never shown); the `tenant` block also has the tenant's fairness numbers.
         name = self.queue_prefix + view.queue_name(alias)
         deps = view.deployments(alias)
         base = self.keys.model(alias, "")
@@ -429,12 +428,13 @@ class AlertEvaluator:
     def evaluate(self, view: ResolvedRegistry, report: Mapping[str, Any]) -> list[Alert]:
         """Every alert state of a report.
 
-        `model_unavailable`: no deployment is enabled (itself and its account), unblocked,
-        healthy, inside the residency list and with its breaker not open. `quota_near_limit`:
-        RPM or TPM use this minute at or above `alerts.quota_used_pct` (off after
-        `CLEAR_SAMPLES` clear samples). `breaker_open`, `kill_switch_on` and `queue_stalled`
-        (the oldest call older than `alerts.queue_age_secs`) were missing (R3OB-17).
+        `model_unavailable`, `quota_near_limit`, `breaker_open`, `kill_switch_on` and
+        `queue_stalled`; docs/how-to/monitor.md says when each fires.
         """
+        # model_unavailable: no deployment enabled, unblocked, healthy, in residency with a
+        # closed breaker. quota_near_limit: use this minute at or above `alerts.quota_used_pct`
+        # (off after `CLEAR_SAMPLES` clear samples). queue_stalled: oldest call older than
+        # `alerts.queue_age_secs` (R3OB-17).
         alerts: list[Alert] = []
         kill_switch = bool(report.get("kill_switch"))
         for model in report["models"]:

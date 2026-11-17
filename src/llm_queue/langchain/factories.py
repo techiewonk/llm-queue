@@ -117,13 +117,11 @@ def _build(kind: str, model_id: str, registry: Any, kw: dict[str, Any]) -> Any:
 def chat_model(model_id: str, /, *, registry: Any = None, **kw: Any) -> Any:
     """The queued chat model for `model_id` (an alias or a provider model id), or None.
 
-    None when the boot registry does not know the model (the caller's own path then).
-    Bedrock models give `QueuedChatBedrockConverse`, OpenAI-compatible ones
-    `QueuedChatOpenAI`, with `model_alias` and the model id set; `**kw` goes to the
-    constructor and wins (`model_id` is positional-only, so `model_id=` in `**kw` reaches the
-    class). `registry` as in `boot_registry`; an `LLMQueue` is also passed as the adapter's
-    `llmq`. `ConfigError` for an embedding model or a provider with no adapter.
+    None when the boot registry does not know it; else `QueuedChatBedrockConverse` or
+    `QueuedChatOpenAI` (`**kw` wins). `ConfigError` for an embedding model or no adapter.
     """
+    # `model_id` is positional-only, so `model_id=` in `**kw` reaches the class. `registry` as
+    # in `boot_registry`; an `LLMQueue` is also passed as the adapter's `llmq`.
     return _build("chat", model_id, registry, kw)
 
 

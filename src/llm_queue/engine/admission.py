@@ -102,12 +102,13 @@ class Ask:
 class Decision:
     """What the script decided.
 
-    `kind`: granted, wait, duplicate, done, cancelled, stale_config, no_config, none (no
-    deployment usable), busy (another model refused a fallback call), gone (every caller of a
-    call asked with `callers_ttl` is gone), tenant_limited (the tenant's fairness quota is
-    used up: `wait_secs` until it has room). A fair_queue wait carries the call's round in
-    `extra["fr"]`.
+    `kind`: granted, wait, duplicate, done, cancelled, stale_config, no_config, none, busy,
+    gone or tenant_limited; a fair_queue wait carries the call's round in `extra["fr"]`.
     """
+
+    # none: no deployment usable; busy: another model refused a fallback call; gone: every
+    # caller asked with `callers_ttl` is gone; tenant_limited: the tenant's fairness quota is
+    # used up (`wait_secs` until it has room).
 
     kind: str
     deployment: str | None = None

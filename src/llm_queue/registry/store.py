@@ -251,12 +251,8 @@ def protected_mismatches(
 ) -> list[tuple[str, str]]:
     """(path, why) of every protected or deploy-only field where `stored` differs from `config`.
 
-    The same rules as a live edit under `registry_live_edit=mode` (`_deploy_only` always,
-    `_protected` under `safe`, accounts added or removed), plus `live_edit` itself: what that
-    mode lets an operator edit live is not a mismatch. A stored document with a higher
-    `registry_version` (a newer deploy) may add or remove whole models; their accounts and the
-    protected fields of the models both keep are still compared. The version fields and the
-    live routing switches are not compared.
+    The rules of a live edit under `registry_live_edit=mode`, plus `live_edit` itself; a
+    newer `registry_version` may add or remove whole models. Versions and switches skipped.
     """
     old_version, new_version = config.get("registry_version"), stored.get("registry_version")
     newer = (
@@ -432,12 +428,13 @@ def admission_numbers(view: ResolvedRegistry, alias: str) -> dict[str, Any]:
 class RegistryStore:
     """The registry of one environment (key prefix) in the state store.
 
-    `current` is the last good `ResolvedRegistry`; hot paths read it without I/O. `config` is
-    this process's own document, used by `boot()` and to restore a lost registry. For metrics:
-    `invalid_count` counts refused reads, `stored_refused` is True while the stored document is
-    refused (invalid or needing a newer library), `lib_too_old` while it needs a newer library
-    (this pod never publishes over it), `on_own_config` while the pod runs on its own document.
+    `current` is the last good `ResolvedRegistry` (no I/O on hot paths); `config` is this
+    process's own document, for `boot()` and to restore a lost registry.
     """
+
+    # For metrics: `invalid_count` counts refused reads, `stored_refused` is True while the
+    # stored document is refused, `lib_too_old` while it needs a newer library (this pod
+    # never publishes over it), `on_own_config` while the pod runs on its own document.
 
     def __init__(
         self,
@@ -542,12 +539,12 @@ class RegistryStore:
     def _readable(self, doc: Mapping[str, Any]) -> Registry | None:
         """The stored document as a registry, or None (logged once) when this pod refuses it.
 
-        A pod that holds its own config also refuses a stored document whose protected fields
-        (accounts and their roles, model ids, residency, region lists, `live_edit`, ...) differ
-        from it (owner decision Q25, R3SE-3): anyone who could write the key could send prompts
-        to another AWS account or model after a schema check only. What the config's live-edit
-        mode allows live, and models a newer deploy adds or removes, are not mismatches.
+        A stored document whose protected fields differ from this pod's config is refused too
+        (Q25, R3SE-3): a key writer could otherwise send prompts to another account or model.
         """
+        # Protected: accounts and roles, model ids, residency, region lists, `live_edit`, ... What
+        # the config's live-edit mode allows, and models a newer deploy adds or removes, are not
+        # mismatches.
         registry, errors, _ = check(doc, strict=False, allowed_hosts=self._hosts)
         if registry is not None and needs_newer_lib(registry.min_lib_version):
             errors = [
@@ -997,16 +994,12 @@ class RegistryStore:
     async def rollback(self, version: int, *, actor: str) -> PublishResult:
         """Publish the content of an earlier version as a new, higher version.
 
-        The new version is the stored one plus one; when a deploy publishes in between (the
-        rollback comes back `ignored` or `not_bumped`), it is read and tried again, up to
-        `Tuning.registry.edit_retries` tries, then `RegistryConflict`. Each try is a whole
-        `publish`, which itself retries `edit_retries + 2` times on a lost race: at most
-        `edit_retries * (edit_retries + 2)` publishes in all (3 x 5 by default; 10 x 12, about
-        135 s of backoff, at the maximum), not the 12.5 s bound of one publish (FC-16).
-
-        The live routing blocks and kill switch are kept, as for any publish, and the result's
-        `carried` lists them (Q41): a rollback never lifts an emergency block.
+        A deploy in between is read and tried again, up to `Tuning.registry.edit_retries`
+        tries; routing blocks and the kill switch are kept and listed in `carried` (Q41).
         """
+        # Each try is a whole `publish` (itself `edit_retries + 2` tries): at most
+        # `edit_retries * (edit_retries + 2)` publishes, 3 x 5 by default and about 135 s of
+        # backoff at the maximum (FC-16). A rollback never lifts an emergency block.
         check_actor(actor)
         kept = await self.kept(version)
         note = f" (rollback to {version})"

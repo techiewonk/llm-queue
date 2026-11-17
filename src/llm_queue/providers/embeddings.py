@@ -37,18 +37,14 @@ ParseReply = Callable[[Any], list[list[float]]]
 class EmbeddingCodec:
     """One embedding family: its limits, its request body and how its reply is read.
 
-    `build_request(texts, options)` returns the model's JSON body (Bedrock InvokeModel's `body`,
-    or the OpenAI `embeddings.create` arguments); `options` holds the per-call `input_type` when
-    one is given (registry `inference` defaults are merged later by the worker).
-    `parse_reply(body)` gets the decoded reply body and returns one vector per text, in order;
-    it raises `ValueError` / `TypeError` / `KeyError` on a body it cannot read.
-    `patterns` are case-insensitive substrings of a model id that name this family.
-    `input_types`, when set, is the closed set of `input_type` values the family takes (others
-    fail before any call). `probe_options` go into the health probe's one-text request.
-    `inference_names` are the registry `inference` names (`dimensions`, `normalize`,
-    `input_type`, `truncate`, `embedding_types`) an InvokeModel body of this family takes: the
-    worker fills those from the registry and drops the others; None leaves the body as built.
+    `build_request` and `parse_reply` shape the body and read the vectors; `patterns` name
+    the family in model ids. See docs/reference/extension-points.md.
     """
+
+    # `options` holds the per-call `input_type`; `parse_reply` raises ValueError / TypeError /
+    # KeyError on a body it cannot read. `input_types` is the closed set of `input_type`
+    # values; `probe_options` go into the health probe; `inference_names` are the registry
+    # `inference` names an InvokeModel body takes (None leaves the body as built).
 
     name: str
     build_request: BuildRequest

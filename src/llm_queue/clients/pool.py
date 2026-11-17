@@ -383,12 +383,12 @@ class ClientPool:
     async def borrow_bedrock(self, route: Route) -> AsyncIterator[BedrockClient]:
         """The route's Bedrock client, counted as in use until the block ends (CL-3).
 
-        An attempt timer that fired while the call waited for a refresh of expiring keys (a
-        slow STS or `credentials=` lookup) raises `CredentialsRefreshSlow`, not
-        `AttemptTimeout`: the region did nothing wrong (CL-8). While the keys are still valid
-        (aiobotocore's advisory window) the cut stays an `AttemptTimeout` (FC-2). A call still
-        queued on botocore's refresh lock (not yet in the refresh) reads as `AttemptTimeout`.
+        A timer that fires during a slow key refresh raises `CredentialsRefreshSlow`, not
+        `AttemptTimeout` (CL-8): the region did nothing wrong.
         """
+        # While the keys are still valid (aiobotocore's advisory window) the cut stays an
+        # `AttemptTimeout` (FC-2); a call still queued on botocore's refresh lock (not yet in the
+        # refresh) reads as `AttemptTimeout` too.
         lease = await self._bedrock_lease(route)
         async with _capped(lease), self._borrowed_bedrock(route, lease) as client:
             yield client

@@ -73,12 +73,11 @@ def pack_reply(
 ) -> dict[str, Any] | None:
     """`response` as its vectors in binary (base64), or None when its body cannot be read.
 
-    A Cohere batch of 96 x 1024 floats was stored as base64 of its JSON body, 3.1 MB a
-    result; with the reply copies and client buffers around it, 300 such calls peaked at
-    +105 MB of store memory (gate B97, +64 MB allowed). Packed it is 1.05 MB (float64), or
-    0.52 MB when every value is exactly a float32: lossless either way. The worker packs only
-    for `embed()`, which reads nothing else of the body; a raw InvokeModel call keeps its body.
+    Packed float64 (float32 when lossless); only for `embed()`, which reads nothing else.
     """
+    # A Cohere batch of 96 x 1024 floats as base64 JSON was 3.1 MB a result; 300 such calls
+    # peaked at +105 MB of store memory (gate B97, +64 MB allowed). Packed: 1.05 MB
+    # (float64) or 0.52 MB (float32). A raw InvokeModel call keeps its body.
     try:
         vectors = vectors_of(provider, codec, response)
         dims = len(vectors[0]) if vectors else 0
@@ -235,14 +234,12 @@ async def embed_detailed(
 ) -> EmbedOutcome:
     """Vectors in order, the error of each text that failed (its vector is `[]`), and usage.
 
-    Before any call (`invalid_request`, naming the text's index): empty, non-string or too
-    long texts, an `input_type` the family does not take, and a model with no family. At most
-    `concurrency` batches exist at once. With `request_id`, batch n is `<request_id>:<n>` (one
-    id for all was refused as a duplicate: A1), its halves `<n>.0` / `<n>.1`. A batch refused
-    for its content is split until the bad text alone fails, with its index in the message.
-    `partial=False` raises the first failure instead. Vectors of different lengths fail the
-    call (`provider_error`).
+    Bad texts fail before any call (`invalid_request` with the index); a batch refused for
+    its content is split until the bad text fails alone. `partial=False` raises at once.
     """
+    # At most `concurrency` batches exist at once. With `request_id`, batch n is
+    # `<request_id>:<n>` (one id for all was refused as a duplicate: A1), its halves `<n>.0` /
+    # `<n>.1`. Vectors of different lengths fail the call (`provider_error`).
     check_texts(texts, request_id)
     if not texts:
         return EmbedOutcome([])

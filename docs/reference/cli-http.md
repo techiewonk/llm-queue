@@ -42,7 +42,7 @@ app.include_router(llmq.http_router(), prefix="/internal/llm-queue")
 |---|---|---|
 | `admin_token` | `LLMQ_ADMIN_TOKEN` | Guards writes, and reads too. A value or a callable read on every request (a rotated secret needs no restart) |
 | `admin_read_token` | `LLMQ_ADMIN_READ_TOKEN` | Guards reads only (`GET` routes and `POST /tenants/hash`) |
-| `admin_header` | `LLMQ_ADMIN_HEADER` (`X-LLMQ-Token`) | The header that carries either token, compared in constant time |
+| `admin_header` | `LLMQ_ADMIN_HEADER` (`X-LLMQ-Token`) | The header that carries either token, compared in constant time. Outside dev each token must be at least 32 characters: a shorter one is a `ConfigError` at mount (a callable is read once to check), and one rotated shorter is refused per request |
 | `dependencies` | none | The app's own admin check (FastAPI dependencies), on every route but the probes and `/metrics`, with or without tokens |
 | `allow_writes` | `LLMQ_ADMIN_WRITES_ENABLED` (false) | Mount the write routes |
 | `actor` | none | `actor(request) -> str`: the authenticated name a write is audited under (`http:<name>`). Without it, the token guard audits `token:<X-LLMQ-Actor>` (`LLMQ_ADMIN_ACTOR_HEADER`), `token:unknown` without the header |
@@ -58,9 +58,11 @@ Guards:
 | read | every other `GET` route, `POST /tenants/hash` | the read token or the admin token in `admin_header`, or `dependencies` (both when both are set) |
 | write | every other `POST` route | the admin token, or `dependencies` plus the `X-LLMQ-Admin` header (a browser cannot send either cross-site without a CORS preflight, so a page an admin visits cannot post with the admin's cookies); `allow_writes=True`; an actor |
 
-The router refuses to be built (`ConfigError`) with no token and no `dependencies` (unless
-`insecure_reads=True`), with write routes but neither the admin token nor `dependencies`, and
-with write routes but no actor (`actor=` or the admin token). The read token never writes.
+With no token and no `dependencies` the router mounts only the probes and `/metrics` and logs
+`admin_routes_unauthenticated` (`insecure_reads=True` mounts the read routes open). It refuses
+to be built (`ConfigError`) with write routes but neither the admin token nor `dependencies`,
+and with write routes but no actor (`actor=` or the admin token). The read token never writes.
+`LLMQ_ADMIN_CSRF_HEADER` renames the `X-LLMQ-Admin` header.
 
 A `GET` takes its arguments from the query string, a `POST` from a JSON object body; path
 parameters are in the route. Unknown or mistyped fields are refused. A write's body takes
