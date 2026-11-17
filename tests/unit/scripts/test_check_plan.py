@@ -77,7 +77,10 @@ def test_default_matrix_is_at_plus_burst_where_load_matters() -> None:
     assert {load for _, load in default} == {"at", "burst"}
     assert {sid for sid, load in default if load == "burst"} == set(scenarios.BURST_SET)
     assert len(default) == len(ids) + len(scenarios.BURST_SET)
-    assert len(scenarios.plan(ids, None, "full")) == 3 * len(ids)
+    # D1 sets its own rate and runs `at` only.
+    one_load = [sid for sid in ids if len(scenarios.BY_ID[sid].loads) == 1]
+    assert one_load == ["D1"]
+    assert len(scenarios.plan(ids, None, "full")) == 3 * len(ids) - 2 * len(one_load)
     assert scenarios.plan(["S4", "S6"], ["under"], "default") == [("S4", "under")]
 
 

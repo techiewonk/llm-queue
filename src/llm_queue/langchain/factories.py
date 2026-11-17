@@ -1,9 +1,10 @@
 """Model factories (0.2.0 E1): the queued LangChain class for a model, or None.
 
 `chat_model(model_id)` / `embeddings(model_id)` return the queued adapter when the *boot*
-registry knows the model, else None: a model outside the registry stays on the caller's own
-path, so an app writes `chat_model(model_id, temperature=0) or ChatBedrockConverse(...)`. No
-langchain module is imported until an adapter is built.
+registry knows the model, else None: a model outside the registry, or every model with the
+library switched off (`LLMQ_ENABLED=false`), stays on the caller's own path, so an app
+writes `chat_model(model_id, temperature=0) or ChatBedrockConverse(...)`. No langchain module
+is imported until an adapter is built.
 
 The boot registry is the document a process starts with (`LLMQ_REGISTRY` /
 `LLMQ_REGISTRY_FILE`, placeholders expanded), read without a store. A model added later by a
@@ -45,24 +46,24 @@ def boot_registry(registry: Any = None) -> Registry:
     document), or None: `LLMQ_REGISTRY` / `LLMQ_REGISTRY_FILE` from the environment.
     `RegistryError` (a `ConfigError`) when it does not read or check.
     """
-    from llm_queue.engine.settings import _read_document
+    from llm_queue.engine.settings import read_document
     from llm_queue.registry.validate import load_registry
 
     document: Any
     if isinstance(registry, Mapping):
         document = registry
     elif isinstance(registry, (str, bytes)) and registry.lstrip()[:1] in ("{", b"{"):
-        document = _read_document(
+        document = read_document(
             registry.decode() if isinstance(registry, bytes) else registry, None
         )
     elif isinstance(registry, (str, os.PathLike)):
-        document = _read_document(None, os.fspath(registry))
+        document = read_document(None, os.fspath(registry))
     elif registry is None:
         text = os.environ.get("LLMQ_REGISTRY") or None
         path = os.environ.get("LLMQ_REGISTRY_FILE") or None
         if text and path:
             raise ConfigError("set one of LLMQ_REGISTRY and LLMQ_REGISTRY_FILE, not both")
-        document = _read_document(text, path)
+        document = read_document(text, path)
     else:  # an LLMQueue: the document it booted with, else its current registry
         settings = getattr(registry, "settings", None)
         if settings is not None and (settings.registry or settings.registry_file):
@@ -85,7 +86,20 @@ def aliases(registry: Any = None) -> dict[str, str]:
     return out
 
 
+def _disabled(registry: Any) -> bool:
+    """True when the library is switched off: the queue given, else `LLMQ_ENABLED`."""
+    if _is_queue(registry):
+        return not getattr(registry, "enabled", True)
+    if registry is None:
+        from llm_queue.engine.settings import _FALSE
+
+        return str(os.environ.get("LLMQ_ENABLED", "")).strip().lower() in _FALSE
+    return False
+
+
 def _build(kind: str, model_id: str, registry: Any, kw: dict[str, Any]) -> Any:
+    if _disabled(registry):  # LLMQ_ENABLED=false: the app's own path (0.2.0 H1)
+        return None
     queue = registry if _is_queue(registry) else None
     boot = boot_registry(registry)
     try:
@@ -117,8 +131,9 @@ def _build(kind: str, model_id: str, registry: Any, kw: dict[str, Any]) -> Any:
 def chat_model(model_id: str, /, *, registry: Any = None, **kw: Any) -> Any:
     """The queued chat model for `model_id` (an alias or a provider model id), or None.
 
-    None when the boot registry does not know it; else `QueuedChatBedrockConverse` or
-    `QueuedChatOpenAI` (`**kw` wins). `ConfigError` for an embedding model or no adapter.
+    None when the boot registry does not know it or `LLMQ_ENABLED` is false; else
+    `QueuedChatBedrockConverse` or `QueuedChatOpenAI` (`**kw` wins). `ConfigError` for an
+    embedding model or no adapter.
     """
     # `model_id` is positional-only, so `model_id=` in `**kw` reaches the class. `registry` as
     # in `boot_registry`; an `LLMQueue` is also passed as the adapter's `llmq`.

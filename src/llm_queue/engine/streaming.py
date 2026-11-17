@@ -83,6 +83,10 @@ class ChunkWriter:
         self.closed = False  # `end` or `error` was written
         self.partial: list[str] = []
 
+    def grow_ttl(self, ttl_secs: int) -> None:
+        """Keep the chunks at least `ttl_secs` from the next write on (an admin extend)."""
+        self._ttl_secs = max(self._ttl_secs, ttl_secs)
+
     @property
     def sent(self) -> bool:
         """True once the caller may have seen part of the answer."""

@@ -18,13 +18,16 @@ llm-queue --actor ann requests cancel --id r-1 --yes   # cancels, audited as ann
   settings and no store.
 - `--actor NAME` (before the resource) records who made a change in the audit; without it the
   OS user is used, looked up only by commands that write (`uid:<n>` when the user has no passwd
-  entry, as in a container run under a bare UID). 1-200 characters without control characters.
+  entry, as in a container run under a bare UID). 1-128 characters without control characters,
+  checked by every write before it acts (registry, requests, dead letters, purges, drains).
 - A command that changes something is a **dry run unless given `--yes`**: it prints what it
   would do. There is no `--dry-run` flag.
 - Values of `registry set path=value` are JSON when they parse (`400`, `true`, `["a"]`), else
   text. Lists such as `purge tenant --remove keys,queued` are comma lists; repeated ids are
   repeated options (`--id A --id B`).
 - Output is one JSON document.
+- With `LLMQ_ENABLED=false` nothing is contacted: `describe` answers `enabled: false`, and every
+  command that needs the store exits 1 with the `QueueDisabled` message.
 
 **Exit codes.** 0 done; 1 an error (a bad name or edit, an unknown or expired id, a refused
 operation, a store outage: one line on stderr, no traceback); 3 a `models drain --wait-secs S`
@@ -38,10 +41,15 @@ that ran out of time with calls still waiting.
 app.include_router(llmq.http_router(), prefix="/internal/llm-queue")
 ```
 
+With `LLMQ_ENABLED=false` the router has the two probes only (`GET /health/live`,
+`GET /health/ready`, both with `"enabled": false`; readiness 503 while draining), whatever the
+options. A route built by hand over a disabled queue's `llmq.admin` answers 503
+`{"reason": "disabled"}` for a store operation.
+
 | Argument | Default | Does |
 |---|---|---|
 | `admin_token` | `LLMQ_ADMIN_TOKEN` | Guards writes, and reads too. A value or a callable read on every request (a rotated secret needs no restart) |
-| `admin_read_token` | `LLMQ_ADMIN_READ_TOKEN` | Guards reads only (`GET` routes and `POST /tenants/hash`) |
+| `admin_read_token` | `LLMQ_ADMIN_READ_TOKEN` | Guards reads only (`GET` routes) |
 | `admin_header` | `LLMQ_ADMIN_HEADER` (`X-LLMQ-Token`) | The header that carries either token, compared in constant time. Outside dev each token must be at least 32 characters: a shorter one is a `ConfigError` at mount (a callable is read once to check), and one rotated shorter is refused per request |
 | `dependencies` | none | The app's own admin check (FastAPI dependencies), on every route but the probes and `/metrics`, with or without tokens |
 | `allow_writes` | `LLMQ_ADMIN_WRITES_ENABLED` (false) | Mount the write routes |
@@ -50,13 +58,18 @@ app.include_router(llmq.http_router(), prefix="/internal/llm-queue")
 | `metrics_route` | false | An open `GET /metrics`: the Prometheus exposition of a `LLMQ_METRICS_SINK=prometheus` process (extra `metrics`) |
 | `insecure_reads` | false | Mount the read routes with no token and no `dependencies` (local development only) |
 
+A tenant is named by its hash on every `GET` route (`?tenant_hash=H`, `-` for calls with no
+tenant): a name in a URL reaches proxy and access logs, so `?tenant=NAME` is refused with 400.
+Get the hash first with `llm-queue tenants hash NAME` (or `POST /tenants/hash`, write guard);
+the CLI and Python take `tenant=NAME` and hash it locally.
+
 Guards:
 
 | Guard | Routes | Needs |
 |---|---|---|
 | open | `GET /health/live`, `GET /health/ready`, `GET /metrics` | nothing |
-| read | every other `GET` route, `POST /tenants/hash` | the read token or the admin token in `admin_header`, or `dependencies` (both when both are set) |
-| write | every other `POST` route | the admin token, or `dependencies` plus the `X-LLMQ-Admin` header (a browser cannot send either cross-site without a CORS preflight, so a page an admin visits cannot post with the admin's cookies); `allow_writes=True`; an actor |
+| read | every other `GET` route | the read token or the admin token in `admin_header`, or `dependencies` (both when both are set) |
+| write | every other `POST` route, `POST /tenants/hash` (it writes nothing, but with the hashes the read routes show it would tell a read token which tenant a hash is; it is never mounted without a write guard) | the admin token, or `dependencies` plus the `X-LLMQ-Admin` header (a browser cannot send either cross-site without a CORS preflight, so a page an admin visits cannot post with the admin's cookies); `allow_writes=True`; an actor |
 
 With no token and no `dependencies` the router mounts only the probes and `/metrics` and logs
 `admin_routes_unauthenticated` (`insecure_reads=True` mounts the read routes open). It refuses
@@ -76,9 +89,10 @@ Status codes of the admin routes:
 | Code | When |
 |---|---|
 | 200 | Done (or the dry run's report) |
-| 400 | Bad input: an unknown, missing or mistyped field, a body that is not a JSON object, an id or name longer than 256 characters, more than 100 edit paths or list items; a refused edit (a protected or deploy-only field, an invalid value) |
+| 400 | Bad input: an unknown, missing or mistyped field, a body that is not a JSON object, an id or name longer than 256 characters, a body value above 64 KiB, more than 100 edit paths or list items, a dead letter id that is not `<ms>-<seq>`; a refused edit (a protected or deploy-only field, an invalid value); a request the store refuses |
 | 403 | No or a wrong token; the read token on a write; a dependency-guarded write without `X-LLMQ-Admin`; dead-letter bodies with the setting off |
 | 404 | An unknown model; an unknown or expired request, dead letter or deployment |
 | 404, 405 | A route that is not mounted: a write with `allow_writes` off (405 where a `GET` shares the path), a read with no guard |
 | 409 | A refused operation (`AdminRefused`: a purge of state still in use, a service not available, a stopped queue), no `Retry-After`; or a write that lost the compare-and-set race with other writes on every try: valid, retry after `Retry-After` (1 s) |
+| 413 | A POST body above `LLMQ_ADMIN_BODY_MAX_BYTES` (1 MiB) |
 | 503 | The state store is unreachable, or the registry is not loaded yet (the router was hit before `start()` finished) |

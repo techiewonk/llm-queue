@@ -290,6 +290,34 @@ class Worker:
                 return None
             return dict(json.loads(line)) if line.startswith(b"{") else None
 
+    async def drain_status(self) -> dict[str, Any] | None:
+        """Its `LLMQueue.drain_status()` (draining, held, running), or None once it is gone."""
+        async with self._lock:
+            if self.proc.poll() is not None or self.proc.stdin is None or not self.proc.stdout:
+                return None
+            try:
+                self.proc.stdin.write(b"drain\n")
+                self.proc.stdin.flush()
+                line = await asyncio.wait_for(asyncio.to_thread(self.proc.stdout.readline), 10)
+            except (OSError, TimeoutError):
+                return None
+            return dict(json.loads(line)) if line.startswith(b"{") else None
+
+    def terminate(self) -> None:
+        """A pod's SIGTERM: the signal on POSIX, a `stop` line on Windows (no SIGTERM there).
+
+        Either way the worker pauses and stops within `LLMQ_DRILL_STOP_DRAIN_SECS` (default 30).
+        """
+        if self.proc.poll() is not None:
+            return
+        if sys.platform != "win32":
+            self.proc.send_signal(signal.SIGTERM)
+            return
+        if self.proc.stdin is not None:
+            with contextlib.suppress(OSError):
+                self.proc.stdin.write(b"stop\n")
+                self.proc.stdin.flush()
+
     async def stop(self) -> None:
         """Graceful: pause, drain, stop; killed if it has not stopped within 60 s.
 
@@ -864,14 +892,28 @@ async def _worker_main() -> None:
             await sink.send(client)
 
     task = asyncio.create_task(flusher())
+    loop = asyncio.get_running_loop()
+    lines: asyncio.Queue[str] = asyncio.Queue()
+
+    def read() -> None:  # a daemon thread: a SIGTERM must not wait for a stdin line
+        for line in iter(sys.stdin.readline, ""):
+            loop.call_soon_threadsafe(lines.put_nowait, line.strip())
+        loop.call_soon_threadsafe(lines.put_nowait, "eof")
+
+    threading.Thread(target=read, name="stdin", daemon=True).start()
+    if sys.platform != "win32":  # a pod's SIGTERM (scenario D1); Windows sends "stop"
+        loop.add_signal_handler(signal.SIGTERM, lines.put_nowait, "sigterm")
     print(f"ready {llmq._engine.worker_id}", flush=True)
-    while True:  # "stats" (the soak's debug hook) until "stop", or EOF when the driver exits
-        line = await asyncio.to_thread(sys.stdin.readline)
-        if line.strip() != "stats":
+    while True:  # "stats" (the soak's debug hook), "drain" (D1) until "stop", SIGTERM or EOF
+        command = await lines.get()
+        if command == "stats":
+            print(json.dumps(process_stats()), flush=True)
+        elif command == "drain":
+            print(json.dumps(llmq.drain_status(), default=str), flush=True)
+        else:
             break
-        print(json.dumps(process_stats()), flush=True)
     llmq.pause_receiving()
-    await llmq.stop(drain_secs=30)
+    await llmq.stop(drain_secs=float(os.environ.get("LLMQ_DRILL_STOP_DRAIN_SECS") or 30))
     task.cancel()
     await sink.send(client)
     await client.aclose()

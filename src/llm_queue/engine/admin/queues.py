@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -12,10 +13,13 @@ from llm_queue.engine._codec import text as _text
 from llm_queue.engine.admin.context import AdminContext
 from llm_queue.engine.admin.requests import RequestsAdapter
 from llm_queue.engine.queue import RETENTION_SECS
+from llm_queue.engine.status import health_report
 from llm_queue.errors import ConfigError
+from llm_queue.registry.store import check_actor
 
 MAX_DLQ_COUNT = 10_000
 MAX_DLQ_IDS = 1000
+_ENTRY_ID = re.compile(r"\d+-\d+")  # a stream entry id, as XADD makes them
 
 
 class StatusAdmin:
@@ -46,6 +50,21 @@ class StatusAdmin:
             alias = view.registry.alias_of(model)
             return await self._ctx.status.model(view, alias, tenant_hash=h)
         return await self._ctx.status.report(view)
+
+    async def health(self, model: str | None = None) -> dict[str, Any]:
+        """Health summary (0.2.0 F2): overall and per model `healthy` / `warning` / `critical`.
+
+        Each row has its `reasons`, budget use this minute, waiting calls, the oldest wait and
+        usable deployments; thresholds are the model's `health_summary` registry setting.
+        """
+        view = await self._ctx.view()
+        if model is not None:
+            alias = view.registry.alias_of(model)
+            row = await self._ctx.status.model(view, alias)
+            report: dict[str, Any] = {"registry_version": view.registry.version, "models": [row]}
+        else:
+            report = await self._ctx.status.report(view)
+        return health_report(view, report)
 
 
 class QueuesAdmin:
@@ -159,6 +178,7 @@ class DlqAdmin:
         unsafe: bool = False,
     ) -> dict[str, Any] | None:
         """One dead letter; its body (prompts, payloads) only with `unsafe`. None if gone."""
+        _check_entry_ids([entry_id])
         queue, _ = await self._queue(model, job, priority)
         key = self._ctx.keys.queue(queue, "dlq")
         entries = await self._ctx.queues.client.xrange(key, entry_id, entry_id, count=1)
@@ -185,6 +205,7 @@ class DlqAdmin:
         dry_run: bool = True,
     ) -> dict[str, Any]:
         """Send up to `count` dead letters back to their queue (a body-less one is dropped)."""
+        check_actor(actor)
         if not 1 <= count <= MAX_DLQ_COUNT:
             raise ConfigError(f"count must be 1-{MAX_DLQ_COUNT}")
         queue, keep = await self._queue(model, job, priority)
@@ -194,8 +215,8 @@ class DlqAdmin:
                     "dry_run": True}  # fmt: skip
         moved = await self._ctx.queues.redrive(queue, count, keep)
         await self._ctx.audit.write(
-            actor=actor, op="dlq_redrive", path=f"dlq.{queue}", before={"dead_letters": dead},
-            after={"moved": moved},
+            kind="dlq", actor=actor, op="dlq_redrive", path=f"dlq.{queue}",
+            before={"dead_letters": dead}, after={"moved": moved},
         )  # fmt: skip
         return {"queue": queue, "moved": moved, "dead_letters": dead - moved, "dry_run": False}
 
@@ -210,6 +231,9 @@ class DlqAdmin:
         dry_run: bool = True,
     ) -> dict[str, Any]:
         """Delete every dead letter of a queue, or only `entry_ids`."""
+        check_actor(actor)
+        if entry_ids is not None:
+            _check_entry_ids(entry_ids)
         queue, _ = await self._queue(model, job, priority)
         client = self._ctx.queues.client
         key = self._ctx.keys.queue(queue, "dlq")
@@ -228,7 +252,7 @@ class DlqAdmin:
             await self._ctx.queues.purge_dead(queue)
             deleted = dead
         await self._ctx.audit.write(
-            actor=actor, op="dlq_purge", path=f"dlq.{queue}", before=None,
+            kind="dlq", actor=actor, op="dlq_purge", path=f"dlq.{queue}", before=None,
             after={"deleted": deleted, "by_id": entry_ids is not None},
         )  # fmt: skip
         return {"queue": queue, "deleted": deleted, "dry_run": False}
@@ -339,14 +363,15 @@ class PurgeAdmin:
 
     async def unschedule(self, target: str, *, actor: str, dry_run: bool = True) -> dict[str, Any]:
         """Drop one scheduled auto purge (`alias` or `alias/account/name`)."""
+        check_actor(actor)
         if dry_run:
             listed = {row["target"] for row in await self._ctx.purge.scheduled()}
             return {"target": target, "cancelled": target in listed, "dry_run": True}
         cancelled = await self._ctx.purge.cancel_scheduled(target)
         if cancelled:
             await self._ctx.audit.write(
-                actor=actor, op="purge_unschedule", path=f"purge.{target}", before="scheduled",
-                after=None,
+                kind="purge", actor=actor, op="purge_unschedule", path=f"purge.{target}",
+                before="scheduled", after=None,
             )  # fmt: skip
         return {"target": target, "cancelled": cancelled, "dry_run": False}
 
@@ -368,3 +393,13 @@ class TenantsAdmin:
         if not tenant:
             raise ConfigError("give a tenant name")
         return {"tenant_hash": self._ctx.hash_id(tenant)}
+
+
+def _check_entry_ids(ids: Sequence[str]) -> None:
+    """`ConfigError` (400) for an id that is not a stream entry id (`<ms>-<seq>`, B-07).
+
+    The store refused it with a raw `ResponseError`, which reached HTTP clients as a 500.
+    """
+    bad = [i for i in ids if not _ENTRY_ID.fullmatch(i)]
+    if bad:
+        raise ConfigError(f"not a dead letter id (`<ms>-<seq>`, e.g. 1700000000000-0): {bad[:5]}")

@@ -18,9 +18,13 @@ and `allow_writes`. With no guard at all only the open routes are mounted, unles
 from __future__ import annotations
 
 import inspect
+import json
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
+
+import orjson
+from redis.exceptions import ResponseError
 
 from llm_queue._logging import get_logger
 from llm_queue.engine.admin.context import NotLoaded
@@ -33,10 +37,11 @@ from llm_queue.errors import (
     LLMQueueError,
     LocalModeRefused,
     MissingExtra,
+    QueueDisabled,
     StoreUnavailable,
     UnknownModel,
 )
-from llm_queue.registry.store import RegistryConflict
+from llm_queue.registry.store import ACTOR_MAX_CHARS, RegistryConflict
 
 if TYPE_CHECKING:
     from llm_queue.engine.admin import AdminServices
@@ -49,10 +54,19 @@ RETRY_AFTER_SECS = 1
 # Bounds on what a client sends before anything reads the store or diffs the registry (FO-15).
 MAX_ID_CHARS = 256
 MAX_EDIT_PATHS = 100
-MAX_ACTOR_CHARS = 128
 # Strict mode (review B-21, owner Q12): an admin token is the only guard on the write routes and
 # can be guessed online, so each configured token must be at least this long.
 MIN_TOKEN_CHARS = 32
+# One value of a JSON body (a registry edit's `values` entry), serialised (B-08).
+MAX_VALUE_BYTES = 65_536
+# A POST body above this answers 413 (B-08, `LLMQ_ADMIN_BODY_MAX_BYTES`).
+BODY_MAX_BYTES = 1_048_576
+# Store answers that mean "refusing for a while", not "bad request".
+_STORE_REFUSALS = ("BUSY", "LOADING", "MASTERDOWN", "MISCONF", "NOREPLICAS", "OOM", "READONLY")
+TENANT_IN_URL = (
+    "a tenant name stays out of URLs: pass tenant_hash (get it with `llm-queue tenants hash "
+    "NAME` or POST /tenants/hash)"
+)
 Token = str | Callable[[], str | None] | None
 
 
@@ -61,8 +75,10 @@ def error_response(exc: BaseException) -> Response:
 
     `UnknownModel` 404; `RegistryConflict` 409 retryable; `AdminRefused` 409; a missing
     registry or a store outage 503; a store-only operation of a local-mode queue
-    (`LocalModeRefused`) 503 with `reason: local_mode`; any other `ConfigError` (bad input,
-    refused edit) 400; another `LLMQueueError` (a stopped queue) 409.
+    (`LocalModeRefused`) 503 with `reason: local_mode`; with the library off (`QueueDisabled`)
+    503 with `reason: disabled`; any other `ConfigError` (bad input, refused edit) 400; another
+    `LLMQueueError` (a stopped queue) 409; a store refusal of the request itself (redis
+    `ResponseError`, B-07) 400, of writes for a while 503.
     """
     if isinstance(exc, UnknownModel):
         return 404, {"error": str(exc)}
@@ -76,10 +92,17 @@ def error_response(exc: BaseException) -> Response:
         return 409, {"error": str(exc)}
     if isinstance(exc, LocalModeRefused):
         return 503, {"error": str(exc), "reason": "local_mode", "mode": "local"}
+    if isinstance(exc, QueueDisabled):
+        return 503, {"error": str(exc), "reason": "disabled", "enabled": False}
     if isinstance(exc, ConfigError):
         return 400, {"error": str(exc)}
     if isinstance(exc, LLMQueueError):
         return 409, {"error": str(exc)}
+    if isinstance(exc, ResponseError):
+        words = str(exc).split(maxsplit=1)
+        if words and words[0].upper() in _STORE_REFUSALS:
+            return 503, {"error": "state store unavailable"}
+        return 400, {"error": f"the store refused the request: {exc}"}
     raise exc
 
 
@@ -110,8 +133,16 @@ def _too_long(value: Any) -> bool:
     if isinstance(value, list):
         return any(_too_long(v) for v in value)
     if isinstance(value, dict):
-        return any(_too_long(k) for k in value)
+        return any(_too_long(k) or _too_big(v) for k, v in value.items())
     return False
+
+
+def _too_big(value: Any) -> bool:
+    """True when one body value is above `MAX_VALUE_BYTES` serialised (B-08)."""
+    try:
+        return len(orjson.dumps(value)) > MAX_VALUE_BYTES
+    except TypeError:
+        return True
 
 
 def _from_query(param: Param, raw: list[str]) -> Any:
@@ -237,6 +268,21 @@ def admin_token_dependency(
     return guard
 
 
+async def _read_body(request: Any, limit: int) -> bytes | None:
+    """The request body, None once it is above `limit` bytes (read no further; B-08)."""
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        return None
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _configured(token: Token) -> bool:
     if token is None:
         return False
@@ -271,6 +317,7 @@ def status_router(
     dlq_bodies: bool = False,
     index_cache_secs: float = 2.0,
     strict: bool = False,
+    body_max_bytes: int = BODY_MAX_BYTES,
 ) -> Any:
     """A FastAPI `APIRouter` of the admin operations (`pip install 'llm-queue[http]'`).
 
@@ -340,7 +387,9 @@ def status_router(
     def who(request: Any) -> str:
         if actor is not None:
             return f"http:{actor(request)}"
-        claimed = request.headers.get(actor_header, "").strip()[:MAX_ACTOR_CHARS]
+        # Cut to fit `token:` within the one actor limit (review B-06): control characters
+        # in a claimed name are refused by the audit's `check_actor` (400).
+        claimed = request.headers.get(actor_header, "").strip()[: ACTOR_MAX_CHARS - 6]
         return f"token:{claimed or 'unknown'}"
 
     def reply(result: Response) -> Any:
@@ -357,6 +406,8 @@ def status_router(
     def mounts(op: Op) -> bool:
         if op.guard == "read" and not reads:
             return False
+        if op.guard == "write" and not (guarded or writes_by_token):
+            return False  # never open: e.g. `tenants.hash` (B-22) with only a read token
         return {
             "always": True,
             "writes": allow_writes,
@@ -381,9 +432,16 @@ def status_router(
                     fields[name] = _from_query(param, query.getlist(name))
                 except ValueError:
                     return reply((400, {"error": f"bad {name} ({_signature(op)})"}))
+            if "tenant" in fields and "tenant_hash" in params:
+                # A name in a URL reaches proxy and access logs the library cannot redact
+                # (review B-05): GET routes take the hash only.
+                return reply((400, {"error": TENANT_IN_URL}))
         else:
+            raw = await _read_body(request, body_max_bytes)
+            if raw is None:
+                return reply((413, {"error": f"the body is above {body_max_bytes} bytes"}))
             try:
-                body = await request.json() if await request.body() else {}
+                body = json.loads(raw) if raw else {}
             except ValueError:
                 return reply((400, {"error": "the body must be a JSON object"}))
             if not isinstance(body, dict):

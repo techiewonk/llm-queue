@@ -36,8 +36,11 @@ Three layers, highest first: **the secrets**, then **`environ`**, then **`defaul
   name. It is merged over `LLMQ_SECRET_NAMES` (the argument wins per setting). The order of the
   layers stays the same.
 
-The CLI (`llm-queue`) and `AdminServices.from_env` read the same
-layers, so `LLMQ_SECRETS_SOURCE` applies to them too.
+The CLI (`llm-queue`) and `AdminServices.from_env` read the same layers, so
+`LLMQ_SECRETS_SOURCE` applies to them too. `AdminServices.from_env` takes `LLMQueue.from_env`'s
+`secrets=`, `defaults=` and `secret_names=` and builds on the same wiring
+(`AdminContext.from_layers`), so an admin worker reproduces an app that configures through
+`defaults=`.
 
 Two groups name one thing two ways: `LLMQ_STORE_URL` or the store parts (`LLMQ_STORE_HOST`,
 `LLMQ_STORE_PORT`, `LLMQ_STORE_DB`, `LLMQ_STORE_TLS_ENABLED`), and `LLMQ_REGISTRY` or
@@ -124,6 +127,12 @@ flowchart LR
 For a store with replicas, also set `min-replicas-to-write` on the primary: a write it refuses
 (`NOREPLICAS`), like `OOM`, `MISCONF` and `BUSY`, is treated as the store being down.
 
+## Off switch
+
+| Variable | Default | Range | Meaning |
+|---|---|---|---|
+| `LLMQ_ENABLED` | true | true or false (`on` / `off`) | `false` switches the library off: `from_env()` returns a disabled queue and reads no other setting but `LLMQ_ENVIRONMENT`, `LLMQ_DRAIN_FILE` and `LLMQ_DRAIN_POLL_SECS` (no store, registry or salt needed). The factories (`chat_model`, `embeddings`) return None so the app runs its own direct path; a direct `llmq.converse()` / `embed()` / admin store operation raises `QueueDisabled` (`config_error`, not retryable; HTTP 503 `reason: disabled`); `install()` mounts only `/health/live` and `/health/ready` (`enabled: false`); the drain file still fails readiness. Read like every setting (secrets, environment, `defaults=`). See [Modes](../how-to/modes.md#the-switch-ladder) |
+
 ## Execution mode
 
 How calls run (see [Modes](../how-to/modes.md) for when to switch and how to undo it).
@@ -142,6 +151,7 @@ Every setting is `LLMQ_<AREA>_<THING>[_<UNIT>]`: units in the name (`_SECS`, `_M
 behaviours of the same thing (`LLMQ_EXECUTION_MODE`). A setting that names a sink, a source
 list or a role is not a mode: `LLMQ_METRICS_SINK` and `LLMQ_SECRETS_SOURCE` keep their names.
 `TTL` (time to live) is a defined term, not an abbreviation (`LLMQ_RESULT_TTL_SECS`).
+`LLMQ_ENABLED` is the one setting without an area: the switch of the whole library.
 
 ## Renamed and removed settings
 
@@ -168,14 +178,15 @@ value). The list is `RENAMED` / `REMOVED` in `llm_queue.engine.settings`:
 | `LLMQ_MODE` | `both` | `both`, `caller`, `worker` | `both` (caller and worker), `caller` (sends and waits only) or `worker` (runs calls only). Does not apply with `LLMQ_EXECUTION_MODE=local` |
 | `LLMQ_WORKER_ID` | empty | letters, digits, `_`, `.`, `:`, `-` | Empty: `POD_NAME` (else the host name) and the pid, e.g. `api-7f9c:12`. This process's id prefix in the store (callers, leases, logs); the engine adds a random tail, so two processes never share one. A `worker_id=` argument wins |
 | `LLMQ_DEFAULT_TENANT` | none | text | The tenant of a call that names none (no `tenant_id=`, none in `request_context`): every call of a single-tenant app carries it, threads included |
-| `LLMQ_ADMIN_TOKEN` | none | text (a secret) | Guards every admin route except the probes and `/metrics`, reads and writes: the request's `LLMQ_ADMIN_HEADER` must equal it (constant-time). Read on every request, so a rotated secret needs no restart. Unset with no `LLMQ_ADMIN_READ_TOKEN`: only the app's `dependencies` guard the routes; with none of the three the router mounts only the probes and `/metrics` (unless `insecure_reads=True`). When strict, at least 32 characters: a shorter one stops the mount (`ConfigError`), and a rotation to a shorter one is refused per request |
-| `LLMQ_ADMIN_READ_TOKEN` | none | text (a secret) | Guards the read routes only (GET, and `POST /tenants/hash`): the request's `LLMQ_ADMIN_HEADER` must equal it or `LLMQ_ADMIN_TOKEN`. It never allows a write. Read on every request. When strict, at least 32 characters, as `LLMQ_ADMIN_TOKEN`. See [Admin API](admin-api.md) |
+| `LLMQ_ADMIN_TOKEN` | none | text (a secret) | Guards every admin route except the probes and `/metrics`, reads and writes: the request's `LLMQ_ADMIN_HEADER` must equal it (constant-time). Read on every request, so a rotated secret needs no restart. Unset with no `LLMQ_ADMIN_READ_TOKEN`: only the app's `dependencies` guard the routes; with none of the three the router mounts only the probes and `/metrics` (unless `insecure_reads=True`) |
+| `LLMQ_ADMIN_READ_TOKEN` | none | text (a secret) | Guards the read routes only (GET): the request's `LLMQ_ADMIN_HEADER` must equal it or `LLMQ_ADMIN_TOKEN`. It never allows a write. Read on every request. See [Admin API](admin-api.md) |
 | `LLMQ_ADMIN_HEADER` | `X-LLMQ-Token` | a header name | The header that carries the admin tokens (read and write) |
 | `LLMQ_ADMIN_WRITES_ENABLED` | false | true or false (`on` / `off`) | Default of `http_router(allow_writes=)`: mount the admin write routes (registry edits, blocks, purges, dead letters, cancels). Each write is still a dry run unless its body says `"dry_run": false` |
 | `LLMQ_ADMIN_ACTOR_HEADER` | `X-LLMQ-Actor` | a header name | With the token guard and no `actor=`: the header whose value a write is audited under, as `token:<value>` (`token:unknown` without it). A claimed name, not an identity |
 | `LLMQ_ADMIN_CSRF_HEADER` | `X-LLMQ-Admin` | a header name | When the write routes are guarded by `dependencies` only (no `LLMQ_ADMIN_TOKEN`), a write needs this header (any value): no simple cross-site request can carry it |
 | `LLMQ_ADMIN_INDEX_CACHE_SECS` | 2 | 0 to 60 | How long `GET /` (the admin index) reuses its live summary, so a dashboard poll cannot load the store |
 | `LLMQ_ADMIN_DLQ_BODIES_ENABLED` | false | true or false (`on` / `off`) | `GET /dlq/{entry_id}?unsafe=true` may return message bodies (prompts, job payloads); off, it answers 403. The CLI and Python `unsafe=True` do not need it |
+| `LLMQ_ADMIN_BODY_MAX_BYTES` | 1048576 | 1024 to 67108864 (whole) | Largest admin POST body; a larger one answers 413 before it is parsed. Each value of a JSON body (a registry edit's `values`) is also capped at 64 KiB serialised (400) |
 | `LLMQ_METRICS_SINK` | `emf` | `emf`, `prometheus`, `none` | `emf` (CloudWatch embedded metrics), `prometheus` (extra `metrics`) or `none`. One sink per process |
 | `LLMQ_METRICS_TENANTS` | empty | at most 50 entries `name` or `name=label`, label `[A-Za-z0-9_.-]{1,64}` (not `other` or `-`) | Tenants that get their own `tenant` label on `llmq_calls_total` and `llmq_wait_seconds` (`globex=t2` shows `globex` as `t2`, so a dashboard need not show the name); every other tenant is `other`, a call with no tenant `-`. The label is always there, so cardinality stays fixed. Names are matched by their keyed hash: no name reaches the store |
 

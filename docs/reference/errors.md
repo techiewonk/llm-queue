@@ -14,6 +14,7 @@ LLMQueueError
 │   ├── LiveEditRefused   a live edit touched fields that change only with a deploy
 │   ├── UnknownModel      a model name not in the registry (also a KeyError)
 │   ├── LocalModeRefused  a store-only operation asked in local mode (LLMQ_EXECUTION_MODE=local)
+│   ├── QueueDisabled     a call or store operation with the library off (LLMQ_ENABLED=false)
 │   └── MissingExtra      an optional feature's extra is not installed (also an ImportError)
 ├── AdminRefused          an admin operation was refused; nothing was changed
 └── StoreUnavailable      the store cannot serve an admin operation (also a ConnectionError)
@@ -36,7 +37,7 @@ becomes `if not llm_queue.error_retryable(exc): stop`.
 | Error | `category` | `retryable` |
 |---|---|---|
 | `CallFailed` | by `kind`, see below (an unknown kind is `internal`, False) | by `kind` |
-| `ConfigError` and its subclasses (`RegistryError`, `LiveEditRefused`, `UnknownModel`, `LocalModeRefused`, `MissingExtra`) | `config_error` | False |
+| `ConfigError` and its subclasses (`RegistryError`, `LiveEditRefused`, `UnknownModel`, `LocalModeRefused`, `QueueDisabled`, `MissingExtra`) | `config_error` | False |
 | `RegistryConflict` | `config_error` | True: the same publish or edit can succeed once the other writes are done |
 | `StoreUnavailable` | `unavailable` | True |
 | `AdminRefused` | `bad_request` | False |
@@ -134,8 +135,9 @@ request gets the same answer. It is a direct `LLMQueueError`, not a `ConfigError
 - `purge.deployment(alias, "account/name")` names a deployment the stored registry still has
   (same);
 - `purge.tenant(..., remove=...)` asks for `queued` or `running`, or a requests operation looks
-  calls up by model or tenant, while the request index is off
-  (`LLMQ_REQUEST_INDEX_ENABLED=false`: the index is needed to find the calls);
+  calls up by model or tenant (`requests.count` and `requests.extend` included), while the
+  request index is off (`LLMQ_REQUEST_INDEX_ENABLED=false`: the index is needed to find the
+  calls, or to know a call's own deadline);
 - a requests operation would read more than `LLMQ_ADMIN_SCAN_MAX` index entries;
 - a process-local operation (`drain.*`) runs without a queue (`AdminServices.from_env()`).
 

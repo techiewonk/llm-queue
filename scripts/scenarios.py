@@ -24,6 +24,11 @@ scenarios add checks (a faulted region serves again, one run for two callers ...
     python scripts/scenarios.py all --jobs 4     # 4 runs at a time (default; 1: one by one;
                                                  # `burst` units always one at a time)
     python scripts/scenarios.py S1 --seed 7      # replay the random choices of a run
+    python scripts/scenarios.py D1 T1 --quick    # short D1, small T1: prove the harness
+
+D1 (rolling deploy through the drain file, ~1 min) and T1 (tenant isolation at the design's
+scale, 300 calls a tenant, ~3 min a load) are the 0.2.0 load scenarios; `--quick` shortens D1
+and runs T1 at 30 calls a tenant.
 
 Every random choice is seeded (`--seed`, printed at the start). In parallel, each run is its own
 process with its own fakellm and store-proxy ports (free ports picked per run) and its own log
@@ -47,8 +52,11 @@ import json
 import math
 import os
 import random
+import shutil
+import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import urllib.request
@@ -59,7 +67,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import failover  # needs the sys.path entry
-from gates import Gate, Result, Run, chat, registry
+from gates import Gate, Result, Run, chat, p95, registry
 from gates_fleet import (
     CHAT_ID,
     EMBED_ID,
@@ -73,9 +81,12 @@ from gates_fleet import (
     log_dir,
     log_file,
     setup_logging,
+    workers,
 )
 
 from llm_queue import CallFailed, LLMQueue, RegistryError, StoreUnavailable
+from llm_queue.engine.local import LocalEngine
+from llm_queue.engine.requests_admin import RequestsAdmin
 
 PROXY_PORT = int(os.environ.get("LLMQ_SCENARIO_PROXY_PORT") or free_port())
 QUEUE_PROXY_PORT = free_port()  # a separate queue store (LLMQ_QUEUE_STORE_URL), L3
@@ -98,6 +109,9 @@ BURST_SET = frozenset(
 # Run one at a time even with --jobs: 300 % load on 3 workers, 2 callers and a fakellm per
 # unit is CPU-bound, and parallel units starved each other (FT-2).
 SERIAL_LOADS = frozenset({"burst"})
+# `--quick`: D1 shortened and T1 at its small scale (30 calls a tenant) to prove the harness.
+# An environment variable, so the processes `parallel` starts inherit it.
+QUICK = os.environ.get("LLMQ_SCENARIO_QUICK") == "1"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -237,6 +251,9 @@ class Scenario:
     share: float = 1.0  # of the load sent by `during` here (client processes send the rest)
     queue_proxy: bool = False  # LLMQ_QUEUE_STORE_URL through its own proxy
     recovers: bool = False  # the faulted region (REGIONS[0]) must serve again after the fault
+    # A scenario with its own traffic and verdict (D1): run instead of the three phases.
+    runner: Callable[[Scenario, str, str], Awaitable[bool]] | None = None
+    loads: tuple[str, ...] = tuple(LOADS)  # the loads it runs under (D1 sets its own rate)
 
 
 async def phase(
@@ -282,6 +299,8 @@ async def settled(ctx: Ctx, cap_secs: float = SETTLE_PROBE_SECS) -> None:
 
 async def run_one(scenario: Scenario, load: str, profile_name: str) -> bool:
     """Run one scenario under one load; print its numbers and verdict."""
+    if scenario.runner is not None:
+        return await scenario.runner(scenario, load, profile_name)
     profile = PROFILES[profile_name]
     doc = registry(
         {"chat": {"rpm": RPM, "worker_slots": 50}, **scenario.models},
@@ -694,6 +713,13 @@ async def caller_cancel(ctx: Ctx) -> None:
     ctx.checks["uncancelled calls served or refused on time"] = kept_ok
 
 
+def requests_admin(ctx: Ctx) -> RequestsAdmin:
+    """The driver's `RequestsAdmin` (its callers run in queue mode)."""
+    engine = ctx.queues[0]._engine
+    assert not isinstance(engine, LocalEngine), "T1 needs queue mode"
+    return engine.requests_admin
+
+
 TENANTS_ID = "openai.tenants-1:0"  # T1's calls: their own fakellm keys and a small budget
 TENANT_CALLS = 30  # per tenant
 
@@ -706,8 +732,7 @@ async def tenant_isolation(ctx: Ctx) -> None:
     a worker is killed. B must not notice: every B call served, none moved or cancelled. A's
     cancelled calls end `cancelled` soon after; at the end the model's request index is empty.
     """
-    llmq = ctx.queues[0]
-    admin = llmq._engine.requests_admin
+    admin = requests_admin(ctx)
     t0 = time.monotonic()
     done: dict[str, tuple[float, str]] = {}  # request id -> (seconds from t0, outcome)
 
@@ -763,6 +788,396 @@ async def tenant_isolation(ctx: Ctx) -> None:
         f"tenants: moved {moved.changed}, cancelled {cancelled.changed} "
         f"({len(a_cancelled)} listed), B served {sum(k == 'ok' for _, k in b.values())}/{len(b)}"
     )
+
+
+# T1 at the design's scale (S-T, gap G12): 300 calls a tenant at 10 a second each (20 offered)
+# on a budget of 16 a second, so calls wait; the operations at the design's times (10, 20 and
+# 25 s of the 30 s send span). `LLMQ_T1_CALLS` scales it down to smoke the harness (the times
+# keep their share of the span).
+T1_CALLS = int(os.environ.get("LLMQ_T1_CALLS") or 300)
+T1_RATE = 10.0  # calls a second per tenant
+T1_RPM = 480  # per deployment, 2 deployments: 16 calls a second
+T1_AT = {
+    name: share * T1_CALLS / T1_RATE
+    for name, share in (("move", 1 / 3), ("cancel", 2 / 3), ("kill", 5 / 6))
+}  # seconds into the wave
+# A small bucket (9 calls a deployment): with the default (48) the first 24 s never waited.
+T1_BURST = 0.02
+# The backlog peaks near 120 calls (~8 s at 16/s, more while a worker is replaced): room for it.
+# A's odd calls take 10 s less, so their deadlines interleave with the even ones' (the move is
+# by deadline): moved and unmoved A calls of the same age.
+T1_TIMEOUT_SECS = 40
+T1_REFILL_SECS = 0.1 * 60 + 2  # the bucket refills (default share of the minute, plus slack)
+T1_P95_SLACK = 0.10  # B's p95 wait may be 10 % above the baseline wave's
+T1_P95_FLOOR_SECS = 0.25  # plus this much, for sub-second baselines
+NATIVE_OK = (":lock:", ":health:", ":debug")  # keys on native TTLs on purpose (engine/expiry.py)
+
+
+@dataclasses.dataclass
+class Wave:
+    """One wave of T1 calls: every call's tenant and result, and what the operations did."""
+
+    calls: dict[str, tuple[str, Result]] = dataclasses.field(default_factory=dict)
+    moved_at: float = 0.0
+    moved: set[str] = dataclasses.field(default_factory=set)
+    unmoved: set[str] = dataclasses.field(default_factory=set)
+    b_moved: int = 0
+    changed: int = 0
+    cancel_at: float = 0.0
+    cancelled_ids: set[str] = dataclasses.field(default_factory=set)
+    cancelled_tenant: str | None = None
+    cancelled: int = 0
+    stages: dict[str, int] = dataclasses.field(default_factory=dict)  # A waiting at the move
+
+    def b_wait_p95(self) -> float:
+        """p95 of B's waits (served calls)."""
+        return float(p95([r.wait_secs for t, r in self.calls.values() if t == "B" and r.ok]))
+
+
+def _at(run: Run, secs: float) -> Awaitable[None]:
+    return asyncio.sleep(max(0.0, float(run.t0) + secs - time.monotonic()))
+
+
+async def tenant_wave(ctx: Ctx, tag: str, *, operations: bool) -> Wave:
+    """A and B send `T1_CALLS` each; with `operations`, the design's move, cancel and kill.
+
+    Half of A's calls have a shorter timeout, so by deadline (the order `reprioritize` takes,
+    oldest first) moved and unmoved A calls of the same age exist: the move takes half of A's
+    queued calls.
+    """
+    admin = requests_admin(ctx)
+    run, wave = Run(), Wave()
+
+    async def one(tenant: str, i: int) -> None:
+        rid = f"st-{tag}-{tenant}-{i}-{random.randrange(10**9)}"
+        await _at(run, i / T1_RATE)
+        short = {"timeout_secs": T1_TIMEOUT_SECS - 10} if tenant == "A" and i % 2 else {}
+        result = await run.call(
+            ctx.queues[i % len(ctx.queues)],
+            "tenants",
+            chat(),
+            tenant_id=tenant,
+            request_id=rid,
+            **short,
+        )
+        wave.calls[rid] = (tenant, result)
+
+    senders = [asyncio.create_task(one(t, i)) for i in range(T1_CALLS) for t in ("A", "B")]
+    try:
+        if operations:
+            await _at(run, T1_AT["move"])
+            page = await admin.list("tenants", tenant="A", state="waiting", limit=1000)
+            queued = {i.request_id for i in page.items if i.stage == "queued"}
+            wave.stages = dict(collections.Counter(i.stage for i in page.items))
+            moved = await admin.reprioritize(
+                "tenants",
+                priority=True,
+                tenant="A",
+                limit=max(1, len(queued) // 2),
+                actor="scenario",
+                dry_run=False,
+            )
+            wave.moved_at, wave.changed = time.monotonic() - run.t0, moved.changed
+            # Every state: a moved call may have started already. Unmoved: queued, not moved.
+            page = await admin.list("tenants", tenant="A", state="all", limit=1000)
+            wave.moved = {i.request_id for i in page.items if i.priority}
+            wave.unmoved = {i.request_id for i in page.items if not i.priority} & queued
+            b_page = await admin.list("tenants", tenant="B", limit=1000)
+            wave.b_moved = sum(1 for i in b_page.items if i.priority)
+            await _at(run, T1_AT["cancel"])
+            waiting = await admin.list("tenants", tenant="A", state="waiting", limit=1000)
+            wave.cancel_at = time.monotonic() - run.t0
+            report = await admin.cancel(
+                "tenants", tenant="A", state="waiting", actor="scenario", dry_run=False
+            )
+            wave.cancelled_ids = {i.request_id for i in waiting.items}
+            wave.cancelled_tenant, wave.cancelled = report.tenant, report.changed
+        # The kill in both waves: the baseline differs from the other only by A's operations.
+        await _at(run, T1_AT["kill"])
+        await random.choice(_live(ctx)).kill()
+        await ctx.gate.workers(1)
+        await asyncio.gather(*senders)
+    finally:
+        for task in senders:
+            task.cancel()
+    ctx.extra_sent += len(senders)
+    return wave
+
+
+async def index_empty(ctx: Ctx, model: str = "tenants", secs: float = 30) -> int:
+    """Until the model's request index is empty (at most `secs`); what is left in it."""
+    admin = requests_admin(ctx)
+    left = -1
+    for _ in range(int(secs * 2)):
+        left = (await admin.count(model)).total
+        if left == 0:
+            break
+        await asyncio.sleep(0.5)
+    return left
+
+
+def moved_first(wave: Wave) -> tuple[int, int]:
+    """Send-second buckets holding moved and unmoved A calls; those where the moved began first.
+
+    A call that never began (cancelled while waiting) begins at infinity: after every moved one.
+    """
+    buckets: dict[int, tuple[list[float], list[float]]] = collections.defaultdict(lambda: ([], []))
+    for rid, (tenant, r) in wave.calls.items():
+        if tenant != "A" or (rid not in wave.moved and rid not in wave.unmoved):
+            continue
+        start = r.started if r.ok else math.inf
+        buckets[int(r.sent)][0 if rid in wave.moved else 1].append(start)
+    shared = [(m, u) for m, u in buckets.values() if m and u]
+    first = sum(1 for m, u in shared if statistics.fmean(m) < statistics.fmean(u))
+    return len(shared), first
+
+
+async def tenant_isolation_full(ctx: Ctx) -> None:
+    """S-T at the design's scale: a baseline wave without operations, then one with them.
+
+    Pass: every B call served, none moved or cancelled; B's p95 wait within 10 % of the
+    baseline's; A's moved calls begin before A's unmoved ones of the same age (send second);
+    A's cancelled calls end `cancelled` within 2 s; the model's index empty after each wave.
+    """
+    await ctx.edit(
+        {
+            "rpm": T1_RPM,
+            "rate_burst": T1_BURST,
+            "timeout_secs": T1_TIMEOUT_SECS,
+            "max_wait_secs": T1_TIMEOUT_SECS,
+        },
+        model="tenants",
+    )
+    admin = requests_admin(ctx)
+    # Each wave starts on a full bucket (the first wave's left it empty: the second waited
+    # 4x longer with no operation at all) and after the edit reached every process.
+    await asyncio.sleep(T1_REFILL_SECS)
+    base = await tenant_wave(ctx, "base", operations=False)
+    base_left = await index_empty(ctx)
+    await asyncio.sleep(T1_REFILL_SECS)
+    wave = await tenant_wave(ctx, "ops", operations=True)
+    left = await index_empty(ctx)
+    b = [(r, rid) for rid, (t, r) in wave.calls.items() if t == "B"]
+    base_p95, p95_now = base.b_wait_p95(), wave.b_wait_p95()
+    shared, first = moved_first(wave)
+    a_cancelled = [wave.calls[rid][1] for rid in wave.cancelled_ids if rid in wave.calls]
+    late = [
+        r
+        for r in a_cancelled
+        if r.ok is False and (r.kind != "cancelled" or r.sent + r.total_secs - wave.cancel_at > 3.0)
+    ]
+    ctx.checks["tenant B: every call served (both waves)"] = all(
+        r.ok for t, r in [*base.calls.values(), *wave.calls.values()] if t == "B"
+    )
+    ctx.checks["tenant B: none moved"] = wave.b_moved == 0
+    ctx.checks["tenant B: none cancelled"] = wave.cancelled_tenant != admin._hash("B") and not any(
+        r.kind == "cancelled" for r, _ in b
+    )
+    ctx.checks["tenant A: calls moved"] = wave.changed > 0
+    ctx.checks["tenant B: p95 wait within 10 % of the baseline wave"] = (
+        p95_now <= base_p95 * (1 + T1_P95_SLACK) + T1_P95_FLOOR_SECS
+    )
+    ctx.checks["tenant A: moved calls begin before unmoved ones of the same age"] = (
+        shared > 0 and first == shared
+    )
+    ctx.checks["tenant A: cancelled calls end cancelled within 2 s"] = not late
+    ctx.checks["the model's request index is empty after each wave"] = base_left == left == 0
+    ctx.notes.append(
+        f"tenants: baseline B p95 wait {base_p95:.2f}s, with operations {p95_now:.2f}s; "
+        f"moved {wave.changed} ({len(wave.moved)} listed, {len(wave.unmoved)} unmoved), "
+        f"A waiting at the move by stage {wave.stages}; "
+        f"moved first in {first}/{shared} same-age buckets; cancelled {wave.cancelled} "
+        f"({len(a_cancelled)} listed, {len(late)} late or not cancelled); "
+        f"B served {sum(r.ok for r, _ in b)}/{len(b)}"
+    )
+
+
+async def tenant_isolation_t1(ctx: Ctx) -> None:
+    """T1: the design's scale, or with `--quick` the small run (30 calls a tenant)."""
+    await (tenant_isolation if QUICK else tenant_isolation_full)(ctx)
+
+
+def swept_leaks(gate: Gate) -> list[str]:
+    """Keys of the run with a native TTL while the store runs `swept` (none may have one)."""
+    client = gate.store.client
+    if client.get(f"{gate.prefix}:expiry") != b"swept":
+        return [f"{gate.prefix}:expiry is not swept"]
+    leaked = []
+    for pattern in (f"{gate.prefix}*", f"{gate.prefix.replace(':', '-')}-*"):
+        for key in client.scan_iter(match=pattern, count=1000):
+            name = key.decode()
+            if not any(part in name for part in NATIVE_OK) and client.pttl(key) > 0:
+                leaked.append(name)
+    return leaked
+
+
+async def swept_leak_check(ctx: Ctx) -> None:
+    """After the run: no key of it has a native TTL (`LLMQ_KEY_EXPIRY=swept`)."""
+    leaked = await asyncio.to_thread(swept_leaks, ctx.gate)
+    ctx.checks["swept: no key with a native TTL at the end"] = not leaked
+    ctx.notes.append(f"swept leak check: {len(leaked)} keys {sorted(leaked)[:5] or ''}".rstrip())
+
+
+# D1 (gap G5): a rolling deploy through the drain file, two pods of three worker processes.
+D1_RATE = 50.0  # calls a second
+D1_HELD_SHARE = 0.3  # of them on a model whose budget makes them wait (held by a worker)
+HELD_ID = "openai.held-1:0"  # D1's waiting calls: their own fakellm keys
+D1_PROCESSES = 3  # per pod
+D1_TERM_AFTER_SECS = 5.0  # the drain file, then SIGTERM this much later
+D1_HANDOFF_SECS = 2.0  # held calls served by pod 2 within this of the pause
+D1_STOP_DRAIN_SECS = 25.0  # LLMQ_DRAIN_SECS' default: stop(drain_secs) after SIGTERM
+D1_GRACE_SECS = 30.0  # Kubernetes' default terminationGracePeriodSeconds
+D1_POLL_SECS = 0.2  # LLMQ_DRAIN_POLL_SECS
+D1_SECS = {"before": 20.0, "after": 15.0}  # load before the drain file and after SIGTERM
+D1_QUICK_SECS = {"before": 6.0, "after": 4.0}
+
+
+def _exit_secs(proc: Any, since: float, cap: float) -> float:
+    """Seconds from `since` until `proc` exited (inf if not within `cap`)."""
+    try:
+        proc.wait(max(0.0, since + cap - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        return math.inf
+    return time.monotonic() - since
+
+
+async def rolling_deploy(scenario: Scenario, load: str, profile_name: str) -> bool:
+    """D1: pod 1 drained by its drain file under load, SIGTERM 5 s later; pod 2 takes over.
+
+    50 calls a second: 70 % on a model with budget to spare, 30 % sent at the top of each second
+    to a model whose budget (that rate, no burst) makes them wait in a worker. Pass: 0 lost;
+    2 s after the pause pod 1 holds no call and every call that was waiting began on pod 2
+    within 2 s of the pause; no call began on pod 1 after the pause; pod 1's processes exit
+    within the grace period; nothing left at the end. `load` is not used (its own rate).
+    """
+    profile = PROFILES[profile_name]
+    held_rate = D1_RATE * D1_HELD_SHARE
+    doc = registry(
+        {
+            "chat": {"rpm": 1_000_000, "worker_slots": 100},
+            "held": {
+                "model_id": HELD_ID,
+                "rpm": round(held_rate * 60),
+                # 9 calls: most of each second's batch of 15 waits. Not lower: with a bucket of
+                # 1-2 calls the priority reserve leaves no room and normal calls never start.
+                "rate_burst": 0.01,
+                "worker_slots": 100,
+            },
+        },
+        accounts=1,
+        regions=1,
+        defaults=profile.defaults,
+    )
+    spans = D1_QUICK_SECS if QUICK else D1_SECS
+    total = spans["before"] + D1_TERM_AFTER_SECS + spans["after"]
+    folder = Path(tempfile.mkdtemp(prefix="llmq-d1-"))
+    drain_file = folder / "drain"
+    env = {
+        **profile.env,
+        "LLMQ_DRAIN_POLL_SECS": str(D1_POLL_SECS),
+        "LLMQ_DRILL_STOP_DRAIN_SECS": str(D1_STOP_DRAIN_SECS),
+    }
+    started = time.monotonic()
+    run = Run()
+    held: list[Result] = []
+    chats: list[Result] = []
+    notes: list[str] = []
+    try:
+        async with Gate(doc, None, **env) as gate:
+            pod1 = await workers({**gate.env, "LLMQ_DRAIN_FILE": str(drain_file)}, D1_PROCESSES)
+            gate.fleet += pod1
+            pod2 = await gate.workers(D1_PROCESSES)
+            queues = await gate.callers(2)
+            run = Run()
+
+            async def held_call(k: int) -> None:
+                held.append(await run.call(queues[k % 2], "held", chat()))
+
+            async def chat_call(k: int) -> None:
+                chats.append(await run.call(queues[k % 2], "chat", chat()))
+
+            async def traffic() -> None:
+                tasks: list[asyncio.Task[None]] = []
+                n_held = round(D1_RATE * D1_HELD_SHARE)
+                n_chat = round(D1_RATE) - n_held
+                for sec in range(math.ceil(total)):
+                    top = float(run.t0) + sec
+                    await asyncio.sleep(max(0.0, top - time.monotonic()))
+                    tasks += [asyncio.create_task(held_call(k)) for k in range(n_held)]
+                    for k in range(n_chat):
+                        tasks.append(asyncio.create_task(chat_call(k)))
+                        await asyncio.sleep(max(0.0, top + (k + 1) / n_chat - time.monotonic()))
+                await asyncio.gather(*tasks)
+
+            marks: dict[str, Any] = {}
+
+            async def deploy() -> None:
+                await _at(run, spans["before"])
+                drain_file.touch()
+                marks["paused"] = time.monotonic() - run.t0
+                await asyncio.sleep(D1_HANDOFF_SECS)
+                marks["status"] = [await w.drain_status() for w in pod1]
+                await _at(run, marks["paused"] + D1_TERM_AFTER_SECS)
+                term = time.monotonic()
+                for w in pod1:
+                    w.terminate()
+                marks["exits"] = await asyncio.gather(
+                    *(asyncio.to_thread(_exit_secs, w.proc, term, D1_GRACE_SECS + 10) for w in pod1)
+                )
+
+            await asyncio.gather(traffic(), deploy())
+            left: dict[str, int] = {}
+            for _ in range(60):
+                left = leftovers(gate, list(doc["models"]))
+                if not any(left.values()):
+                    break
+                await asyncio.sleep(0.5)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    secs = time.monotonic() - started
+    paused = float(marks.get("paused", math.inf))
+    pod1_ids = {w.worker_id for w in pod1}
+    pod2_ids = {w.worker_id for w in pod2}
+    statuses = list(marks.get("status") or [])
+    exits = list(marks.get("exits") or [math.inf])
+    # Waiting at the pause: sent before it, began after pod 1 saw the file (one poll plus slack:
+    # a grant already under way when the file appeared may still start there).
+    seen = paused + D1_POLL_SECS + 0.3
+    waiting = [r for r in held if r.ok and r.sent < paused and r.started > seen]
+    late_pod1 = [r for r in run.results if r.ok and r.worker in pod1_ids and r.started > seen]
+    handoff = max((r.started - paused for r in waiting), default=0.0)
+    checks = {
+        "0 lost (every call served)": all(r.ok for r in run.results),
+        "pod 1 draining and holding no call 2 s after the pause": bool(statuses)
+        and all(s is not None and s.get("draining") and int(s["held"]) == 0 for s in statuses),
+        "calls waiting at the pause began on pod 2 within 2 s": bool(waiting)
+        and all(r.worker in pod2_ids for r in waiting)
+        and handoff <= D1_HANDOFF_SECS,
+        "no call began on pod 1 after it saw the file (pause + poll + 0.3 s)": not late_pod1,
+        f"pod 1 exits within the grace period ({D1_GRACE_SECS:.0f} s)": max(exits) <= D1_GRACE_SECS,
+        f"nothing left at the end {dict(left) if any(left.values()) else ''}".rstrip(): not any(
+            left.values()
+        ),
+    }
+    held_waits = [r.wait_secs for r in held if r.ok]
+    notes += [
+        f"{len(run.results)} calls ({len(held)} on the held model, "
+        f"{sum(w > 0.05 for w in held_waits)} waited > 50 ms); failures {run.kinds() or 0}",
+        f"paused at {paused:.1f}s; pod 1 drain status after 2 s {statuses}",
+        f"{len(waiting)} calls waiting at the pause, last began {handoff:.2f}s after it, "
+        f"{sum(r.worker in pod1_ids for r in waiting)} on pod 1; "
+        f"{len(late_pod1)} calls began on pod 1 after the pause",
+        f"pod 1 exit after SIGTERM: {[round(e, 1) for e in exits]} s",
+    ]
+    passed = all(checks.values())
+    print(f"[{scenario.sid} {load}] {scenario.title} ({secs:.0f}s)", flush=True)
+    for note in notes:
+        print(f"    {note}")
+    for name, ok in checks.items():
+        if not ok:
+            print(f"    FAIL {name}")
+    print(f"{'PASS' if passed else 'FAIL'}  {scenario.sid} {load}", flush=True)
+    return passed
 
 
 async def caller_dies(ctx: Ctx) -> None:
@@ -1228,6 +1643,16 @@ SCENARIOS = [
     ),
     _s("S2", "worker", "worker restarted (graceful)", "nothing lost", worker_restart),
     _s(
+        "D1",
+        "worker",
+        "rolling deploy: drain file on pod 1 of 2 (3 processes each), SIGTERM 5 s later",
+        "0 lost; waiting calls on pod 2 within 2 s of the pause; pod 1 exits in its grace "
+        "period (own rate: 50 calls/s, 30 % waiting for budget)",
+        _hold,  # not used: `runner` sends its own traffic
+        runner=rolling_deploy,
+        loads=("at",),
+    ),
+    _s(
         "S3",
         "worker",
         "every worker down, then back",
@@ -1360,14 +1785,18 @@ SCENARIOS = [
         "T1",
         "caller",
         "tenant isolation: one tenant moved, cancelled, a worker killed (S-T)",
-        "the other tenant served, untouched; index empty",
-        tenant_isolation,
-        # 2 deployments x 60 rpm: 2 calls a second, so the tenants' 60 calls wait.
+        "the other tenant served, untouched, p95 within 10 % of a baseline; moved first; "
+        "index empty; no swept leak (--quick: 30 calls a tenant)",
+        tenant_isolation_t1,
+        extra=swept_leak_check,
+        env={"LLMQ_KEY_EXPIRY": "swept"},
+        # 2 deployments x 60 rpm: 2 calls a second, so the quick run's 60 calls wait (the
+        # design-scale run edits the budget to T1_RPM live).
         models={
             "tenants": {
                 "model_id": TENANTS_ID,
                 "rpm": 60,
-                "worker_slots": 50,
+                "worker_slots": 3,  # few held per worker: most waiting calls stay queued
                 "timeout_secs": 25,
                 "max_wait_secs": 25,
             }
@@ -1608,7 +2037,7 @@ def plan(ids: list[str], loads: list[str] | None, matrix: str = "full") -> list[
             chosen = list(LOADS)
         else:
             chosen = ["at", "burst"] if sid in BURST_SET else ["at"]
-        units += [(sid, load) for load in chosen]
+        units += [(sid, load) for load in chosen if load in BY_ID[sid].loads]
     return units
 
 
@@ -1647,7 +2076,16 @@ def main() -> int:
     parser.add_argument("--jobs", type=int, default=4, help="runs at a time (1: one by one)")
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--seed", type=int, help="seed of every random choice (default: new)")
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="short D1 and the small T1 (30 calls a tenant): prove the harness, not the design",
+    )
     args = parser.parse_args()
+    if args.quick:  # the processes `parallel` starts read it at import
+        global QUICK
+        QUICK = True
+        os.environ["LLMQ_SCENARIO_QUICK"] = "1"
     if args.list:
         for s in SCENARIOS:
             burst = " [burst in the default matrix]" if s.sid in BURST_SET else ""

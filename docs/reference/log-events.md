@@ -3,8 +3,8 @@
 Every structured log event the library writes, by name. Each line is `event key=value ...`
 (structlog key-value format; the app configures the renderer). Use the name to search and alarm;
 the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alarming on.
-`llmq_admin` is written once per audited admin write (`actor`, `op`, `path`, `after`: counts,
-never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, ...).
+`llmq_admin` is written once per audited admin write (`kind`, `actor`, `op`, `path`, `after`:
+counts, never a tenant name), purges included (which also write `llmq_purge`); `call_cancel` carries `source` (`api`, `admin`, `purge`, ...).
 
 | Event | Level | Where |
 |---|---|---|
@@ -45,6 +45,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `deployment_disabled` | error | engine/runtime.py, engine/local.py |
 | `deployment_failing_last_usable` | error | engine/runtime.py |
 | `deployment_recovered` | info | engine/runtime.py |
+| `direct_run_after_result_failed` | warning | engine/runtime.py (a step after a direct run stored its success raised; the caller gets the success) |
 | `direct_run_failed` | warning | engine/runtime.py |
 | `drain_callback_failed` | warning | drain.py |
 | `drain_file_seen` | info | drain.py |
@@ -78,9 +79,13 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `job_task_failed` | warning | engine/jobs.py |
 | `job_upkeep_failed` | warning | engine/jobs.py |
 | `key_expiry_changed` | warning | engine/runtime.py |
+| `key_expiry_conflict` | warning | engine/runtime.py |
 | `key_expiry_publish_failed` | warning | engine/runtime.py |
-| `llmq_admin` | info | engine/audit.py, engine/requests_admin.py |
+| `llmq_admin` | info | engine/audit.py |
 | `llmq_call_finished` | info | engine/runtime.py |
+| `llmq_configured` | info | core.py (once per `start()`, every mode: the `describe()` summary: version, worker id, roles, environment, store `scheme://host:port` (no password), prefixes, key expiry, pool, metrics sink, registry version and models, `default_tenant_hash`; never a salt, token, tenant name or registry body) |
+| `llmq_configured_failed` | warning | core.py (`describe()` raised at start, e.g. a registry file changed since `from_env`; the start goes on) |
+| `llmq_disabled` | info | disabled.py (`LLMQ_ENABLED=false`: once at `start()`, with `describe()`: version, `enabled: false`, environment, whether a drain file is watched) |
 | `llmq_purge` | info | engine/purge.py |
 | `llmq_registry_audit` | info | registry/store.py |
 | `llmq_start_failed` | error | fastapi.py (`on_start_error="log"`: the app stays up, not ready) |
@@ -136,6 +141,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `replicas_short` | warning | engine/store_guard.py |
 | `request_extended` | info | engine/requests_admin.py |
 | `request_moved` | info | engine/requests_admin.py |
+| `request_records_stale` | error | engine/requests_admin.py |
 | `request_unusable` | error | engine/runtime.py, engine/local.py |
 | `result_drop_skipped` | warning | engine/requests.py |
 | `result_reader_error` | warning | engine/runtime.py |
@@ -145,6 +151,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `secrets_refresh_failed` | warning | secrets.py (the last values are kept) |
 | `setting_removed` | warning | engine/settings.py (a removed setting is still set, outside strict mode: `setting`, `hint`) |
 | `setting_renamed` | warning | engine/settings.py (a renamed setting is still set, outside strict mode: `setting`, `use`) |
+| `settle_replayed` | info | engine/runtime.py (the end-of-call script ran again after a lost reply: not a double run) |
 | `shutdown_give_back_failed` | warning | engine/runtime.py |
 | `start_rollback_failed` | warning | core.py |
 | `static_cap_process_count_unset` | warning | core.py (queue mode: `models` with `store_down: static_cap` while `LLMQ_LOCAL_PROCESS_COUNT` is 1) |

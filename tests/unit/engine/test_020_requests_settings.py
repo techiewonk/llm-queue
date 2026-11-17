@@ -11,10 +11,10 @@ import json
 import pytest
 
 from llm_queue.engine.metrics import TenantLabels
-from llm_queue.engine.purge import keyed_hash
 from llm_queue.engine.requests_admin import AdminSettings
 from llm_queue.engine.settings import InfraSettings, parse_metrics_tenants
 from llm_queue.errors import ConfigError
+from llm_queue.ids import keyed_hash
 
 DEV = {"LLMQ_STORE_URL": "redis://localhost:6379", "LLMQ_ENVIRONMENT": "dev"}
 

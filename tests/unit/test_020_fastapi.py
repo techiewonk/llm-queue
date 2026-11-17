@@ -428,15 +428,14 @@ def test_ready_needs_start_registry_no_drain_and_no_evicting_store(
 
 
 def test_queue_ready() -> None:
-    assert queue_ready(False) is True  # queue off: the direct path serves
     set_default_queue(None)
-    assert queue_ready(True) is False  # on, and nothing started
+    assert queue_ready() is False  # nothing started
     queue: Any = FakeQueue([])
-    assert queue_ready(True, queue) is False
+    assert queue_ready(queue) is False
     queue.ready = True
-    assert queue_ready(True, queue) is True
+    assert queue_ready(queue) is True
     set_default_queue(queue)
     try:
-        assert queue_ready(True) is True
+        assert queue_ready() is True
     finally:
         set_default_queue(None)

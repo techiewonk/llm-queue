@@ -373,6 +373,9 @@ local state = redis.call('HGET', job_key, 'state')
 if state == 'done' or state == 'failed' or state == 'expired' or state == 'cancelled' then
   return cjson.encode({r = 'done'})
 end
+-- An admin extend's deadline (0.2.0 T2): returned with a grant or a wait, so a worker that
+-- took the call after the extend's notice runs and waits to it (RQ-1).
+local job_dl = tonumber(redis.call('HGET', job_key, 'dl') or '')
 -- A call just received (req.callers = the caller TTL): `gone` when every caller of it is gone,
 -- unless the store came back less than a TTL ago (their keys not renewed yet). It was a script
 -- of its own (CALLERS_ALIVE in requests.py), one more round trip per call.
@@ -405,7 +408,7 @@ local held = redis.call('HGET', entry_key, 'owner')
 if held then
   if held == req.owner then
     local again = {r = 'granted', dep = redis.call('HGET', entry_key, 'dep'),
-      minute = hnum(entry_key, 'minute', minute), repeat_ = true}
+      minute = hnum(entry_key, 'minute', minute), repeat_ = true, dl = job_dl}
     if req.chunks then again.streamed = redis.call('XLEN', P .. ':{r:' .. rid .. '}:chunks') end
     return cjson.encode(again)
   end
@@ -751,7 +754,7 @@ if not chosen then
   redis.call('ZADD', exp_key, exp, cls .. '|' .. rid)
   X.expire(exp_key, KEY_MS)
   local reply = {r = 'wait', ms = math.max(1, math.floor(best_wait or num(T.wait_ms, 100))),
-    reason = best_reason or 'slot'}
+    reason = best_reason or 'slot', dl = job_dl}
   if tf_st then tf_refused(alias, tf_st, rid, exp, reply) end
   return cjson.encode(reply)
 end
@@ -817,7 +820,7 @@ for field, value in pairs(rot_writes) do redis.call('HSET', mk(alias, 'rot'), fi
 if req.strategy == 'round_robin' or next(rot_writes) then slide(mk(alias, 'rot'), DAY_MS) end
 if tf_st then tf_grant(alias, req.tf, tf_st, entry_key, req.owner, rid, lease_ms) end
 local granted = {r = 'granted', dep = chosen.key, minute = minute, limit = res.limit,
-  tier = chosen.tier}
+  tier = chosen.tier, dl = job_dl}
 -- A stream's call: how far its chunk stream got (another worker may have begun it, R19); an
 -- XLEN of its own before.
 if req.chunks then granted.streamed = redis.call('XLEN', P .. ':{r:' .. rid .. '}:chunks') end

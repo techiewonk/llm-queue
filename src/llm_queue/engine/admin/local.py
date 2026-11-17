@@ -146,6 +146,19 @@ class LocalStatusAdmin:
             raise LocalModeRefused("status outside the local-mode process")
         return await engine.status(model)
 
+    async def health(self, model: str | None = None) -> dict[str, Any]:
+        """Health summary of this process's view (budgets are this process's share)."""
+        from llm_queue.engine.status import health_report
+
+        engine = self._ctx.engine
+        if engine is None:
+            raise LocalModeRefused("health summary outside the local-mode process")
+        report = await engine.status()
+        if model is not None:
+            alias = engine.registry.current.registry.alias_of(model)
+            report = {**report, "models": [m for m in report["models"] if m["model"] == alias]}
+        return health_report(engine.registry.current, report)
+
 
 class LocalDrainAdmin:
     """Drain of this process; not audited (the audit lives in the store)."""
@@ -240,6 +253,7 @@ class LocalOpsAdmin:
                     for d in m["deployments"]
                 ),
                 "open_breakers": sum(d["breaker"] == "open" for d in m["deployments"]),
+                "health": m["health"]["state"],
             }
             for m in report["models"]
         ]

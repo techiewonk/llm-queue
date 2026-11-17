@@ -272,7 +272,8 @@ named events, for example:
 | `registry_invalid_replaced`, `registry_needs_newer_library` | The stored registry was invalid and replaced; or it needs a newer library and this pod keeps its own |
 | `second_llm_queue_started` | A second `LLMQueue` was started in one process |
 | `store_eviction_policy` | The store may evict the library's keys (`allkeys-*`, or `volatile-*` with native key expiry) |
-| `key_expiry_changed` | A store's key expiry mode changed (`native` / `swept`): a policy change, or processes with different `LLMQ_KEY_EXPIRY` |
+| `key_expiry_changed` | A store's key expiry mode changed from `native` to `swept` (or was set first): a policy change, or a process set to `swept` |
+| `key_expiry_conflict` | This process's `LLMQ_KEY_EXPIRY` differs from the store's mode; it follows the store (give every process one setting) |
 | `job_no_consumer` | A job was sent to a name no running process consumes |
 | `store_down` | The state store failed before a call was sent; the `store_down` rule applies |
 | `deployment_disabled`, `deployment_recovered` | Health checks turned a deployment off or back on |

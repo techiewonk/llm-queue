@@ -17,6 +17,7 @@ it:
 | 2. Canary | Registry `queue_pct` below 100 on a model (live edit) | That share of calls (by request id) runs direct in the calling pod, still under the shared budgets in the store | Set `queue_pct` back to 100 |
 | 3. Kill switch | Registry `routing.kill_switch: true` (live edit) | Every call runs direct in the calling pod; the budgets, breakers and request records are still the store's | Set it back to false |
 | 4. Local | `LLMQ_EXECUTION_MODE=local` and a restart | Every call runs in its own process against the provider; the store is never contacted (no client is built) | Set `queue` (or remove it) and restart |
+| 5. Off | `LLMQ_ENABLED=false` and a restart | The library does nothing: the factories return None, so the app runs its own direct path (`chat_model(...) or ChatBedrockConverse(...)`); a direct `llmq.converse()` raises `QueueDisabled`; `install()` mounts the two probes only (`enabled: false`); the drain file still fails readiness | Remove it (or set `true`) and restart |
 
 Steps 2 and 3 need the store: they move where a call runs, not where its budget lives. Step 4
 is for when the store itself is the problem (lost, being migrated, not yet provisioned) or for
@@ -28,7 +29,10 @@ When to use which:
   calling pods keep serving with the shared budgets.
 - Trying the queue on part of the traffic, or ramping it up: step 2.
 - The store is down for long or must be replaced: step 4, then back to step 1 once a store is
-  there again. A model's `store_down: static_cap` does the same for short outages on its own,
+  there again.
+- The library itself is in doubt (a bug in it, an incident you want it out of): step 5. Only an
+  app that keeps its own direct path behind the factories (`chat_model(...) or <direct>`) can
+  take it; code that calls `llmq.converse()` directly gets `QueueDisabled` instead. A model's `store_down: static_cap` does the same for short outages on its own,
   per call, with the same local executor.
 
 ## Local mode
@@ -83,6 +87,18 @@ queues views, jobs and dead letters, and fairness across pods. Each raises `Loca
 `"reason": "local_mode"`, on the CLI exit 1. `llmq.admin.status.get`, `ops.index`,
 `describe()`, `drain.*`, `registry.get` / `diff` / `schema` and `tenants.hash` answer from
 this process. To change a model in local mode, change the registry document and restart.
+
+## Off (`LLMQ_ENABLED=false`)
+
+`LLMQueue.from_env()` returns a `DisabledQueue` (`llmq.enabled` is False) and reads nothing else
+but `LLMQ_ENVIRONMENT`, `LLMQ_DRAIN_FILE` and `LLMQ_DRAIN_POLL_SECS`. On each surface:
+
+| Surface | With the library off |
+|---|---|
+| Python | `start()` / `stop()` run the drain file watcher only and log `llmq_disabled` once; `converse`, `chat`, `call`, the streams, `embed`, the `*_sync` calls, jobs, `status()` and `request_status()` raise `QueueDisabled`; `health()` and `describe()` say `enabled: false`; `ready` and `queue_ready()` are true unless draining; `llmq.admin` serves `describe`, `ops`, `registry.schema` and `drain.*`, every other operation raises `QueueDisabled` |
+| LangChain | `chat_model()` / `embeddings()` return None (with no queue given they read `LLMQ_ENABLED` from the environment) |
+| HTTP | `install()` / `mount()` mount `GET /health/live` (`{"live": true, "enabled": false}`) and `GET /health/ready` (200, or 503 while draining) only, whatever the router options; the context middleware is still added |
+| CLI | `llm-queue describe` answers `enabled: false`; every store command exits 1 with the `QueueDisabled` message |
 
 ## HTTP routes and probes
 

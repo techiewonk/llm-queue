@@ -31,6 +31,7 @@ class _Engine:
         self.registry = SimpleNamespace(current=None)
         self.queues = None
         self.metrics = None
+        self.hash_id = str  # the job runner hashes a job's ids with it
         self.settings = SimpleNamespace(
             queue_prefix="", drain_secs=0, queue_wait_replicas=0, queue_wait_ms=100
         )
@@ -46,6 +47,9 @@ class _Engine:
         await asyncio.sleep(0)  # a real start awaits: two starts would interleave here
         self.tasks.append("reload")
         await self._step("start")
+
+    def pause_receiving(self) -> None:
+        return None  # `stop()` pauses first (A-2)
 
     async def stop(self, **kw: Any) -> None:
         self.tasks.clear()

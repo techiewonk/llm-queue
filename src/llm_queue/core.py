@@ -119,6 +119,18 @@ class FairnessStatus(TypedDict):
     waiting_within_share: int
 
 
+class ModelHealth(TypedDict):
+    """A model's health summary (0.2.0 F2) and the numbers behind it."""
+
+    state: str  # healthy, warning or critical
+    reasons: list[str]
+    budget_used_pct: float | None
+    waiting: int
+    oldest_waiting_secs: float | None
+    usable_deployments: int
+    deployments: int
+
+
 class ModelStatus(TypedDict):
     """One model: waiting calls per class, calls in progress, dead letters, deployments."""
 
@@ -128,6 +140,7 @@ class ModelStatus(TypedDict):
     in_progress: int
     dead_letters: int
     deployments: list[DeploymentStatus]
+    health: ModelHealth  # thresholds: the model's `health_summary` setting (0.2.0 F2)
     fairness: NotRequired[FairnessStatus]  # only when `fairness.mode` is on
     # Local mode (LLMQ_EXECUTION_MODE=local): `local`, and this process's slots of the model.
     mode: NotRequired[str]
@@ -150,6 +163,7 @@ class StatusReport(TypedDict):
     blocked_regions: list[str]
     blocked_accounts: list[str]
     models: list[ModelStatus]
+    health: str  # the worst model's state: healthy, warning or critical
     jobs: NotRequired[list[JobStatus]]
     # Local mode: `local`, and the LLMQ_LOCAL_PROCESS_COUNT that divides every budget.
     mode: NotRequired[str]
@@ -263,6 +277,7 @@ class LLMQueue:
             metrics=engine.metrics,
             replica_wait=getattr(engine, "replica_wait", None),  # one per process (R3FM-5, Q8)
             job_settings=job_settings,
+            hash_id=engine.hash_id,
         )
         self._builder = builder
         self._offload = offload
@@ -304,10 +319,15 @@ class LLMQueue:
 
         The secrets are `secrets`, else the sources `LLMQ_SECRETS_SOURCE` names; `secret_names`
         reads a setting under another key, `tuning` sets timeouts and pools in code (see
-        docs/reference/environment.md). `ConfigError` lists every problem.
+        docs/reference/environment.md). `LLMQ_ENABLED=false` returns a `DisabledQueue` (probes
+        and the drain file only, every call refused); `ConfigError` lists every problem.
         """
         layers = Layers(environ, secrets, defaults, secret_names)  # reads a source once
         settings = InfraSettings.from_layers(layers)
+        if not settings.enabled:  # LLMQ_ENABLED=false: the off switch (0.2.0 H1)
+            from llm_queue.disabled import DisabledQueue
+
+            return DisabledQueue(settings)
         if settings.execution_mode == "local":  # no store client at all (engine/local.py)
             return cls._from_env_local(settings, layers, metrics, worker_id, credentials, tuning)
         jobs = JobSettings.from_env(layers)  # the same layers as every other setting
@@ -644,6 +664,16 @@ class LLMQueue:
             )
             self._drain_watcher.start()
         self.started = True
+        self._log_configured()
+
+    def _log_configured(self) -> None:
+        """One `llmq_configured` line with `describe()` (0.2.0 D2); never fails the start."""
+        try:
+            summary = self.describe()
+        except Exception as exc:  # a registry file changed or broken since from_env
+            logger.warning("llmq_configured_failed", error=repr(exc))
+            return
+        logger.info("llmq_configured", **summary)
 
     async def _wait_for_start(self) -> None:
         """Let a `start()` running on this loop finish (or roll back) before stopping (FC-3).
@@ -754,6 +784,11 @@ class LLMQueue:
         return bool(self._engine.draining)
 
     @property
+    def enabled(self) -> bool:
+        """True; False only for the queue `LLMQ_ENABLED=false` gives (`DisabledQueue`)."""
+        return True
+
+    @property
     def execution_mode(self) -> str:
         """`queue` (calls through the store) or `local` (in this process, no store)."""
         return "local" if self._local else "queue"
@@ -801,8 +836,9 @@ class LLMQueue:
     async def stop(self, drain_secs: float | None = None) -> None:
         """Shut down in order (plan §3.18) and close every client; a second call does nothing.
 
-        `drain_secs` (default `LLMQ_DRAIN_SECS`) bounds the whole wait: jobs first, then
-        running calls. Every step runs even when one fails; the first failure is raised last.
+        Receiving stops first (as `pause_receiving()`); `drain_secs` (default `LLMQ_DRAIN_SECS`)
+        bounds the whole wait: jobs, then running calls. Every step runs even when one fails;
+        the first failure is raised last.
         """
         # Calls made during the drain are served; new calls are refused once it is over. If the
         # stop is cancelled, the steps left still close their clients, without draining.
@@ -824,7 +860,15 @@ class LLMQueue:
         # return at once, so store pools, provider sessions and the S3 client leaked (CO-1).
         cancelled = False
         watcher, self._drain_watcher = self._drain_watcher, None
+
+        async def pause() -> None:
+            # Receiving stops first (owner RV2, review A-2): calls taken while jobs drained got
+            # only the rest of the drain, then streams failed `worker_shutdown` and other calls
+            # ran again elsewhere. Callers' own calls are still served by any pod.
+            self.pause_receiving()
+
         steps: list[tuple[str, Callable[[], Awaitable[Any]]]] = [
+            ("pause", pause),
             ("drain_watcher", lambda: watcher.stop() if watcher else asyncio.sleep(0)),
             ("jobs", lambda: self._jobs.stop(drain_secs=0 if cancelled else drain)),
             (
@@ -1145,7 +1189,7 @@ class LLMQueue:
         request); with no token and no `dependencies` only the probes and `/metrics` are mounted.
         Guards, actors and the drain routes: docs/reference/cli-http.md "HTTP routes".
         """
-        from llm_queue.engine.http import status_router
+        from llm_queue.engine.http import BODY_MAX_BYTES, status_router
 
         s = self.settings
         env_token = getattr(self, "_admin_token", None)
@@ -1169,6 +1213,7 @@ class LLMQueue:
             dlq_bodies=bool(s.admin_dlq_bodies_enabled) if s else False,
             index_cache_secs=float(s.admin_index_cache_secs) if s else 2.0,
             strict=bool(s.strict) if s else False,
+            body_max_bytes=int(s.admin_body_max_bytes) if s else BODY_MAX_BYTES,
         )
 
     def describe(self) -> dict[str, Any]:
@@ -1243,15 +1288,14 @@ async def _close_offload(offload: ResultOffload | None) -> None:
             logger.warning("offload_close_failed", error=repr(exc))
 
 
-def queue_ready(enabled: bool = True, llmq: LLMQueue | None = None) -> bool:
-    """Readiness of an app that sends its model calls through the queue (0.2.0 B4).
+def queue_ready(llmq: LLMQueue | None = None) -> bool:
+    """Readiness of an app that sends its model calls through the queue (0.2.0 B4, H1).
 
-    True when `enabled` is False (the app runs its direct path); else `llmq.ready`, where
-    `llmq` defaults to the started default queue (False when none is started). A start that
-    failed under `install(on_start_error="log")` therefore keeps the pod out of traffic.
+    `llmq.ready`, where `llmq` defaults to the started default queue (False when none is
+    started). A queue switched off (`LLMQ_ENABLED=false`) is ready unless draining: the app's
+    direct path serves. A start that failed under `install(on_start_error="log")` keeps the
+    pod out of traffic.
     """
-    if not enabled:
-        return True
     if llmq is None:
         from llm_queue.langchain import get_default_queue
 

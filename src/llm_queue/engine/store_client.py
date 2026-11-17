@@ -59,7 +59,8 @@ def store_client(
         # (measured: a half-open store hung a command 60 s with the default, 15 s without).
         # A connection reset mid-reply is retried too, and the script may already have run
         # (EN-5). Scripts with a receipt or owner check are safe to replay (ACK, RETURN,
-        # EXTEND, FAIL, which ends its receipt, the admission scripts, REGISTER_SEND). The
+        # EXTEND, FAIL, which ends its receipt, the admission scripts, REGISTER and
+        # REGISTER_SEND by their nonce, RESULT_PUT and SETTLE_DONE by their stored body). The
         # worker's RECEIVE_FIRST is too: it records its batch under a nonce in a per-loop claim,
         # a replay hands back the same batch, and a receive whose reply never came is reclaimed
         # (S11). Still not: a plain RECEIVE (jobs, tools) takes a second batch on replay, and a

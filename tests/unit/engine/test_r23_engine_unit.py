@@ -16,7 +16,13 @@ from llm_queue.engine.jobs import JobRunner
 from llm_queue.engine.queue import NotReplicated
 from llm_queue.engine.runtime import StoreClock, _api_kwargs, _by_deployment, _call_timeout_secs
 from llm_queue.engine.store_guard import ReplicaWait, parse_scopes
+from llm_queue.ids import keyed_hash
 from llm_queue.registry import load_registry
+
+
+def _hash(value: str) -> str:
+    """The keyed hash a job runner is built with (its ids travel hashed)."""
+    return keyed_hash("test-salt", value)
 
 
 class _Clock:
@@ -129,7 +135,7 @@ class _Queues:
 async def test_r3fm5_a_job_send_waits_for_replicas_and_sends_anyway() -> None:
     """R3FM-5: a job send never waited for replicas; a lost primary lost the job unnoticed."""
     queues = _Queues(short=True)
-    runner = JobRunner(queues, replica_wait=ReplicaWait(replicas=2))  # type: ignore[arg-type]
+    runner = JobRunner(queues, replica_wait=ReplicaWait(replicas=2), hash_id=_hash)  # type: ignore[arg-type]
     ident = await runner.send("j", {})
     assert ident
     assert queues.waits == [2]

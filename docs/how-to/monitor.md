@@ -89,6 +89,12 @@ rollover. Their gauges suit dashboards better than paging.
   hash, waiting / held / running / cancelling calls, oldest wait and, with `fairness` on, its
   weight, quota, use this minute, slots and activity); every model report has `tenants`
   (`active` tenants and their `indexed_calls`) and `request_index`.
+- At a glance (0.2.0): `llm-queue health` (or `GET /status/health`, `llmq.admin.status.health()`)
+  gives each model `healthy`, `warning` or `critical` with its `reasons` (no usable
+  deployment, budget use, waiting calls, oldest wait, open breakers, disabled deployments, dead
+  letters, kill switch), and the worst as `health`. Tune the marks per model with the registry
+  setting `health_summary` (see [Configuration](../reference/configuration.md)); the same
+  summary is in `status()` and `GET /`.
 
 ## Logs Insights
 

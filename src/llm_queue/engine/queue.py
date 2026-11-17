@@ -693,7 +693,16 @@ class QueueFull(Exception):  # the plan's error kind is `queue_full`
 
 
 class NotReplicated(Exception):  # the plan's error kind is `queue_unavailable`
-    """The send reached the primary but not `queue_wait_replicas` replicas in time."""
+    """The send reached the primary but not `queue_wait_replicas` replicas in time.
+
+    `message_id` is the id of the message the primary holds (the send stands): without it the
+    call was recorded with no message and an admin reprioritize skipped it as `direct` (RQ-7).
+    """
+
+    def __init__(self, message: str, *, message_id: str = "") -> None:
+        """Keep the sent message's id beside the text."""
+        super().__init__(message)
+        self.message_id = message_id
 
 
 class StreamQueues:
@@ -790,7 +799,8 @@ class StreamQueues:
             raise QueueFull(queue, int(reply[1]))
         if acked is not None and int(acked) < wait_replicas:
             raise NotReplicated(
-                f"queue {queue}: {acked} of {wait_replicas} replicas in {wait_ms} ms"
+                f"queue {queue}: {acked} of {wait_replicas} replicas in {wait_ms} ms",
+                message_id=_text(reply[1]),
             )
         return _text(reply[1])
 

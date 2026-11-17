@@ -289,6 +289,15 @@ HEALTH_DEFAULTS = {
     "slow_min_samples": 20,
 }
 ALERT_DEFAULTS = {"quota_used_pct": 90, "dlq_messages": 1, "queue_age_secs": 600}
+# The per-model health summary of `status()` (0.2.0 F2): `warning` / `critical` at or above.
+HEALTH_SUMMARY_DEFAULTS = {
+    "budget_warning_pct": 80,
+    "budget_critical_pct": 98,
+    "waiting_warning": 1000,
+    "waiting_critical": 10000,
+    "wait_warning_secs": 30,
+    "wait_critical_secs": 120,
+}
 # A queue's messages and dead letters (which hold the prompt) live at most two weeks.
 MAX_RETENTION_SECS = 1_209_600
 QUEUE_DEFAULTS = {
@@ -316,9 +325,9 @@ _PCT = number(0, 100, integer=True)
 _POS = number(0, lo_open=True)
 _SECS = number(0, DAY_SECS, lo_open=True)  # timeouts and waits: at most one day (Q42)
 
-# Per-tenant fairness (owner Q28, Q29, Q50), off by default. `weights` and `quotas` name raw
-# tenant ids: they stay in the registry document and the worker's memory; the store and the
-# metrics only ever see the keyed hash of a tenant (`Engine.hash_id`).
+# Per-tenant fairness (owner Q28, Q29, Q50), off by default. `weights` and `quotas` name
+# tenants in the file; every registry write path replaces each name by its keyed hash and marks
+# the block `tenant_keys: hashed` (D2, review RQ-5), so the store only holds hashes.
 FAIRNESS_MODES = ("off", "share", "quota", "fair_queue")
 FAIRNESS_DEFAULTS = {"mode": "off", "default_weight": 1, "active_secs": 60}
 MAX_TENANT_ID_CHARS = 256
@@ -355,6 +364,9 @@ _FAIRNESS = obj(
         "tpm": number(1, integer=True),
         "quotas": TenantMap(_TENANT_CAPS),
         "active_secs": number(1, DAY_SECS),
+        # `hashed`: `weights` / `quotas` are keyed by tenant hashes already (every registry
+        # write path hashes names and writes this; an exported document keeps it).
+        "tenant_keys": one_of("names", "hashed"),
     }
 )
 
@@ -529,6 +541,23 @@ SETTINGS: Mapping[str, Spec] = {
             },
         ),
         ALERT_DEFAULTS,
+        merge=True,
+    ),
+    # Thresholds of the per-model health summary in `status()` (0.2.0 F2, healthy / warning /
+    # critical): budget use this minute, waiting calls, the oldest call's wait.
+    "health_summary": _spec(
+        "D,M",
+        obj(
+            {
+                "budget_warning_pct": number(1, 100),
+                "budget_critical_pct": number(1, 100),
+                "waiting_warning": number(1, 100_000_000, integer=True),
+                "waiting_critical": number(1, 100_000_000, integer=True),
+                "wait_warning_secs": number(1, DAY_SECS),
+                "wait_critical_secs": number(1, DAY_SECS),
+            }
+        ),
+        HEALTH_SUMMARY_DEFAULTS,
         merge=True,
     ),
     "admission": _spec("D,M", hook_name),

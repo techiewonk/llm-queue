@@ -6,8 +6,6 @@ source and a few process limits. Every problem is reported at once.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import math
 import os
 import re
@@ -24,6 +22,7 @@ from llm_queue._logging import get_logger
 from llm_queue.engine.expiry import KEY_EXPIRY_MODES
 from llm_queue.engine.store_guard import WAIT_SCOPES, parse_scopes
 from llm_queue.errors import ConfigError
+from llm_queue.ids import keyed_hash
 from llm_queue.registry.interpolate import YAML_SUFFIXES, expand, load_yaml, to_json
 from llm_queue.registry.validate import parse_document
 
@@ -113,6 +112,7 @@ SETTING_NAMES = frozenset(
     {
         "LLMQ_ADMIN_ACTOR_HEADER",
         "LLMQ_ADMIN_BATCH",
+        "LLMQ_ADMIN_BODY_MAX_BYTES",
         "LLMQ_ADMIN_CSRF_HEADER",
         "LLMQ_ADMIN_DLQ_BODIES_ENABLED",
         "LLMQ_ADMIN_HEADER",
@@ -133,6 +133,7 @@ SETTING_NAMES = frozenset(
         "LLMQ_DRAIN_HANDBACK_ENABLED",
         "LLMQ_DRAIN_POLL_SECS",
         "LLMQ_DRAIN_SECS",
+        "LLMQ_ENABLED",
         "LLMQ_ENVIRONMENT",
         "LLMQ_EXECUTION_MODE",
         "LLMQ_HTTP_PURGE_WAIT_SECS",
@@ -529,15 +530,6 @@ METRICS_TENANTS_MAX = 50
 _LABEL_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}\Z")
 
 
-def _switch(get: Callable[..., Any], name: str, default: bool, problems: list[str]) -> bool:
-    """A true / false variable (`on` / `off`, `1` / `0`, `yes` / `no` too)."""
-    raw = str(get(name, "true" if default else "false")).strip().lower()
-    if raw not in _TRUE + _FALSE:
-        problems.append(f"LLMQ_{name} must be true or false (on / off)")
-        return default
-    return raw in _TRUE
-
-
 def parse_metrics_tenants(text: str) -> tuple[tuple[tuple[str, str], ...], list[str]]:
     """`LLMQ_METRICS_TENANTS` (`acme,globex=t2`) as (tenant name, label) pairs, and problems.
 
@@ -568,14 +560,17 @@ def parse_metrics_tenants(text: str) -> tuple[tuple[tuple[str, str], ...], list[
 
 
 def _admin_settings(
-    get: Callable[..., Any], number: Callable[..., Any], problems: list[str]
+    layers: Mapping[str, Any],
+    get: Callable[..., Any],
+    number: Callable[..., Any],
+    problems: list[str],
 ) -> dict[str, Any]:
     """The request index and admin settings (design 0.2.0 T1, T2, T6) as `InfraSettings` fields."""
     tenants, found = parse_metrics_tenants(str(get("METRICS_TENANTS", "") or ""))
     problems.extend(found)
     return {
-        "request_index_enabled": _switch(get, "REQUEST_INDEX_ENABLED", True, problems),
-        "tenant_names_enabled": _switch(get, "TENANT_NAMES_ENABLED", False, problems),
+        "request_index_enabled": read_bool(layers, "REQUEST_INDEX_ENABLED", True, problems),
+        "tenant_names_enabled": read_bool(layers, "TENANT_NAMES_ENABLED", False, problems),
         "admin_batch": number("ADMIN_BATCH", 500, int, lo=1, hi=10_000),
         "admin_scan_max": number("ADMIN_SCAN_MAX", 100_000, int, lo=1_000, hi=10_000_000),
         "requests_list_max": number("REQUESTS_LIST_MAX", 1_000, int, lo=1, hi=10_000),
@@ -587,7 +582,7 @@ def _admin_settings(
     }
 
 
-def _read_document(
+def read_document(
     registry: str | None,
     registry_file: str | None,
     lookup: Callable[[str], str | None] | None = None,
@@ -623,6 +618,9 @@ class InfraSettings:
     """The process settings of one environment."""
 
     store_url: str = field(repr=False)  # holds the password
+    # LLMQ_ENABLED (0.2.0 H1, FU1): false switches the library off (a disabled queue: probes,
+    # the drain file and `describe()` only; every other setting is then not read or checked).
+    enabled: bool = True
     queue_store_url: str | None = field(default=None, repr=False)
     store_max_connections: int = 200
     # LLMQ_STORE_MAX_CONNECTIONS=auto (0.2.0 D7): the size above is the boot registry's worker
@@ -686,6 +684,7 @@ class InfraSettings:
     admin_csrf_header: str = "X-LLMQ-Admin"  # LLMQ_ADMIN_CSRF_HEADER: a write route needs it
     admin_index_cache_secs: float = 2.0  # LLMQ_ADMIN_INDEX_CACHE_SECS
     admin_dlq_bodies_enabled: bool = False  # LLMQ_ADMIN_DLQ_BODIES_ENABLED
+    admin_body_max_bytes: int = 1_048_576  # LLMQ_ADMIN_BODY_MAX_BYTES: a larger POST is a 413
     # How keys expire (LLMQ_KEY_EXPIRY): `auto` picks native TTLs on a `noeviction` store and the
     # expiry index on a `volatile-*` one (owner decision K4, 0.1.0b3); engine/expiry.py.
     key_expiry: str = "auto"
@@ -758,6 +757,8 @@ class InfraSettings:
         placeholder = layers.lookup
         secrets_shown = layers.describe_secrets()
         problems: list[str] = []
+        if not read_bool(layers, "ENABLED", True, problems) and not problems:
+            return cls._disabled(layers)
         store = get("STORE_URL")
         execution_mode = str(get("EXECUTION_MODE", "queue")).strip().lower()
         if execution_mode not in EXECUTION_MODES:
@@ -795,7 +796,7 @@ class InfraSettings:
         elif registry or registry_file:
             used: set[str] = set()
             try:
-                text = _read_document(registry, registry_file, placeholder, used)
+                text = read_document(registry, registry_file, placeholder, used)
                 document = boot = orjson.loads(text)
             except ConfigError as exc:
                 problems.append(str(exc))
@@ -961,7 +962,7 @@ class InfraSettings:
                 problems += [found_pool] if found_pool else []
         else:
             pool = number("STORE_MAX_CONNECTIONS", 200, int, lo=4, hi=100_000)
-        admin = _admin_settings(get, number, problems)
+        admin = _admin_settings(layers, get, number, problems)
         settings = cls(
             store_url=urls["STORE_URL"] or str(store or ""),
             queue_store_url=urls["QUEUE_STORE_URL"],
@@ -1017,6 +1018,9 @@ class InfraSettings:
             admin_csrf_header=csrf_header,
             admin_index_cache_secs=number("ADMIN_INDEX_CACHE_SECS", 2.0, zero=True, hi=60),
             admin_dlq_bodies_enabled=switches["ADMIN_DLQ_BODIES_ENABLED"],
+            admin_body_max_bytes=number(
+                "ADMIN_BODY_MAX_BYTES", 1_048_576, int, lo=1024, hi=67_108_864
+            ),
             key_expiry=key_expiry,
             ttl_sweep_batch=number("TTL_SWEEP_BATCH", 500, int, lo=1, hi=5_000),
             ttl_sweep_rounds=number("TTL_SWEEP_ROUNDS", 100, int, lo=1, hi=10_000),
@@ -1034,6 +1038,35 @@ class InfraSettings:
             raise ConfigError("invalid LLMQ settings:\n  " + "\n  ".join(problems))
         return settings
 
+    @classmethod
+    def _disabled(cls, layers: Layers) -> InfraSettings:
+        """`LLMQ_ENABLED=false`: only what a disabled queue uses (environment and drain file).
+
+        No store, registry or salt is needed; the other `LLMQ_*` values are not read, so an
+        app can switch the library off without removing them (or before they exist).
+        """
+        problems: list[str] = []
+        environment = str(layers.get(PREFIX + "ENVIRONMENT", "") or "").strip().lower()
+        environment = {"": "unset", "production": "prod"}.get(environment, environment)
+        poll_raw = layers.get(PREFIX + "DRAIN_POLL_SECS", 1.0)
+        try:
+            poll = float(poll_raw)
+        except (TypeError, ValueError):
+            poll = 1.0
+            problems.append("LLMQ_DRAIN_POLL_SECS must be a number")
+        if not (math.isfinite(poll) and 0.1 <= poll <= 60):
+            problems.append("LLMQ_DRAIN_POLL_SECS must be at least 0.1 and at most 60")
+        if problems:
+            raise ConfigError("invalid LLMQ settings:\n  " + "\n  ".join(problems))
+        return cls(
+            store_url="",
+            enabled=False,
+            environment=environment,
+            drain_file=str(layers.get(PREFIX + "DRAIN_FILE", "") or "").strip(),
+            drain_poll_secs=poll,
+            secrets_source=layers.secrets_source,
+        )
+
     def registry_document(self) -> str:
         """The registry JSON from `LLMQ_REGISTRY` or the file `LLMQ_REGISTRY_FILE`.
 
@@ -1042,12 +1075,8 @@ class InfraSettings:
         """
         from llm_queue.engine.fairness import hash_tenant_names
 
-        text = _read_document(self.registry, self.registry_file, self.placeholder_lookup)
+        text = read_document(self.registry, self.registry_file, self.placeholder_lookup)
         document = parse_document(text)
-        salt = (self.id_hash_salt or "").encode()
-
-        def hash_id(value: str) -> str:
-            return hmac.new(salt, value.encode(), hashlib.sha256).hexdigest()[:16]
-
-        hashed = hash_tenant_names(document, hash_id)
+        salt = self.id_hash_salt or ""
+        hashed = hash_tenant_names(document, lambda value: keyed_hash(salt, value))
         return text if hashed == document else to_json(hashed)

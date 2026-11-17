@@ -1,4 +1,4 @@
-"""The plan's load and chaos gates (§11: B17, B19, B22, B23, B33, B34, B56, B91-B97) on fakellm.
+"""The plan's load and chaos gates (§11: B17 ... B97; 0.2.0: BL1, G-T1, G-T2) on fakellm.
 
 Workers are real processes (pods) against one store, driven from here. Rates and durations are
 scaled to run on one machine in minutes; each gate prints its numbers and the plan's pass mark
@@ -11,7 +11,12 @@ it applies. Nothing calls a real LLM.
     python scripts/gates.py B34 --record-baseline   # store this machine's B34 numbers
 
 `--quick` leaves out B17 (fixed windows over whole minutes), B91 (20 models x 30 deployments),
-and B92 (3 minutes idle); run every gate before a release.
+B92 (3 minutes idle), BL1 (3 minutes of local mode) and G-T2 (10,000 waiting calls); run every
+gate before a release. `--short` scales BL1 (40 s), G-T1 (400 calls a side) and G-T2 (1,000
+waiting) down to prove the harness; their pass marks are for the full size.
+
+    python scripts/gates.py BL1 G-T1 G-T2           # the 0.2.0 gates (about 6 minutes)
+    python scripts/gates.py BL1 G-T1 G-T2 --short   # a harness smoke (about 2 minutes)
 """
 
 from __future__ import annotations
@@ -22,12 +27,13 @@ import contextlib
 import functools
 import itertools
 import json
+import math
 import random
 import statistics
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -973,6 +979,373 @@ async def b23() -> bool:
     )
 
 
+async def f2() -> bool:
+    """Health summary (plan 0.2.0 F2): its states follow a real backlog, and it is cheap.
+
+    Pass: an idle model is `healthy`; with a backlog over its `health_summary` marks it turns
+    `critical` (reasons `waiting` and `oldest_wait`) within 20 s; once the backlog is cancelled
+    it is `healthy` again within 15 s; a summary read takes <= 200 ms at p95.
+    """
+    marks = {
+        "waiting_warning": 10,
+        "waiting_critical": 40,
+        "wait_warning_secs": 3,
+        "wait_critical_secs": 8,
+        "budget_warning_pct": 100,  # budget use is not what this gate drives
+        "budget_critical_pct": 100,
+    }
+    doc = registry(
+        {"chat": {"rpm": 30, "worker_slots": 10, "health_summary": marks}},
+        accounts=1,
+        regions=1,
+        defaults={"timeout_secs": 300, "timeout_max_secs": 300, "max_wait_secs": 300},
+    )
+    states: list[tuple[float, str, list[str]]] = []
+    reads: list[float] = []
+    idle = critical_at = healthy_after = None
+    async with Gate(doc) as gate:
+        await gate.workers(2)
+        (queue,) = await gate.callers(1)
+        admin = queue.admin
+        run = Run()
+
+        async def summary() -> dict[str, Any]:
+            t0 = time.monotonic()
+            row: dict[str, Any] = (await admin.status.health("chat"))["models"][0]
+            reads.append(time.monotonic() - t0)
+            states.append((time.monotonic() - run.t0, row["state"], row["reasons"]))
+            return row
+
+        idle = (await summary())["state"]
+        for _ in range(19):
+            await summary()
+        tasks = [asyncio.create_task(run.call(queue, "chat", chat())) for _ in range(80)]
+        sent = time.monotonic()
+        while time.monotonic() - sent < 20:
+            row = await summary()
+            if row["state"] == "critical" and {"waiting", "oldest_wait"} <= set(row["reasons"]):
+                critical_at = time.monotonic() - sent
+                break
+            await asyncio.sleep(0.5)
+        await admin.requests.cancel(model="chat", state="waiting", actor="gate", dry_run=False)
+        cancelled = time.monotonic()
+        while time.monotonic() - cancelled < 15:
+            if (await summary())["state"] == "healthy":
+                healthy_after = time.monotonic() - cancelled
+                break
+            await asyncio.sleep(0.5)
+        await asyncio.gather(*tasks, return_exceptions=True)
+    read_p95 = p95(reads) * 1000
+    seen = sorted({state for _, state, _ in states}, key=("healthy", "warning", "critical").index)
+    return verdict(
+        "F2",
+        {
+            "idle model is healthy": idle == "healthy",
+            "backlog turns critical within 20 s": critical_at is not None,
+            "healthy again within 15 s of the cancel": healthy_after is not None,
+            "summary read p95 <= 200 ms": read_p95 <= 200,
+        },
+        [
+            f"states seen {seen}; critical after {critical_at or 0:.1f}s, healthy "
+            f"{healthy_after or 0:.1f}s after the cancel; read p95 {read_p95:.0f} ms over "
+            f"{len(reads)} reads; calls {len(run.results)} (failures {run.kinds() or 0})"
+        ],
+    )
+
+
+async def _local_pods(env: dict[str, str], specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Client processes (`gates_fleet.py client`), started, then all sent `go`; their reports."""
+    procs = []
+    try:
+        for spec in specs:
+            log = log_file("client")
+            procs.append(
+                subprocess.Popen(  # noqa: ASYNC220  # started once each, before the run
+                    [PY, str(Path(__file__).parent / "gates_fleet.py"), "client", json.dumps(spec)],
+                    env=env,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=log,
+                )
+            )
+            log.close()
+
+        async def line(proc: Any) -> dict[str, Any]:
+            while True:
+                raw = await asyncio.wait_for(asyncio.to_thread(proc.stdout.readline), 600)
+                if not raw:
+                    raise RuntimeError(f"client process ended (exit {proc.poll()})")
+                if raw.startswith(b"{"):
+                    return dict(json.loads(raw))
+
+        for proc in procs:
+            await line(proc)  # ready
+        for proc in procs:
+            assert proc.stdin is not None
+            proc.stdin.write(b"go\n")
+            proc.stdin.flush()
+        return list(await asyncio.gather(*(line(proc) for proc in procs)))
+    finally:
+        await asyncio.gather(*(kill_and_reap(p) for p in procs), return_exceptions=True)
+
+
+BL1_RPM = 600  # the registry's rpm and fakellm's own limit (one deployment)
+BL1_PROCESSES = 4
+BL1_OFFERED = 1.5  # of the rpm
+BL1_TIMEOUT_SECS = 30
+
+
+async def bl1() -> bool:
+    """Local mode at fleet level: 4 processes share one provider quota (gap G9, LM-15).
+
+    `LLMQ_EXECUTION_MODE=local`, `LLMQ_LOCAL_PROCESS_COUNT=4` (each process takes a quarter of
+    the rpm), fakellm limited to the registry's rpm, 150 % offered for 3 minutes (`--short`:
+    40 s). The model uses `fixed` minute windows: a smooth bucket lets its burst through once
+    per process on top of the minute. Pass: fakellm never saw more than its rpm in a wall-clock
+    minute (+2 at the boundary); every call answered or `rate_limited`, none after its deadline.
+    """
+    secs = 40.0 if SHORT else 180.0
+    key = f"{CHAT_ID}@aws-0/{REGIONS[0]}"
+    scenario = {**FAST, "models": {key: {"rpm": BL1_RPM}}}
+    doc = registry(
+        {
+            "chat": {
+                "rpm": BL1_RPM,
+                "rate_window": "fixed",
+                "timeout_secs": BL1_TIMEOUT_SECS,
+                "attempt_timeout_secs": 10,
+                "max_wait_secs": 20,
+            }
+        },
+        accounts=1,
+        regions=1,
+    )
+    rate = BL1_OFFERED * BL1_RPM / 60 / BL1_PROCESSES  # per process
+    async with Gate(
+        doc,
+        scenario,
+        LLMQ_EXECUTION_MODE="local",
+        LLMQ_LOCAL_PROCESS_COUNT=str(BL1_PROCESSES),
+    ) as gate:
+        specs = [
+            {"op": "converse", "model": "chat", "calls": round(rate * secs), "rate": rate,
+             "tag": f"bl1-{k}", "priority_every": 0}
+            for k in range(BL1_PROCESSES)
+        ]  # fmt: skip
+        reports = await _local_pods(gate.env, specs)
+        provider = (await asyncio.to_thread(gate.fake.stats)).get(key) or {}
+    calls = [r for report in reports for r in report["results"]]
+    kinds = collections.Counter(r.get("kind", "ok") for r in calls)
+    bad = {k: n for k, n in kinds.items() if k not in ("ok", "rate_limited")}
+    late = [r["secs"] for r in calls if r["secs"] > BL1_TIMEOUT_SECS + 5 + 1]
+    by_minute = {int(m): int(n) for m, n in (provider.get("by_minute") or {}).items()}
+    worst = max(by_minute.values(), default=0)
+    return verdict(
+        "BL1",
+        {
+            f"provider: never over {BL1_RPM} in a minute (+2)": worst <= BL1_RPM + 2,
+            "every call answered or rate_limited": not bad,
+            "no answer after its deadline": not late,
+            "calls were served": kinds["ok"] > 0,
+        },
+        [
+            f"{len(calls)} calls from {BL1_PROCESSES} local-mode processes over {secs:.0f}s "
+            f"({BL1_OFFERED:.0%} of rpm {BL1_RPM}); outcomes {dict(kinds)}",
+            f"provider calls per wall-clock minute {sorted(by_minute.items())}; throttled "
+            f"{provider.get('throttled', 0)}; slowest answer "
+            f"{max((r['secs'] for r in calls), default=0):.1f}s",
+        ],
+    )
+
+
+def _sha(prefix: str, body: str) -> str:
+    """The EVALSHA id of one request script under `prefix` (requests.py registers it so)."""
+    import hashlib
+
+    from llm_queue.engine.expiry import prelude
+
+    return hashlib.sha1((prelude(prefix) + body).encode()).hexdigest()  # Redis' script id
+
+
+async def _index_cost(index: bool, calls: int) -> tuple[float, dict[str, float], list[str]]:
+    """B19's burst with the request index on or off: scripts per call, usec per script call.
+
+    Server times come from the store's slow log at a 0 us threshold (raised for the run, then
+    put back): every EVALSHA with its duration, matched to REGISTER_SEND / SETTLE_DONE by sha.
+    """
+    from llm_queue.engine.requests import REGISTER_SEND, SETTLE_DONE
+
+    doc = registry({"chat": {"rpm": 1_000_000, "worker_slots": 100}}, accounts=1, regions=1)
+    async with Gate(doc, LLMQ_REQUEST_INDEX_ENABLED="true" if index else "false") as gate:
+        await gate.workers(4)
+        queues = await gate.callers(2)
+        warm = Run()
+        await paced(20, 1, lambda i: warm.call(queues[i % 2], "chat", chat()))  # scripts loaded
+        client = gate.store.client
+        keep = {k: client.config_get(k)[k] for k in ("slowlog-log-slower-than", "slowlog-max-len")}
+        run = Run()
+        try:
+            client.config_set("slowlog-max-len", 1_000_000)
+            client.config_set("slowlog-log-slower-than", 0)
+            client.slowlog_reset()
+            # Idle polling (and anything else on the shared store) subtracted, as B22 does:
+            # 400 calls in 2 s moved 4.45 -> 5.07 scripts a call between two identical runs.
+            idle_t0, idle0 = time.monotonic(), gate.store.script_calls()
+            await asyncio.sleep(3)
+            idle_rate = (gate.store.script_calls() - idle0) / (time.monotonic() - idle_t0)
+            t0, before = time.monotonic(), gate.store.script_calls()
+            await paced(200, calls / 200, lambda i: run.call(queues[i % 2], "chat", chat()))
+            await asyncio.sleep(2)
+            secs = time.monotonic() - t0
+            scripts = gate.store.script_calls() - before - idle_rate * secs
+            log = client.slowlog_get(1_000_000)
+        finally:
+            for name, value in keep.items():
+                client.config_set(name, value)
+            client.slowlog_reset()
+        names = {
+            _sha(gate.prefix, REGISTER_SEND): "REGISTER_SEND",
+            _sha(gate.prefix, SETTLE_DONE): "SETTLE_DONE",
+        }
+    durations: dict[str, list[int]] = collections.defaultdict(list)
+    for entry in log:
+        parts = bytes(entry["command"]).split()
+        if len(parts) > 1 and parts[0].upper() == b"EVALSHA" and parts[1].decode() in names:
+            durations[names[parts[1].decode()]].append(int(entry["duration"]))
+    # The median: on Docker Desktop the mean of one script moved by 200-300 us run to run.
+    usec = {name: float(statistics.median(v)) for name, v in durations.items()}
+    failed = [r.kind for r in run.results if not r.ok]
+    return scripts / max(1, len(run.results)), usec, failed
+
+
+async def gt1() -> bool:
+    """Request index cost (0.2.0 design G-T1): B19's burst with the index off, then on.
+
+    Pass: store scripts per call unchanged (the index rides in existing scripts) and the store
+    time of REGISTER_SEND + SETTLE_DONE (median usec per script call) within +50 us of the
+    index-off run. `--short`: 400 calls a side instead of 2,000.
+    """
+    calls = 400 if SHORT else 2000
+    off_scripts, off_usec, off_failed = await _index_cost(False, calls)
+    on_scripts, on_usec, on_failed = await _index_cost(True, calls)
+    pair = ("REGISTER_SEND", "SETTLE_DONE")
+    off_sum = sum(off_usec.get(n, math.nan) for n in pair)
+    on_sum = sum(on_usec.get(n, math.nan) for n in pair)
+    return verdict(
+        "G-T1",
+        {
+            "every call served (both runs)": not off_failed and not on_failed,
+            "both scripts seen in the slow log (both runs)": all(
+                n in u for n in pair for u in (off_usec, on_usec)
+            ),
+            # B19 prints one decimal (11.6): a tenth of a script of noise from idle polling.
+            "store scripts per call unchanged (+0.1)": on_scripts <= off_scripts + 0.1,
+            "REGISTER_SEND + SETTLE_DONE within +50 us of the index off": on_sum <= off_sum + 50,
+        },
+        [
+            f"{calls} calls a run; failures off {off_failed[:3] or 0}, on {on_failed[:3] or 0}",
+            f"store scripts per call: off {off_scripts:.2f}, on {on_scripts:.2f}",
+            "median usec per script call: off "
+            + ", ".join(f"{k} {v:.0f}" for k, v in sorted(off_usec.items()))
+            + "; on "
+            + ", ".join(f"{k} {v:.0f}" for k, v in sorted(on_usec.items()))
+            + f"; sum off {off_sum:.0f}, on {on_sum:.0f} (+{on_sum - off_sum:.0f})",
+        ],
+    )
+
+
+GT2_TENANTS = 20
+
+
+async def _timed(fn: Callable[[], Awaitable[Any]], times: int = 1) -> tuple[float, Any]:
+    """Median milliseconds of `times` runs of `fn`, and its last result."""
+    spent, out = [], None
+    for _ in range(times):
+        t0 = time.monotonic()
+        out = await fn()
+        spent.append((time.monotonic() - t0) * 1000)
+    return statistics.median(spent), out
+
+
+async def gt2() -> bool:
+    """Admin latency at scale (0.2.0 design G-T2): 10,000 waiting calls of 20 tenants.
+
+    No worker runs, so every call waits in its queue. Pass: `list` 100 rows <= 20 ms, `count`
+    of one tenant <= 100 ms, reprioritize 1,000 <= 2 s, cancel all 10,000 <= 3 s (local stack;
+    a machine note as B91), and every cancelled caller gets `cancelled`. `--short`: 1,000
+    waiting, reprioritize 100 (same marks).
+    """
+    waiting = 1_000 if SHORT else 10_000
+    moves = waiting // 10
+    doc = registry(
+        {"chat": {"rpm": 1_000_000, "timeout_secs": 300, "max_wait_secs": 300}},
+        accounts=1,
+        regions=1,
+    )
+    async with Gate(doc) as gate:
+        queues = await gate.callers(2)
+        llmq = queues[0]
+        engine = llmq._engine
+        assert hasattr(engine, "requests_admin"), "G-T2 needs queue mode"
+        admin = engine.requests_admin
+        outcomes: collections.Counter[str] = collections.Counter()
+
+        async def one(i: int) -> None:
+            try:
+                await queues[i % 2].converse(
+                    "chat", chat(f"g-t2 {i}"), tenant_id=f"tenant-{i % GT2_TENANTS}"
+                )
+                outcomes["ok"] += 1
+            except CallFailed as exc:
+                outcomes[exc.kind] += 1
+
+        tasks = [asyncio.create_task(one(i)) for i in range(waiting)]
+        indexed = 0
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 120:
+            indexed = (await admin.count("chat")).total
+            if indexed >= waiting:
+                break
+            await asyncio.sleep(0.5)
+        fill_secs = time.monotonic() - t0
+        list_ms, page = await _timed(lambda: admin.list("chat", limit=100), 5)
+        count_ms, counts = await _timed(lambda: admin.count("chat", tenant="tenant-0"), 3)
+        move_ms, moved = await _timed(
+            lambda: admin.reprioritize(
+                "chat", priority=True, limit=moves, actor="g-t2", dry_run=False
+            )
+        )
+        cancel_ms, cancelled = await _timed(
+            lambda: admin.cancel("chat", state="waiting", actor="g-t2", dry_run=False)
+        )
+        _, pending = await asyncio.wait(tasks, timeout=30)
+        for task in pending:
+            task.cancel()
+    return verdict(
+        "G-T2",
+        {
+            f"{waiting} calls indexed as waiting": indexed >= waiting,
+            "list 100 rows <= 20 ms": len(page.items) == 100 and list_ms <= 20,
+            "count of one tenant <= 100 ms": count_ms <= 100,
+            f"reprioritize {moves} <= 2 s": moved.changed == moves and move_ms <= 2000,
+            f"cancel {waiting} <= 3 s": cancelled.changed == waiting and cancel_ms <= 3000,
+            "every caller answered cancelled within 30 s": not pending
+            and outcomes["cancelled"] == waiting,
+        },
+        [
+            f"{waiting} waiting of {GT2_TENANTS} tenants, indexed in {fill_secs:.1f}s "
+            f"(index total {indexed})",
+            f"list 100: {list_ms:.1f} ms; count one tenant: {count_ms:.1f} ms "
+            f"({counts.total} calls)",
+            f"reprioritize: {moved.changed}/{moves} moved in {move_ms:.0f} ms "
+            f"(skipped {moved.skipped or 0})",
+            f"cancel: {cancelled.changed}/{waiting} in {cancel_ms:.0f} ms "
+            f"(skipped {cancelled.skipped or 0}); callers {dict(outcomes)}, "
+            f"{len(pending)} unanswered",
+        ],
+    )
+
+
 GATES: dict[str, Callable[[], Coroutine[Any, Any, bool]]] = {
     "B17": b17,
     "B19": b19,
@@ -987,10 +1360,15 @@ GATES: dict[str, Callable[[], Coroutine[Any, Any, bool]]] = {
     "B95": b95,
     "B96": b96,
     "B97": b97,
+    "F2": f2,
+    "BL1": bl1,
+    "G-T1": gt1,
+    "G-T2": gt2,
 }
 
 
-SLOW_GATES = frozenset({"B17", "B91", "B92"})  # left out by --quick
+SLOW_GATES = frozenset({"B17", "B91", "B92", "BL1", "G-T2"})  # left out by --quick
+SHORT = "--short" in sys.argv  # BL1 / G-T1 / G-T2 scaled down to prove the harness
 
 
 def main() -> int:
@@ -1004,6 +1382,9 @@ def main() -> int:
     parser.add_argument("--list", action="store_true", help="list the gates and exit")
     parser.add_argument("--seed", type=int, help="replay the random choices of a run")
     parser.add_argument("--record-baseline", action="store_true", help="kept for check.py")
+    parser.add_argument(
+        "--short", action="store_true", help="BL1, G-T1, G-T2 scaled down (a harness smoke)"
+    )
     # FT-27: argparse, so `--quick B19` works and a typo is an error, not a KeyError.
     opts = parser.parse_args()
     seed = opts.seed if opts.seed is not None else random.randrange(2**31)

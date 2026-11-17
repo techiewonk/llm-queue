@@ -70,7 +70,7 @@ class Op:
     `method`: dotted path on `AdminServices` (None for the process routes served by
     `LLMQueue` itself: health, metrics). `missing`: why a surface is absent, by surface name
     (`python`, `cli`, `http`). `store`: the CLI needs the environment's settings and stores
-    (False only for `registry schema`).
+    (False only for `registry schema`). `guard_write`: a read that needs the write guard.
     """
 
     id: str
@@ -87,13 +87,14 @@ class Op:
     missing: Mapping[str, str] = field(default_factory=dict)
     mount: Mount = "always"
     store: bool = True
+    guard_write: bool = False
 
     @property
     def guard(self) -> Guard:
-        """`open` (probes, metrics), `write` for writes, else `read`."""
+        """`open` (probes, metrics), `write` for writes (and `guard_write`), else `read`."""
         if self.resource in ("health", "metrics"):
             return "open"
-        return "write" if self.writes else "read"
+        return "write" if self.writes or self.guard_write else "read"
 
 
 def _w(id: str, resource: str, verb: Verb, summary: str, audit: str, **kw: Any) -> Op:
@@ -153,6 +154,9 @@ OPERATIONS: tuple[Op, ...] = (
     _r("status.get", "status",
        "Live status of every model and job, or of one model (and one tenant on it)",
        params=(_OPT_MODEL, *_TENANT_PICK), http=("GET", "/status"), cli=("status",)),
+    _r("status.health", "status",
+       "Health summary per model and overall: healthy, warning or critical, and why",
+       params=(_OPT_MODEL,), http=("GET", "/status/health"), cli=("health",)),
     # -- registry -------------------------------------------------------------------------
     _r("registry.get", "registry", "The live registry (secrets hidden) and its live edits",
        params=(_OPT_MODEL,), http=("GET", "/registry"), cli=("registry", "get")),
@@ -247,9 +251,12 @@ OPERATIONS: tuple[Op, ...] = (
     _r("tenants.list", "tenants",
        "Tenants with calls in flight on a model: hash, calls, next deadline",
        params=(_MODEL,), http=("GET", "/tenants"), cli=("tenants", "list")),
-    _r("tenants.hash", "tenants", "The keyed hash of a tenant name (needs only the salt)",
+    # Write-guarded (review B-22): with the hashes the read routes show, a read token could
+    # confirm which tenant a hash is. Nothing is written, so no dry run and no audit.
+    Op("tenants.hash", "tenants", "read", "tenants.hash",
+       "The keyed hash of a tenant name (needs only the salt)",
        params=(Param("tenant", str, cli="arg"),), http=("POST", "/tenants/hash"),
-       cli=("tenants", "hash")),
+       cli=("tenants", "hash"), guard_write=True),
     # -- queues, dead letters, jobs -------------------------------------------------------
     _r("queues.list", "queues", "Every model and job queue: depth, held, dead letters",
        http=("GET", "/queues"), cli=("queues", "list")),

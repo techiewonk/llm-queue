@@ -29,6 +29,7 @@ class _Engine:
         self.registry = SimpleNamespace(current=None)
         self.queues = None
         self.metrics = None
+        self.hash_id = str  # the job runner hashes a job's ids with it
         self.settings = SimpleNamespace(queue_prefix="", drain_secs=5)
         self.stream_closed = False
         self.fail_start = False
@@ -39,6 +40,9 @@ class _Engine:
             await self.gate.wait()
         if self.fail_start:
             raise RuntimeError("start failed")
+
+    def pause_receiving(self) -> None:
+        return None  # `stop()` pauses first (A-2)
 
     async def stop(self, **kw: Any) -> None:
         self.steps.append("stop")

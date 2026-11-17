@@ -17,8 +17,9 @@ from engine_testkit import CHAT, Make, registry
 
 from llm_queue.engine.cli import amain
 from llm_queue.engine.errors import CallFailed
-from llm_queue.engine.purge import PurgeService, PurgeSettings, keyed_hash
+from llm_queue.engine.purge import PurgeService, PurgeSettings
 from llm_queue.errors import AdminRefused
+from llm_queue.ids import keyed_hash
 from llm_queue.registry.store import RegistryStore
 
 pytestmark = pytest.mark.integration

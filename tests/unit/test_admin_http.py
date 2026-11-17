@@ -75,6 +75,8 @@ def test_read_token_reads_only_and_admin_token_does_both() -> None:
     )
     http.post("/registry", json=body, headers={TOKEN: "w"})
     assert admin.calls[-1][1]["actor"] == "token:unknown"  # D5: no claimed name
+    http.post("/registry", json=body, headers={TOKEN: "w", "X-LLMQ-Actor": "b" * 500})
+    assert len(admin.calls[-1][1]["actor"]) == 128  # B-06: the one limit, `token:` included
 
 
 def test_token_is_read_per_request_and_an_empty_one_refuses() -> None:
@@ -152,6 +154,27 @@ def test_path_and_query_arguments() -> None:
     assert http.get("/requests", params={"model": "m", "state": "odd"}).status_code == 400
     http.post("/requests/cancel", json={"request_ids": ["a", "b"]}, headers=ADMIN)
     assert admin.calls[-1][1]["request_ids"] == ["a", "b"]
+
+
+@pytest.mark.parametrize("path", ["/status", "/requests", "/requests/count"])
+def test_b05_get_routes_take_the_tenant_hash_only(path: str) -> None:
+    """B-05: a name in a query string reached proxy and access logs nobody can redact."""
+    admin = FakeAdmin()
+    http = _writes(admin)
+    refused = http.get(path, params={"model": "m", "tenant": "acme"})
+    assert refused.status_code == 400
+    assert "tenant_hash" in refused.json()["error"]
+    assert http.get(path, params={"model": "m", "tenant_hash": "-"}).status_code == 200
+    assert admin.calls[-1][1]["tenant_hash"] == "-"
+
+
+def test_b22_tenant_hash_needs_the_write_guard() -> None:
+    """B-22: with the hashes reads show, a read token could confirm which tenant a hash is."""
+    http = client(FakeAdmin(), admin_token="w", read_token="r")
+    assert http.post("/tenants/hash", json={"tenant": "a"}, headers={TOKEN: "r"}).status_code == 403
+    assert http.post("/tenants/hash", json={"tenant": "a"}, headers={TOKEN: "w"}).status_code == 200
+    reads_only = client(FakeAdmin(), read_token="r")
+    assert reads_only.post("/tenants/hash", json={"tenant": "a"}).status_code == 404  # unmounted
 
 
 def test_fo15_bounds_on_ids_and_edits() -> None:
@@ -256,9 +279,9 @@ def test_drain_routes_are_writes_and_audited_with_the_actor() -> None:
 
 def test_fo16_redaction_shares_the_store_set_and_walks_lists() -> None:
     """FO-16: two copies of the secret-field set; a new field had to be added in both."""
-    from llm_queue.registry.store import _SECRET_FIELDS, audit_diff
+    from llm_queue.registry.store import SECRET_FIELDS, audit_diff
 
-    doc = {"accounts": [dict.fromkeys(_SECRET_FIELDS, "secret")]}
+    doc = {"accounts": [dict.fromkeys(SECRET_FIELDS, "secret")]}
     assert all(v == "[redacted]" for v in redacted(doc)["accounts"][0].values())
     (entry,) = audit_diff({"a": []}, {"a": [{"api_key_ref": "LLMQ_ACCOUNT_K"}]})
     assert entry["after"] == [{"api_key_ref": "[redacted]"}]

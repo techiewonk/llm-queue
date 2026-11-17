@@ -117,15 +117,16 @@ async def turn(...):
 
 `llmq.ready` is a sync, cheap check: started, registry loaded, not draining, and (strict mode)
 no store whose eviction policy may drop queue keys. Unlike `health()["ready"]` it is also false
-before `start()` and after `stop()`. `llm_queue.queue_ready(enabled, llmq=None)` folds it into
-an app's own probe: True when `enabled` is False (the app runs its direct path), else the
-queue's `ready` (default: the started default queue; False when none is started).
+before `start()` and after `stop()`. `llm_queue.queue_ready(llmq=None)` folds it into an app's
+own probe: the queue's `ready` (default: the started default queue; False when none is
+started). With the library off (`LLMQ_ENABLED=false`) the queue is ready unless draining, so
+the app needs no flag of its own.
 
 ```python
 from llm_queue import queue_ready
 
 @app.get("/ready")
 async def ready():
-    ok = queue_ready(settings.llm_queue_enabled) and db.ready
+    ok = queue_ready() and db.ready
     return Response(status_code=200 if ok else 503)
 ```

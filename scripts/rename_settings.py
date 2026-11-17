@@ -124,6 +124,8 @@ PY_RULES: tuple[tuple[tuple[str, ...], str, str], ...] = (
     (("src/llm_queue/engine/admin/process.py",), r"\bmode=s\.role\b", "role=s.role"),
     (ADMIN, r'"worker": engine\.worker_id', '"instance": engine.worker_id'),
     (ADMIN, r'"mode": settings\.role', '"role": settings.role'),
+    # describe()'s tenant key (W5a, review B-04) follows `tenant_default`.
+    ((*CODE, "docs/", "CHANGELOG.md"), r"\bdefault_tenant_hash\b", "tenant_default_hash"),
 )
 # What --check still reports as an old Python name once the rules ran.
 PY_LEFT = re.compile(r"\b(?:settings|s)\.(?:mode|worker_id|queue_wait_ms)\b")
@@ -135,7 +137,8 @@ def field_rules(pending: dict[str, str]) -> list[tuple[tuple[str, ...], str, str
     for old, new in pending.items():
         field, target = old[len("LLMQ_") :].lower(), new[len("LLMQ_") :].lower()
         if field not in TARGETED_FIELDS:
-            rules.append(((*CODE, "docs/", "README.md"), rf"(?<!\w){field}(?!\w)", target))
+            where = (*CODE, "docs/", "README.md", "CHANGELOG.md")  # CHANGELOG: [Unreleased] only
+            rules.append((where, rf"(?<!\w){field}(?!\w)", target))
     return rules
 
 

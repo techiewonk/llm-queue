@@ -74,7 +74,13 @@ def test_from_env_worker_id_tenant_admin_and_describe(monkeypatch: pytest.Monkey
     described = llmq.describe()
     text = repr(described)
     assert described["store"] == "redis://localhost:6379"
-    assert described["default_tenant"] == "acme"
+    # The hash only (review B-04): the name with LLMQ_TENANT_NAMES_ENABLED alone.
+    assert described["default_tenant_hash"] == llmq._engine.hash_id("acme")
+    assert "acme" not in text
+    named = LLMQueue.from_env(
+        {**DEV, "LLMQ_DEFAULT_TENANT": "acme", "LLMQ_TENANT_NAMES_ENABLED": "true"}
+    )
+    assert named.describe()["default_tenant"] == "acme"
     assert "rotated" not in text
     assert "s3cret" not in text
     assert "r3ad" not in text

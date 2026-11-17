@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import orjson
 from redis.exceptions import ConnectionError as StoreConnectionError
@@ -65,9 +66,12 @@ local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 # places differ per script).
 # Returns new | attached | takeover | done | expired | conflict | cancelled. Only a success is
 # replayed (owner decision Q2): an id whose last run ended failed, expired or cancelled runs
-# again (`new`), its old result, status and cancel mark dropped in the same script.
+# again (`new`), its old result, status and cancel mark dropped in the same script. `nonce`:
+# one registration's random token, kept with a `new` / `takeover` (`rn`, `ro`); the same nonce
+# again is redis-py replaying the script after a lost reply and gets the first outcome (A-5:
+# it answered `attached` to the caller's own record, which then sent nothing for ~6 s).
 _REGISTER_FN = """
-local function register(caller_ttl, lease_ms)
+local function register(caller_ttl, lease_ms, nonce)
 local job = redis.call('HGETALL', KEYS[1])
 local clock = redis.call('TIME')
 local now = tonumber(clock[1])
@@ -85,7 +89,7 @@ local function keep_callers()
 end
 local function create()
   redis.call('HSET', KEYS[1], 'state', 'queued', 'user', ARGV[1], 'params', ARGV[2],
-    'caller', ARGV[3], 'confirmed', '0', 'created', now)
+    'caller', ARGV[3], 'confirmed', '0', 'created', now, 'rn', nonce or '', 'ro', 'new')
   if ARGV[9] == '1' then redis.call('HSET', KEYS[1], 'app', '1') end
   X.expire(KEYS[1], tonumber(ARGV[4]) * 1000)
   redis.call('SADD', KEYS[2], ARGV[3])
@@ -104,6 +108,7 @@ if #job == 0 then
 end
 local fields = {}
 for i = 1, #job, 2 do fields[job[i]] = job[i + 1] end
+if nonce and nonce ~= '' and fields['rn'] == nonce then return fields['ro'] end
 if fields['params'] == nil then
   -- A record a worker's claim made (its caller's record was gone): the call is running;
   -- attach to it rather than call it a conflict.
@@ -130,7 +135,8 @@ end
 if redis.call('EXISTS', cancel_key) == 1 then return 'cancelled' end
 -- An unconfirmed record older than the grace: its send failed or its sender died; take over.
 if fields['confirmed'] == '0' and now - tonumber(fields['created'] or '0') >= tonumber(ARGV[8]) then
-  redis.call('HSET', KEYS[1], 'caller', ARGV[3], 'created', now)
+  redis.call('HSET', KEYS[1], 'caller', ARGV[3], 'created', now, 'rn', nonce or '',
+    'ro', 'takeover')
   redis.call('SADD', KEYS[2], ARGV[3])
   keep_callers()
   return 'takeover'
@@ -145,7 +151,7 @@ if fields['direct'] == '1' and fields['caller'] ~= ARGV[3] and tonumber(lease_ms
     local now_ms = now * 1000 + math.floor(tonumber(clock[2]) / 1000)
     if state ~= 'running' or now_ms - tonumber(fields['hb'] or '0') >= tonumber(lease_ms) then
       redis.call('HSET', KEYS[1], 'caller', ARGV[3], 'created', now, 'confirmed', '0',
-        'state', 'queued')
+        'state', 'queued', 'rn', nonce or '', 'ro', 'takeover')
       redis.call('HDEL', KEYS[1], 'direct', 'owner', 'hb')
       redis.call('SADD', KEYS[2], ARGV[3])
       keep_callers()
@@ -159,7 +165,7 @@ return 'attached'
 end
 """
 
-REGISTER = _REGISTER_FN + "return register(ARGV[10], ARGV[11])\n"
+REGISTER = _REGISTER_FN + "return register(ARGV[10], ARGV[11], ARGV[12])\n"
 
 # The request index per model and tenant (0.2.0 T1): `P:{m:ALIAS}:tq:H` (request id -> the
 # call's deadline, store ms) and `P:{m:ALIAS}:tq` (tenant hash -> its latest deadline). Written
@@ -172,15 +178,26 @@ _INDEX_FN = """
 local function index_add(job, ix, ixs, rid, h, keep_ms, mid, cls, names, name)
   local now = X.now()
   local dl = now + keep_ms
+  -- A takeover by a caller of another tenant: the old tenant's entry goes (RQ-9), or the call
+  -- was listed twice and the old tenant's cancel reached it.
+  local old = redis.call('HGET', job, 'ix')
+  if old and old ~= ix then redis.call('ZREM', old, rid) end
   redis.call('HSET', job, 'ix', ix, 'ixh', h, 'mid', mid, 'q', cls)
   redis.call('ZADD', ix, dl, rid)
   redis.call('ZREMRANGEBYSCORE', ix, '-inf', '(' .. now)
   redis.call('ZADD', ixs, 'GT', dl, h)
+  local has_names = names and names ~= ''
+  if has_names then
+    -- Tenants whose last call lapsed leave the names hash with the index (RQ-14): it only
+    -- grew while traffic went on.
+    local lapsed = redis.call('ZRANGEBYSCORE', ixs, '-inf', '(' .. now)
+    if #lapsed > 0 then redis.call('HDEL', names, unpack(lapsed)) end
+  end
   redis.call('ZREMRANGEBYSCORE', ixs, '-inf', '(' .. now)
   local ms = keep_ms + 60000
   if X.pttl(ix) < ms then X.expire(ix, ms) end
   if X.pttl(ixs) < ms then X.expire(ixs, ms) end
-  if names and names ~= '' and name and name ~= '' then
+  if has_names and name and name ~= '' then
     redis.call('HSET', names, h, name)
     if X.pttl(names) < ms then X.expire(names, ms) end
   end
@@ -193,18 +210,23 @@ end
 
 # KEYS: REGISTER's, then the queue's keys (stream first, `_PARTS` order), then (index on) the
 # request index `tq:H`, the tenant index `tq` and (names on) `tqn`. ARGV: REGISTER's, then body,
-# max waiting, retention ms, doorbell key, keep secs, caller ttl, lease ms, then (index on) the
-# tenant hash, the index keep ms, the class (`p` / `n`) and the tenant name ('' for none).
-# Register, send a new call and confirm it in one round trip when the queues share the state
-# store (three before). A full queue drops the record it just made and indexes nothing. Reply:
-# {outcome}, {outcome, message id} or {'full', depth}.
+# max waiting, retention ms, doorbell key, keep secs, caller ttl, lease ms, the registration
+# nonce, then (index on) the tenant hash, the index keep ms, the class (`p` / `n`) and the
+# tenant name ('' for none). Register, send a new call and confirm it in one round trip when
+# the queues share the state store (three before). A full queue drops the record it just made
+# and indexes nothing. A replay (same nonce) answers the first outcome and its message id
+# (`rm`), sending nothing again. Reply: {outcome}, {outcome, message id} or {'full', depth}.
 REGISTER_SEND = (
     _NOW_MS
     + SEND_FN
     + _REGISTER_FN
     + _INDEX_FN
     + """
-local outcome = register(ARGV[15], ARGV[16])
+if ARGV[17] ~= '' and redis.call('HGET', KEYS[1], 'rn') == ARGV[17] then
+  local first = redis.call('HMGET', KEYS[1], 'ro', 'rm')
+  if first[2] then return {first[1], first[2]} end
+end
+local outcome = register(ARGV[15], ARGV[16], ARGV[17])
 if outcome ~= 'new' and outcome ~= 'takeover' then return {outcome} end
 local sent = send(KEYS[5], ARGV[10], tonumber(ARGV[11]), tonumber(ARGV[12]), ARGV[13])
 if sent[1] == 'full' then
@@ -216,13 +238,13 @@ if sent[1] == 'full' then
   end
   return sent
 end
-redis.call('HSET', KEYS[1], 'confirmed', '1')
+redis.call('HSET', KEYS[1], 'confirmed', '1', 'rm', sent[2])
 X.expire(KEYS[1], tonumber(ARGV[14]) * 1000)
 X.expire(KEYS[2], tonumber(ARGV[14]) * 1000)
 if #KEYS >= 13 then
   local rid = string.match(KEYS[1], ':{r:(.*)}:job$')
-  index_add(KEYS[1], KEYS[12], KEYS[13], rid, ARGV[17], tonumber(ARGV[18]), sent[2], ARGV[19],
-    KEYS[14], ARGV[20])
+  index_add(KEYS[1], KEYS[12], KEYS[13], rid, ARGV[18], tonumber(ARGV[19]), sent[2], ARGV[20],
+    KEYS[14], ARGV[21])
 end
 return {outcome, sent[2]}
 """
@@ -280,29 +302,48 @@ local function set_status(key, state, ttl, from)
 end
 """
 
+# The final write of a call (A-1, owner Q-1): a `done` claim is never replaced (a late reply
+# after a success writes nothing), the result is set only if absent, and the claim's state
+# moves only with a result written or from a state not yet final; a late failure or cancel
+# once set `cancelled` over a stored success and the next registration ran it again. Returns
+# 1 written, 2 this same body was already stored (a replay of this write), else 0.
+_FINAL_FN = """
+local function final_write(res, job, body, ttl_ms, state, keep_ms)
+  local current = redis.call('HGET', job, 'state')
+  local written = false
+  if current ~= 'done' then written = X.set(res, body, ttl_ms, true) end
+  if redis.call('EXISTS', job) == 1 then
+    local final = current == 'done' or current == 'failed' or current == 'expired'
+      or current == 'cancelled'
+    if written or not final then redis.call('HSET', job, 'state', state) end
+    X.expire(job, keep_ms)
+  end
+  if written then return 1 end
+  if redis.call('GET', res) == body then return 2 end
+  return 0
+end
+"""
+
 # KEYS: result, job, callers, status. ARGV: reply JSON, result ttl, final state, keep secs,
 # channel prefix (`<prefix>:done:`), request id, then '1' to write the status too (its TTL and
 # field / value pairs follow). Writes the result only if none exists, marks the claim final,
 # writes the final status and wakes every caller waiting on this id (one round trip; the
-# status was a second). The call leaves the request index (T1). Reply: 1 written, 0 a result
-# already existed.
+# status was a second). The call leaves the request index (T1). Reply: 1 written, 2 this body
+# was already stored (a replayed write), 0 another result already existed.
 RESULT_PUT = (
     _STATUS_FN
     + _INDEX_FN
+    + _FINAL_FN
     + """
-local written = X.set(KEYS[1], ARGV[1], tonumber(ARGV[2]) * 1000, true)
-if redis.call('EXISTS', KEYS[2]) == 1 then
-  index_drop(KEYS[2], ARGV[6])
-  redis.call('HSET', KEYS[2], 'state', ARGV[3])
-  X.expire(KEYS[2], tonumber(ARGV[4]) * 1000)
-end
+index_drop(KEYS[2], ARGV[6])
+local written = final_write(KEYS[1], KEYS[2], ARGV[1], tonumber(ARGV[2]) * 1000, ARGV[3],
+  tonumber(ARGV[4]) * 1000)
 for _, caller in ipairs(redis.call('SMEMBERS', KEYS[3])) do
   redis.call('PUBLISH', ARGV[5] .. caller, ARGV[6])
 end
 X.expire(KEYS[3], tonumber(ARGV[4]) * 1000)  -- (S9) no-op when the set is gone
 if ARGV[7] == '1' then set_status(KEYS[4], ARGV[3], tonumber(ARGV[8]), 9) end
-if written then return 1 end
-return 0
+return written
 """
 )
 
@@ -314,19 +355,18 @@ return 0
 # prefix, request id, status ttl, message id, generation, then status field / value pairs.
 # FINISH runs under `pcall`: a failing settle never undoes the stored result or the ack (they
 # were separate scripts, and a refused FINISH only logged). Reply: {written, acked, settled},
-# settled -1 when FINISH raised (its error is the 4th element).
+# settled -1 when FINISH raised (its error is the 4th element). written is `final_write`'s
+# answer: 2 when this same body was stored already, a replay of this script (A-7).
 SETTLE_DONE = (
     _COMMON
     + _SETTLE
     + _STATUS_FN
     + _INDEX_FN
+    + _FINAL_FN
     + """
-local written = X.set(KEYS[1], ARGV[4], tonumber(ARGV[5]) * 1000, true)
-if redis.call('EXISTS', KEYS[2]) == 1 then
-  index_drop(KEYS[2], ARGV[9])
-  redis.call('HSET', KEYS[2], 'state', ARGV[6])
-  X.expire(KEYS[2], tonumber(ARGV[7]) * 1000)
-end
+index_drop(KEYS[2], ARGV[9])
+local written = final_write(KEYS[1], KEYS[2], ARGV[4], tonumber(ARGV[5]) * 1000, ARGV[6],
+  tonumber(ARGV[7]) * 1000)
 for _, caller in ipairs(redis.call('SMEMBERS', KEYS[3])) do
   redis.call('PUBLISH', ARGV[8] .. caller, ARGV[9])
 end
@@ -343,8 +383,8 @@ if redis.call('HGET', KEYS[7], ARGV[11]) == ARGV[12] then
 end
 local ok, settled = pcall(settle, req.alias, req.owner, req.request_id, num(req.refund_r, 0),
   num(req.refund_t, 0), true, req.outcome, num(req.latency_ms, -1), num(req.retry_after_ms, 0))
-if not ok then return {written and 1 or 0, acked, -1, tostring(settled)} end
-return {written and 1 or 0, acked, settled}
+if not ok then return {written, acked, -1, tostring(settled)} end
+return {written, acked, settled}
 """
 )
 
@@ -395,9 +435,9 @@ RESULT_DROP = _DROP_READ + "return 1\n"
 # read-then-write never cancelled a shared id, or cancelled a caller that attached in between).
 # A call already final is left alone, so a later run of its id (Q2) is not cancelled by a stale
 # mark. An attach after the mark waits on the same call and gets its `cancelled` reply. Reply:
-# {marked, skipped because they started (only state `queued`)}.
+# {the ids marked, how many were skipped because they started (only state `queued`)}.
 CANCEL = """
-local n, started = 0, 0
+local marked, started = {}, 0
 for i = 1, #KEYS / 2 do
   local state = redis.call('HGET', KEYS[2 * i - 1], 'state')
   if state ~= 'done' and state ~= 'failed' and state ~= 'expired' and state ~= 'cancelled' then
@@ -406,11 +446,11 @@ for i = 1, #KEYS / 2 do
     else
       X.set(KEYS[2 * i], '1', tonumber(ARGV[1]) * 1000)
       redis.call('PUBLISH', ARGV[2], ARGV[3 + i])
-      n = n + 1
+      table.insert(marked, ARGV[3 + i])
     end
   end
 end
-return {n, started}
+return {marked, started}
 """
 
 # Extend a call's deadline (0.2.0 T2, owner D6). KEYS: job, callers, status. ARGV: the new
@@ -420,7 +460,9 @@ return {n, started}
 # and all three move here: the records (job `dl`, grown TTLs of job / callers / status and the
 # request index score), each worker holding the call (the notice on the cancel channel, every
 # worker reads it; a worker that receives it later reads `dl` before it expires the call) and
-# each waiting caller (the notice on its done channel: its timer is rescheduled). Only grows.
+# each waiting caller (the notice on its done channel: its timer is rescheduled). Only grows:
+# the current deadline is the later of `dl` and the first one (the index score less the caller
+# margin), so an extend shorter than the call's own timeout is `already` (RQ-4).
 # Reply: {'ok'} or {'final' | 'gone' | 'already' | 'past'}.
 EXTEND = """
 local state = redis.call('HGET', KEYS[1], 'state')
@@ -429,7 +471,14 @@ if state == 'done' or state == 'failed' or state == 'expired' or state == 'cance
   return {'final'}
 end
 local dl = tonumber(ARGV[1])
-if dl <= tonumber(redis.call('HGET', KEYS[1], 'dl') or '0') then return {'already'} end
+local current = tonumber(redis.call('HGET', KEYS[1], 'dl') or '0')
+local ix = redis.call('HGET', KEYS[1], 'ix')
+local h = redis.call('HGET', KEYS[1], 'ixh')
+if ix then
+  local first = tonumber(redis.call('ZSCORE', ix, ARGV[6]) or '')
+  if first then current = math.max(current, first - tonumber(ARGV[3])) end
+end
+if dl <= current then return {'already'} end
 local now = X.now()
 if dl <= now then return {'past'} end
 redis.call('HSET', KEYS[1], 'dl', ARGV[1])
@@ -437,8 +486,6 @@ local keep = dl - now + tonumber(ARGV[2])
 for i = 1, 3 do
   if redis.call('EXISTS', KEYS[i]) == 1 and X.pttl(KEYS[i]) < keep then X.expire(KEYS[i], keep) end
 end
-local ix = redis.call('HGET', KEYS[1], 'ix')
-local h = redis.call('HGET', KEYS[1], 'ixh')
 if ix and h then
   local score = dl + tonumber(ARGV[3])
   redis.call('ZADD', ix, 'XX', 'GT', score, ARGV[6])
@@ -481,6 +528,19 @@ class Registration:
 
     outcome: str
     message_id: str = ""  # `register_send`: the id of the message it sent ('' when none)
+
+
+class Settled(NamedTuple):
+    """What `put_result_settled` did: result written, message acked, grant settled (-1 raised).
+
+    `replayed`: the result held this very body already, so the script ran before (a replay
+    after a lost reply, A-7): its ack and settle happened then, not a second run.
+    """
+
+    written: bool
+    acked: bool
+    settled: int
+    replayed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -598,6 +658,7 @@ class RequestStore:
                 "1" if app_id else "0",
                 self.caller_ttl_secs,
                 self.lease_ms,
+                os.urandom(8).hex(),  # a replay of this script re-sends it: the first outcome
             ],
         )
         return Registration(_text(outcome))
@@ -650,6 +711,7 @@ class RequestStore:
                 int(keep_secs) + self.status_ttl_secs,
                 self.caller_ttl_secs,
                 self.lease_ms,
+                os.urandom(8).hex(),  # the registration nonce (A-5)
                 *index_args,
             ],
         )
@@ -718,11 +780,43 @@ class RequestStore:
                 self._unsent.pop(next(iter(self._unsent)))
             raise
         self._unsent.pop(reply.request_id, None)
-        if not written and data.startswith(MARKER):
-            # A result was already stored (a duplicate run): the object just uploaded would
-            # stay until the bucket rule removed it (R3JE-29).
+        if int(written) == 0 and data.startswith(MARKER):
+            # Another result was already stored (a duplicate run): the object just uploaded
+            # would stay until the bucket rule removed it (R3JE-29). A replay of this write
+            # (2) stored this very marker: its object stays.
             await self._delete_object(data[len(MARKER) :].decode())
-        return bool(written)
+        return int(written) != 0
+
+    async def put_results(
+        self, replies: Sequence[Reply], *, final_state: str, status: Mapping[str, Any]
+    ) -> int:
+        """`put_result` of many small replies in one pipelined round trip; how many written.
+
+        For final replies the store makes up itself (an admin cancel answering waiting calls):
+        one script per id, one round trip for all (a 50k cancel made 50k serial round trips).
+        """
+        if not replies:
+            return 0
+        async with self._client.pipeline(transaction=False) as pipe:
+            for reply in replies:
+                job, callers, status_key, result = self._req(reply.request_id)
+                await self._put(
+                    [result, job, callers, status_key],
+                    [
+                        reply.dumps(),
+                        self.result_ttl_secs,
+                        final_state,
+                        self.status_ttl_secs,
+                        f"{self.keys.prefix}:done:",
+                        reply.request_id,
+                        "1",
+                        self.status_ttl_secs,
+                        *_pairs(status),
+                    ],
+                    client=pipe,
+                )
+            written = await pipe.execute()
+        return sum(1 for w in written if w)
 
     async def put_result_settled(
         self,
@@ -734,13 +828,12 @@ class RequestStore:
         message_id: str,
         generation: int | str,
         finish: Sequence[Any],
-    ) -> tuple[bool, bool, int]:
+    ) -> Settled:
         """`put_result`, the message's ack and the grant's FINISH in one round trip (FL-22).
 
-        Only when the queue lives in this store. `finish` is `Admission.finish_args(...)`.
-        Safe to call again after a store error, as each part is (the result is set once, the
-        ack checks its receipt, FINISH its owner). Returns (result written, acked, settled);
-        settled is -1 when FINISH raised (logged; the result and the ack stand).
+        Only when the queue lives in this store. `finish` is `Admission.finish_args(...)`. Safe
+        to call again after a store error, as each part is (result set once, ack checks its
+        receipt, FINISH its owner); a replay that found this body stored says `replayed`.
         """
         job, callers, status_key, result = self._req(reply.request_id)
         data = await self._prepared(reply)
@@ -768,12 +861,12 @@ class RequestStore:
                 self._unsent.pop(next(iter(self._unsent)))
             raise
         self._unsent.pop(reply.request_id, None)
-        written, acked, settled = bool(out[0]), bool(out[1]), int(out[2])
+        written, acked, settled = int(out[0]), bool(out[1]), int(out[2])
         if settled < 0:
             logger.warning("finish_failed", request_id=reply.request_id, error=_text(out[3]))
-        if not written and data.startswith(MARKER):
+        if written == 0 and data.startswith(MARKER):
             await self._delete_object(data[len(MARKER) :].decode())
-        return written, acked, settled
+        return Settled(written == 1, acked, settled, written == 2)
 
     async def _delete_object(self, ref: str) -> None:
         """Delete an offloaded object no marker points to; a failure is only logged."""
@@ -959,15 +1052,29 @@ class RequestStore:
         only_state: str | None = None,
     ) -> tuple[int, int]:
         """`cancel`, returning (marked, skipped because they were no longer in `only_state`)."""
+        marked, started = await self.cancel_ids(
+            request_ids, ttl_secs=ttl_secs, channel=channel, only_state=only_state
+        )
+        return len(marked), started
+
+    async def cancel_ids(
+        self,
+        request_ids: Sequence[str],
+        *,
+        ttl_secs: int,
+        channel: str,
+        only_state: str | None = None,
+    ) -> tuple[list[str], int]:
+        """`cancel`, returning (the ids it marked, how many were no longer in `only_state`)."""
         if not request_ids:
-            return 0, 0
+            return [], 0
         keys = [
             k
             for rid in request_ids
             for k in (self.keys.request(rid, "job"), self.keys.request(rid, "cancel"))
         ]
         reply = await self._cancel(keys, [ttl_secs, channel, only_state or "", *request_ids])
-        return int(reply[0]), int(reply[1])
+        return [_text(rid) for rid in reply[0]], int(reply[1])
 
     async def extend(self, request_id: str, *, deadline_ms: int, margin_secs: float) -> str:
         """Move a call's deadline to `deadline_ms` (store ms) everywhere it lives (`EXTEND`).
