@@ -2033,6 +2033,7 @@ class Engine:
                     attempts=1,
                     tokens_in=result.usage.input_tokens,
                     tokens_out=result.usage.output_tokens,
+                    provider_request_id=result.request_id,
                 )
                 # Tokens spent with no record before: the store is down, so only here (R3OB-5).
                 self._outcome(envelope, alias, dep.account, dep.region, "ok", meta, "static_cap")
@@ -3695,6 +3696,7 @@ class Engine:
                         "tokens_in": result.usage.input_tokens,
                         "tokens_out": result.usage.output_tokens,
                         "worker": self.worker_id,
+                        "provider_request_id": result.request_id,
                     },
                 )
         except Exception as exc:
@@ -3854,6 +3856,7 @@ class Engine:
             tokens_in=result.usage.input_tokens,
             tokens_out=result.usage.output_tokens,
             worker=self.worker_id,
+            provider_request_id=result.request_id,
         )
         # In the caller's shape: a fallback model of the other provider answered (Q40).
         response = shapes.reply(result.response, env.op, served_op, model=alias)

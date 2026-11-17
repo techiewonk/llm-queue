@@ -30,6 +30,7 @@ from llm_queue.langchain._client import (
 )
 from llm_queue.langchain._stream import (
     finish_reason,
+    queue_metadata,
     queued_chunks,
     should_stream,
     usage_metadata,
@@ -145,6 +146,9 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
     `astream()` (and LangGraph's message streaming) yield tokens as they arrive, through
     `LLMQueue.converse_stream`; off by default (one full message). Sync `stream()` always
     yields one full message: the queue has no sync stream.
+
+    Replies carry how the queue served them in `response_metadata["llmq"]` (the `Meta`) and
+    boto's `response_metadata["ResponseMetadata"]` (`RequestId` is Bedrock's request id).
     """
 
     llmq: Any = Field(default=None, exclude=True)
@@ -226,18 +230,23 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
         """Parse like the parent (same call, canned reply), then add how the queue served it."""
         response = result.response or {}
         chat = self._run_parent(messages, stop, call_kwargs, lambda _request: response)
-        meta = result.meta.model_dump()
+        added = queue_metadata(result.meta.model_dump())
         for generation in chat.generations:
-            generation.message.response_metadata.update(meta)
-        served = result.meta.served_model
-        if served and served != self._alias:
+            generation.message.response_metadata.update(added)
+        if result.meta.fallback == "model":
             # Model fallback: report the model that answered (tracers price by `llm_output`).
-            chat.llm_output = {**(chat.llm_output or {}), "model_name": self._model_id_of(served)}
+            served = self._model_id_of(result.meta.served_model, "model")
+            chat.llm_output = {**(chat.llm_output or {}), "model_name": served}
         return chat
 
-    def _model_id_of(self, served: str) -> str:
-        """The Bedrock id of the model that answered (this one unless it fell back)."""
-        if not served or served == self._alias:
+    def _model_id_of(self, served: str, fallback: str | None) -> str:
+        """The Bedrock id of the model that answered (this one unless it fell back).
+
+        Read from the engine's `fallback`, not by comparing `served` with `_alias`: without
+        `model_alias`, `_alias` is the model id while `served` is the registry alias, so every
+        reply looked like a model fallback and paid a registry lookup.
+        """
+        if fallback != "model" or not served:
             return self.model_id
         registry = getattr(self._queue(), "registry", None)
         return registry.current.model(served).model_id if registry else served
@@ -308,8 +317,10 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
         def closing(info: Mapping[str, Any], had_usage: bool) -> ChatGenerationChunk:
             meta = dict(info.get("meta") or {})
             metadata: dict[str, Any] = {
-                **meta,
-                "model_name": self._model_id_of(str(meta.get("served_model") or "")),
+                **queue_metadata(meta),
+                "model_name": self._model_id_of(
+                    str(meta.get("served_model") or ""), meta.get("fallback")
+                ),
             }
             if stop_reason and (reason := finish_reason(stop_reason[-1] or None)):
                 metadata["finish_reason"] = reason

@@ -30,6 +30,36 @@ public API (see STABILITY.md).
 - `breaker_probe_secs` left unset is now the larger of 60 and the deployment's
   `attempt_timeout_secs`, so a registry with an attempt timeout above 60 s and no probe time
   loads instead of being refused. An explicit value below the attempt timeout is still refused.
+- `category` and `retryable` on every `LLMQueueError` (C1): `category` is one of `throttled`,
+  `timeout`, `bad_request`, `unavailable`, `config_error`, `cancelled`, `internal`
+  (`llm_queue.CATEGORIES`); `retryable` is True when a later retry by the caller can succeed
+  (the queue already retried). A `CallFailed` takes both from its kind
+  (`llm_queue.KIND_CATEGORIES`); `llm_queue.error_category(exc)` and
+  `llm_queue.error_retryable(exc)` answer for any exception (`internal` / False for one that is
+  not llm-queue's). Computed, so pickling is unchanged. See
+  [Errors](docs/reference/errors.md#category-and-retryable).
+- The provider's request id reaches the caller (C2): `Meta.provider_request_id` is Bedrock's
+  `x-amzn-RequestId` or the OpenAI-compatible server's `x-request-id` of the attempt that
+  answered, on plain and streamed calls (also in a stream's `meta_event=True` last event). The
+  LangChain chat adapters add boto's `response_metadata["ResponseMetadata"]` (`RequestId`,
+  `HTTPStatusCode` 200, `RetryAttempts` = attempts - 1; no `HTTPHeaders`), so code that reads
+  the AWS request id from a direct `ChatBedrockConverse` reply reads it here too. fakellm
+  sends both headers.
+
+### Changed
+
+- The LangChain chat adapters put how the queue served a reply under
+  `response_metadata["llmq"]` (the `Meta` dict) instead of flat keys
+  (`response_metadata["deployment"]` is now `response_metadata["llmq"]["deployment"]`), on whole
+  replies and on a `queue_streaming` stream's last chunk. `model_name`, `finish_reason` and
+  `stopReason` stay where LangChain puts them.
+
+### Fixed
+
+- `QueuedChatBedrockConverse` without `model_alias` (only `model_id`) treated every reply as a
+  model fallback (C3): the served alias never equals the model id, so each reply paid a
+  registry lookup to fill `model_name`. A fallback is now read from the engine's
+  `Meta.fallback == "model"`.
 
 ## [0.1.1] - 2026-11-17
 

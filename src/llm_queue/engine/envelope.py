@@ -165,7 +165,11 @@ def params_hash(params: Any) -> str:
 
 
 class Meta(BaseModel):
-    """How a call was served: deployment, fallback, attempts, timings, tokens."""
+    """How a call was served: deployment, fallback, attempts, timings, tokens.
+
+    `provider_request_id` is the provider's own id of the attempt that answered (Bedrock
+    `x-amzn-RequestId`, OpenAI `x-request-id`): the id to quote to the provider's support.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -178,6 +182,7 @@ class Meta(BaseModel):
     tokens_in: int | None = None
     tokens_out: int | None = None
     worker: str = ""
+    provider_request_id: str = ""
 
 
 class Reply(BaseModel):

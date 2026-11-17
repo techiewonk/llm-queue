@@ -17,6 +17,7 @@ import pytest
 import redis.asyncio
 from aiohttp.test_utils import TestServer
 from engine_testkit import FakeEngine, Scenario, create_app, registry
+from fakellm import REQUEST_IDS
 
 from llm_queue import CallFailed, LLMQueue, OpenAIOptions, Tuning, request_context
 from llm_queue.http_transport import _error_response
@@ -99,6 +100,7 @@ async def llmq(
 
     queue.register_job("ingest", ingest)
     queue.seen = seen  # type: ignore[attr-defined]
+    queue.fakellm = server  # type: ignore[attr-defined]
     await queue.start()
     yield queue
     await queue.stop()
@@ -106,6 +108,35 @@ async def llmq(
     keys = [k async for k in store.scan_iter(match=f"{key_prefix}:*", count=500)]
     if keys:
         await store.delete(*keys)
+
+
+def _sent_ids(llmq: LLMQueue) -> list[str]:
+    """The request ids fakellm sent (`x-amzn-RequestId` / `x-request-id`), newest last."""
+    return list(llmq.fakellm.app[REQUEST_IDS])  # type: ignore[attr-defined]
+
+
+def _assert_request_id(llmq: LLMQueue, metadata: dict[str, Any]) -> None:
+    """A LangChain reply's boto-shaped `ResponseMetadata` names the provider's request id."""
+    boto = metadata["ResponseMetadata"]
+    assert boto["RequestId"] in _sent_ids(llmq)
+    assert boto["RequestId"] == metadata["llmq"]["provider_request_id"]
+    assert boto["HTTPStatusCode"] == 200
+    assert boto["RetryAttempts"] == metadata["llmq"]["attempts"] - 1
+    assert "HTTPHeaders" not in boto
+
+
+async def test_c2_provider_request_id_reaches_the_caller(llmq: LLMQueue) -> None:
+    """C2: queued Converse, a queued ConverseStream and an OpenAI chat carry the provider's id."""
+    request = {"messages": [{"role": "user", "content": [{"text": "hi"}]}]}
+    reply = await llmq.converse("big", request)
+    assert reply.meta.provider_request_id == _sent_ids(llmq)[-1]
+    events = [e async for e in llmq.converse_stream("big", request, meta_event=True)]
+    meta = events[-1]["llmq"]["meta"]
+    assert meta["provider_request_id"] == _sent_ids(llmq)[-1]
+    chat = await llmq.chat("local", {"messages": [{"role": "user", "content": "hi"}]})
+    assert chat.meta.provider_request_id == _sent_ids(llmq)[-1]
+    ids = [reply.meta.provider_request_id, meta["provider_request_id"]]
+    assert len({*ids, chat.meta.provider_request_id}) == 3
 
 
 async def test_converse_with_request_context(llmq: LLMQueue) -> None:
@@ -184,7 +215,9 @@ async def test_langchain_bedrock_chat_and_tools(llmq: LLMQueue) -> None:
     assert model.model_id == "openai.gpt-oss-120b-1:0"  # looked up from the registry
     message = await model.ainvoke("hello")
     assert str(message.content).startswith("fakellm")
-    assert message.response_metadata["deployment"] == "aws-a/r1"
+    assert message.response_metadata["llmq"]["deployment"] == "aws-a/r1"
+    assert "deployment" not in message.response_metadata  # under `llmq` only (0.2.0)
+    _assert_request_id(llmq, message.response_metadata)
 
     @tool
     def lookup(query: str) -> str:
@@ -216,7 +249,8 @@ async def test_langchain_queue_streaming(llmq: LLMQueue) -> None:
         text: Any = whole.text  # a method on langchain-core 0.3, a property on 1.x
         assert str(text if isinstance(text, str) else text()).startswith("fakellm")
         assert whole.response_metadata["finish_reason"] == "stop"
-        assert whole.response_metadata["served_model"] in ("big", "local")
+        assert whole.response_metadata["llmq"]["served_model"] in ("big", "local")
+        _assert_request_id(llmq, whole.response_metadata)
         assert whole.usage_metadata is not None
         assert whole.usage_metadata["output_tokens"] > 0
         with pytest.raises(LLMQueueError) as refused:  # a sync call on the queue's own loop
@@ -243,7 +277,8 @@ async def test_langchain_openai_chat_and_embeddings(llmq: LLMQueue) -> None:
     chat = QueuedChatOpenAI(model="local", llmq=llmq)
     message = await chat.ainvoke("hello")
     assert str(message.content).startswith("fakellm")
-    assert message.response_metadata["served_model"] == "local"
+    assert message.response_metadata["llmq"]["served_model"] == "local"
+    _assert_request_id(llmq, message.response_metadata)
     emb = QueuedOpenAIEmbeddings(model="local-emb", llmq=llmq)
     vectors = await emb.aembed_documents(["a", "b", "c"])
     assert len(vectors) == 3

@@ -3,26 +3,73 @@
 Callers catch one type, `LLMQueueError` (calls raise `CallFailed`, a subclass with a `kind`);
 workers turn provider exceptions into `ErrorInfo` so retry, budgets and health never depend on
 SDK-specific exception classes.
+
+Every `LLMQueueError` has a `category` (one of `CATEGORIES`, for logs and dashboards) and
+`retryable` (a later retry by the caller can succeed: the queue already retried what it could);
+`error_category` / `error_retryable` answer for any exception.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import ClassVar, Literal, get_args
+
+Category = Literal[
+    "throttled",
+    "timeout",
+    "bad_request",
+    "unavailable",
+    "config_error",
+    "cancelled",
+    "internal",
+]
+CATEGORIES: frozenset[str] = frozenset(get_args(Category))
 
 
 class LLMQueueError(Exception):
-    """Base class for every error this package raises to callers."""
+    """Base class for every error this package raises to callers.
+
+    `category` and `retryable` are computed from the class (and a `CallFailed`'s kind), never
+    stored on the instance, so pickling and the constructor are unchanged.
+    """
+
+    _category: ClassVar[Category] = "internal"
+    _retryable: ClassVar[bool] = False
+
+    @property
+    def category(self) -> Category:
+        """What kind of failure this is (one of `CATEGORIES`)."""
+        return self._category
+
+    @property
+    def retryable(self) -> bool:
+        """True when a later retry by the caller can succeed (the queue already retried)."""
+        return self._retryable
+
+
+def error_category(exc: BaseException) -> Category:
+    """The `category` of an llm-queue error; `"internal"` for any other exception."""
+    return exc.category if isinstance(exc, LLMQueueError) else "internal"
+
+
+def error_retryable(exc: BaseException) -> bool:
+    """The `retryable` of an llm-queue error; False for any other exception."""
+    return exc.retryable if isinstance(exc, LLMQueueError) else False
 
 
 class ConfigError(LLMQueueError):
     """Invalid configuration, raised at startup or on a refused edit (never mid-call)."""
+
+    _category = "config_error"
 
 
 class UnknownModel(ConfigError, KeyError):  # named for what it is
     """A model name that is neither an alias nor a model id in the registry.
 
     Also a `KeyError`, so code that looks models up by key keeps working (HTTP 404, CLI).
+    Category `config_error` (from `ConfigError`): the name comes from the app's code or
+    configuration, and retrying it unchanged cannot succeed.
     """
 
     def __str__(self) -> str:
@@ -35,6 +82,9 @@ class StoreUnavailable(LLMQueueError, ConnectionError):  # named for what it is
     Raised by `cancel`, `status`, `send_job` and the registry's edits and reads; a call
     raises `CallFailed` instead. Also a `ConnectionError`, so existing handlers keep working.
     """
+
+    _category = "unavailable"
+    _retryable = True
 
 
 class PurgeRefused(LLMQueueError):

@@ -10,9 +10,11 @@ from fakellm.app import create_app
 from fakellm.behaviour import Engine, KeyStats, Outcome
 from fakellm.errors import ERRORS, ErrorSpec
 from fakellm.scenario import Behaviour, Phase, Scenario, ScenarioError, load_scenario
+from fakellm.state import REQUEST_IDS
 
 __all__ = [
     "ERRORS",
+    "REQUEST_IDS",
     "Behaviour",
     "Engine",
     "ErrorSpec",

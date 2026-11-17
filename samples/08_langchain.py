@@ -32,7 +32,8 @@ async def main() -> None:
         # model_id comes from the registry of the started queue
         chat = QueuedChatBedrockConverse(model_alias="gpt120b", max_tokens=400)  # type: ignore[call-arg]
         message = await chat.ainvoke("In one line, what is an index fund?")
-        print(f"chat: {message.text()[:120]!r} via {message.response_metadata['deployment']}")
+        served = message.response_metadata["llmq"]
+        print(f"chat: {message.text()[:120]!r} via {served['deployment']}")
 
         with_tools = chat.bind_tools([stock_price])
         called = await with_tools.ainvoke("Use the stock_price tool to get the price of RELIANCE.")
