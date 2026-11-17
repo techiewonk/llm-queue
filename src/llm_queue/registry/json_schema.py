@@ -99,8 +99,6 @@ def check_schema(check: st.Check) -> dict[str, Any]:
         }
     if isinstance(check, st.ObjCheck):
         properties = {name: check_schema(sub) for name, sub in check.fields.items()}
-        for name, reason in check.deprecated.items():
-            properties[name] = {"deprecated": True, "description": reason}
         out = {"type": "object", "properties": properties, "additionalProperties": False}
         if check.required:
             out["required"] = list(check.required)

@@ -146,21 +146,14 @@ def any_object(value: Any) -> str | None:
 class ObjCheck:
     """An object whose keys are among `fields`, each checked; `required` keys must be present.
 
-    `deprecated` names are accepted and dropped with a warning (`registry.schema` reads
-    `fields` and `deprecated` to do it, and drops unknown fields with a warning in lenient
-    mode: a newer pod's sub-field made every older pod refuse the stored document, R3CF-8).
+    `registry.schema` reads `fields` to drop unknown fields with a warning in lenient mode: a
+    newer pod's sub-field made every older pod refuse the stored document (R3CF-8).
     """
 
-    def __init__(
-        self,
-        fields: Mapping[str, Check],
-        required: tuple[str, ...] = (),
-        deprecated: Mapping[str, str] | None = None,
-    ) -> None:
-        """`deprecated` maps a removed name to the reason shown in its warning."""
+    def __init__(self, fields: Mapping[str, Check], required: tuple[str, ...] = ()) -> None:
+        """Check the keys of `fields`; `required` must be present."""
         self.fields = fields
         self.required = required
-        self.deprecated: Mapping[str, str] = deprecated or {}
 
     def __call__(self, value: Any) -> str | None:
         """Every problem of `value`, joined; None when it is valid."""
@@ -170,8 +163,6 @@ class ObjCheck:
         for key, item in value.items():
             sub = self.fields.get(key)
             if sub is None:
-                if key in self.deprecated:
-                    continue
                 known = ", ".join(sorted(self.fields))
                 problems.append(f"unknown field `{key}` (known: {known})")
                 continue
@@ -181,14 +172,9 @@ class ObjCheck:
         return "; ".join(problems) or None
 
 
-def obj(
-    fields: Mapping[str, Check],
-    *,
-    required: tuple[str, ...] = (),
-    deprecated: Mapping[str, str] | None = None,
-) -> ObjCheck:
+def obj(fields: Mapping[str, Check], *, required: tuple[str, ...] = ()) -> ObjCheck:
     """An object check (see `ObjCheck`)."""
-    return ObjCheck(fields, required, deprecated)
+    return ObjCheck(fields, required)
 
 
 def _tags(value: Any) -> str | None:
@@ -303,12 +289,6 @@ HEALTH_DEFAULTS = {
     "slow_min_samples": 20,
 }
 ALERT_DEFAULTS = {"quota_used_pct": 90, "dlq_messages": 1, "queue_age_secs": 600}
-# Alert settings removed in 0.1.0b2 (they did nothing): accepted with a warning until 0.2, so a
-# 0.1.0b1 document still loads (owner Q34, R3AP-5).
-REMOVED_ALERTS = dict.fromkeys(
-    ("quota_used_mins", "spill_pct", "spill_window_secs", "waiting_age_secs"),
-    "removed in 0.1.0b2 (it did nothing); ignored, and refused from 0.2",
-)
 # A queue's messages and dead letters (which hold the prompt) live at most two weeks.
 MAX_RETENTION_SECS = 1_209_600
 QUEUE_DEFAULTS = {
@@ -547,7 +527,6 @@ SETTINGS: Mapping[str, Spec] = {
                 "dlq_messages": number(1, integer=True),
                 "queue_age_secs": number(1),  # queue_stalled (R3OB-17)
             },
-            deprecated=REMOVED_ALERTS,
         ),
         ALERT_DEFAULTS,
         merge=True,

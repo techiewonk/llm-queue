@@ -274,8 +274,8 @@ one call's reservation and fields the mode never reads are warned about. Only tr
 should set `priority=True`: priority calls are served before every tenant's share.
 
 The 0.1.0b1 alert names `quota_used_mins`, `spill_pct`, `spill_window_secs` and
-`waiting_age_secs` did nothing and were removed: a document naming them still loads, with a
-deprecation warning, until 0.2.
+`waiting_age_secs` did nothing and were removed: from 0.2.0 they are unknown fields, refused in
+strict mode like any other.
 
 ### Validation
 

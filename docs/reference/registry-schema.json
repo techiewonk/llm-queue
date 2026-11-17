@@ -45,22 +45,6 @@
               "type": "number",
               "minimum": 1,
               "maximum": 9007199254740991
-            },
-            "quota_used_mins": {
-              "deprecated": true,
-              "description": "removed in 0.1.0b2 (it did nothing); ignored, and refused from 0.2"
-            },
-            "spill_pct": {
-              "deprecated": true,
-              "description": "removed in 0.1.0b2 (it did nothing); ignored, and refused from 0.2"
-            },
-            "spill_window_secs": {
-              "deprecated": true,
-              "description": "removed in 0.1.0b2 (it did nothing); ignored, and refused from 0.2"
-            },
-            "waiting_age_secs": {
-              "deprecated": true,
-              "description": "removed in 0.1.0b2 (it did nothing); ignored, and refused from 0.2"
             }
           },
           "additionalProperties": false,
@@ -1727,22 +1711,6 @@
               "type": "number",
               "minimum": 1,
               "maximum": 9007199254740991
-            },
-            "quota_used_mins": {
-              "deprecated": true,
-              "description": "removed in 0.1.0b2 (it did nothing); ignored, and refused from 0.2"
-            },
-            "spill_pct": {
-              "deprecated": true,
-              "description": "removed in 0.1.0b2 (it did nothing); ignored, and refused from 0.2"
-            },
-            "spill_window_secs": {
-              "deprecated": true,
-              "description": "removed in 0.1.0b2 (it did nothing); ignored, and refused from 0.2"
-            },
-            "waiting_age_secs": {
-              "deprecated": true,
-              "description": "removed in 0.1.0b2 (it did nothing); ignored, and refused from 0.2"
             }
           },
           "additionalProperties": false,
