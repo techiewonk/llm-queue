@@ -7,6 +7,31 @@ public API (see STABILITY.md).
 
 ## [Unreleased]
 
+### Added
+
+- Drain API (plan A1-A5). `pause_receiving()` stays sync and callable from any thread;
+  `resume_receiving()` undoes it (ready again when started; `LLMQueueError` after `stop()`);
+  `await drain(drain_secs=None)` pauses and waits for running calls and jobs (it does not
+  stop the queue); `draining` / `draining_since` properties and `drain_status()`.
+- `health()` reports `draining` and `draining_since`; a paused process answers
+  `not_ready_reason="draining"` (before the eviction reason).
+- `LLMQ_DRAIN_FILE` (default off) and `LLMQ_DRAIN_POLL_SECS` (1 s): a file whose mtime is
+  newer than the queue's construction (minus 1 s) pauses every process of a pod, in every
+  role; a resumed process pauses again only on a newer mtime. `llm_queue.drain.DrainWatcher`
+  is the same watcher, standalone (no heavy imports) for apps without a queue.
+- `http_router(drain_routes=True)`: `POST /drain`, `POST /resume` (guarded like the write
+  routes: a token or `dependencies`, plus `X-LLMQ-Admin`) and an open `GET /drain` (status
+  only). They reach one process; multi-process pods use the drain file.
+- `JobRunner.resume()`.
+
+### Changed
+
+- `pause_receiving()` now hands held calls (waiting for budget, not started) back to the
+  queue at once, for another pod (`LLMQ_DRAIN_HANDBACK_ENABLED`, default true; false keeps
+  0.1.1's behaviour). Messages a receive in flight took when the pause landed go back
+  unadmitted, and one that would wait for budget is released instead of held. A one-replica
+  deploy therefore waits for the new pod to run those calls.
+
 ## [0.1.1] - 2026-11-17
 
 The first release that installs without `--pre`: `pip install llm-queue` (or

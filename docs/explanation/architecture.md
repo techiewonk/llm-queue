@@ -386,6 +386,8 @@ are defaults. [Background tasks](background.md) has more on each.
 | `_cancel_reader` | worker | pub/sub on `P:cancel` | - | Cancel running attempts; reads the cancel keys after a re-subscribe |
 | `_warm_clients` | worker | once at start; `HEAD` every 10 s per client | - | Build every Bedrock client concurrently, keep connections warm |
 | `JobRunner` (one per job name) | worker | doorbell, up to 0.5 s | - | Run jobs |
+| `DrainWatcher` (`drain.py`) | all, when `LLMQ_DRAIN_FILE` is set | `LLMQ_DRAIN_POLL_SECS` (1 s) | - | `stat` the drain file; a new one (or a newer mtime) calls `pause_receiving()`; stopped first in `stop()` |
+| `drain_hand_back` (one per pause) | worker | once, after `pause_receiving()` | - | Return held calls to the queue (`LLMQ_DRAIN_HANDBACK_ENABLED`); `stop()` waits for it |
 
 A loop that dies is logged (`background_loop_died`), counted (`llmq_loop_died_total`) and makes
 liveness false; a model loop is started again by the next heartbeat.

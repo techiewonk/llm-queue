@@ -87,5 +87,9 @@ who reaches the app (`/registry` lists accounts, regions, model ids and base URL
 router logs `admin_routes_unauthenticated` when it is built. See
 [Secure a deployment](../how-to/secure.md#4-protect-the-http-write-routes).
 
-The `/drain` route used by a preStop hook is the app's own (see `samples/09_http_router.py`);
-the router has none. It must answer GET, which is what `preStop: httpGet` sends.
+`drain_routes=True` adds `POST /drain` (pause receiving), `POST /resume` (409 after `stop()`)
+and an open `GET /drain` (`draining`, `since`, `held`, `running`; it changes nothing). The POST
+routes need an admin token or `dependencies` (else `ConfigError`) and the `X-LLMQ-Admin` header,
+like the write routes. They reach the one process that answered: a pod with several processes
+drains through `LLMQ_DRAIN_FILE` from an `exec` preStop hook (see
+[Drain a pod](../how-to/operate.md#drain-a-pod)).

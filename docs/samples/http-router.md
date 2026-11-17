@@ -23,9 +23,10 @@ flowchart LR
   (`LLMQ_METRICS_SINK=prometheus`, or `metrics=PrometheusSink()` as in the sample; install the
   `metrics` extra). It is open like the probes, so a scraper needs no admin credentials.
 - A preStop hook calls `pause_receiving()`. Readiness then fails and no new queued work starts,
-  while running calls finish. `/drain` is the app's own route (the router has none) and answers
-  GET, which is what Kubernetes' `preStop: httpGet` sends; a POST-only route answers it 405 and
-  nothing drains.
+  while running calls finish. The sample's `/drain` is the app's own GET route; since 0.2.0 the
+  router can serve it (`drain_routes=True`: guarded `POST /drain` and `POST /resume`), and a pod
+  with several processes touches `LLMQ_DRAIN_FILE` instead (see
+  [Drain a pod](../how-to/operate.md#drain-a-pod)).
 - The sample calls the app in process with httpx's ASGI transport, so no port is opened. In an
   app, uvicorn serves the same router.
 
