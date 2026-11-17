@@ -44,6 +44,10 @@ by default on every surface. No old name is kept:
 | `GET /drain` open | `GET /drain` needs a read guard |
 | Read routes mounted open with no guard (a warning) | Not mounted: with no token and no `dependencies` only the probes and `/metrics` are (warning `admin_routes_unauthenticated`), unless `insecure_reads=True` |
 
+In a strict environment with `LLMQ_BEDROCK_ENDPOINT_URL` set, the `botocore` Bedrock transport
+(`Tuning(bedrock=BedrockOptions(transport="botocore"))`) is refused at `from_env`: it follows
+redirects with the signed request (see [Secure](docs/how-to/secure.md)).
+
 In a strict environment `LLMQ_ADMIN_TOKEN` and `LLMQ_ADMIN_READ_TOKEN` (or the tokens passed
 to `http_router()`, a callable's value included) must be at least 32 characters: a shorter one
 stops the mount with a `ConfigError`, and a token rotated to a shorter value is refused per

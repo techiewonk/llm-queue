@@ -16,6 +16,23 @@ tokens of 32 characters or more, and it refuses debug capture. See [Environment 
 `verify=False` (or `use_ssl=False`) in an account's `credentials=` is allowed in every mode, with a
 `bedrock_tls_verify_off` warning: use it only against a local fake.
 
+### Redirects and the Bedrock transport
+
+The default Bedrock transport (`BedrockOptions.transport="aiohttp"`) never follows an HTTP
+redirect. The `botocore` transport does: aiobotocore sends with `allow_redirects=True` and has
+no setting to turn it off, so a 301, 307 or 308 from the endpoint re-sends the SigV4-signed
+request, its body and the session token to the host the redirect names. Against AWS's own
+endpoints that does not happen; with `LLMQ_BEDROCK_ENDPOINT_URL` (a proxy, a VPC endpoint, a
+gateway) it is the proxy's choice. So:
+
+- When strict, `LLMQ_BEDROCK_ENDPOINT_URL` set with `Tuning(bedrock=BedrockOptions(
+  transport="botocore"))` stops `from_env` with a `ConfigError`. Keep the default transport.
+- An account whose `credentials=` returns keys only botocore understands (`verify`,
+  `api_version`, ...) still switches that account to botocore at its first call, in every mode,
+  with the `bedrock_transport_fallback` warning (a call is never failed for it). With an
+  endpoint override, return only the AWS keys (`aws_access_key_id`, `aws_secret_access_key`,
+  `aws_session_token`) and treat that warning as an alarm.
+
 ## 2. Keep account secrets out of the registry
 
 The registry names secrets; it never holds them:

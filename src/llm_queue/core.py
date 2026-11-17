@@ -322,9 +322,10 @@ class LLMQueue:
         # engine adds a random tail, so two processes never share one.
         worker_id = worker_id or settings.worker_id or _default_worker_id()
         tuning = tuning or Tuning()
-        if problems := tuning.problems(
+        problems = tuning.problems(
             queue_wait_ms=settings.queue_wait_ms, result_ttl_secs=settings.result_ttl_secs
-        ):
+        )
+        if problems := problems + _transport_problems(settings, tuning):
             raise ConfigError("invalid tuning:\n  " + "\n  ".join(problems))
         # One sink for both engines (O5). EMF: the environment is a dimension, so two
         # environments in one account are not summed; pod and version are plain fields (R3OB-12).
@@ -454,9 +455,10 @@ class LLMQueue:
         """
         worker_id = worker_id or settings.worker_id or _default_worker_id()
         tuning = tuning or Tuning()
-        if problems := tuning.problems(
+        problems = tuning.problems(
             queue_wait_ms=settings.queue_wait_ms, result_ttl_secs=settings.result_ttl_secs
-        ):
+        )
+        if problems := problems + _transport_problems(settings, tuning):
             raise ConfigError("invalid tuning:\n  " + "\n  ".join(problems))
         sink = metrics or sink_for(
             settings.metrics_sink,
@@ -1199,6 +1201,21 @@ class LLMQueue:
     def describe(self) -> dict[str, Any]:
         """This queue's settings for a log line: no password, salt, token or registry body."""
         return self.admin.describe()
+
+
+def _transport_problems(settings: InfraSettings, tuning: Tuning) -> list[str]:
+    """Strict mode with `LLMQ_BEDROCK_ENDPOINT_URL`: the botocore transport is refused.
+
+    botocore follows 301 / 307 / 308 redirects (aiobotocore has no switch for it), so a signed
+    request and its session token could be re-sent to another host (review B-29).
+    """
+    if settings.strict and settings.bedrock_endpoint_url and tuning.bedrock.transport != "aiohttp":
+        return [
+            f"BedrockOptions.transport={tuning.bedrock.transport} is refused outside dev with "
+            "LLMQ_BEDROCK_ENDPOINT_URL set: it follows HTTP redirects with the signed request; "
+            "use the default aiohttp transport"
+        ]
+    return []
 
 
 def _local_shares(view: Any, limits: LocalLimits) -> dict[str, dict[str, float | None]]:
