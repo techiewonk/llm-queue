@@ -126,6 +126,12 @@ flowchart LR
 For a store with replicas, also set `min-replicas-to-write` on the primary: a write it refuses
 (`NOREPLICAS`), like `OOM`, `MISCONF` and `BUSY`, is treated as the store being down.
 
+## Off switch
+
+| Variable | Default | Range | Meaning |
+|---|---|---|---|
+| `LLMQ_ENABLED` | true | true or false (`on` / `off`) | `false` switches the library off: `from_env()` returns a disabled queue and reads no other setting but `LLMQ_ENVIRONMENT`, `LLMQ_DRAIN_FILE` and `LLMQ_DRAIN_POLL_SECS` (no store, registry or salt needed). The factories (`chat_model`, `embeddings`) return None so the app runs its own direct path; a direct `llmq.converse()` / `embed()` / admin store operation raises `QueueDisabled` (`config_error`, not retryable; HTTP 503 `reason: disabled`); `install()` mounts only `/health/live` and `/health/ready` (`enabled: false`); the drain file still fails readiness. Read like every setting (secrets, environment, `defaults=`). See [Modes](../how-to/modes.md#the-switch-ladder) |
+
 ## Execution mode
 
 How calls run (see [Modes](../how-to/modes.md) for when to switch and how to undo it).

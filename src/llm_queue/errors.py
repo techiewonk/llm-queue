@@ -101,6 +101,20 @@ class LocalModeRefused(ConfigError):
         self.operation = operation
 
 
+class QueueDisabled(ConfigError):
+    """A call or store operation asked of a queue switched off with `LLMQ_ENABLED=false`.
+
+    The off switch keeps the app on its own direct path: the factories return None, so only
+    code that calls the queue directly gets this. Category `config_error`, not retryable;
+    HTTP routes answer 503 with `reason: disabled`.
+    """
+
+    def __init__(self, operation: str) -> None:
+        """`operation` names what was asked (`converse`, `status`, `purge.model`...)."""
+        super().__init__(f"llm-queue is disabled (LLMQ_ENABLED=false): {operation} refused")
+        self.operation = operation
+
+
 class AdminRefused(LLMQueueError):
     """An admin operation that was refused; nothing was changed.
 

@@ -37,6 +37,7 @@ from llm_queue.errors import (
     LLMQueueError,
     LocalModeRefused,
     MissingExtra,
+    QueueDisabled,
     StoreUnavailable,
     UnknownModel,
 )
@@ -74,9 +75,10 @@ def error_response(exc: BaseException) -> Response:
 
     `UnknownModel` 404; `RegistryConflict` 409 retryable; `AdminRefused` 409; a missing
     registry or a store outage 503; a store-only operation of a local-mode queue
-    (`LocalModeRefused`) 503 with `reason: local_mode`; any other `ConfigError` (bad input,
-    refused edit) 400; another `LLMQueueError` (a stopped queue) 409; a store refusal of the
-    request itself (redis `ResponseError`, B-07) 400, of writes for a while 503.
+    (`LocalModeRefused`) 503 with `reason: local_mode`; with the library off (`QueueDisabled`)
+    503 with `reason: disabled`; any other `ConfigError` (bad input, refused edit) 400; another
+    `LLMQueueError` (a stopped queue) 409; a store refusal of the request itself (redis
+    `ResponseError`, B-07) 400, of writes for a while 503.
     """
     if isinstance(exc, UnknownModel):
         return 404, {"error": str(exc)}
@@ -90,6 +92,8 @@ def error_response(exc: BaseException) -> Response:
         return 409, {"error": str(exc)}
     if isinstance(exc, LocalModeRefused):
         return 503, {"error": str(exc), "reason": "local_mode", "mode": "local"}
+    if isinstance(exc, QueueDisabled):
+        return 503, {"error": str(exc), "reason": "disabled", "enabled": False}
     if isinstance(exc, ConfigError):
         return 400, {"error": str(exc)}
     if isinstance(exc, LLMQueueError):

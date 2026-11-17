@@ -206,6 +206,7 @@ of every setting and the level it came from.
 | `params` | deployment | none | any object | Extra request fields of one deployment (guardrails); protected |
 | `health` | all four | see fields | object, fields below | *merged*: when a deployment is disabled, probed and marked slow |
 | `alerts` | defaults, model | see fields | object, fields below | *merged*: alert thresholds of `status()` and `/health` |
+| `health_summary` | defaults, model | see fields | object, fields below | *merged*: thresholds of the per-model health summary (`healthy` / `warning` / `critical`) in `status()`, `status.health` and `GET /` |
 | `admission` | defaults, model | none | a hook name | Name of a registered admission hook (1-64 letters, digits, `_`, `.`, `-`) |
 | `fallback_policy` | defaults, model | none | a hook name | Name of a registered fallback policy hook |
 | `token_estimator` | defaults, model | none | a hook name | Name of a registered token estimator |
@@ -260,6 +261,12 @@ A field left out takes the default below (the *merged* objects merge it across l
 | `alerts.quota_used_pct` | 90 | 1 to 100 | `quota_near_limit` alert when RPM or TPM use passes this share |
 | `alerts.dlq_messages` | 1 | 1 or more (whole) | `dead_letters` alert at this many dead letters |
 | `alerts.queue_age_secs` | 600 | 1 or more | `queue_stalled` alert when the oldest queued call is older than this |
+| `health_summary.budget_warning_pct` | 80 | 1 to 100 | `warning` when this minute's use of the usable deployments' budgets (the fuller of RPM and TPM, summed over them) reaches this share |
+| `health_summary.budget_critical_pct` | 98 | 1 to 100 | ... `critical` at this share |
+| `health_summary.waiting_warning` | 1000 | 1 to 100000000 (whole) | `warning` at this many waiting calls (queued and held for budget) |
+| `health_summary.waiting_critical` | 10000 | 1 to 100000000 (whole) | ... `critical` at this many |
+| `health_summary.wait_warning_secs` | 30 | 1 to 86400 | `warning` when the oldest waiting call has waited this long |
+| `health_summary.wait_critical_secs` | 120 | 1 to 86400 | ... `critical` at this wait |
 | `fairness.mode` | `off` | `off`, `share`, `quota`, `fair_queue` | `share`: weighted share of RPM, TPM and slots, unused share lent to others; `quota`: hard per-tenant RPM / TPM; `fair_queue`: round robin between tenants among waiters |
 | `fairness.weights` | none | tenant id -> above 0 to 1000000 | `share`: a tenant's weight |
 | `fairness.default_weight` | 1 | above 0 to 1000000 | `share`: the weight of a tenant not in `weights` |

@@ -303,6 +303,15 @@ HEALTH_DEFAULTS = {
     "slow_min_samples": 20,
 }
 ALERT_DEFAULTS = {"quota_used_pct": 90, "dlq_messages": 1, "queue_age_secs": 600}
+# The per-model health summary of `status()` (0.2.0 F2): `warning` / `critical` at or above.
+HEALTH_SUMMARY_DEFAULTS = {
+    "budget_warning_pct": 80,
+    "budget_critical_pct": 98,
+    "waiting_warning": 1000,
+    "waiting_critical": 10000,
+    "wait_warning_secs": 30,
+    "wait_critical_secs": 120,
+}
 # Alert settings removed in 0.1.0b2 (they did nothing): accepted with a warning until 0.2, so a
 # 0.1.0b1 document still loads (owner Q34, R3AP-5).
 REMOVED_ALERTS = dict.fromkeys(
@@ -553,6 +562,23 @@ SETTINGS: Mapping[str, Spec] = {
             deprecated=REMOVED_ALERTS,
         ),
         ALERT_DEFAULTS,
+        merge=True,
+    ),
+    # Thresholds of the per-model health summary in `status()` (0.2.0 F2, healthy / warning /
+    # critical): budget use this minute, waiting calls, the oldest call's wait.
+    "health_summary": _spec(
+        "D,M",
+        obj(
+            {
+                "budget_warning_pct": number(1, 100),
+                "budget_critical_pct": number(1, 100),
+                "waiting_warning": number(1, 100_000_000, integer=True),
+                "waiting_critical": number(1, 100_000_000, integer=True),
+                "wait_warning_secs": number(1, DAY_SECS),
+                "wait_critical_secs": number(1, DAY_SECS),
+            }
+        ),
+        HEALTH_SUMMARY_DEFAULTS,
         merge=True,
     ),
     "admission": _spec("D,M", hook_name),

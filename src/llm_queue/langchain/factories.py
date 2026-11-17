@@ -1,9 +1,10 @@
 """Model factories (0.2.0 E1): the queued LangChain class for a model, or None.
 
 `chat_model(model_id)` / `embeddings(model_id)` return the queued adapter when the *boot*
-registry knows the model, else None: a model outside the registry stays on the caller's own
-path, so an app writes `chat_model(model_id, temperature=0) or ChatBedrockConverse(...)`. No
-langchain module is imported until an adapter is built.
+registry knows the model, else None: a model outside the registry, or every model with the
+library switched off (`LLMQ_ENABLED=false`), stays on the caller's own path, so an app
+writes `chat_model(model_id, temperature=0) or ChatBedrockConverse(...)`. No langchain module
+is imported until an adapter is built.
 
 The boot registry is the document a process starts with (`LLMQ_REGISTRY` /
 `LLMQ_REGISTRY_FILE`, placeholders expanded), read without a store. A model added later by a
@@ -85,7 +86,20 @@ def aliases(registry: Any = None) -> dict[str, str]:
     return out
 
 
+def _disabled(registry: Any) -> bool:
+    """True when the library is switched off: the queue given, else `LLMQ_ENABLED`."""
+    if _is_queue(registry):
+        return not getattr(registry, "enabled", True)
+    if registry is None:
+        from llm_queue.engine.settings import _FALSE
+
+        return str(os.environ.get("LLMQ_ENABLED", "")).strip().lower() in _FALSE
+    return False
+
+
 def _build(kind: str, model_id: str, registry: Any, kw: dict[str, Any]) -> Any:
+    if _disabled(registry):  # LLMQ_ENABLED=false: the app's own path (0.2.0 H1)
+        return None
     queue = registry if _is_queue(registry) else None
     boot = boot_registry(registry)
     try:
@@ -117,7 +131,8 @@ def _build(kind: str, model_id: str, registry: Any, kw: dict[str, Any]) -> Any:
 def chat_model(model_id: str, /, *, registry: Any = None, **kw: Any) -> Any:
     """The queued chat model for `model_id` (an alias or a provider model id), or None.
 
-    None when the boot registry does not know the model (the caller's own path then).
+    None when the boot registry does not know the model or `LLMQ_ENABLED` is false (the
+    caller's own path then).
     Bedrock models give `QueuedChatBedrockConverse`, OpenAI-compatible ones
     `QueuedChatOpenAI`, with `model_alias` and the model id set; `**kw` goes to the
     constructor and wins (`model_id` is positional-only, so `model_id=` in `**kw` reaches the

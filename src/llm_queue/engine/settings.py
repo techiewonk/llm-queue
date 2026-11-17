@@ -506,6 +506,9 @@ class InfraSettings:
     """The process settings of one environment."""
 
     store_url: str = field(repr=False)  # holds the password
+    # LLMQ_ENABLED (0.2.0 H1, FU1): false switches the library off (a disabled queue: probes,
+    # the drain file and `describe()` only; every other setting is then not read or checked).
+    enabled: bool = True
     queue_store_url: str | None = field(default=None, repr=False)
     store_max_connections: int = 200
     # LLMQ_STORE_MAX_CONNECTIONS=auto (0.2.0 D7): the size above is the boot registry's worker
@@ -638,6 +641,8 @@ class InfraSettings:
         placeholder = layers.lookup
         secrets_shown = layers.describe_secrets()
         problems: list[str] = []
+        if not read_bool(layers, "ENABLED", True, problems) and not problems:
+            return cls._disabled(layers)
         store = get("STORE_URL")
         execution_mode = str(get("EXECUTION_MODE", "queue")).strip().lower()
         if execution_mode not in EXECUTION_MODES:
@@ -907,6 +912,35 @@ class InfraSettings:
         if problems:
             raise ConfigError("invalid LLMQ settings:\n  " + "\n  ".join(problems))
         return settings
+
+    @classmethod
+    def _disabled(cls, layers: Layers) -> InfraSettings:
+        """`LLMQ_ENABLED=false`: only what a disabled queue uses (environment and drain file).
+
+        No store, registry or salt is needed; the other `LLMQ_*` values are not read, so an
+        app can switch the library off without removing them (or before they exist).
+        """
+        problems: list[str] = []
+        environment = str(layers.get(PREFIX + "ENVIRONMENT", "") or "").strip().lower()
+        environment = {"": "unset", "production": "prod"}.get(environment, environment)
+        poll_raw = layers.get(PREFIX + "DRAIN_POLL_SECS", 1.0)
+        try:
+            poll = float(poll_raw)
+        except (TypeError, ValueError):
+            poll = 1.0
+            problems.append("LLMQ_DRAIN_POLL_SECS must be a number")
+        if not (math.isfinite(poll) and 0.1 <= poll <= 60):
+            problems.append("LLMQ_DRAIN_POLL_SECS must be at least 0.1 and at most 60")
+        if problems:
+            raise ConfigError("invalid LLMQ settings:\n  " + "\n  ".join(problems))
+        return cls(
+            store_url="",
+            enabled=False,
+            environment=environment,
+            drain_file=str(layers.get(PREFIX + "DRAIN_FILE", "") or "").strip(),
+            drain_poll_secs=poll,
+            secrets_source=layers.secrets_source,
+        )
 
     def registry_document(self) -> str:
         """The registry JSON from `LLMQ_REGISTRY` or the file `LLMQ_REGISTRY_FILE`.

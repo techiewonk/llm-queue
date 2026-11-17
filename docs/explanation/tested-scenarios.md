@@ -616,6 +616,7 @@ whole run takes about 20 minutes (about 14 with `--quick`).
 | BL1 | Local mode: 4 processes with `LLMQ_LOCAL_PROCESS_COUNT=4`, fakellm's RPM limit equal to the registry's, 150 % offered | fakellm's calls per minute | Never over its RPM in any minute (+2); every call answered or `rate_limited` on time | LM-15 (`TODO(test)`) |
 | G-T1 | Request index on and off, at B19's load | Store scripts per call; time of the send and settle scripts | Scripts per call unchanged; the index adds at most 50 us per call | AO-28 (`TODO(test)`) |
 | G-T2 | 10,000 waiting calls of 20 tenants on one model | Admin list, count, cancel and move times | List 100 <= 20 ms; count <= 100 ms; cancel 10,000 <= 3 s; move 1,000 <= 2 s | AO-28 (`TODO(test)`) |
+| F2 | Health summary (0.2.0): an idle model, then 80 calls on a 30 RPM model with `health_summary` marks of 10 / 40 waiting and 3 / 8 s oldest wait, then the backlog cancelled | `status.health` state and reasons every 0.5 s; summary read time | Idle `healthy`; `critical` (`waiting`, `oldest_wait`) within 20 s; `healthy` within 15 s of the cancel; read p95 <= 200 ms | AO-29, OB-14 |
 
 B93 has no id of its own: it is judged inside B56 (the `B56` entry of `GATES`, printed as
 `B56/B93`). `check.py` step `gates` runs `scripts/gates.py`, with `--quick` under

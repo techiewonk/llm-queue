@@ -58,12 +58,27 @@ class DrainAdmin:
             )  # fmt: skip
 
 
+def _default_tenant(s: InfraSettings) -> dict[str, Any]:
+    """`LLMQ_DEFAULT_TENANT` as its keyed hash; the name too only with tenant names on (B-04)."""
+    name = s.default_tenant
+    out: dict[str, Any] = {
+        "default_tenant_hash": keyed_hash(s.id_hash_salt or "", name) if name else None
+    }
+    if s.tenant_names_enabled:
+        out["default_tenant"] = name
+    return out
+
+
 def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> dict[str, Any]:
-    """Settings for a log line: no password, salt, token or registry body."""
+    """Settings for a log line: no password, salt, token or registry body; tenant as a hash."""
     out: dict[str, Any] = {"version": __version__, "worker_id": worker_id}
     s = settings
     if s is None:
         return out
+    if not s.enabled:  # LLMQ_ENABLED=false: nothing else was read
+        out.update(enabled=False, environment=s.environment, drain_file=bool(s.drain_file))
+        return out
+    out["enabled"] = True
     doc = orjson.loads(s.registry_document()) if (s.registry or s.registry_file) else {}
     out["execution_mode"] = s.execution_mode
     # Kinds and ids of the secrets sources and the mapped setting names: never a value.
@@ -100,21 +115,6 @@ def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> 
         registry_version=doc.get("registry_version"),
         models=sorted(doc.get("models") or {}),
     )
-    return out
-
-
-def _default_tenant(s: InfraSettings) -> dict[str, Any]:
-    """`LLMQ_DEFAULT_TENANT` as its keyed hash; the name too with `LLMQ_TENANT_NAMES_ENABLED`.
-
-    `describe()` is served on a read route and logged at start: a raw tenant name there broke
-    "tenant names hashed" (review B-04).
-    """
-    name = s.default_tenant
-    out: dict[str, Any] = {
-        "default_tenant_hash": keyed_hash(s.id_hash_salt or "", name) if name else None
-    }
-    if s.tenant_names_enabled:
-        out["default_tenant"] = name
     return out
 
 
@@ -197,9 +197,11 @@ class OpsAdmin:
                 "deployments": len(m["deployments"]),
                 "usable_deployments": sum(usable(d) for d in m["deployments"]),
                 "open_breakers": sum(d["breaker"] == "open" for d in m["deployments"]),
+                "health": m["health"]["state"],
             }
             for m in report["models"]
         ]
+        out["health"] = report.get("health")
         out["jobs"] = report.get("jobs", [])
         out["purges"] = {
             "scheduled": len(scheduled),

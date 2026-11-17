@@ -47,6 +47,7 @@ from llm_queue.engine.runtime import (
     request_params,
     shape_ok,
 )
+from llm_queue.engine.status import model_health, worst_health
 from llm_queue.engine.streaming import text_of
 from llm_queue.errors import ConfigError, ErrorKind, LocalModeRefused
 from llm_queue.ids import keyed_hash, new_id
@@ -1726,6 +1727,7 @@ class LocalEngine:
         if model is not None:
             return self._model_status(view, view.registry.alias_of(model))
         routing = view.registry.routing
+        models = [self._model_status(view, alias) for alias in view.registry.models]
         return {
             "mode": "local",
             "registry_version": view.registry.version,
@@ -1733,13 +1735,14 @@ class LocalEngine:
             "blocked_regions": list(routing.blocked_regions),
             "blocked_accounts": list(routing.blocked_accounts),
             "process_count": self.limits.process_count,
-            "models": [self._model_status(view, alias) for alias in view.registry.models],
+            "models": models,
+            "health": worst_health(m["health"]["state"] for m in models),
         }
 
     def _model_status(self, view: ResolvedRegistry, alias: str) -> dict[str, Any]:
         slots = self.executor.slots(alias)
         deps = [self._dep_status(view, alias, dep) for dep in view.deployments(alias)]
-        return {
+        out: dict[str, Any] = {
             "model": alias,
             "mode": "local",
             "enabled": bool(view.effective(alias, "enabled").value),
@@ -1749,6 +1752,8 @@ class LocalEngine:
             "concurrency": {"limit": slots.size, "in_use": slots.in_use},
             "deployments": deps,
         }
+        out["health"] = model_health(view, out)
+        return out
 
     def _dep_status(self, view: ResolvedRegistry, alias: str, dep: Deployment) -> dict[str, Any]:
         limits = self.limits

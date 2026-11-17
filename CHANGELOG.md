@@ -72,6 +72,27 @@ index (below).
 
 ### Added
 
+- The off switch `LLMQ_ENABLED` (default `true`; 0.2.0 H1). `false` makes `from_env()` return a
+  disabled queue (`llmq.enabled` False) that reads no other setting but `LLMQ_ENVIRONMENT` and
+  the drain file: the factories return None (the app's direct path), direct calls, jobs,
+  `status()` and admin store operations raise the new `QueueDisabled` (`config_error`, not
+  retryable; HTTP 503 `reason: disabled`, CLI exit 1), `install()` mounts only the two probes
+  (`enabled: false`), `health()` / `describe()` say so, `llmq_disabled` is logged once at start,
+  and the drain file still fails readiness. The fifth step of the switch ladder
+  (docs/how-to/modes.md).
+- Health summary (0.2.0 F2): each model in `status()` has `health` (`state` `healthy` /
+  `warning` / `critical`, `reasons`, budget use this minute, waiting calls, oldest wait,
+  usable deployments) and the report has the worst state as `health`; the new operation
+  `status.health` serves the summary alone on every surface (`llmq.admin.status.health()`,
+  `llm-queue health [--model M]`, `GET /status/health`), and `GET /` shows each model's
+  state. Thresholds are the registry setting `health_summary` (defaults and per model, live
+  editable): `budget_warning_pct` 80 / `budget_critical_pct` 98, `waiting_warning` 1000 /
+  `waiting_critical` 10000, `wait_warning_secs` 30 / `wait_critical_secs` 120. Its gate is F2
+  in `scripts/gates.py`.
+- One `llmq_configured` info line at every `start()` with the log-safe `describe()` summary
+  (0.2.0 D2): how the process is set up, with no password, salt, token, tenant name or
+  registry body. A `describe()` that fails there logs `llmq_configured_failed` and the start
+  goes on.
 - Local execution mode: `LLMQ_EXECUTION_MODE=local` (default `queue`) runs every call in its
   own process straight against the provider, with the same API, classes, LangChain adapters
   and `install()`, and never contacts the store (no store client is built; `LLMQ_STORE_URL`
@@ -200,6 +221,11 @@ index (below).
 
 ### Removed
 
+- `describe()` / `GET /describe` / `llm-queue describe` no longer show `default_tenant` (the
+  name, review B-04): they show `default_tenant_hash`, and the name only with
+  `LLMQ_TENANT_NAMES_ENABLED=true`.
+- `queue_ready(enabled, llmq=None)` loses `enabled`: it is `queue_ready(llmq=None)`. The app's own
+  flag is replaced by `LLMQ_ENABLED=false`, whose queue is ready unless draining.
 - `LLMQ_TENANT_INDEX` and its cross-model index `P:tenant:H:reqs` (with
   `PurgeService.index_call`): a tenant purge of `queued` / `running` calls reads the request
   index of each model. `LLMQ_PURGE_BATCH` (now `LLMQ_ADMIN_BATCH`).

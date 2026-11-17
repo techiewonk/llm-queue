@@ -9,7 +9,8 @@ unless `dry_run=False` (D3).
 From a running queue: `llmq.admin`. Without one (a script, an admin worker):
 `async with AdminServices.from_env() as admin:`; process-local operations (`drain.*`) then
 refuse with `AdminRefused`. In local mode (`LLMQ_EXECUTION_MODE=local`, `for_local`) the
-store-only operations raise `LocalModeRefused` (see `engine/admin/local.py`).
+store-only operations raise `LocalModeRefused` (see `engine/admin/local.py`); with the library
+switched off (`LLMQ_ENABLED=false`, `for_disabled`) they raise `QueueDisabled`.
 """
 
 from __future__ import annotations
@@ -162,6 +163,27 @@ class AdminServices:
         return admin
 
     @classmethod
+    def for_disabled(cls, *, settings: InfraSettings | None, process: Any = None) -> AdminServices:
+        """The services with `LLMQ_ENABLED=false`: store operations raise `QueueDisabled`.
+
+        `describe`, `ops`, `registry.schema` and (inside a process) `drain.*` are served.
+        """
+        from llm_queue.engine.admin import disabled
+
+        ctx = disabled.DisabledContext(settings, process)
+        admin = cls.__new__(cls)
+        parts: dict[str, Any] = {name: disabled.Refused(name) for name in disabled.REFUSED}
+        parts.update(
+            context=ctx,
+            registry=disabled.DisabledRegistryAdmin(),
+            drain=disabled.DisabledDrainAdmin(ctx),
+            ops=disabled.DisabledOpsAdmin(ctx),
+            _owned=[],
+        )
+        vars(admin).update(parts)
+        return admin
+
+    @classmethod
     def from_env(
         cls,
         environ: Mapping[str, str] | None = None,
@@ -177,6 +199,8 @@ class AdminServices:
         """
         layers = Layers(environ, secrets, defaults, secret_names)
         settings = InfraSettings.from_layers(layers)
+        if not settings.enabled:  # LLMQ_ENABLED=false: nothing to talk to
+            return cls.for_disabled(settings=settings)
         if settings.execution_mode == "local":  # no store to talk to
             return cls.for_local(None, settings=settings)
         ctx = AdminContext.from_layers(layers)

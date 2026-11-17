@@ -26,6 +26,8 @@ llm-queue --actor ann requests cancel --id r-1 --yes   # cancels, audited as ann
   text. Lists such as `purge tenant --remove keys,queued` are comma lists; repeated ids are
   repeated options (`--id A --id B`).
 - Output is one JSON document.
+- With `LLMQ_ENABLED=false` nothing is contacted: `describe` answers `enabled: false`, and every
+  command that needs the store exits 1 with the `QueueDisabled` message.
 
 **Exit codes.** 0 done; 1 an error (a bad name or edit, an unknown or expired id, a refused
 operation, a store outage: one line on stderr, no traceback); 3 a `models drain --wait-secs S`
@@ -38,6 +40,11 @@ that ran out of time with calls still waiting.
 ```python
 app.include_router(llmq.http_router(), prefix="/internal/llm-queue")
 ```
+
+With `LLMQ_ENABLED=false` the router has the two probes only (`GET /health/live`,
+`GET /health/ready`, both with `"enabled": false`; readiness 503 while draining), whatever the
+options. A route built by hand over a disabled queue's `llmq.admin` answers 503
+`{"reason": "disabled"}` for a store operation.
 
 | Argument | Default | Does |
 |---|---|---|

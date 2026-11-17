@@ -66,6 +66,7 @@ mistyped fields are a 400.
 | `drain.start` | update | `await llmq.admin.drain.start(actor="ann")` | process-local (pods use `LLMQ_DRAIN_FILE`) | `POST /drain` | write | `drain` | no |
 | `drain.resume` | update | `await llmq.admin.drain.resume(actor="ann")` | process-local | `POST /resume` | write | `resume` | no |
 | `status.get` | read | `await llmq.admin.status.get("sonnet", tenant="acme")` | `llm-queue status [--model M] [--tenant T]` | `GET /status?model=M&tenant_hash=H` | read |  |  |
+| `status.health` | read | `await llmq.admin.status.health()` | `llm-queue health [--model M]` | `GET /status/health?model=M` | read |  |  |
 | `registry.get` | read | `await llmq.admin.registry.get()` | `llm-queue registry get [--model M]` | `GET /registry` | read |  |  |
 | `registry.versions` | read | `await llmq.admin.registry.versions()` | `llm-queue registry versions` | `GET /registry/versions` | read |  |  |
 | `registry.diff` | read | `await llmq.admin.registry.diff()` | `llm-queue registry diff` | `GET /registry/diff` | read |  |  |
@@ -118,7 +119,9 @@ settings (`registry.set`); jobs are sent by the app (`llmq.send_job`), their dea
 
 | Op | Parameters (default) | Answer |
 |---|---|---|
+| `process.describe` | | `{version, worker_id, enabled, execution_mode, secrets, mode, environment, store, separate_queue_store, key_prefix, queue_prefix, key_expiry, store_max_connections, metrics_sink, default_tenant_hash, admin_writes_enabled, registry_version, models}` (no password, salt, token or registry body; `default_tenant` too only with `LLMQ_TENANT_NAMES_ENABLED`); logged once at start as `llmq_configured`. Off: `{version, enabled: false, environment, drain_file}` |
 | `status.get` | `model` (all), `tenant` / `tenant_hash` (with a model) | `StatusReport`, or `ModelStatus` of one model (with `tenants` and `request_index`); with a tenant also `tenant: {tenant, waiting, running, by_stage, oldest_wait_secs, fairness}` |
+| `status.health` | `model` (all) | `{health, registry_version, models: [{model, state, reasons, budget_used_pct, waiting, oldest_waiting_secs, usable_deployments, deployments}]}`; `state` is `healthy`, `warning` or `critical` (`health` the worst), against the model's `health_summary` thresholds. Critical: `no_usable_deployment` (an enabled model), `budget_used`, `waiting`, `oldest_wait` at their critical mark; warning: those at their warning mark, `breaker_open`, `deployment_disabled`, `dead_letters` (`alerts.dlq_messages`), `kill_switch`, `model_disabled`. Local mode: this process's view and budget shares. The same summary is each model's `health` in `status.get` and `GET /` |
 | `registry.get` | `model` (whole document) | `{registry, changes, live_edits}`, secrets shown as `[redacted]` |
 | `registry.versions` | | `{versions: [int], current: int}` |
 | `registry.set` | `values` (`{path: value}`, at most 100; `null` deletes), `model` | `{diff, version, dry_run}` |

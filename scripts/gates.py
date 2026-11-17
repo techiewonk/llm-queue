@@ -973,6 +973,80 @@ async def b23() -> bool:
     )
 
 
+async def f2() -> bool:
+    """Health summary (plan 0.2.0 F2): its states follow a real backlog, and it is cheap.
+
+    Pass: an idle model is `healthy`; with a backlog over its `health_summary` marks it turns
+    `critical` (reasons `waiting` and `oldest_wait`) within 20 s; once the backlog is cancelled
+    it is `healthy` again within 15 s; a summary read takes <= 200 ms at p95.
+    """
+    marks = {
+        "waiting_warning": 10,
+        "waiting_critical": 40,
+        "wait_warning_secs": 3,
+        "wait_critical_secs": 8,
+        "budget_warning_pct": 100,  # budget use is not what this gate drives
+        "budget_critical_pct": 100,
+    }
+    doc = registry(
+        {"chat": {"rpm": 30, "worker_slots": 10, "health_summary": marks}},
+        accounts=1,
+        regions=1,
+        defaults={"timeout_secs": 300, "timeout_max_secs": 300, "max_wait_secs": 300},
+    )
+    states: list[tuple[float, str, list[str]]] = []
+    reads: list[float] = []
+    idle = critical_at = healthy_after = None
+    async with Gate(doc) as gate:
+        await gate.workers(2)
+        (queue,) = await gate.callers(1)
+        admin = queue.admin
+        run = Run()
+
+        async def summary() -> dict[str, Any]:
+            t0 = time.monotonic()
+            row: dict[str, Any] = (await admin.status.health("chat"))["models"][0]
+            reads.append(time.monotonic() - t0)
+            states.append((time.monotonic() - run.t0, row["state"], row["reasons"]))
+            return row
+
+        idle = (await summary())["state"]
+        for _ in range(19):
+            await summary()
+        tasks = [asyncio.create_task(run.call(queue, "chat", chat())) for _ in range(80)]
+        sent = time.monotonic()
+        while time.monotonic() - sent < 20:
+            row = await summary()
+            if row["state"] == "critical" and {"waiting", "oldest_wait"} <= set(row["reasons"]):
+                critical_at = time.monotonic() - sent
+                break
+            await asyncio.sleep(0.5)
+        await admin.requests.cancel(model="chat", state="waiting", actor="gate", dry_run=False)
+        cancelled = time.monotonic()
+        while time.monotonic() - cancelled < 15:
+            if (await summary())["state"] == "healthy":
+                healthy_after = time.monotonic() - cancelled
+                break
+            await asyncio.sleep(0.5)
+        await asyncio.gather(*tasks, return_exceptions=True)
+    read_p95 = p95(reads) * 1000
+    seen = sorted({state for _, state, _ in states}, key=("healthy", "warning", "critical").index)
+    return verdict(
+        "F2",
+        {
+            "idle model is healthy": idle == "healthy",
+            "backlog turns critical within 20 s": critical_at is not None,
+            "healthy again within 15 s of the cancel": healthy_after is not None,
+            "summary read p95 <= 200 ms": read_p95 <= 200,
+        },
+        [
+            f"states seen {seen}; critical after {critical_at or 0:.1f}s, healthy "
+            f"{healthy_after or 0:.1f}s after the cancel; read p95 {read_p95:.0f} ms over "
+            f"{len(reads)} reads; calls {len(run.results)} (failures {run.kinds() or 0})"
+        ],
+    )
+
+
 GATES: dict[str, Callable[[], Coroutine[Any, Any, bool]]] = {
     "B17": b17,
     "B19": b19,
@@ -987,6 +1061,7 @@ GATES: dict[str, Callable[[], Coroutine[Any, Any, bool]]] = {
     "B95": b95,
     "B96": b96,
     "B97": b97,
+    "F2": f2,
 }
 
 
