@@ -211,10 +211,10 @@ async def test_a_store_pool_smaller_than_the_slots_is_warned(
     assert any("store_pool_small" in r.getMessage() for r in caplog.records)
 
 
-def test_public_types_and_deprecated_internals() -> None:
+def test_public_types_and_no_internal_aliases() -> None:
     """Q35: apps imported Provider, Route, JobFn, Secrets and PublishResult from private modules.
 
-    They are public now; `LLMQueue.engine` and `.jobs` became private, with aliases that warn.
+    They are public; the deprecated `LLMQueue.engine` / `.jobs` aliases are gone in 0.2.0.
     """
     import llm_queue
 
@@ -223,7 +223,6 @@ def test_public_types_and_deprecated_internals() -> None:
         assert getattr(llm_queue, name) is not None
     engine = _Engine()
     queue = _queue(engine)
-    with pytest.warns(DeprecationWarning, match=r"LLMQueue\.engine is private"):
-        assert queue.engine is cast("Any", engine)
-    with pytest.warns(DeprecationWarning, match=r"LLMQueue\.jobs is private"):
-        assert queue.jobs is queue._jobs
+    assert queue._engine is cast("Any", engine)
+    assert not hasattr(queue, "engine")
+    assert not hasattr(queue, "jobs")

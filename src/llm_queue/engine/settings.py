@@ -168,6 +168,9 @@ class InfraSettings:
     # What the replica wait covers (owner Q8 / Q51), LLMQ_QUEUE_WAIT_SCOPES: all by default.
     queue_wait_scopes: frozenset[str] = frozenset(WAIT_SCOPES)
     debug_capture_from_config: bool = False
+    worker_id: str = ""  # LLMQ_WORKER_ID: this process's id prefix (default pod:pid)
+    default_tenant: str | None = None  # LLMQ_DEFAULT_TENANT: when a call names none
+    admin_header: str = "X-LLMQ-Token"  # LLMQ_ADMIN_HEADER: the admin token's header
     # How keys expire (LLMQ_KEY_EXPIRY): `auto` picks native TTLs on a `noeviction` store and the
     # expiry index on a `volatile-*` one (owner decision K4, 0.1.0b3); engine/expiry.py.
     key_expiry: str = "auto"
@@ -277,6 +280,13 @@ class InfraSettings:
         live_edit = str(get("REGISTRY_LIVE_EDIT", "safe"))
         if live_edit not in ("safe", "all", "off"):
             problems.append("LLMQ_REGISTRY_LIVE_EDIT must be safe, all or off")
+        worker_id = str(get("WORKER_ID", "") or "").strip()
+        if worker_id and not _PREFIX_RE.match(worker_id.replace(":", "_")):
+            problems.append("LLMQ_WORKER_ID must be letters, digits, `_`, `.`, `:` or `-`")
+        default_tenant = str(get("DEFAULT_TENANT", "") or "").strip() or None
+        admin_header = str(get("ADMIN_HEADER", "X-LLMQ-Token") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", admin_header):
+            problems.append("LLMQ_ADMIN_HEADER must be a header name (letters, digits, `-`)")
         mode = str(get("MODE", "both"))
         if mode not in ("both", "caller", "worker"):
             problems.append("LLMQ_MODE must be both, caller or worker")
@@ -390,6 +400,9 @@ class InfraSettings:
             queue_wait_ms=number("QUEUE_WAIT_MS", 100, int, hi=60_000),
             queue_wait_scopes=scopes,
             debug_capture_from_config=capture,
+            worker_id=worker_id,
+            default_tenant=default_tenant,
+            admin_header=admin_header,
             key_expiry=key_expiry,
             ttl_sweep_batch=number("TTL_SWEEP_BATCH", 500, int, lo=1, hi=5_000),
             ttl_sweep_rounds=number("TTL_SWEEP_ROUNDS", 100, int, lo=1, hi=10_000),

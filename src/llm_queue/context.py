@@ -47,8 +47,14 @@ def request_context(
         user_id=user_id if user_id is not None else base.user_id,
         tenant_id=tenant_id if tenant_id is not None else base.tenant_id,
     )
+    previous = _CURRENT.get()
     token = _CURRENT.set(ctx)
     try:
         yield ctx
     finally:
-        _CURRENT.reset(token)
+        try:
+            _CURRENT.reset(token)
+        except ValueError:
+            # The block ended in another context (an async generator finalized by another
+            # task): the token cannot be reset there, so the value it replaced is restored.
+            _CURRENT.set(previous)

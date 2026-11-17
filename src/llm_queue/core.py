@@ -16,7 +16,6 @@ import contextlib
 import os
 import socket
 import threading
-import warnings
 import weakref
 from collections.abc import (
     AsyncGenerator,
@@ -24,6 +23,7 @@ from collections.abc import (
     Awaitable,
     Callable,
     Coroutine,
+    Iterator,
     Mapping,
     Sequence,
 )
@@ -232,6 +232,7 @@ class LLMQueue:
         """
         self._engine = engine
         self.settings = settings
+        self._admin_token: Callable[[], str | None] = lambda: None  # `from_env` sets it
         self._tuning = tuning or Tuning()
         self._jobs = JobRunner(
             engine.queues,
@@ -256,31 +257,6 @@ class LLMQueue:
         self._inherited = False
         _QUEUES.add(self)
 
-    @property
-    def engine(self) -> Engine:
-        """Deprecated: the engine is private (owner decision Q35); use the queue's methods.
-
-        Kept as an alias that warns until 0.2.
-        """
-        warnings.warn(
-            "LLMQueue.engine is private since 0.1.0b2 and will be removed in 0.2; use the "
-            "LLMQueue methods (call, status, registry, ...)",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._engine
-
-    @property
-    def jobs(self) -> JobRunner:
-        """Deprecated: the job runner is private (Q35); use `register_job` and `send_job`."""
-        warnings.warn(
-            "LLMQueue.jobs is private since 0.1.0b2 and will be removed in 0.2; use "
-            "register_job / send_job",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._jobs
-
     # ---------------------------------------------------------------- construction
 
     @classmethod
@@ -302,7 +278,11 @@ class LLMQueue:
         defaults); a bad value or combination raises `ConfigError` listing every problem.
         """
         settings = InfraSettings.from_env(environ, secrets=secrets)
-        jobs = JobSettings.from_env(os.environ if environ is None else environ)
+        env = os.environ if environ is None else environ
+        jobs = JobSettings.from_env(_SecretFirst(env, secrets))  # secrets too (0.1.1 read env only)
+        # This process's id prefix: the argument, LLMQ_WORKER_ID, else pod (or host) and pid; the
+        # engine adds a random tail, so two processes never share one.
+        worker_id = worker_id or settings.worker_id or _default_worker_id()
         tuning = tuning or Tuning()
         if problems := tuning.problems(
             queue_wait_ms=settings.queue_wait_ms, result_ttl_secs=settings.result_ttl_secs
@@ -389,7 +369,7 @@ class LLMQueue:
             )
 
         sync_cap = min(SYNC_STORE_CONNECTIONS, settings.store_max_connections)
-        return cls(
+        queue = cls(
             build(),
             settings=settings,
             builder=lambda: build(sync_cap),
@@ -397,6 +377,8 @@ class LLMQueue:
             job_settings=jobs,
             tuning=tuning,
         )
+        queue._admin_token = lambda: _setting_value("LLMQ_ADMIN_TOKEN", env, secrets)
+        return queue
 
     # ---------------------------------------------------------------- guards (C2)
 
@@ -635,7 +617,9 @@ class LLMQueue:
             "priority": ctx.priority if priority is None else priority,
             "session_id": kw.pop("session_id", None) or ctx.session_id,
             "user_id": kw.pop("user_id", None) or ctx.user_id,
-            "tenant_id": kw.pop("tenant_id", None) or ctx.tenant_id,
+            "tenant_id": kw.pop("tenant_id", None)
+            or ctx.tenant_id
+            or getattr(self.settings, "default_tenant", None),
         }
         out.update({k: v for k, v in kw.items() if v is not None})
         return out
@@ -914,22 +898,59 @@ class LLMQueue:
         allow_writes: bool = False,
         actor: Callable[[Any], str] | None = None,
         metrics_route: bool = False,
+        admin_token: str | Callable[[], str | None] | None = None,
+        admin_header: str | None = None,
     ) -> Any:
         """A FastAPI router with status, requests, registry and health (extra `http`).
 
         Writes need `actor(request) -> str`, the authenticated name recorded in the audit.
         `metrics_route=True` adds `GET /metrics` (Prometheus exposition, open like the health
-        routes); it was reachable only through the private engine.
+        routes). `admin_token` (a value, or a callable read on every request so a rotated
+        secret needs no restart; default `LLMQ_ADMIN_TOKEN`) guards every route but the
+        probes and `/metrics` with header `admin_header` (default `LLMQ_ADMIN_HEADER`,
+        `X-LLMQ-Token`), compared in constant time. With no token configured anywhere, only
+        `dependencies` guard the routes, as before; a token that reads empty refuses all.
         """
-        from llm_queue.engine.http import status_router
+        from llm_queue.engine.http import admin_token_dependency, status_router
 
+        token = admin_token if admin_token is not None else self._admin_token
+        header = admin_header or (self.settings.admin_header if self.settings else "X-LLMQ-Token")
+        guards = list(dependencies)
+        if admin_token is not None or (callable(token) and token() is not None):
+            guards.append(admin_token_dependency(token, header))
         return status_router(
             self._engine,
-            dependencies=dependencies,
+            dependencies=guards,
             allow_writes=allow_writes,
             actor=actor,
             metrics_route=metrics_route,
         )
+
+    def describe(self) -> dict[str, Any]:
+        """This queue's settings for a log line: no password, salt, token or registry body."""
+        from urllib.parse import urlsplit
+
+        s = self.settings
+        out: dict[str, Any] = {"version": __version__, "worker_id": self._engine.worker_id}
+        if s is None:
+            return out
+        store = urlsplit(s.store_url)
+        doc = orjson.loads(s.registry_document()) if (s.registry or s.registry_file) else {}
+        out.update(
+            mode=s.mode,
+            environment=s.environment,
+            store=f"{store.scheme}://{store.hostname}:{store.port or 6379}",
+            separate_queue_store=s.queue_store_url is not None,
+            key_prefix=s.key_prefix,
+            queue_prefix=s.queue_prefix,
+            key_expiry=s.key_expiry,
+            store_max_connections=s.store_max_connections,
+            metrics_sink=s.metrics_sink,
+            default_tenant=s.default_tenant,
+            registry_version=doc.get("registry_version"),
+            models=sorted(doc.get("models") or {}),
+        )
+        return out
 
 
 async def _embed(
@@ -1139,3 +1160,43 @@ def _warn_if_loop_running() -> None:
         "sync_call_on_event_loop",
         hint="converse_sync / embed_sync block this event loop; await converse / embed instead",
     )
+
+
+class _SecretFirst(Mapping[str, str]):
+    """`env` with each name looked up in `secrets` first: what `InfraSettings.from_env` reads."""
+
+    def __init__(self, env: Mapping[str, str], secrets: Secrets | None) -> None:
+        self._env = env
+        self._secrets = secrets
+
+    def __getitem__(self, name: str) -> str:
+        value = self._secrets(name) if self._secrets is not None else None
+        if value is not None and value != "":
+            return value
+        return self._env[name]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._env)
+
+    def __len__(self) -> int:
+        return len(self._env)
+
+    def get(self, name: str, default: Any = None) -> Any:
+        try:
+            return self[name]
+        except KeyError:
+            return default
+
+
+def _setting_value(name: str, env: Mapping[str, str], secrets: Secrets | None) -> str | None:
+    """A setting read now: the secret first, then the environment; None when unset or empty."""
+    value = secrets(name) if secrets is not None else None
+    if value in (None, ""):
+        value = env.get(name)
+    return value or None
+
+
+def _default_worker_id() -> str:
+    """This process's id prefix: `POD_NAME` (Kubernetes), else the host name, and the pid."""
+    pod = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or socket.gethostname()
+    return f"{pod}:{os.getpid()}"

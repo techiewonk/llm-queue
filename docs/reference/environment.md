@@ -90,6 +90,10 @@ For a store with replicas, also set `min-replicas-to-write` on the primary: a wr
 | `LLMQ_KEY_PREFIX` | `llmq` in dev; **required** when strict | 1-64 letters, digits, `_`, `.`, `:` or `-` | Prefix of this environment's store keys: name it per app and environment (`myapp-prod`, `llmq:prod:v3`). No braces or glob characters: it is part of every key |
 | `LLMQ_QUEUE_PREFIX` | empty | 0-64 letters, digits, `_`, `.` or `-` | Prefix of this environment's queue names (no `:`: it goes inside hash tags) |
 | `LLMQ_MODE` | `both` | `both`, `caller`, `worker` | `both` (caller and worker), `caller` (sends and waits only) or `worker` (runs calls only) |
+| `LLMQ_WORKER_ID` | empty | letters, digits, `_`, `.`, `:`, `-` | Empty: `POD_NAME` (else the host name) and the pid, e.g. `api-7f9c:12`. This process's id prefix in the store (callers, leases, logs); the engine adds a random tail, so two processes never share one. A `worker_id=` argument wins |
+| `LLMQ_DEFAULT_TENANT` | none | text | The tenant of a call that names none (no `tenant_id=`, none in `request_context`): every call of a single-tenant app carries it, threads included |
+| `LLMQ_ADMIN_TOKEN` | none | text (a secret) | Guards the router's routes except the probes and `/metrics`: the request's `LLMQ_ADMIN_HEADER` must equal it (constant-time). Read on every request, so a rotated secret needs no restart. Unset: only the app's `dependencies` guard the routes |
+| `LLMQ_ADMIN_HEADER` | `X-LLMQ-Token` | a header name | The header that carries the admin token |
 | `LLMQ_METRICS_SINK` | `emf` | `emf`, `prometheus`, `none` | `emf` (CloudWatch embedded metrics), `prometheus` (extra `metrics`) or `none`. One sink per process |
 
 ## Registry

@@ -455,3 +455,22 @@ def status_router(
             return reply(refused or await purges.cancel_scheduled(body, actor=who(request)))
 
     return router
+
+
+def admin_token_dependency(token: str | Callable[[], str | None], header: str) -> Any:
+    """A FastAPI dependency: the request's `header` must equal the token (constant time).
+
+    `token` is read on every request when it is a callable (a rotated secret needs no restart).
+    An empty or missing token refuses every request (fail closed).
+    """
+    import hmac
+
+    from fastapi import HTTPException, Request
+
+    async def guard(request: Request) -> None:
+        expected = token() if callable(token) else token
+        given = request.headers.get(header, "")
+        if not expected or not hmac.compare_digest(given.encode(), str(expected).encode()):
+            raise HTTPException(status_code=403, detail="forbidden")
+
+    return guard
