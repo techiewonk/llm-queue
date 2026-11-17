@@ -40,6 +40,16 @@ public API (see STABILITY.md).
 - `LLMQ_STORE_MAX_CONNECTIONS=auto` (D7): the boot registry's `worker_slots` summed plus
   `STORE_POOL_MARGIN` (10), within 4 to 100,000, computed once by `from_env`. A number works
   as before (default 200).
+- Model factories (E1): `llm_queue.langchain.chat_model(model_id, *, registry=None, **kw)`
+  and `embeddings(...)` return the queued LangChain class for a model the
+  boot registry knows (by alias or model id; Bedrock or OpenAI-compatible adapter by the
+  model's provider, `**kw` passed through), else None, so `chat_model(...) or <direct model>`
+  keeps the app's direct path for a model outside the registry. `registry=` is a document,
+  JSON text, a path, an `LLMQueue` or None (`LLMQ_REGISTRY` / `LLMQ_REGISTRY_FILE`, read
+  without a store, placeholders expanded). No langchain module is imported for an unknown
+  model.
+  `aliases(registry)` maps model ids to aliases; `boot_registry(registry)` returns the parsed
+  registry. See [Use LangChain models](docs/how-to/langchain.md).
 - `LLMQueue.embed_one(model, text, **kw)` and `embed_one_sync(...)` (H8): one text's vector.
 
 ### Changed
