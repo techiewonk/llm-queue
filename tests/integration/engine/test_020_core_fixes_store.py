@@ -12,7 +12,7 @@ from typing import Any
 import orjson
 import pytest
 import redis.asyncio
-from engine_testkit import CHAT, GPT, Make
+from engine_testkit import CHAT, GPT, SMALL, Make, away_from_minute_end, stats
 
 from llm_queue.engine import requests as requests_module
 from llm_queue.engine.envelope import Reply
@@ -311,3 +311,65 @@ async def test_a4_a_cancel_during_an_admission_in_flight_gives_the_grant_back(
         assert loop.time() < until, "the grant was not given back"
         await asyncio.sleep(0.05)
     assert "a4" not in engine._held
+
+
+# ---------------------------------------------------------------- A-11 (G21), G20
+
+HOME_ONE_RPM: dict[str, Any] = {
+    "rpm": 1,
+    "rate_window": "smooth",  # no minute boundary to cross mid-test
+    "retry_base_secs": 0.05,
+    "deployments": {"aws-a": {"confirmed": ["r1"]}},
+    "model_fallback": {"on": ["exhausted"], "after_secs": 0, "models": ["small"]},
+}
+
+
+async def test_a11_a_retry_after_a_failed_fallback_attempt_goes_home_first(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A-11 (owner Q-5): a retry after a failed attempt on the fallback model stayed there.
+
+    It was re-admitted as the fallback model's own call and never went back to its model,
+    even with capacity again. The retry now asks the call's own model first.
+    """
+    # A fixed window: a raised rpm counts at once (a smooth one keeps the old spacing).
+    home = {**HOME_ONE_RPM, "rate_window": "fixed"}
+    engine, _ = await make(
+        {"big": home, "small": {"max_attempts": 3, "retry_base_secs": 0.05}},
+        {"models": {f"{SMALL}@r1": {"force_error": "InternalServerException"}}},
+    )
+    await away_from_minute_end(engine.clock.now)
+    assert (await engine.call("big", CHAT)).meta.served_model == "big"  # its budget is used
+    real = engine._attempt
+
+    async def attempt(view: Any, alias: str, *args: Any, **kwargs: Any) -> Any:
+        result = await real(view, alias, *args, **kwargs)
+        if alias == "small" and result.outcome != "ok":  # the home model recovers meanwhile
+            await engine.registry.set({"rpm": 600}, model="big", actor="t")
+        return result
+
+    monkeypatch.setattr(engine, "_attempt", attempt)
+    reply = await engine.call("big", CHAT, timeout_secs=10)
+    assert reply.meta.served_model == "big"  # provider_error after three tries on small before
+    assert reply.meta.attempts == 2
+
+
+async def test_g20_a_tenant_at_its_quota_is_not_served_by_the_fallback_model(
+    make: Make,
+) -> None:
+    """G20: fairness with model fallback: a tenant is charged once, refused per its own quota.
+
+    The home model is out of budget and the tenant at its quota there: the call fails
+    `rate_limited` at once instead of going round the quota on the fallback model; another
+    tenant falls back; the refused tenant's one grant is all it was charged.
+    """
+    engine, fake = await make({"big": {**HOME_ONE_RPM, "fairness": {"mode": "quota", "rpm": 1}}})
+    first = await engine.call("big", CHAT, tenant_id="acme")
+    assert first.meta.served_model == "big"
+    with pytest.raises(CallFailed) as caught:
+        await engine.call("big", CHAT, tenant_id="acme", timeout_secs=5)
+    assert caught.value.kind == "rate_limited"
+    for _ in range(2):  # served by the fallback, never charged to its quota on the home model
+        other = await engine.call("big", CHAT, tenant_id="globex", timeout_secs=5)
+        assert other.meta.served_model == "small"
+    assert stats(fake, f"{SMALL}@r1")["calls"] == 2  # globex only: acme was never run there

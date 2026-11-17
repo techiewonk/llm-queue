@@ -3682,11 +3682,37 @@ class Engine:
         broken: bool = False,
     ) -> bool:
         """Try the model's fallback models when its rule allows; True when one granted."""
+        picked = await self._fallback_pick(view, alias, held, attempt, waited, broken=broken)
+        if picked is None:
+            return False
+        decision, other = picked
+        # The run (and its grant in `held.grants`) first; the status is informational, written
+        # behind. A failed status write before it left the grant neither run nor given back,
+        # holding a slot until its lease ended (audit RT-10).
+        self._start_run(held, decision, attempt, served=other)
+        self._fallback_status(held, other)
+        return True
+
+    async def _fallback_pick(
+        self,
+        view: ResolvedRegistry,
+        alias: str,
+        held: _Held,
+        attempt: int,
+        waited: float,
+        *,
+        broken: bool = False,
+        failed_by: Mapping[str, set[str]] | None = None,
+    ) -> tuple[Decision, str] | None:
+        """A grant on one of the model's fallback models (and that model), when its rule allows.
+
+        `failed_by`: deployments a retry already saw fail, per model (tried last).
+        """
         rule = view.value(alias, "model_fallback")
         env = held.envelope
         cause = "broken" if broken else "exhausted"
         if not self._may_spill(view, alias, env, waited, cause, "model_fallback"):
-            return False
+            return None
         for item in rule["models"]:
             other = item["model"]
             if other not in view.registry.models or not _takes_calls(view, other):
@@ -3694,23 +3720,21 @@ class Engine:
             if not self._shape_ok(view, other, env.op, env.params, stream=env.stream):
                 continue
             pct = int(view.value(other, "require_headroom_pct")) if item["require_headroom"] else 0
-            ask = self._ask(
-                view, other, held, attempt, frozenset(), foreign_from=alias, require_pct=pct
-            )
+            failed = frozenset((failed_by or {}).get(other, ()))
+            ask = self._ask(view, other, held, attempt, failed, foreign_from=alias, require_pct=pct)
             if ask is None:
                 continue
             decision = await self._pick_take(held, ask)
             if decision.kind == "granted":
-                # The run (and its grant in `held.grants`) first; the status is informational,
-                # written behind. A failed status write before it left the grant neither run
-                # nor given back, holding a slot until its lease ended (audit RT-10).
-                self._start_run(held, decision, attempt, served=other)
-                self._spawn(
-                    self.requests.set_status(env.request_id, "in_progress", served_model=other),
-                    "fallback_status",
-                )
-                return True
-        return False
+                return decision, other
+        return None
+
+    def _fallback_status(self, held: _Held, served: str) -> None:
+        """Write behind that a call runs on a fallback model (informational, best effort)."""
+        rid = held.envelope.request_id
+        self._spawn(
+            self.requests.set_status(rid, "in_progress", served_model=served), "fallback_status"
+        )
 
     # ================================================================ worker: running
 
@@ -3829,9 +3853,11 @@ class Engine:
     async def _attempts(self, held: _Held, decision: Decision, attempt: int, alias: str) -> None:
         throttles = 0
         tries = 0
-        failed: set[str] = set()
+        home = held.envelope.model
+        failed_by: dict[str, set[str]] = {}  # failed deployments per model (keys may repeat)
         retry_secs = 0.0
         while True:
+            failed = failed_by.setdefault(alias, set())
             view = self.registry.current
             dep_key = decision.deployment or ""
             owner = self._owner(held, attempt)
@@ -3909,12 +3935,25 @@ class Engine:
                 # The view now: one read before the failed attempt still offered a deployment
                 # a reload had removed (FE-13).
                 view = self.registry.current
-                next_decision = await self._decide(view, alias, held, attempt, frozenset(failed))
+                # After a failed attempt on a fallback model the call's own model is asked
+                # first, then the fallback rule again (A-11, owner Q-5): re-admitted as the
+                # fallback model's own call, it never went back to a recovered home model.
+                tried_home = frozenset(failed_by.get(home, ()))
+                next_decision = await self._decide(view, home, held, attempt, tried_home)
                 if next_decision is None:
                     return
                 if next_decision.kind == "granted":
-                    decision = next_decision
+                    decision, alias = next_decision, home
                     break
+                if alias != home and next_decision.kind == "wait":
+                    waited = self.clock.now() - held.position_ms / 1000.0
+                    picked = await self._fallback_pick(
+                        view, home, held, attempt, waited, failed_by=failed_by
+                    )
+                    if picked is not None:
+                        (decision, alias) = picked
+                        self._fallback_status(held, alias)
+                        break
                 if next_decision.kind == "busy":
                     await self._finish_call(held, "rate_limited", "fallback model is busy")
                     return
