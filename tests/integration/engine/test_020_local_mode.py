@@ -498,6 +498,49 @@ async def test_stop_drains_then_fails_calls_still_running(rig: Rig) -> None:
     assert time.monotonic() - started < 3
 
 
+async def test_local_mode_reads_a_secrets_source_like_queue_mode(rig: Rig, tmp_path: Path) -> None:
+    """Review L-7: an account's `api_key_ref` and both admin tokens from a `file:` source."""
+    volume = tmp_path / "llmq-secrets"
+    volume.mkdir()
+    (volume / "vllm_key").write_text("sk-local\n", encoding="utf-8")
+    (volume / "LLMQ_ADMIN_READ_TOKEN").write_text("r34d\n", encoding="utf-8")
+    (volume / "LLMQ_ADMIN_TOKEN").write_text("wr1te\n", encoding="utf-8")
+    doc = registry_doc(None)
+    doc["accounts"]["vllm"] = {
+        "kind": "openai",
+        "base_url": f"{str(rig.server.make_url('')).rstrip('/')}/v1",
+        "api_key_ref": "LLMQ_ACCOUNT_VLLM_KEY",
+    }
+    doc["models"]["oss"] = {
+        "type": "chat",
+        "provider": "openai",
+        "model_id": "gpt-oss-120b",
+        "deployments": {"vllm": {"confirmed": ["dc1"]}},
+    }
+    env = {
+        **rig.env(),
+        "LLMQ_REGISTRY": json.dumps(doc),
+        "LLMQ_SECRETS_SOURCE": f"file:{volume}",
+        "LLMQ_SECRET_NAMES": json.dumps({"LLMQ_ACCOUNT_VLLM_KEY": "vllm_key"}),
+    }
+    llmq = LLMQueue.from_env(env)
+    rig.queues.append(llmq)
+    await llmq.start()
+    reply = await llmq.call("oss", {"messages": [{"role": "user", "content": "hi"}]})
+    assert reply.ok  # without the key the route is refused (CredentialsUnavailable)
+    assert llmq.describe()["secrets"]["sources"] == [f"file:{volume}"]
+    app = FastAPI()
+    app.include_router(llmq.http_router(), prefix="/q")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://app") as client:
+        for token, code in (("r34d", 200), ("wr1te", 200), ("nope", 403)):
+            got = await client.get("/q/status", headers={"X-LLMQ-Token": token})
+            assert got.status_code == code, (token, got.text)
+        assert (await client.get("/q/status", headers={"X-LLMQ-Token": "r34d"})).json()[
+            "mode"
+        ] == "local"
+
+
 def test_settings_validate_the_local_variables() -> None:
     from llm_queue import ConfigError
     from llm_queue.engine.settings import InfraSettings

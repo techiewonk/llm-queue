@@ -61,6 +61,12 @@ def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> 
         return out
     doc = orjson.loads(s.registry_document()) if (s.registry or s.registry_file) else {}
     out["execution_mode"] = s.execution_mode
+    # Kinds and ids of the secrets sources and the mapped setting names: never a value.
+    out["secrets"] = {
+        "sources": list(s.secret_sources),
+        "names": list(s.secret_names),
+        "cache_secs": s.secrets_cache_secs,
+    }
     if s.execution_mode == "local":  # no store: its settings do not apply
         out.update(
             environment=s.environment,

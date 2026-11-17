@@ -28,8 +28,24 @@ The registry names secrets; it never holds them:
 - `api_key_ref` and `external_id_ref` must be upper-case names starting with `LLMQ_ACCOUNT_`.
   Anything else is refused, so a registry author (or a live edit) cannot send the store password
   or the pod's own AWS keys as a Bearer token.
-- The value is looked up in `from_env(secrets=)` first, then the environment.
+- The value is looked up in the secrets (`from_env(secrets=)`, else `LLMQ_SECRETS_SOURCE`)
+  first, then the environment.
 - Audit entries and the HTTP router redact `role_arn`, `external_id_ref` and `api_key_ref`.
+
+### Read secrets from a secret store, not the manifest
+
+Set `LLMQ_SECRETS_SOURCE` (`aws-secretsmanager:<id>` on the pod role, or `file:<path>` on a
+mounted Kubernetes secret) and `LLMQ_SECRET_NAMES`, so the store password, the id salt and the
+admin token never sit in a manifest or the environment (see
+[Configure: Secrets](configure.md#secrets)):
+
+- grant the pod role `secretsmanager:GetSecretValue` on that one secret only;
+- a source that cannot be read at start (denied, missing) stops the process with a
+  `ConfigError` naming the source; values never appear in an error, a log line, `repr` or
+  `describe()` (which shows the source kinds, secret ids and mapped names only);
+- values are cached for `LLMQ_SECRETS_CACHE_SECS` (300), so a rotation reaches new store
+  connections within that time without a restart; a failed refresh keeps the last values and
+  logs `secrets_refresh_failed`.
 
 ## 3. Restrict `base_url`
 

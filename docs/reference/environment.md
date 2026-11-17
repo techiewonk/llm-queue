@@ -17,21 +17,27 @@ llmq = LLMQueue.from_env(secrets=lookup,                      # the app's own va
                          secret_names={"LLMQ_STORE_HOST": "valkey_host"})
 ```
 
-Three layers, highest first: **`secrets=`**, then **`environ`**, then **`defaults=`**.
+Three layers, highest first: **the secrets**, then **`environ`**, then **`defaults=`**.
 
-- `environ=` replaces `os.environ` with a mapping you build (from a config file, Secrets
-  Manager, a test fixture). Nothing is read from the process environment then.
-- `secrets=` is a function from a name to a value or `None`; each `LLMQ_*` name is looked up
-  there first, then in `environ`. `LLMQ_STORE_PASSWORD` and `LLMQ_QUEUE_STORE_PASSWORD` are read
-  through the layers on every new store connection, so a rotated password needs no restart (a
-  password in the environment works without `secrets=` too). Account secrets (`api_key_ref`,
-  `external_id_ref`) are looked up the same way.
+- The secrets are `secrets=` when given (code wins), else the sources `LLMQ_SECRETS_SOURCE`
+  names (see [Secrets](#secrets)), else none. `secrets=` is a function from a name to a value
+  or `None`; each `LLMQ_*` name is looked up there first, then in `environ`.
+  `LLMQ_STORE_PASSWORD` and `LLMQ_QUEUE_STORE_PASSWORD` are read through the layers on every
+  new store connection, so a rotated password needs no restart (a password in the environment
+  works without a secrets source too). Account secrets (`api_key_ref`, `external_id_ref`) are
+  looked up in the secrets, then in `environ`.
+- `environ=` replaces `os.environ` with a mapping you build (from a config file, a test
+  fixture). Nothing is read from the process environment then.
 - `defaults=` (a mapping of `LLMQ_*` names to values; `True` / `False` read as `true` /
   `false`) is used for a name neither layer above sets: the app's own defaults, kept in code.
   A name without the `LLMQ_` prefix is refused.
-- `secret_names=` maps an `LLMQ_*` setting to the secret that holds it under another name
-  (`{"LLMQ_STORE_PASSWORD": "valkey_password"}`): that secret is asked instead of the
-  `LLMQ_*` name. The order of the layers stays the same.
+- `secret_names=` maps an `LLMQ_*` setting to the key that holds it in the secrets
+  (`{"LLMQ_STORE_PASSWORD": "valkey_password"}`): that key is asked instead of the `LLMQ_*`
+  name. It is merged over `LLMQ_SECRET_NAMES` (the argument wins per setting). The order of the
+  layers stays the same.
+
+The CLI (`llm-queue`), `AdminServices.from_env` and `PurgeService.from_env` read the same
+layers, so `LLMQ_SECRETS_SOURCE` applies to them too.
 
 Two groups name one thing two ways: `LLMQ_STORE_URL` or the store parts (`LLMQ_STORE_HOST`,
 `LLMQ_STORE_PORT`, `LLMQ_STORE_DB`, `LLMQ_STORE_TLS_ENABLED`), and `LLMQ_REGISTRY` or
@@ -46,6 +52,19 @@ An empty value (`LLMQ_LEASE_SECS=`, as compose's `${VAR:-}` writes) counts as un
 How to read the **Range** column: `1 to 100` includes both ends; `above 0` excludes 0;
 `(whole)` means a whole number (`200.0` and `1e3` are refused). TTLs stay within 2147483647
 seconds, the longest `EXPIRE` takes.
+
+## Secrets
+
+Where the secret layer comes from when no `secrets=` is passed. These settings are read from
+`environ` and `defaults=` only, never from a secret.
+
+| Variable | Default | Range | Meaning |
+|---|---|---|---|
+| `LLMQ_SECRETS_SOURCE` | `none` | comma list of `aws-secretsmanager:<secret-id>`, `file:<path>`, `env`, `none` | Sources tried in order for each name; the first that has it wins. `aws-secretsmanager:<id>`: one Secrets Manager secret holding a JSON object (credentials from the default chain, the pod role on EKS). `file:<path>`: a directory with one file per key (a Kubernetes secret volume; one trailing newline stripped), a `.json` file holding an object, or any other file read as `.env` lines (`KEY=VALUE`, `#` comments, optional quotes). `env`: the environment. `none`: no source. `${NAME}` and `${NAME:-default}` are expanded from the environment (`aws-secretsmanager:${ENV}/app/secret`). A source that cannot be read at `from_env` (missing, denied, not JSON) raises `ConfigError` naming it; a key no source has is unset |
+| `LLMQ_SECRET_NAMES` | empty | JSON object of `LLMQ_*` names to keys | The key each setting has in the secrets: `{"LLMQ_STORE_HOST":"valkey_host","LLMQ_STORE_PASSWORD":"valkey_key"}`. Merged with `secret_names=` (the argument wins per setting). Keys must be `LLMQ_*` settings (not these five) and values non-empty |
+| `LLMQ_SECRETS_REGION` | the AWS default (`AWS_REGION`, then `AWS_DEFAULT_REGION`) | an AWS region | Region of the `aws-secretsmanager` sources |
+| `LLMQ_SECRETS_CACHE_SECS` | 300 | 0 to 86400 | Each source's values are kept this long, then read again (so a rotated value is seen within it). 0: read on every lookup. A refresh that fails keeps the last values (`secrets_refresh_failed`) |
+| `LLMQ_SECRETS_TIMEOUT_SECS` | 10 | 1 to 300 | Connect and read timeout of a Secrets Manager request (3 attempts) |
 
 ## `LLMQ_ENVIRONMENT`: strict or dev
 

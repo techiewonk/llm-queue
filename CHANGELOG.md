@@ -71,8 +71,24 @@ index (below).
   registry versions and writes, audit, models, deployments, blocks, queues and dead letters)
   raise the new `LocalModeRefused` (a `ConfigError`); the generated HTTP routes answer 503 with
   `"reason": "local_mode"`. `llmq.admin.status`, `ops.index` (`GET /`), `describe`, `drain.*`,
-  `registry.get` and `tenants.hash` answer from the process. See [Queue and local modes](docs/how-to/modes.md), with the
-  switch ladder from the queue to local mode.
+  `registry.get` and `tenants.hash` answer from the process. Local mode reads its settings and secrets like queue mode. See
+  [Queue and local modes](docs/how-to/modes.md), with the switch ladder from the queue to local mode.
+- Configurable secrets (`llm_queue.secrets`): `LLMQ_SECRETS_SOURCE` is an ordered list of
+  sources (`aws-secretsmanager:<secret-id>` with one JSON secret, `file:<path>` for a
+  Kubernetes secret volume, a `.json` or a `.env` file, `env`, `none` by default) with
+  `${NAME}` / `${NAME:-default}` expanded from the environment; `LLMQ_SECRET_NAMES` (a JSON
+  object, merged under `secret_names=`) maps settings to the secret's own keys;
+  `LLMQ_SECRETS_REGION`, `LLMQ_SECRETS_CACHE_SECS` (300; 0 reads on every lookup) and
+  `LLMQ_SECRETS_TIMEOUT_SECS` (10). A source that cannot be read at start is a `ConfigError`
+  naming it; a refresh that fails later keeps the last values (`secrets_refresh_failed`). The
+  source serves every reader: settings, store passwords on each new connection, the admin
+  token, `LLMQ_JOB_*`, account secrets, registry placeholders, the CLI,
+  `AdminServices.from_env` and `PurgeService.from_env`. In code: `secrets_from_config(spec)`, `SecretReader` and the
+  `SecretSource` protocol. Precedence: `secrets=` in code, else `LLMQ_SECRETS_SOURCE`; then the
+  environment; then `defaults=`. `describe()` gains `secrets` (source kinds and ids, mapped
+  names, cache time; never a value), and `InfraSettings` the matching fields
+  (`secrets_source`, `secret_sources`, `secret_names`, ...). `InfraSettings.from_layers(layers)`
+  reads built `Layers`, so a source is read once per `from_env`.
 - Registry placeholders: the boot document (`LLMQ_REGISTRY` / `LLMQ_REGISTRY_FILE`) may hold
   `${NAME}` and `${NAME:-default}` in any string value, read from `secrets=` and then the
   environment; `$${` is a literal `${`. A string that is one whole placeholder and expands to
@@ -159,6 +175,11 @@ index (below).
 
 ### Changed
 
+- Account secrets (`api_key_ref`, `external_id_ref`) are looked up in the secrets and then the
+  environment (with `secrets=` they were looked up in `secrets=` only).
+- The `llm-queue` CLI, `AdminServices.from_env` and `PurgeService.from_env` read settings and
+  store passwords through the same layers as `LLMQueue.from_env` (the CLI read the
+  environment only).
 - `LLMQ_STORE_PASSWORD` / `LLMQ_QUEUE_STORE_PASSWORD` set in the environment are used without
   `secrets=` (D3; 0.1.1 ignored them there and logged in with the URL's password, or none). They
   are still read on every new connection and win over a password in the URL.

@@ -12,6 +12,7 @@ Named hooks an app registers to change one decision without forking the library.
 | Token estimator | `register_token_estimator(name, fn)` | `token_estimator` | `fn(op, params) -> input tokens` |
 | Embedding family | `register_embedding_family(name, codec)` | model `family`, or the codec's id `patterns` | an `EmbeddingCodec`: `build_request(texts, options)`, `parse_reply(body)`, `max_batch`, `max_chars`; register before the registry loads ([Embedding families](../how-to/call.md#embedding-families)) |
 | Provider, account kind | `register_provider(name, factory)`, `register_account_kind(kind, provider)` | model `provider`, account `kind` | a `Provider` with `call(op, params, route, timing, sink=None, *, converse_api="converse")` and `classify(exc)` |
+| Secret source | `llm_queue.secrets`: `SecretReader([source], cache_secs=...)` or `secrets_from_config(spec)`, passed as `from_env(secrets=)` | `secrets=` (wins over `LLMQ_SECRETS_SOURCE`) | a `SecretSource`: `kind`, `label` (safe to log, no values) and `load() -> Mapping[str, str]`, raising `ConfigError` naming the source when it cannot be read; see [Configure: Secrets](../how-to/configure.md#secrets) |
 | Others | `register_job`; `from_env(credentials=, secrets=, metrics=, offload=, offload_bytes=, worker_id=)` | | credentials per account, secret source, metrics sink, S3 offload |
 
 Hooks run through `call_safely`. A balancer, fallback policy, sticky key, probe or token

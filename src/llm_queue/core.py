@@ -303,22 +303,20 @@ class LLMQueue:
         offload_bytes: int | None = None,
         tuning: Tuning | None = None,
     ) -> LLMQueue:
-        """Build from `LLMQ_*`: `secrets` first when given, then `environ`, then `defaults`.
+        """Build from `LLMQ_*`: the secrets first, then `environ`, then `defaults`.
 
-        `defaults` (`{"LLMQ_KEY_PREFIX": "myapp", ...}`) is the lowest layer, for the app's
-        own values; `secret_names` reads a setting from a secret under another name
+        The secrets are `secrets` when given, else the sources `LLMQ_SECRETS_SOURCE` names
+        (`llm_queue.secrets`), else none. `defaults` (`{"LLMQ_KEY_PREFIX": "myapp", ...}`) is
+        the lowest layer, for the app's own values; `secret_names` (merged over
+        `LLMQ_SECRET_NAMES`) reads a setting from a secret under another key
         (`{"LLMQ_STORE_HOST": "valkey_host"}`). See `engine.settings.Layers`. `tuning` sets
         timeouts, pool sizes and loop pacing in code (`Tuning()` is the defaults); a bad value
         or combination raises `ConfigError` listing every problem.
         """
-        layers = Layers(environ, secrets, defaults, secret_names)
-        settings = InfraSettings.from_env(
-            environ, secrets=secrets, defaults=defaults, secret_names=secret_names
-        )
+        layers = Layers(environ, secrets, defaults, secret_names)  # reads a source once
+        settings = InfraSettings.from_layers(layers)
         if settings.execution_mode == "local":  # no store client at all (engine/local.py)
-            return cls._from_env_local(
-                settings, layers, secrets is not None, metrics, worker_id, credentials, tuning
-            )
+            return cls._from_env_local(settings, layers, metrics, worker_id, credentials, tuning)
         jobs = JobSettings.from_env(layers)  # the same layers as every other setting
         # This process's id prefix: the argument, LLMQ_WORKER_ID, else pod (or host) and pid; the
         # engine adds a random tail, so two processes never share one.
@@ -373,8 +371,10 @@ class LLMQueue:
             }
             if credentials is not None:
                 pool_kwargs["credentials"] = credentials
-            if secrets is not None:
-                pool_kwargs["secrets"] = layers.secret  # `secret_names` apply to accounts too
+            if layers.secrets is not None:
+                # Account secrets (`api_key_ref`, `external_id_ref`): the secrets under their
+                # mapped keys, then the environment.
+                pool_kwargs["secrets"] = layers.lookup
             engine_settings = EngineSettings(
                 queue_prefix=settings.queue_prefix,
                 lease_secs=settings.lease_secs,
@@ -431,7 +431,6 @@ class LLMQueue:
         cls,
         settings: InfraSettings,
         layers: Layers,
-        has_secrets: bool,
         metrics: Metrics | None,
         worker_id: str | None,
         credentials: Callable[[Any], Mapping[str, Any] | None] | None,
@@ -474,8 +473,9 @@ class LLMQueue:
         }
         if credentials is not None:
             pool_kwargs["credentials"] = credentials
-        if has_secrets:
-            pool_kwargs["secrets"] = layers.secret  # `secret_names` apply to accounts too
+        if layers.secrets is not None:
+            # Account secrets (`api_key_ref`, `external_id_ref`): as in queue mode.
+            pool_kwargs["secrets"] = layers.lookup
 
         def build() -> LocalEngine:
             registry = LocalRegistry(
