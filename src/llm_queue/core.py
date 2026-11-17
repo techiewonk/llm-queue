@@ -913,11 +913,15 @@ class LLMQueue:
         """
         from llm_queue.engine.http import admin_token_dependency, status_router
 
-        token = admin_token if admin_token is not None else self._admin_token
-        header = admin_header or (self.settings.admin_header if self.settings else "X-LLMQ-Token")
+        settings = getattr(self, "settings", None)
+        header = admin_header or getattr(settings, "admin_header", None) or "X-LLMQ-Token"
         guards = list(dependencies)
-        if admin_token is not None or (callable(token) and token() is not None):
-            guards.append(admin_token_dependency(token, header))
+        if admin_token is not None:
+            guards.append(admin_token_dependency(admin_token, header))
+        else:
+            reader = getattr(self, "_admin_token", None)  # LLMQ_ADMIN_TOKEN, read per request
+            if reader is not None and reader() is not None:
+                guards.append(admin_token_dependency(reader, header))
         return status_router(
             self._engine,
             dependencies=guards,
