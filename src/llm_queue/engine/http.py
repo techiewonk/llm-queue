@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from llm_queue.engine.admin import AdminServices
 
 logger = get_logger(__name__)
-ADMIN_HEADER = "X-LLMQ-Admin"
+ADMIN_HEADER = "X-LLMQ-Admin"  # LLMQ_ADMIN_CSRF_HEADER default
 Response = tuple[int, dict[str, Any]]
 # A lost compare-and-set is valid and retryable: 409 with `Retry-After`, not 400 (FO-6).
 RETRY_AFTER_SECS = 1
@@ -265,6 +265,7 @@ def status_router(
     read_token: Token = None,
     token_header: str = "X-LLMQ-Token",
     actor_header: str = "X-LLMQ-Actor",
+    csrf_header: str = ADMIN_HEADER,
     insecure_reads: bool = False,
     wait_cap_secs: float = 60.0,
     dlq_bodies: bool = False,
@@ -364,8 +365,8 @@ def status_router(
         }[op.mount]
 
     async def run(op: Op, request: Request) -> Any:
-        if op.writes and not writes_by_token and not request.headers.get(ADMIN_HEADER, "").strip():
-            return reply((403, {"error": f"write routes need the {ADMIN_HEADER} header"}))
+        if op.writes and not writes_by_token and not request.headers.get(csrf_header, "").strip():
+            return reply((403, {"error": f"write routes need the {csrf_header} header"}))
         fields: dict[str, Any]
         if op.http and op.http[0] == "GET":
             query = request.query_params

@@ -61,9 +61,6 @@ if TYPE_CHECKING:
     from llm_queue.engine.admin import AdminServices
 
 logger = get_logger(__name__)
-# Store connections of the private engine that serves sync calls when no queue is started
-# (Celery workers, scripts): a caller-only engine needs few (D1).
-SYNC_STORE_CONNECTIONS = 20
 # A sync call on a started queue's loop checks this often that the loop still runs (CO-26).
 _LOOP_CHECK_SECS = 1.0
 # How long closing the private engine of the sync calls may take before it is logged and left.
@@ -424,7 +421,7 @@ class LLMQueue:
                 local_limits=local_limits,
             )
 
-        sync_cap = min(SYNC_STORE_CONNECTIONS, settings.store_max_connections)
+        sync_cap = min(settings.sync_store_max_connections, settings.store_max_connections)
         queue = cls(
             build(),
             settings=settings,
@@ -1190,6 +1187,7 @@ class LLMQueue:
             read_token=admin_read_token if admin_read_token is not None else env_read,
             token_header=admin_header or (s.admin_header if s else "X-LLMQ-Token"),
             actor_header=s.admin_actor_header if s else "X-LLMQ-Actor",
+            csrf_header=s.admin_csrf_header if s else "X-LLMQ-Admin",
             insecure_reads=insecure_reads,
             wait_cap_secs=float(s.http_purge_wait_secs) if s else 60.0,
             dlq_bodies=bool(s.admin_dlq_bodies_enabled) if s else False,

@@ -338,18 +338,16 @@ def _one_budget_form(out: _Collector, path: str, settings: dict[str, Any]) -> No
 def _sub_fields(
     out: _Collector, path: str, value: dict[str, Any], check: ObjCheck
 ) -> dict[str, Any]:
-    """`value` without deprecated or (in lenient mode) unknown sub-fields, each warned.
+    """`value` without (in lenient mode) unknown sub-fields, each warned.
 
     A stored document is read leniently: a sub-field a newer pod added (`health.new_field`)
     made every older pod refuse the whole document, and its refresh then republished its own
-    config over it (R3CF-8). Removed alert names are accepted with a warning until 0.2 (Q34).
+    config over it (R3CF-8).
     """
     kept: dict[str, Any] = {}
     for key, item in value.items():
         if key in check.fields:
             kept[key] = item
-        elif key in check.deprecated:
-            out.warn(f"{path}.{key}", check.deprecated[key])
         elif not out.strict:
             out.warn(f"{path}.{key}", f"unknown field `{key}` (ignored)")
         else:
@@ -423,9 +421,13 @@ def _account(
         )
     if texts["external_id_ref"] and not texts["role_arn"]:
         out.error(f"{path}.external_id_ref", "needs `role_arn`")
+    from llm_queue.engine.settings import SETTING_NAMES  # the settings module reads registries
+
     for key in ("external_id_ref", "api_key_ref"):
         ref = texts[key]
-        if ref and not _SECRET_REF_RE.match(ref):
+        if ref and ref in SETTING_NAMES:  # review B-03: a process setting is never an account's
+            out.error(f"{path}.{key}", f"`{ref}` is a process setting, not an account secret")
+        elif ref and not _SECRET_REF_RE.match(ref):
             # Any other name could be the store password or the pod's own AWS keys, sent as a
             # Bearer token to a base_url the registry author chose.
             out.error(
