@@ -9,7 +9,7 @@ alerts, sent as gauges every sample, with a log line once per change (plan §3.1
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -20,7 +20,7 @@ from llm_queue.engine.fairness import fairness_for
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import StreamQueues
 from llm_queue.errors import ConfigError
-from llm_queue.registry.settings import ALERT_DEFAULTS
+from llm_queue.registry.settings import ALERT_DEFAULTS, HEALTH_SUMMARY_DEFAULTS
 
 if TYPE_CHECKING:
     import redis.asyncio
@@ -147,6 +147,7 @@ class StatusReader:
         fairness = view.value(alias, "fairness")
         if fairness.get("mode", "off") != "off":
             report["fairness"] = await self._fairness(alias, fairness, now_secs)
+        report["health"] = model_health(view, report)
         report["request_index"] = self.request_index
         report["tenants"] = await self._tenants(alias, now_secs)
         if tenant_hash is not None:
@@ -344,6 +345,7 @@ class StatusReader:
             "blocked_accounts": list(routing.blocked_accounts),
             "models": list(models),
             "jobs": jobs,
+            "health": worst_health(m["health"]["state"] for m in models),
         }
 
     async def request(self, request_id: str) -> dict[str, Any]:
@@ -362,6 +364,106 @@ class StatusReader:
                 status["state"] = "in_progress"
                 status["deployment"] = fields.get("dep", "")
         return {"request_id": request_id, **status}
+
+
+HEALTH_STATES = ("healthy", "warning", "critical")  # best to worst
+
+
+def worst_health(states: Iterable[str]) -> str:
+    """The worst of `states` (`healthy` when there are none)."""
+    return max(states, key=HEALTH_STATES.index, default="healthy")
+
+
+def _usable(dep: Mapping[str, Any]) -> bool:
+    """The alert rule's usable deployment: enabled, unblocked, healthy, inside residency."""
+    return bool(
+        dep["enabled"]
+        and dep["account_enabled"]
+        and not dep["blocked"]
+        and dep["healthy"]
+        and not dep.get("outside_residency", False)
+        and dep["breaker"] != "open"
+    )
+
+
+def _budget_used_pct(deps: list[Mapping[str, Any]]) -> float | None:
+    """This minute's use of the usable deployments' budgets, the fuller of rpm and tpm (%)."""
+    worst: float | None = None
+    for budget in ("rpm", "tpm"):
+        limit = sum(d[budget]["limit"] or 0 for d in deps if d[budget].get("limit"))
+        if limit:
+            used = sum(d[budget]["used"] for d in deps if d[budget].get("limit"))
+            pct = 100.0 * used / limit
+            worst = pct if worst is None else max(worst, pct)
+    return None if worst is None else round(worst, 1)
+
+
+def model_health(view: ResolvedRegistry, report: Mapping[str, Any]) -> dict[str, Any]:
+    """A model's health summary (0.2.0 F2): `healthy`, `warning` or `critical`, and why.
+
+    From numbers the report already has, against the model's `health_summary` thresholds:
+    critical when no deployment is usable (an enabled model), or budget use, waiting calls or
+    the oldest call's wait reach their critical mark; warning at the warning marks, and for an
+    open breaker, an auto-disabled deployment, dead letters (`alerts.dlq_messages`), the kill
+    switch or a disabled model. `reasons` names each rule that fired.
+    """
+    alias = report["model"]
+    marks = {**HEALTH_SUMMARY_DEFAULTS, **view.value(alias, "health_summary")}
+    dlq_mark = view.value(alias, "alerts").get("dlq_messages", ALERT_DEFAULTS["dlq_messages"])
+    deps: list[Mapping[str, Any]] = report["deployments"]
+    usable = [d for d in deps if _usable(d)]
+    used = _budget_used_pct(usable)
+    waiting = sum(report["waiting"].values()) + sum(report.get("waiting_for_grant", {}).values())
+    oldest = report.get("oldest_waiting_secs")
+    critical: list[str] = []
+    warning: list[str] = []
+    if not report["enabled"]:
+        warning.append("model_disabled")
+    elif not usable:
+        critical.append("no_usable_deployment")
+    for name, value, kind in (
+        ("budget_used", used, "pct"),
+        ("waiting", waiting, ""),
+        ("oldest_wait", oldest, "secs"),
+    ):
+        key = {"pct": "budget_{}_pct", "": "waiting_{}", "secs": "wait_{}_secs"}[kind]
+        if value is None:
+            continue
+        if value >= marks[key.format("critical")]:
+            critical.append(name)
+        elif value >= marks[key.format("warning")]:
+            warning.append(name)
+    if any(d["breaker"] == "open" for d in deps):
+        warning.append("breaker_open")
+    if any(not d["healthy"] for d in deps):
+        warning.append("deployment_disabled")
+    if report.get("dead_letters", 0) >= dlq_mark:
+        warning.append("dead_letters")
+    if view.registry.routing.kill_switch:
+        warning.append("kill_switch")
+    state = "critical" if critical else "warning" if warning else "healthy"
+    return {
+        "state": state,
+        "reasons": critical + warning,
+        "budget_used_pct": used,
+        "waiting": waiting,
+        "oldest_waiting_secs": oldest,
+        "usable_deployments": len(usable),
+        "deployments": len(deps),
+    }
+
+
+def health_report(view: ResolvedRegistry, report: Mapping[str, Any]) -> dict[str, Any]:
+    """The `status.health` answer: overall state and one summary row per model."""
+    rows = [
+        {"model": m["model"], **(m.get("health") or model_health(view, m))}
+        for m in report["models"]
+    ]
+    return {
+        "health": worst_health(r["state"] for r in rows),
+        "registry_version": report.get("registry_version"),
+        "models": rows,
+    }
 
 
 @dataclass(frozen=True, slots=True)

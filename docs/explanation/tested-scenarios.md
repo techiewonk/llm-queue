@@ -178,6 +178,7 @@ store and fakellm, prints its numbers and the checks it applies, and fails when 
 | B95 | 500 calls waiting (timeout 300 s); after 5 s the state store is blocked for 45 s | Failure kinds | 0 calls dropped as `caller_gone`; all served |
 | B96 | Kill switch on; 4 caller processes with 500 direct calls each, waiting on a 600 RPM model | Store scripts per caller process per second, over 20 s | Every caller started and is still waiting; scripts > 0; scripts <= 20 per process per second |
 | B97 | One `embed()` of 28,800 texts on Cohere (300 calls of 96) at 600 RPM | Store memory above the start, sampled every 0.5 s | Every batch served; peak <= +64 MB |
+| F2 | Health summary (0.2.0): an idle model, then 80 calls on a 30 RPM model with `health_summary` marks of 10 / 40 waiting and 3 / 8 s oldest wait, then the backlog cancelled | `status.health` state and reasons every 0.5 s; summary read time | Idle `healthy`; `critical` (`waiting`, `oldest_wait`) within 20 s; `healthy` within 15 s of the cancel; read p95 <= 200 ms |
 
 B93 has no id of its own: it is judged inside B56 (the `B56` entry of `GATES`, printed as
 `B56/B93`). Gate ids are the design plan's; the plan is not in the published docs.

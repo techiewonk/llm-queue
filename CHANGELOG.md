@@ -73,6 +73,15 @@ index (below).
   (`enabled: false`), `health()` / `describe()` say so, `llmq_disabled` is logged once at start,
   and the drain file still fails readiness. The fifth step of the switch ladder
   (docs/how-to/modes.md).
+- Health summary (0.2.0 F2): each model in `status()` has `health` (`state` `healthy` /
+  `warning` / `critical`, `reasons`, budget use this minute, waiting calls, oldest wait,
+  usable deployments) and the report has the worst state as `health`; the new operation
+  `status.health` serves the summary alone on every surface (`llmq.admin.status.health()`,
+  `llm-queue health [--model M]`, `GET /status/health`), and `GET /` shows each model's
+  state. Thresholds are the registry setting `health_summary` (defaults and per model, live
+  editable): `budget_warning_pct` 80 / `budget_critical_pct` 98, `waiting_warning` 1000 /
+  `waiting_critical` 10000, `wait_warning_secs` 30 / `wait_critical_secs` 120. Its gate is F2
+  in `scripts/gates.py`.
 - One `llmq_configured` info line at every `start()` with the log-safe `describe()` summary
   (0.2.0 D2): how the process is set up, with no password, salt, token, tenant name or
   registry body. A `describe()` that fails there logs `llmq_configured_failed` and the start

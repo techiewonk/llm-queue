@@ -193,9 +193,11 @@ class OpsAdmin:
                 "deployments": len(m["deployments"]),
                 "usable_deployments": sum(usable(d) for d in m["deployments"]),
                 "open_breakers": sum(d["breaker"] == "open" for d in m["deployments"]),
+                "health": m["health"]["state"],
             }
             for m in report["models"]
         ]
+        out["health"] = report.get("health")
         out["jobs"] = report.get("jobs", [])
         out["purges"] = {
             "scheduled": len(scheduled),

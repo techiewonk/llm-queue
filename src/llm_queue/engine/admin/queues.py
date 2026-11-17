@@ -12,6 +12,7 @@ from llm_queue.engine._codec import text as _text
 from llm_queue.engine.admin.context import AdminContext
 from llm_queue.engine.admin.requests import RequestsAdapter
 from llm_queue.engine.queue import RETENTION_SECS
+from llm_queue.engine.status import health_report
 from llm_queue.errors import ConfigError
 
 MAX_DLQ_COUNT = 10_000
@@ -46,6 +47,21 @@ class StatusAdmin:
             alias = view.registry.alias_of(model)
             return await self._ctx.status.model(view, alias, tenant_hash=h)
         return await self._ctx.status.report(view)
+
+    async def health(self, model: str | None = None) -> dict[str, Any]:
+        """Health summary (0.2.0 F2): overall and per model `healthy` / `warning` / `critical`.
+
+        Each row has its `reasons`, budget use this minute, waiting calls, the oldest wait and
+        usable deployments; thresholds are the model's `health_summary` registry setting.
+        """
+        view = await self._ctx.view()
+        if model is not None:
+            alias = view.registry.alias_of(model)
+            row = await self._ctx.status.model(view, alias)
+            report: dict[str, Any] = {"registry_version": view.registry.version, "models": [row]}
+        else:
+            report = await self._ctx.status.report(view)
+        return health_report(view, report)
 
 
 class QueuesAdmin:

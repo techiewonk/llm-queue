@@ -326,6 +326,51 @@
             "slow_min_samples": 20
           }
         },
+        "health_summary": {
+          "type": "object",
+          "properties": {
+            "budget_warning_pct": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "budget_critical_pct": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "waiting_warning": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100000000
+            },
+            "waiting_critical": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100000000
+            },
+            "wait_warning_secs": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 86400
+            },
+            "wait_critical_secs": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 86400
+            }
+          },
+          "additionalProperties": false,
+          "description": "Levels: defaults, model.",
+          "default": {
+            "budget_warning_pct": 80,
+            "budget_critical_pct": 98,
+            "waiting_warning": 1000,
+            "waiting_critical": 10000,
+            "wait_warning_secs": 30,
+            "wait_critical_secs": 120
+          }
+        },
         "inference": {
           "type": "object",
           "properties": {
@@ -2046,6 +2091,51 @@
             "slow_ratio": 3.0,
             "slow_min_secs": 5,
             "slow_min_samples": 20
+          }
+        },
+        "health_summary": {
+          "type": "object",
+          "properties": {
+            "budget_warning_pct": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "budget_critical_pct": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "waiting_warning": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100000000
+            },
+            "waiting_critical": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100000000
+            },
+            "wait_warning_secs": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 86400
+            },
+            "wait_critical_secs": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 86400
+            }
+          },
+          "additionalProperties": false,
+          "description": "Levels: defaults, model.",
+          "default": {
+            "budget_warning_pct": 80,
+            "budget_critical_pct": 98,
+            "waiting_warning": 1000,
+            "waiting_critical": 10000,
+            "wait_warning_secs": 30,
+            "wait_critical_secs": 120
           }
         },
         "inference": {

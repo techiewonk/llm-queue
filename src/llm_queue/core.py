@@ -122,6 +122,18 @@ class FairnessStatus(TypedDict):
     waiting_within_share: int
 
 
+class ModelHealth(TypedDict):
+    """A model's health summary (0.2.0 F2) and the numbers behind it."""
+
+    state: str  # healthy, warning or critical
+    reasons: list[str]
+    budget_used_pct: float | None
+    waiting: int
+    oldest_waiting_secs: float | None
+    usable_deployments: int
+    deployments: int
+
+
 class ModelStatus(TypedDict):
     """One model: waiting calls per class, calls in progress, dead letters, deployments."""
 
@@ -131,6 +143,7 @@ class ModelStatus(TypedDict):
     in_progress: int
     dead_letters: int
     deployments: list[DeploymentStatus]
+    health: ModelHealth  # thresholds: the model's `health_summary` setting (0.2.0 F2)
     fairness: NotRequired[FairnessStatus]  # only when `fairness.mode` is on
     # Local mode (LLMQ_EXECUTION_MODE=local): `local`, and this process's slots of the model.
     mode: NotRequired[str]
@@ -153,6 +166,7 @@ class StatusReport(TypedDict):
     blocked_regions: list[str]
     blocked_accounts: list[str]
     models: list[ModelStatus]
+    health: str  # the worst model's state: healthy, warning or critical
     jobs: NotRequired[list[JobStatus]]
     # Local mode: `local`, and the LLMQ_LOCAL_PROCESS_COUNT that divides every budget.
     mode: NotRequired[str]

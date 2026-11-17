@@ -152,6 +152,9 @@ OPERATIONS: tuple[Op, ...] = (
     _r("status.get", "status",
        "Live status of every model and job, or of one model (and one tenant on it)",
        params=(_OPT_MODEL, *_TENANT_PICK), http=("GET", "/status"), cli=("status",)),
+    _r("status.health", "status",
+       "Health summary per model and overall: healthy, warning or critical, and why",
+       params=(_OPT_MODEL,), http=("GET", "/status/health"), cli=("health",)),
     # -- registry -------------------------------------------------------------------------
     _r("registry.get", "registry", "The live registry (secrets hidden) and its live edits",
        params=(_OPT_MODEL,), http=("GET", "/registry"), cli=("registry", "get")),
