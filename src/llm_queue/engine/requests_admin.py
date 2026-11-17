@@ -26,6 +26,7 @@ import orjson
 
 from llm_queue._logging import get_logger
 from llm_queue.engine._codec import text as _text
+from llm_queue.engine.envelope import Meta, Reply
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import RETENTION_SECS, StreamQueues
 from llm_queue.engine.requests import FINAL_STATES, RequestStore
@@ -566,6 +567,8 @@ class RequestsAdmin:
             changed += marked
             if moved_on:
                 _bump(skipped, "started" if state == "waiting" else "not_running", moved_on)
+            if state != "running":
+                await self._settle_waiting(batch)
             for rid in batch:
                 logger.info("call_cancel", request_id=rid, source="admin", by=actor)
         if self._metrics is not None:
@@ -971,6 +974,36 @@ class RequestsAdmin:
         if not self.settings.tenant_names:
             return {}
         return _decode(await self._state.hgetall(self.keys.tenant_names(alias)))
+
+    async def _settle_waiting(self, request_ids: Sequence[str]) -> None:
+        """End the cancelled calls that never started: their callers get `cancelled` now.
+
+        A waiting call is only stopped when a worker next asks for it (PICK_TAKE sees the mark),
+        which for a message deep in a queue can be minutes. Once the mark is set no worker can
+        start the call, so a call still `queued` with a mark is answered here (the same final
+        reply a worker writes; written once). Its message is acked by the worker that takes it
+        (PICK_TAKE answers `done`). A call that started meanwhile is left to its worker.
+        """
+        k = self.keys
+        async with self._state.pipeline(transaction=False) as pipe:
+            for rid in request_ids:
+                pipe.hget(k.request(rid, "job"), "state")
+                pipe.exists(k.request(rid, "cancel"))
+            replies = await pipe.execute()
+        for i, rid in enumerate(request_ids):
+            state, marked = replies[2 * i], replies[2 * i + 1]
+            if state is None or _text(state) != "queued" or not marked:
+                continue
+            reply = Reply(
+                request_id=rid,
+                ok=False,
+                error="cancelled",
+                message="the call was cancelled by an admin",
+                meta=Meta(worker=self._owner),
+            )
+            await self._requests.put_result(
+                reply, final_state="cancelled", status={"error": "cancelled"}
+            )
 
     async def _moved_records(self, moved: Sequence[tuple[str, str]], cls: str) -> None:
         """Separate queue store: the moved calls' job `mid` / `q` and status `priority`."""

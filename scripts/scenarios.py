@@ -690,6 +690,77 @@ async def caller_cancel(ctx: Ctx) -> None:
     ctx.checks["uncancelled calls served or refused on time"] = kept_ok
 
 
+TENANTS_ID = "openai.tenants-1:0"  # T1's calls: their own fakellm keys and a small budget
+TENANT_CALLS = 30  # per tenant
+
+
+async def tenant_isolation(ctx: Ctx) -> None:
+    """S-T (0.2.0 T): tenants A and B on one model; A's calls moved, then cancelled; a worker dies.
+
+    A and B send `TENANT_CALLS` calls each to a model whose budget makes them wait. At 2 s
+    A's waiting calls move to the priority queue, at 4 s A's waiting calls are cancelled, at 5 s
+    a worker is killed. B must not notice: every B call served, none moved or cancelled. A's
+    cancelled calls end `cancelled` soon after; at the end the model's request index is empty.
+    """
+    llmq = ctx.queues[0]
+    admin = llmq._engine.requests_admin
+    t0 = time.monotonic()
+    done: dict[str, tuple[float, str]] = {}  # request id -> (seconds from t0, outcome)
+
+    async def one(tenant: str, i: int) -> None:
+        rid = f"st-{tenant}-{i}-{random.randrange(10**9)}"
+        await asyncio.sleep(i * 0.1)
+        try:
+            await ctx.queues[i % len(ctx.queues)].converse(
+                "tenants", chat(), tenant_id=tenant, request_id=rid
+            )
+            done[rid] = (time.monotonic() - t0, "ok")
+        except CallFailed as exc:
+            done[rid] = (time.monotonic() - t0, exc.kind)
+
+    senders = [
+        asyncio.create_task(one(tenant, i)) for i in range(TENANT_CALLS) for tenant in ("A", "B")
+    ]
+    await asyncio.sleep(2)
+    moved = await admin.reprioritize(
+        "tenants", priority=True, tenant="A", actor="scenario", dry_run=False
+    )
+    b_moved = [i for i in (await admin.list("tenants", tenant="B", limit=1000)).items if i.priority]
+    await asyncio.sleep(2)
+    waiting = await admin.list("tenants", tenant="A", state="waiting", limit=1000)
+    cancel_at = time.monotonic() - t0
+    cancelled = await admin.cancel(
+        "tenants", tenant="A", state="waiting", actor="scenario", dry_run=False
+    )
+    await asyncio.sleep(1)
+    await random.choice(_live(ctx)).kill()
+    await ctx.gate.workers(1)
+    await asyncio.gather(*senders)
+    b = {rid: v for rid, v in done.items() if rid.startswith("st-B-")}
+    a_cancelled = [done[i.request_id] for i in waiting.items if i.request_id in done]
+    ctx.checks["tenant B: every call served"] = all(kind == "ok" for _, kind in b.values())
+    ctx.checks["tenant B: none moved"] = not b_moved
+    ctx.checks["tenant B: none cancelled"] = cancelled.tenant != admin._hash("B")
+    ctx.checks["tenant A: calls moved"] = moved.changed > 0
+    ctx.checks["tenant A: cancelled calls end cancelled within 2 s"] = all(
+        kind == "cancelled" and at - cancel_at <= 2.0 + 1.0  # + the run's clock slack
+        for at, kind in a_cancelled
+        if kind != "ok"  # granted between the list and the cancel: served
+    )
+    index_left = -1
+    for _ in range(40):  # the last final writes and the killed worker's redelivery
+        index_left = (await admin.count("tenants")).total
+        if index_left == 0:
+            break
+        await asyncio.sleep(0.5)
+    ctx.checks["the model's request index is empty at the end"] = index_left == 0
+    ctx.extra_sent += len(senders)
+    ctx.notes.append(
+        f"tenants: moved {moved.changed}, cancelled {cancelled.changed} "
+        f"({len(a_cancelled)} listed), B served {sum(k == 'ok' for _, k in b.values())}/{len(b)}"
+    )
+
+
 async def caller_dies(ctx: Ctx) -> None:
     """A caller process with 100 calls waiting is killed; its calls must not stay held."""
     log = log_file("dying-caller")  # FT-30: a start failure leaves a trace
@@ -1280,6 +1351,24 @@ SCENARIOS = [
         caller_cancel,
         models={"slow": {"model_id": SLOW_ID, "rpm": RPM, "worker_slots": 50}},
         fake={SLOW_ID: {"latency_ms": {"p50": 2000, "p95": 2000}}},
+    ),
+    _s(
+        "T1",
+        "caller",
+        "tenant isolation: one tenant moved, cancelled, a worker killed (S-T)",
+        "the other tenant served, untouched; index empty",
+        tenant_isolation,
+        # 2 deployments x 60 rpm: 2 calls a second, so the tenants' 60 calls wait.
+        models={
+            "tenants": {
+                "model_id": TENANTS_ID,
+                "rpm": 60,
+                "worker_slots": 50,
+                "timeout_secs": 25,
+                "max_wait_secs": 25,
+            }
+        },
+        fake={TENANTS_ID: {"latency_ms": {"p50": 200, "p95": 300}}},
     ),
     _s(
         "C2",

@@ -245,10 +245,14 @@ async def test_cancel_waiting_running_all_and_by_ids(
     done = await admin.cancel("small", tenant=A, actor="ops", dry_run=False)
     assert (done.matched, done.changed) == (2, 2)
     assert not await engine.state.exists(engine.keys.request(running, "cancel"))
+    # The waiting ones were answered `cancelled` at once: a second run finds nothing to do.
     again = await admin.cancel("small", tenant=A, actor="ops", dry_run=False)
-    assert (again.matched, again.changed, again.skipped["already_cancelling"]) == (0, 0, 2)
+    assert (again.matched, again.changed) == (0, 0)
     run = await admin.cancel("small", tenant=A, state="running", actor="ops", dry_run=False)
     assert (run.matched, run.changed, run.sample_ids) == (1, 1, [running])
+    # A running call stays until its worker ends it: cancelling it again is `already_cancelling`.
+    twice = await admin.cancel("small", tenant=A, state="all", actor="ops", dry_run=False)
+    assert (twice.matched, twice.skipped) == (0, {"already_cancelling": 1})
     # Tenant B untouched.
     b = await admin.list("small", tenant=B)
     assert len(b.items) == 2
@@ -284,19 +288,27 @@ async def test_cancel_waiting_skips_a_call_granted_meanwhile(
     assert not await engine.state.exists(engine.keys.request(rid, "cancel"))
 
 
-async def test_cancelled_waiting_calls_fail_cancelled(make: Make) -> None:
+async def test_cancelled_waiting_calls_fail_cancelled_at_once(make: Make) -> None:
+    """S-T: a cancelled waiting call ends now, not when a worker reaches its message."""
     engine, _ = await make(worker=False)
     calls = _Calls(engine)
     try:
         await calls.send(2, A)
         report = await _admin(engine).cancel("small", tenant=A, actor="ops", dry_run=False)
         assert report.changed == 2
-        worker, _ = await make(caller=False)
-        for task in calls.tasks:
+        for task in calls.tasks:  # no worker runs: the admin answered them
             with pytest.raises(CallFailed, match="cancelled"):
-                await asyncio.wait_for(task, 10)
-        assert worker.keys.prefix == engine.keys.prefix
+                await asyncio.wait_for(task, 3)
         assert await engine.state.zcard(engine.keys.request_index("small", engine.hash_id(A))) == 0
+        stream = engine.keys.queue(_queue(engine), "s")
+        assert await engine.state.xlen(stream) == 2  # still there: the next worker acks them
+        worker, _ = await make(caller=False)
+        for _ in range(200):
+            if not await engine.state.xlen(stream):
+                break
+            await asyncio.sleep(0.05)
+        assert await engine.state.xlen(stream) == 0
+        assert worker.keys.prefix == engine.keys.prefix
     finally:
         await calls.close()
 
