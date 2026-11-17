@@ -65,7 +65,7 @@ flowchart LR
 
 | Variable | Default | Range | Meaning |
 |---|---|---|---|
-| `LLMQ_STORE_URL` | required | a store URL | The state store: `redis://`, `rediss://`, `valkey://` or `valkeys://` |
+| `LLMQ_STORE_URL` | required | a store URL | The state store: `redis://`, `rediss://`, `valkey://` or `valkeys://`. Not needed, never checked and never contacted with `LLMQ_EXECUTION_MODE=local` |
 | `LLMQ_STORE_PASSWORD` | none | text | Optional; read through `secrets=` on every new connection (rotation); wins over a password in the URL |
 | `LLMQ_QUEUE_STORE_URL` | the state store | a store URL | Optional separate store for queues and doorbells (same TLS rule) |
 | `LLMQ_QUEUE_STORE_PASSWORD` | none | text | As `LLMQ_STORE_PASSWORD`, for the queue store |
@@ -81,6 +81,16 @@ flowchart LR
 For a store with replicas, also set `min-replicas-to-write` on the primary: a write it refuses
 (`NOREPLICAS`), like `OOM`, `MISCONF` and `BUSY`, is treated as the store being down.
 
+## Execution mode
+
+How calls run (see [Modes](../how-to/modes.md) for when to switch and how to undo it).
+
+| Variable | Default | Range | Meaning |
+|---|---|---|---|
+| `LLMQ_EXECUTION_MODE` | `queue` | `queue`, `local` | `queue`: calls go through the store's queues and shared budgets. `local`: every call runs in this process straight against the provider, with the same API, classes, LangChain adapters and `install()`; no store client is built (`LLMQ_STORE_URL` is not needed), store-only operations raise `LocalModeRefused` (HTTP 503) and `LLMQ_MODE` does not apply |
+| `LLMQ_LOCAL_PROCESS_COUNT` | 1 | above 0 to 100000 (whole) | The local executor's share of each budget: every deployment's (and account's shared) `rpm` / `tpm` is divided by this in each process. Set it to the processes sharing the quota (pods x workers). Used in `local` mode and by `store_down: static_cap` |
+| `LLMQ_LOCAL_CONCURRENCY` | 10 | above 0 to 100000 (whole) | Calls in flight per model and process on the local executor (`local` mode and `store_down: static_cap`); priority calls get a free slot first |
+
 ## Environment, names and process
 
 | Variable | Default | Range | Meaning |
@@ -89,7 +99,7 @@ For a store with replicas, also set `min-replicas-to-write` on the primary: a wr
 | `LLMQ_ID_HASH_SALT` | none | 16 or more characters when strict | Key of the user / session id hash (HMAC). Use the same value in every service that shares the store |
 | `LLMQ_KEY_PREFIX` | `llmq` in dev; **required** when strict | 1-64 letters, digits, `_`, `.`, `:` or `-` | Prefix of this environment's store keys: name it per app and environment (`myapp-prod`, `llmq:prod:v3`). No braces or glob characters: it is part of every key |
 | `LLMQ_QUEUE_PREFIX` | empty | 0-64 letters, digits, `_`, `.` or `-` | Prefix of this environment's queue names (no `:`: it goes inside hash tags) |
-| `LLMQ_MODE` | `both` | `both`, `caller`, `worker` | `both` (caller and worker), `caller` (sends and waits only) or `worker` (runs calls only) |
+| `LLMQ_MODE` | `both` | `both`, `caller`, `worker` | `both` (caller and worker), `caller` (sends and waits only) or `worker` (runs calls only). Does not apply with `LLMQ_EXECUTION_MODE=local` |
 | `LLMQ_WORKER_ID` | empty | letters, digits, `_`, `.`, `:`, `-` | Empty: `POD_NAME` (else the host name) and the pid, e.g. `api-7f9c:12`. This process's id prefix in the store (callers, leases, logs); the engine adds a random tail, so two processes never share one. A `worker_id=` argument wins |
 | `LLMQ_DEFAULT_TENANT` | none | text | The tenant of a call that names none (no `tenant_id=`, none in `request_context`): every call of a single-tenant app carries it, threads included |
 | `LLMQ_ADMIN_TOKEN` | none | text (a secret) | Guards the router's routes except the probes and `/metrics`: the request's `LLMQ_ADMIN_HEADER` must equal it (constant-time). Read on every request, so a rotated secret needs no restart. Unset: only the app's `dependencies` guard the routes |
@@ -121,7 +131,6 @@ For a store with replicas, also set `min-replicas-to-write` on the primary: a wr
 | `LLMQ_DRAIN_HANDBACK_ENABLED` | true | true or false | `pause_receiving()` returns the calls held here waiting for budget to the queue at once, for another pod; false keeps them here until `stop()` (0.1.1 behaviour). See [Drain](../how-to/operate.md#drain-a-pod) |
 | `LLMQ_DRAIN_FILE` | empty | a path | A file whose appearance (an mtime newer than the queue's construction, minus 1 s) pauses every process of the pod; a resumed process pauses again only when it is touched anew. Empty: off. For a preStop hook in a pod with several processes |
 | `LLMQ_DRAIN_POLL_SECS` | 1 | 0.1 to 60 | How often each process checks `LLMQ_DRAIN_FILE` |
-| `LLMQ_LOCAL_LIMIT_CAP` | 10 | above 0 to 100000 (whole) | Calls per process and model run without the store under `store_down: static_cap` |
 
 ## Purge
 

@@ -13,6 +13,7 @@ LLMQueueError
 │   ├── RegistryConflict  a live edit or publish lost the race with other writes every time
 │   ├── LiveEditRefused   a live edit touched fields that change only with a deploy
 │   ├── UnknownModel      a model name not in the registry (also a KeyError)
+│   ├── LocalModeRefused  a store-only operation asked in local mode (LLMQ_EXECUTION_MODE=local)
 │   └── MissingExtra      an optional feature's extra is not installed (also an ImportError)
 ├── PurgeRefused          a purge would delete state still in use; nothing was deleted
 └── StoreUnavailable      the store cannot serve an admin operation (also a ConnectionError)
@@ -35,7 +36,7 @@ becomes `if not llm_queue.error_retryable(exc): stop`.
 | Error | `category` | `retryable` |
 |---|---|---|
 | `CallFailed` | by `kind`, see below (an unknown kind is `internal`, False) | by `kind` |
-| `ConfigError` and its subclasses (`RegistryError`, `RegistryConflict`, `LiveEditRefused`, `UnknownModel`, `MissingExtra`) | `config_error` | False |
+| `ConfigError` and its subclasses (`RegistryError`, `RegistryConflict`, `LiveEditRefused`, `UnknownModel`, `LocalModeRefused`, `MissingExtra`) | `config_error` | False |
 | `StoreUnavailable` | `unavailable` | True |
 | `PurgeRefused`, a plain `LLMQueueError`, anything else | `internal` | False |
 

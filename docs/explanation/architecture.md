@@ -92,6 +92,38 @@ flowchart TB
 A caller-only pod still calls providers in three cases: sync calls, calls routed direct (see
 [Direct path](call-lifecycle.md#4-direct-path)), and `static_cap` during a store outage.
 
+## Execution modes: `LLMQ_EXECUTION_MODE`
+
+`queue` (the default) is everything on this page. `local` builds no store client at all:
+`LLMQueue.from_env` takes a branch at its top and wraps a `LocalEngine` (`engine/local.py`)
+instead of an `Engine`. The public API, the LangChain adapters and `install()` are the same;
+see [Queue and local modes](../how-to/modes.md) for the switch ladder.
+
+```mermaid
+flowchart LR
+  A[LLMQueue] -- queue --> E[Engine] --> S[(store)]
+  A -- local --> L[LocalEngine] --> X[LocalExecutor] --> P[provider]
+  E -- "store_down: static_cap" --> X
+```
+
+The **local executor** (`LocalExecutor`) runs one call the way a worker does, with the
+process's memory in place of the store:
+
+| In the queue engine (store) | In the local executor (`LocalLimits`, one per process) |
+|---|---|
+| `PICK_TAKE` budgets (GCRA / fixed minute) per deployment and account | `_Bucket`s with the same rules, each limit divided by `LLMQ_LOCAL_PROCESS_COUNT` |
+| Worker slots per model and pod | `_PrioritySlots`: `LLMQ_LOCAL_CONCURRENCY` per model, priority waiters first |
+| `FINISH`: refunds, breaker, throttle backoff, latency | `settle()`: the same refund rule and breaker / throttle rules |
+| `P:...:health` target errors and auto-disable | `target_error()`: the same `health` settings |
+| Retry budget per model and minute | `retry_allowed()`: the same sliding minute |
+| Sticky map, round robin position | In-memory maps |
+
+Shared with the engine (module functions of `engine/runtime.py`): `build_envelope` (disabled
+model fallback, `max_message_bytes`, timeout, `admission` hook), `request_params`,
+`estimate_of`, `may_spill`, `shape_ok` and `log_outcome`. The private engine of the sync calls
+shares the process's `LocalLimits`, so a process has one budget. Store-only operations of a
+`LocalEngine` (and its `LocalRegistry`) raise `LocalModeRefused`; the HTTP handlers answer 503.
+
 ## Roles: `LLMQ_MODE`
 
 `LLMQueue.start()` starts the engine with `worker = mode in (both, worker)` and
@@ -417,6 +449,7 @@ calls per queued call ([Performance](performance.md)). See
 |---|---|
 | `core.py` | `LLMQueue`: `from_env`, `start`, `pause_receiving`, `stop`, calls, streams, `embed`, `*_sync` (private loop, caller-only engine), jobs, `cancel`, status, `health`, `registry`, `purge`, `http_router`; the fork and loop guards |
 | `engine/runtime.py` | `Engine`: caller (register, send, wait, `store_down`), worker (receive, admit, hold, run, attempts, retries, fallback, settle), direct path, cancel, every background loop |
+| `engine/local.py` | `LocalExecutor` (in-process calls with per-process budgets: local mode and `static_cap`), `LocalLimits`, `LocalEngine`, `LocalRegistry` |
 | `engine/_admission_lua.py`, `engine/admission.py` | `PICK_TAKE`, `FINISH`, `UNDO`, `RELEASE`, `RENEW`, `SWEEP`, `REREGISTER` and their Python wrapper (`Ask`, `Decision`) |
 | `engine/queue.py` | `StreamQueues`, doorbells, receive claims, dead letters, `ReplicaWait` |
 | `engine/requests.py` | `RequestStore`: claim, callers, result (with offload), status, cancel |

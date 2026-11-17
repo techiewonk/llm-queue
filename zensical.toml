@@ -37,6 +37,7 @@ nav = [
   { "Run background jobs" = "how-to/jobs.md" },
   { "Keep large results in S3" = "how-to/large-results.md" },
     { "Operate" = "how-to/operate.md" },
+    { "Queue and local modes" = "how-to/modes.md" },
     { "Purge store state" = "how-to/purge.md" },
     { "Run on a shared cache store" = "how-to/shared-cache-store.md" },
     { "Monitor" = "how-to/monitor.md" },

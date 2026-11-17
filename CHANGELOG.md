@@ -9,6 +9,21 @@ public API (see STABILITY.md).
 
 ### Added
 
+- Local execution mode: `LLMQ_EXECUTION_MODE=local` (default `queue`) runs every call in its
+  own process straight against the provider, with the same API, classes, LangChain adapters
+  and `install()`, and never contacts the store (no store client is built; `LLMQ_STORE_URL`
+  is not needed). Each deployment's rpm / tpm (and account shared budgets) divided by
+  `LLMQ_LOCAL_PROCESS_COUNT` (default 1) is this process's budget, as token buckets with the
+  registry's window rules; at most `LLMQ_LOCAL_CONCURRENCY` (default 10) calls per model run at
+  once, priority calls first. Retries, backoff, attempt and call timeouts, `max_wait_secs`,
+  region and model fallback (with shape conversion), sticky sessions, breakers, throttle
+  backoff and target-error health work as in the queue, in memory; streams and batched
+  embeddings too. `describe()`, `health()`, `status()` and the probes say `mode: "local"` and
+  show the local budgets; `LLMQueue.execution_mode` reads it. Store-only operations (request
+  status and cancel by id, purges, registry live edits, publish and rollback, jobs and dead
+  letters) raise the new `LocalModeRefused` (a `ConfigError`), and their HTTP routes answer 503
+  with `"reason": "local_mode"`. See [Queue and local modes](docs/how-to/modes.md), with the
+  switch ladder from the queue to local mode.
 - Registry placeholders: the boot document (`LLMQ_REGISTRY` / `LLMQ_REGISTRY_FILE`) may hold
   `${NAME}` and `${NAME:-default}` in any string value, read from `secrets=` and then the
   environment; `$${` is a literal `${`. A string that is one whole placeholder and expands to
@@ -48,6 +63,13 @@ public API (see STABILITY.md).
 
 ### Changed
 
+- `store_down: static_cap` runs on the local executor: the per-process budgets (rpm / tpm
+  divided by `LLMQ_LOCAL_PROCESS_COUNT`), `LLMQ_LOCAL_CONCURRENCY` calls per model, retries,
+  breakers and fallbacks, where it was one attempt per confirmed deployment with no budget.
+  `LLMQ_LOCAL_LIMIT_CAP` is removed: set `LLMQ_LOCAL_CONCURRENCY` instead (same default, 10).
+  The `static_cap_attempt_failed` log event is now `local_attempt_failed` (field `path`).
+- `llmq_calls_total` has a `path` label (`queue`, `direct`, `static_cap`, `local`,
+  `dead_letter`); `health()` has `mode`.
 - `breaker_probe_secs` left unset is now the larger of 60 and the deployment's
   `attempt_timeout_secs`, so a registry with an attempt timeout above 60 s and no probe time
   loads instead of being refused. An explicit value below the attempt timeout is still refused.
