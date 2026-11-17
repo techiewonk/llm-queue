@@ -7,7 +7,7 @@ public API (see STABILITY.md).
 
 ## [Unreleased]
 
-## [0.1.1] - UNRELEASED
+## [0.1.1] - 2026-11-17
 
 The first release that installs without `--pre`: `pip install llm-queue` (or
 `llm-queue==0.1.1`). The code is 0.1.0b3's plus the changes below; the 0.1.0b3 upgrade notes
@@ -34,6 +34,14 @@ apply when coming from 0.1.0b2 or earlier.
   `smoke_install.py` (a clean install from PyPI, TestPyPI or a wheel), `watch_release.py` (a
   release's publish run and PyPI, without `gh`) and `store_keys_page.py` (one searchable page of
   every store key). CONTRIBUTING lists them under "Manual tools".
+
+### Release checks
+
+All checks passed: lint, types, docs links, unit, integration (native and swept key expiry:
+845), coverage, failover, load, 48 of 48 scenarios, samples, and gates except B91. B91 (admission
+script p99 <= 2 ms at 20 models x 30 deployments) is not judged on the Windows / Docker Desktop
+dev machine: 0.1.1 measured 2.79-3.26 ms and 0.1.0b2 2.83-3.16 ms there, back to back, so no
+regression; the 2 ms target stands for Linux reference runs.
 
 ### Documentation
 
