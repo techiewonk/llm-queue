@@ -603,6 +603,20 @@ class LLMQueue:
         """When the pause began (Unix seconds), None when not draining."""
         return self._engine.draining_since
 
+    @property
+    def ready(self) -> bool:
+        """True when this queue can take calls (0.2.0 B4).
+
+        Started, registry loaded, not draining, and (strict mode) no store whose eviction
+        policy may drop queue keys. Sync and cheap (cached state, no store round trip), for
+        the app's own readiness probe. Unlike `health()["ready"]` it is also False before
+        `start()` and after `stop()`.
+        """
+        engine = self._engine
+        if not self.started or self._closing or not engine.ready or engine.draining:
+            return False
+        return engine.registry._current is not None and engine._evicting() is None
+
     def drain_status(self) -> dict[str, Any]:
         """`draining`, `since`, `held` (calls waiting for budget) and `running` (calls and jobs)."""
         out = dict(self._engine.drain_status())
@@ -1066,6 +1080,26 @@ async def _close_offload(offload: ResultOffload | None) -> None:
             await close()
         except Exception as exc:  # logged, not raised: a failing S3 close vanished (CO-8)
             logger.warning("offload_close_failed", error=repr(exc))
+
+
+def queue_ready(enabled: bool = True, llmq: LLMQueue | None = None) -> bool:
+    """Readiness of an app that sends its model calls through the queue (0.2.0 B4).
+
+    True when `enabled` is False (the app runs its direct path); else `llmq.ready`, where
+    `llmq` defaults to the started default queue (False when none is started). A start that
+    failed under `install(on_start_error="log")` therefore keeps the pod out of traffic.
+    """
+    if not enabled:
+        return True
+    if llmq is None:
+        from llm_queue.langchain import get_default_queue
+
+        try:
+            default = get_default_queue()
+        except LLMQueueError:
+            return False
+        return bool(getattr(default, "ready", False))
+    return llmq.ready
 
 
 def _wait_on_loop[T](future: Future[T], loop: asyncio.AbstractEventLoop) -> T:

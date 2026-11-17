@@ -13,7 +13,15 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 from llm_queue._version import __version__
-from llm_queue.context import RequestContext, current_context, request_context
+from llm_queue.context import (
+    RequestContext,
+    background,
+    background_priority,
+    create_background_task,
+    current_context,
+    request_context,
+    run_in_thread,
+)
 from llm_queue.engine.errors import KIND_CATEGORIES, KINDS, CallFailed, Kind
 from llm_queue.engine.hooks import (
     CallContext,
@@ -48,6 +56,7 @@ from llm_queue.tuning import (
 )
 
 if TYPE_CHECKING:
+    from llm_queue.asgi import RequestContextMiddleware
     from llm_queue.clients.hub import run
     from llm_queue.clients.pool import Route
     from llm_queue.clients.providers import Provider, register_provider
@@ -61,6 +70,7 @@ if TYPE_CHECKING:
         RateStatus,
         RequestStatus,
         StatusReport,
+        queue_ready,
     )
     from llm_queue.engine.envelope import Meta, Reply
     from llm_queue.engine.jobs import JobContext, JobFn, JobSettings, current_job
@@ -122,6 +132,9 @@ _LAZY = {
     # Purges of removed models / deployments and tenants (0.1.0b3): `LLMQueue.purge`.
     "PurgeService": "llm_queue.engine.purge",
     "PurgeReport": "llm_queue.engine.purge",
+    # Readiness and the per-request middleware (0.2.0 B3, B4).
+    "queue_ready": "llm_queue.core",
+    "RequestContextMiddleware": "llm_queue.asgi",
 }
 
 __all__ = [
@@ -168,6 +181,7 @@ __all__ = [
     "Reject",
     "Reply",
     "RequestContext",
+    "RequestContextMiddleware",
     "RequestStatus",
     "ResultOffload",
     "Route",
@@ -180,10 +194,14 @@ __all__ = [
     "UnknownModel",
     "WarmOptions",
     "__version__",
+    "background",
+    "background_priority",
+    "create_background_task",
     "current_context",
     "current_job",
     "error_category",
     "error_retryable",
+    "queue_ready",
     "register_account_kind",
     "register_admission",
     "register_balancer",
@@ -195,6 +213,7 @@ __all__ = [
     "register_token_estimator",
     "request_context",
     "run",
+    "run_in_thread",
 ]
 
 

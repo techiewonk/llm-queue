@@ -13,6 +13,8 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `alerts_failed` | warning | engine/runtime.py |
 | `audit_entry_unreadable` | warning | registry/store.py |
 | `background_loop_died` | error | engine/runtime.py |
+| `background_task_failed` | warning | context.py (a `create_background_task` task raised) |
+| `background_thread_failed` | warning | context.py (a `run_in_thread` function raised) |
 | `bad_dead_letter` | warning | engine/runtime.py |
 | `bad_message` | warning | engine/runtime.py |
 | `bell_failed` | warning | engine/runtime.py |
@@ -80,6 +82,7 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `llmq_call_finished` | info | engine/runtime.py |
 | `llmq_purge` | info | engine/purge.py |
 | `llmq_registry_audit` | info | registry/store.py |
+| `llmq_start_failed` | error | fastapi.py (`on_start_error="log"`: the app stays up, not ready) |
 | `message_needs_newer_library` | warning | engine/runtime.py |
 | `metric_dropped` | warning | engine/metrics.py |
 | `model_loop_died` | error | engine/runtime.py |
