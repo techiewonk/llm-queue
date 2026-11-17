@@ -75,6 +75,8 @@ def test_read_token_reads_only_and_admin_token_does_both() -> None:
     )
     http.post("/registry", json=body, headers={TOKEN: "w"})
     assert admin.calls[-1][1]["actor"] == "token:unknown"  # D5: no claimed name
+    http.post("/registry", json=body, headers={TOKEN: "w", "X-LLMQ-Actor": "b" * 500})
+    assert len(admin.calls[-1][1]["actor"]) == 128  # B-06: the one limit, `token:` included
 
 
 def test_token_is_read_per_request_and_an_empty_one_refuses() -> None:

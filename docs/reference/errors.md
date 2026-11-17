@@ -134,8 +134,9 @@ request gets the same answer. It is a direct `LLMQueueError`, not a `ConfigError
 - `purge.deployment(alias, "account/name")` names a deployment the stored registry still has
   (same);
 - `purge.tenant(..., remove=...)` asks for `queued` or `running`, or a requests operation looks
-  calls up by model or tenant, while the request index is off
-  (`LLMQ_REQUEST_INDEX_ENABLED=false`: the index is needed to find the calls);
+  calls up by model or tenant (`requests.count` and `requests.extend` included), while the
+  request index is off (`LLMQ_REQUEST_INDEX_ENABLED=false`: the index is needed to find the
+  calls, or to know a call's own deadline);
 - a requests operation would read more than `LLMQ_ADMIN_SCAN_MAX` index entries;
 - a process-local operation (`drain.*`) runs without a queue (`AdminServices.from_env()`).
 
