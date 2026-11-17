@@ -572,6 +572,7 @@ class InfraSettings:
     admin_actor_header: str = "X-LLMQ-Actor"  # LLMQ_ADMIN_ACTOR_HEADER
     admin_index_cache_secs: float = 2.0  # LLMQ_ADMIN_INDEX_CACHE_SECS
     admin_dlq_bodies_enabled: bool = False  # LLMQ_ADMIN_DLQ_BODIES_ENABLED
+    admin_body_max_bytes: int = 1_048_576  # LLMQ_ADMIN_BODY_MAX_BYTES: a larger POST is a 413
     # How keys expire (LLMQ_KEY_EXPIRY): `auto` picks native TTLs on a `noeviction` store and the
     # expiry index on a `volatile-*` one (owner decision K4, 0.1.0b3); engine/expiry.py.
     key_expiry: str = "auto"
@@ -894,6 +895,9 @@ class InfraSettings:
             admin_actor_header=actor_header,
             admin_index_cache_secs=number("ADMIN_INDEX_CACHE_SECS", 2.0, zero=True, hi=60),
             admin_dlq_bodies_enabled=switches["ADMIN_DLQ_BODIES_ENABLED"],
+            admin_body_max_bytes=number(
+                "ADMIN_BODY_MAX_BYTES", 1_048_576, int, lo=1024, hi=67_108_864
+            ),
             key_expiry=key_expiry,
             ttl_sweep_batch=number("TTL_SWEEP_BATCH", 500, int, lo=1, hi=5_000),
             ttl_sweep_rounds=number("TTL_SWEEP_ROUNDS", 100, int, lo=1, hi=10_000),

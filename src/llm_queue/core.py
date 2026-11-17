@@ -809,8 +809,9 @@ class LLMQueue:
     async def stop(self, drain_secs: float | None = None) -> None:
         """Shut down in order (plan §3.18) and close every client; a second call does nothing.
 
-        `drain_secs` (default `LLMQ_DRAIN_SECS`) bounds the whole wait: jobs first (they make
-        calls), then running calls get what is left of it. Calls made during the drain are
+        Receiving stops first (calls and jobs, as `pause_receiving()`); `drain_secs` (default
+        `LLMQ_DRAIN_SECS`) bounds the whole wait: jobs first (they make calls), then running
+        calls get what is left of it. Calls made during the drain are
         served; new calls are refused once it is over. Every step runs even when an earlier
         one fails (each failure is logged) and the first failure is raised at the end; if the
         stop is cancelled, the steps left still close their clients, without draining.
@@ -833,7 +834,15 @@ class LLMQueue:
         # return at once, so store pools, provider sessions and the S3 client leaked (CO-1).
         cancelled = False
         watcher, self._drain_watcher = self._drain_watcher, None
+
+        async def pause() -> None:
+            # Receiving stops first (owner RV2, review A-2): calls taken while jobs drained got
+            # only the rest of the drain, then streams failed `worker_shutdown` and other calls
+            # ran again elsewhere. Callers' own calls are still served by any pod.
+            self.pause_receiving()
+
         steps: list[tuple[str, Callable[[], Awaitable[Any]]]] = [
+            ("pause", pause),
             ("drain_watcher", lambda: watcher.stop() if watcher else asyncio.sleep(0)),
             ("jobs", lambda: self._jobs.stop(drain_secs=0 if cancelled else drain)),
             (
@@ -1172,7 +1181,7 @@ class LLMQueue:
         `LLMQ_DRAIN_FILE`); `metrics_route=True` adds an open `GET /metrics`. Outside dev each
         token must be at least 32 characters (`ConfigError` here, read once to check).
         """
-        from llm_queue.engine.http import status_router
+        from llm_queue.engine.http import BODY_MAX_BYTES, status_router
 
         s = self.settings
         env_token = getattr(self, "_admin_token", None)
@@ -1195,6 +1204,7 @@ class LLMQueue:
             dlq_bodies=bool(s.admin_dlq_bodies_enabled) if s else False,
             index_cache_secs=float(s.admin_index_cache_secs) if s else 2.0,
             strict=bool(s.strict) if s else False,
+            body_max_bytes=int(s.admin_body_max_bytes) if s else BODY_MAX_BYTES,
         )
 
     def describe(self) -> dict[str, Any]:

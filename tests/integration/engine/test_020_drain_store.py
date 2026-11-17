@@ -30,6 +30,7 @@ from engine_testkit import (
 from engine_testkit import registry as registry_doc
 
 from llm_queue import LLMQueue, LLMQueueError
+from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.runtime import Engine
 
 pytestmark = pytest.mark.integration
@@ -183,6 +184,82 @@ async def test_resume_makes_the_engine_ready_and_receiving_again(make: Make) -> 
     assert (await asyncio.wait_for(task, 15)).ok
 
 
+async def test_a8_resume_from_another_thread_wakes_the_loops(make: Make) -> None:
+    """A-8: `resume_receiving()` set the loop's events from the calling thread.
+
+    The pause is thread-safe; the resume was not: with asyncio debug on it raised, and the
+    wake-up was not delivered. It now goes through `call_soon_threadsafe`.
+    """
+    worker, _ = await make()
+    caller, _ = await make(worker=False)
+    worker.pause_receiving()
+    await asyncio.sleep(0.3)  # the receive loops wait out the pause on their events
+    loop = asyncio.get_running_loop()
+    loop.set_debug(True)
+    try:
+        await asyncio.to_thread(worker.resume_receiving)
+    finally:
+        loop.set_debug(False)
+    assert (await asyncio.wait_for(caller.call("small", CHAT, timeout_secs=20), 15)).ok
+
+
+async def test_g22_a_pause_hands_back_a_call_waiting_between_retries(make: Make) -> None:
+    """G22 (DR-15): a call in retry backoff (run task alive, no grant) was not handed back.
+
+    It kept the drain open until its deadline and retried on the paused pod. It now goes back
+    at once, not failed, and another pod serves it.
+    """
+    first, fake = await make(
+        {"small": {"retry_base_secs": 8, "retry_max_secs": 8, "max_attempts": 3}},
+        {"models": {f"{SMALL}@r1": {"force_error": "InternalServerException"}}},
+    )
+    caller, _ = await make(worker=False)
+    task = asyncio.create_task(caller.call("small", CHAT, request_id="g22-r", timeout_secs=30))
+    await _until(
+        lambda: (h := first._held.get("g22-r")) is not None and h.retry_wait,
+        what="the call in its retry backoff",
+    )
+    first.pause_receiving()
+    await _until(lambda: "g22-r" not in first._held, secs=2, what="the call handed back")
+    second, other = await make()
+    reply = await asyncio.wait_for(task, 20)
+    assert reply.ok
+    assert reply.meta.worker == second.worker_id
+    assert stats(fake, f"{SMALL}@r1")["calls"] == 1  # never retried on the paused pod
+    assert stats(other, f"{SMALL}@r1")["calls"] == 1
+
+
+async def test_g22_a_stream_cut_by_the_drain_timeout_ends_and_is_not_run_again(
+    make: Make,
+) -> None:
+    """G22 (DR-11): a stream that sent chunks when the drain ran out cannot move elsewhere.
+
+    Its caller gets `worker_shutdown` with the partial text, and no other pod runs it again.
+    """
+    first, fake = await make(
+        {"small": {"stream_flush_ms": 0, "timeout_secs": 30, "attempt_timeout_secs": 25}},
+        {"models": {f"{SMALL}@r1": {"output_tokens": 400, "tokens_per_s": 20}}},
+    )
+    caller, _ = await make(worker=False)
+    seen: list[dict[str, Any]] = []
+
+    async def consume() -> None:
+        async for event in caller.stream("small", CHAT, request_id="g22-s", timeout_secs=30):
+            seen.append(event)
+
+    task = asyncio.create_task(consume())
+    await _until(lambda: len(seen) > 2, secs=10, what="chunks reaching the caller")
+    await first.stop(drain_secs=0.2)
+    with pytest.raises(CallFailed) as info:
+        await asyncio.wait_for(task, 10)
+    assert info.value.kind == "worker_shutdown"
+    assert info.value.partial_text
+    _, other = await make()  # another pod: it must not run the cut stream again
+    await asyncio.sleep(1.5)
+    assert stats(fake, f"{SMALL}@r1")["calls"] == 1
+    assert stats(other, f"{SMALL}@r1").get("calls", 0) == 0
+
+
 async def test_draining_is_in_health_with_its_reason(make: Make) -> None:
     engine, _ = await make()
     health = await engine.health_check()
@@ -316,3 +393,34 @@ async def test_the_drain_file_pauses_every_queue_and_ignores_an_old_file(
     await _until(lambda: one.draining, what="paused again by a newer file")
     await one.stop(drain_secs=0)
     assert one._drain_watcher is None or not one._drain_watcher.running
+
+
+async def test_a2_stop_stops_receiving_before_the_jobs_drain(
+    queues: Callable[..., Awaitable[LLMQueue]],
+) -> None:
+    """A-2 (G4): `stop()` with no pause kept receiving calls while its jobs drained.
+
+    Calls taken then got only the rest of the drain (streams failed `worker_shutdown`, others
+    ran again elsewhere). A call sent after `stop()` began now waits for another pod.
+    """
+    started = asyncio.Event()
+
+    async def job(payload: dict[str, Any]) -> None:
+        started.set()
+        await asyncio.sleep(2.0)
+
+    first = await queues(jobs={"j": job})
+    second = await queues()
+    second.pause_receiving()
+    await first.send_job("j", {"n": 1})
+    await asyncio.wait_for(started.wait(), 10)
+    stopping = asyncio.create_task(first.stop(drain_secs=5))
+    await _until(lambda: first.draining, what="the stop's pause")
+    call = asyncio.create_task(second.call("small", CHAT, request_id="a2-call", timeout_secs=20))
+    await asyncio.sleep(1.0)
+    assert not call.done()  # the first queue took and ran it while its job drained, before
+    await stopping
+    second.resume_receiving()
+    reply = await asyncio.wait_for(call, 15)
+    assert reply.ok
+    assert reply.meta.worker == second._engine.worker_id

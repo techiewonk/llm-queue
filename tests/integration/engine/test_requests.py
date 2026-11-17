@@ -315,7 +315,7 @@ async def test_fl22_result_ack_and_finish_in_one_script(
     await store.hset(entry, mapping={"owner": "o1", "bud": "{bad", "mode": "fixed"})
     finish = [prefix, orjson.dumps({"alias": "m", "owner": "o1", "request_id": "req-1"}), ""]
 
-    async def settle(response: dict[str, int]) -> tuple[bool, bool, int]:
+    async def settle(response: dict[str, int]) -> tuple[bool, bool, int, bool]:
         return await requests.put_result_settled(
             Reply(request_id="req-1", ok=True, response=response),
             final_state="done",
@@ -326,12 +326,12 @@ async def test_fl22_result_ack_and_finish_in_one_script(
             finish=finish,
         )
 
-    assert await settle({"x": 1}) == (True, True, -1)
+    assert await settle({"x": 1}) == (True, True, -1, False)
     assert await store.xlen(keys.queue("q", "s")) == 0  # acked
     taken = await requests.take_result("req-1")
     assert taken is not None
     assert taken.response == {"x": 1}
     assert (await requests.status("req-1"))["state"] == "done"
-    assert await settle({"x": 2}) == (False, False, -1)  # a replay: nothing written twice
+    assert await settle({"x": 2}) == (False, False, -1, False)  # nothing written twice
     await store.delete(entry)
-    assert await settle({"x": 3}) == (False, False, 0)  # the grant is gone: settled 0
+    assert await settle({"x": 3}) == (False, False, 0, False)  # grant gone: settled 0

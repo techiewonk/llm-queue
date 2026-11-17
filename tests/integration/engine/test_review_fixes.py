@@ -166,9 +166,10 @@ def test_settings_refuse_unsafe_values(env: dict[str, str], problem: str) -> Non
 
 def test_settings_accept_valkey_urls_and_hide_the_password() -> None:
     settings = InfraSettings.from_env(
-        {"LLMQ_STORE_URL": "valkey://:secret@localhost:6379/0", "LLMQ_ENVIRONMENT": "dev"}
+        {"LLMQ_STORE_URL": "valkey://:pw-4f9a2c@localhost:6379/0", "LLMQ_ENVIRONMENT": "dev"}
     )
-    assert "secret" not in repr(settings)
+    # A unique password value: field names such as `secrets_source` contain "secret".
+    assert "pw-4f9a2c" not in repr(settings)
 
 
 async def test_start_twice_and_restart(make: Make, store: Any, prefix: str) -> None:

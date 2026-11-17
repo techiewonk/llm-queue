@@ -40,6 +40,9 @@ class _Engine:
         if self.fail_start:
             raise RuntimeError("start failed")
 
+    def pause_receiving(self) -> None:
+        return None  # `stop()` pauses first (A-2)
+
     async def stop(self, **kw: Any) -> None:
         self.steps.append("stop")
         if self.drain is not None:

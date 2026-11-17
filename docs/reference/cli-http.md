@@ -74,9 +74,10 @@ Status codes of the admin routes:
 | Code | When |
 |---|---|
 | 200 | Done (or the dry run's report) |
-| 400 | Bad input: an unknown, missing or mistyped field, a body that is not a JSON object, an id or name longer than 256 characters, more than 100 edit paths or list items; a refused edit (a protected or deploy-only field, an invalid value) |
+| 400 | Bad input: an unknown, missing or mistyped field, a body that is not a JSON object, an id or name longer than 256 characters, a body value above 64 KiB, more than 100 edit paths or list items, a dead letter id that is not `<ms>-<seq>`; a refused edit (a protected or deploy-only field, an invalid value); a request the store refuses |
 | 403 | No or a wrong token; the read token on a write; a dependency-guarded write without `X-LLMQ-Admin`; dead-letter bodies with the setting off |
 | 404 | An unknown model; an unknown or expired request, dead letter or deployment |
 | 404, 405 | A route that is not mounted: a write with `allow_writes` off (405 where a `GET` shares the path), a read with no guard |
 | 409 | A refused operation (`AdminRefused`: a purge of state still in use, a service not available, a stopped queue), no `Retry-After`; or a write that lost the compare-and-set race with other writes on every try: valid, retry after `Retry-After` (1 s) |
+| 413 | A POST body above `LLMQ_ADMIN_BODY_MAX_BYTES` (1 MiB) |
 | 503 | The state store is unreachable, or the registry is not loaded yet (the router was hit before `start()` finished) |

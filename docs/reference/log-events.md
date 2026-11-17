@@ -45,6 +45,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `deployment_disabled` | error | engine/runtime.py, engine/local.py |
 | `deployment_failing_last_usable` | error | engine/runtime.py |
 | `deployment_recovered` | info | engine/runtime.py |
+| `direct_run_after_result_failed` | warning | engine/runtime.py (a step after a direct run stored its success raised; the caller gets the success) |
 | `direct_run_failed` | warning | engine/runtime.py |
 | `drain_callback_failed` | warning | drain.py |
 | `drain_file_seen` | info | drain.py |
@@ -78,6 +79,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `job_task_failed` | warning | engine/jobs.py |
 | `job_upkeep_failed` | warning | engine/jobs.py |
 | `key_expiry_changed` | warning | engine/runtime.py |
+| `key_expiry_conflict` | warning | engine/runtime.py |
 | `key_expiry_publish_failed` | warning | engine/runtime.py |
 | `llmq_admin` | info | engine/audit.py, engine/requests_admin.py |
 | `llmq_call_finished` | info | engine/runtime.py |
@@ -145,6 +147,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `secrets_refresh_failed` | warning | secrets.py (the last values are kept) |
 | `setting_removed` | warning | engine/settings.py (a removed setting is still set, outside strict mode: `setting`, `hint`) |
 | `setting_renamed` | warning | engine/settings.py (a renamed setting is still set, outside strict mode: `setting`, `use`) |
+| `settle_replayed` | info | engine/runtime.py (the end-of-call script ran again after a lost reply: not a double run) |
 | `shutdown_give_back_failed` | warning | engine/runtime.py |
 | `start_rollback_failed` | warning | core.py |
 | `static_cap_process_count_unset` | warning | core.py (queue mode: `models` with `store_down: static_cap` while `LLMQ_LOCAL_PROCESS_COUNT` is 1) |
