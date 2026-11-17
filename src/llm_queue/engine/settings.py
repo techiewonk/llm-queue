@@ -21,6 +21,7 @@ from redis.connection import parse_url, to_bool
 from llm_queue.engine.expiry import KEY_EXPIRY_MODES
 from llm_queue.engine.store_guard import WAIT_SCOPES, parse_scopes
 from llm_queue.errors import ConfigError
+from llm_queue.registry.interpolate import YAML_SUFFIXES, expand, load_yaml, to_json
 from llm_queue.registry.validate import parse_document
 
 PREFIX = "LLMQ_"
@@ -119,19 +120,34 @@ def _purge_settings(
     return out
 
 
-def _read_document(registry: str | None, registry_file: str | None) -> str:
-    """The registry JSON from the variable or the file, refused when it repeats a key."""
+def _read_document(
+    registry: str | None,
+    registry_file: str | None,
+    lookup: Callable[[str], str | None] | None = None,
+) -> str:
+    """The registry JSON from the variable or the file, refused when it repeats a key.
+
+    `${NAME}` placeholders are expanded with `lookup` (default: `os.environ`) after parsing,
+    so the repeated-key check sees the document as written and the expanded text is checked
+    again (`registry.interpolate`). A file ending `.yaml` / `.yml` is read as YAML (extra
+    `yaml`). Text without placeholders is returned as it is.
+    """
+    yaml_file = False
     if registry:
         text = registry
     elif registry_file:
+        yaml_file = Path(registry_file).suffix.lower() in YAML_SUFFIXES
         try:
             text = Path(registry_file).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             raise ConfigError(f"LLMQ_REGISTRY_FILE cannot be read: {exc}") from exc
     else:
         raise ConfigError("no registry: set LLMQ_REGISTRY or LLMQ_REGISTRY_FILE")
-    parse_document(text)  # RegistryError (a ConfigError) for bad JSON or a repeated key
-    return text
+    # RegistryError (a ConfigError) for bad JSON or a repeated key; YAML has its own check.
+    document = load_yaml(text) if yaml_file else parse_document(text)
+    if "${" not in text and not yaml_file:
+        return text
+    return to_json(expand(document, lookup or os.environ.get))
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +201,11 @@ class InfraSettings:
     purge_batch: int = 500
     tenant_purge_default: str = "keys"  # comma list of TENANT_PURGE_PARTS
     tenant_index: bool = False
+    # Where registry placeholders are read (`secrets=` first, then the environment `from_env`
+    # read); None: `os.environ`. Never shown or compared.
+    placeholder_lookup: Callable[[str], str | None] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def strict(self) -> bool:
@@ -212,6 +233,14 @@ class InfraSettings:
             if value is None or not str(value).strip():
                 return default
             return value
+
+        def placeholder(name: str) -> str | None:
+            # A registry placeholder names the variable in full (no LLMQ_ prefix).
+            if secrets is not None:
+                value = secrets(name)
+                if value:
+                    return value
+            return env.get(name)
 
         problems: list[str] = []
         store = get("STORE_URL")
@@ -244,7 +273,7 @@ class InfraSettings:
             problems.append("set one of LLMQ_REGISTRY and LLMQ_REGISTRY_FILE, not both")
         elif registry or registry_file:
             try:
-                document = orjson.loads(_read_document(registry, registry_file))
+                document = orjson.loads(_read_document(registry, registry_file, placeholder))
             except ConfigError as exc:
                 problems.append(str(exc))
             except ValueError as exc:  # orjson refuses what `json` took (NaN): R3CF-1
@@ -407,6 +436,7 @@ class InfraSettings:
             ttl_sweep_batch=number("TTL_SWEEP_BATCH", 500, int, lo=1, hi=5_000),
             ttl_sweep_rounds=number("TTL_SWEEP_ROUNDS", 100, int, lo=1, hi=10_000),
             **purge,
+            placeholder_lookup=placeholder,
         )
         if problems:
             raise ConfigError("invalid LLMQ settings:\n  " + "\n  ".join(problems))
@@ -415,7 +445,8 @@ class InfraSettings:
     def registry_document(self) -> str:
         """The registry JSON from `LLMQ_REGISTRY` or the file `LLMQ_REGISTRY_FILE`.
 
-        `ConfigError` when neither is set, the file cannot be read, the text is not JSON or an
-        object repeats a key.
+        Placeholders expanded (see `_read_document`). `ConfigError` when neither is set, the
+        file cannot be read, the text is not JSON (or YAML), an object repeats a key or a
+        placeholder names an unset variable without a default.
         """
-        return _read_document(self.registry, self.registry_file)
+        return _read_document(self.registry, self.registry_file, self.placeholder_lookup)

@@ -219,6 +219,12 @@ def _check_model(
     for dep in deployments:
         limits = view.effective(alias, "rate_limits", dep.key)
         rpm, tpm = _budget_numbers(view, alias, dep)
+        for budget, value in (("rpm", rpm), ("tpm", tpm)):
+            if value == 0:  # only a quota can give 0: `rpm` / `tpm` themselves start at 1
+                errors.append(
+                    f"{_at(path, dep)}: `quota_{budget}` x `budget_pct` rounds down to 0 "
+                    f"{budget}; raise either"
+                )
         if limits.level != "library":
             if limits.value == "rpm" and rpm is None:
                 errors.append(f"{_at(path, dep)}: `rate_limits` is rpm but no `rpm` is set")

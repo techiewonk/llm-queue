@@ -406,6 +406,11 @@ SETTINGS: Mapping[str, Spec] = {
     "enabled": _spec("A,M,R", boolean, True),
     "rpm": _spec("D,M,R", number(1, integer=True)),
     "tpm": _spec("D,M,R", number(1, integer=True)),
+    # The provider's quota and the share of it to use, instead of `rpm` / `tpm`: the budget is
+    # floor(quota x budget_pct) (`registry.resolve`). One level sets one of the two forms.
+    "quota_rpm": _spec("D,M,R", number(1, integer=True)),
+    "quota_tpm": _spec("D,M,R", number(1, integer=True)),
+    "budget_pct": _spec("D,A,M,R", number(0, 1, lo_open=True), 1.0),
     "rate_limits": _spec(
         "D,A,M,R",
         one_of("both", "rpm", "tpm", "off"),

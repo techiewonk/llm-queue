@@ -8,6 +8,7 @@ warnings for a stored document (read leniently, so an older pod still starts).
 
 from __future__ import annotations
 
+import dataclasses
 import difflib
 import ipaddress
 import math
@@ -319,7 +320,19 @@ def _settings(
             out.error(f"{path}.queue.name", "a queue name can only be set on a model")
             continue
         kept[name] = value
+    _one_budget_form(out, path, kept)
     return kept
+
+
+def _one_budget_form(out: _Collector, path: str, settings: dict[str, Any]) -> None:
+    """Refuse (and drop) `quota_rpm` / `quota_tpm` set beside `rpm` / `tpm` on one level.
+
+    Either form sets the same budget; with both, which one wins would be a guess.
+    """
+    for budget, quota in (("rpm", "quota_rpm"), ("tpm", "quota_tpm")):
+        if budget in settings and quota in settings:
+            out.error(f"{path}.{quota}", f"set `{budget}` or `{quota}`, not both")
+            del settings[quota]
 
 
 def _sub_fields(
@@ -535,6 +548,8 @@ def _deployments(
                 continue
             entry = by_name[target]
             merged = {**entry.settings, **_settings(out, opath, values, R)}
+            # A profile's `rpm` and an override's `quota_rpm` are still one level (R).
+            _one_budget_form(out, opath, merged)
             by_name[target] = RegionEntry(
                 name=entry.name,
                 region=entry.region,
@@ -547,7 +562,13 @@ def _deployments(
     return result
 
 
+# `allowed_regions: "auto"` until `build` knows every deployment: compared by identity, so a
+# region list that happens to read ("auto",) is never taken for it.
+_AUTO_RESIDENCY: tuple[str, ...] = ("auto",)
+
+
 def _residency(out: _Collector, path: str, raw: Any) -> tuple[str, ...] | None:
+    """The residency list; `_AUTO_RESIDENCY` for `"auto"` (resolved by `_auto_residency`)."""
     if raw is None:
         return None
     body = out.mapping(path, raw)
@@ -556,7 +577,38 @@ def _residency(out: _Collector, path: str, raw: Any) -> tuple[str, ...] | None:
     for key in body:
         if key != "allowed_regions":
             out.unknown(f"{path}.{key}", key, frozenset({"allowed_regions"}), "in residency")
-    return out.names(f"{path}.allowed_regions", body.get("allowed_regions", []))
+    allowed = body.get("allowed_regions", [])
+    if allowed == "auto":
+        return _AUTO_RESIDENCY
+    if isinstance(allowed, str):
+        out.error(f"{path}.allowed_regions", 'must be a list of strings or "auto"')
+        return ()
+    return out.names(f"{path}.allowed_regions", allowed)
+
+
+def _regions_used(models: Mapping[str, ModelEntry]) -> tuple[str, ...]:
+    """Every region a deployment calls or a profile routes to, across all models, sorted."""
+    found = {
+        region
+        for model in models.values()
+        for entries in model.deployments.values()
+        for entry in entries
+        for region in (entry.region, *entry.routes_to)
+    }
+    return tuple(sorted(found))
+
+
+def _auto_residency(models: dict[str, ModelEntry]) -> tuple[str, ...]:
+    """Replace `"auto"` residency lists with the regions in use (H4); return that union.
+
+    The union is taken over every model, so a model's own `"auto"` allows the same regions
+    as the top-level one. Recomputed on every load: a region added to a deployment is in it.
+    """
+    used = _regions_used(models)
+    for alias, model in models.items():
+        if model.residency is _AUTO_RESIDENCY:
+            models[alias] = dataclasses.replace(model, residency=used)
+    return used
 
 
 def _model(
@@ -694,13 +746,15 @@ def build(
         for alias, body in models_raw.items()
         if (model := _model(out, alias, body, accounts)) is not None
     }
+    used = _auto_residency(models)
+    residency = _residency(out, "residency", raw.get("residency"))
     registry = Registry(
         version=version,
         defaults=_frozen(defaults),
         routing=_routing(out, raw.get("routing")),
         accounts=MappingProxyType(accounts),
         models=MappingProxyType(models),
-        residency=_residency(out, "residency", raw.get("residency")),
+        residency=used if residency is _AUTO_RESIDENCY else residency,
         min_lib_version=min_lib,
         live_edit=live_edit,
         raw=_frozen(raw),

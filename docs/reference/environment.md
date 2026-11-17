@@ -101,7 +101,7 @@ For a store with replicas, also set `min-replicas-to-write` on the primary: a wr
 | Variable | Default | Range | Meaning |
 |---|---|---|---|
 | `LLMQ_REGISTRY` | none | JSON | The registry document ([shape](registry.md)) |
-| `LLMQ_REGISTRY_FILE` | none | a path | A file holding it (set one of the two, not both). A repeated JSON key is refused |
+| `LLMQ_REGISTRY_FILE` | none | a path | A file holding it (set one of the two, not both). A repeated JSON key is refused. A path ending `.yaml` / `.yml` is read as YAML (extra `yaml`). Either form may hold `${NAME}` placeholders ([registry](registry.md#placeholders-and-yaml)) |
 | `LLMQ_REGISTRY_LIVE_EDIT` | `safe` | `safe`, `all`, `off` | The live-edit mode when the document has no `live_edit` field (see [Live edits](../how-to/configure.md#live-edits)) |
 | `LLMQ_CFG_RELOAD_SECS` | 30 | 1 to 3600 | How often each process reloads the registry |
 | `LLMQ_AUDIT_RETENTION_DAYS` | 90 | above 0 to 3650 (whole) | How long registry audit entries are kept (also capped at about 10,000 entries) |
