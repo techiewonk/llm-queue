@@ -430,3 +430,5 @@ async def test_a10_a_mode_change_reaches_every_process_at_once(
     while second.expiry.mode != "swept":
         assert loop.time() < until, "the change notice never arrived"
         await asyncio.sleep(0.02)
+    # The native window above left native TTLs on purpose: not a swept-mode leak at teardown.
+    await store.set(first.expiry.mode_key, "native")
