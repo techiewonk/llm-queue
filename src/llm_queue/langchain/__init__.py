@@ -4,6 +4,9 @@ The adapter classes are loaded on first attribute access, so importing this pack
 example to call `set_default_queue` from `LLMQueue.start()`) never imports langchain, boto3 or
 httpx. `QueuedChatBedrockConverse` / `QueuedBedrockEmbeddings` need `[langchain-aws]`;
 `QueuedChatOpenAI` / `QueuedOpenAIEmbeddings` need `[openai,langchain-openai]`.
+
+`chat_model(model_id)` / `embeddings(model_id)` pick the queued class for a registry model, or
+return None when the queue is off or the model is not in the boot registry (`factories`).
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from llm_queue.langchain._client import (
     get_default_queue,
     set_default_queue,
 )
+from llm_queue.langchain.factories import aliases, boot_registry, chat_model, embeddings
 
 if TYPE_CHECKING:
     from llm_queue.langchain.bedrock import (
@@ -43,6 +47,10 @@ __all__ = [
     "QueuedChatOpenAI",
     "QueuedOpenAIEmbeddings",
     "ReplyLike",
+    "aliases",
+    "boot_registry",
+    "chat_model",
+    "embeddings",
     "get_default_queue",
     "set_default_queue",
 ]

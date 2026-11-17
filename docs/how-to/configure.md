@@ -18,15 +18,77 @@ name to a value or `None`), each name is looked up there first, then in the envi
 llmq = LLMQueue.from_env(secrets=my_secret_lookup)
 ```
 
-`LLMQ_STORE_PASSWORD` and `LLMQ_QUEUE_STORE_PASSWORD` are read from `secrets=` on every new
-connection, so a rotated password is picked up without a restart. To avoid environment
-variables entirely, pass a mapping: `LLMQueue.from_env(environ={...}, secrets=...)`.
+`LLMQ_STORE_PASSWORD` and `LLMQ_QUEUE_STORE_PASSWORD` are read on every new connection (from
+`secrets=`, else the environment), so a rotated password is picked up without a restart. To
+avoid environment variables entirely, pass a mapping: `LLMQueue.from_env(environ={...},
+secrets=...)`.
+
+### Layers: secrets, environment, defaults
+
+`from_env` reads every `LLMQ_*` name from three layers, highest first:
+
+1. `secrets=`: a function from a name to a value or `None` (Secrets Manager, Vault);
+2. `environ=` (default `os.environ`);
+3. `defaults=`: a mapping the app keeps in code, used for any name the two above leave unset.
+
+```python
+llmq = LLMQueue.from_env(
+    secrets=my_secret_lookup,
+    secret_names={                       # the secrets' own names
+        "LLMQ_STORE_HOST": "valkey_host",
+        "LLMQ_STORE_PASSWORD": "valkey_password",
+        "LLMQ_ADMIN_TOKEN": "llmq_admin_token",
+    },
+    defaults={                           # the app's defaults; a manifest or a secret wins
+        "LLMQ_KEY_PREFIX": "research-dev",
+        "LLMQ_REGISTRY_FILE": "llm_registry.yaml",
+        "LLMQ_STORE_MAX_CONNECTIONS": "auto",
+        "LLMQ_DRAIN_FILE": "/tmp/drain",
+    },
+)
+```
+
+- `secret_names` asks the secret under its own name instead of the `LLMQ_*` name; the order of
+  the layers does not change. It covers every setting read through the layers: the store
+  passwords, `LLMQ_ADMIN_TOKEN`, `LLMQ_JOB_*` and the account secrets.
+- A secret wins over the environment, as in 0.1. For the environment to win over a secret,
+  build the environment yourself: `environ=collections.ChainMap(os.environ, secret_map)`.
+- Two settings that name one thing two ways form a group: `LLMQ_STORE_URL` against the store
+  parts, and `LLMQ_REGISTRY` against `LLMQ_REGISTRY_FILE`. The highest layer that sets any
+  name of the group picks the form and the other form is ignored in every layer, so a default
+  `LLMQ_REGISTRY_FILE` in code gives way to a manifest's `LLMQ_REGISTRY`. One layer that sets
+  both is refused.
+
+### The store as parts
+
+Instead of one URL, give the store as parts (often what a secret holds):
+
+| Setting | Default |
+|---|---|
+| `LLMQ_STORE_HOST` | none (then `LLMQ_STORE_URL` is required) |
+| `LLMQ_STORE_PORT` | 6379 |
+| `LLMQ_STORE_DB` | 0 |
+| `LLMQ_STORE_TLS_ENABLED` | true (`rediss://`) |
+| `LLMQ_STORE_PASSWORD` | none |
+
+The URL is built from them (the password percent-escaped, so `@`, `/` and `:` in it are safe)
+and checked like `LLMQ_STORE_URL`: in strict mode a host that is not local needs TLS, and the
+certificate and host name checks are written into it. Setting the parts and `LLMQ_STORE_URL` in
+one layer is refused.
+
+### Size the store pool from the registry
+
+`LLMQ_STORE_MAX_CONNECTIONS=auto` sizes the pool as the sum of `worker_slots` over the boot
+registry's models plus 10 (the receive loop, the result subscriber, heartbeats, status reads),
+within 4 to 100,000. It is computed once by `from_env`: a live edit that raises `worker_slots`
+does not resize it (`start()` warns when the pool is below the slots). A number (default 200)
+works as before.
 
 The settings you set in most deployments:
 
 | Setting | Meaning |
 |---|---|
-| `LLMQ_STORE_URL` | The state store (`redis://` or `rediss://`). Required |
+| `LLMQ_STORE_URL` | The state store (`redis://` or `rediss://`). Required, unless the store is given as parts (`LLMQ_STORE_HOST`, above) |
 | `LLMQ_ENVIRONMENT` | `dev`, `local`, `test` or `ci` relax the checks; anything else, **unset included**, is strict: TLS stores, `LLMQ_ID_HASH_SALT`, allowed `base_url` hosts, no debug capture |
 | `LLMQ_ID_HASH_SALT` | Key of the user / session id hash (HMAC); required when strict |
 | `LLMQ_KEY_PREFIX`, `LLMQ_QUEUE_PREFIX` | Names of this environment's keys and queues. The key prefix defaults to `llmq` in dev and is **required** in strict mode (name it per app and environment); the queue prefix defaults to empty |

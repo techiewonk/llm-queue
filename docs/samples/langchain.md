@@ -34,6 +34,9 @@ LangChain / LangGraph chains, agents and RAG pipelines.
 - Both find the started `LLMQueue` on their own. `model_alias` names a registry model, and the
   `model_id` comes from the registry.
 - They work with LangChain 1.x; CI also checks the 0.3 line.
+- `chat_model(model_id)` / `embeddings(model_id)` build the right class from the registry, or
+  return None when the model is not in the registry, for
+  `chat_model(...) or <direct model>`: see [Use LangChain models](../how-to/langchain.md).
 
 ## Code
 

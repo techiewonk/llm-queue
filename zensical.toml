@@ -34,6 +34,7 @@ nav = [
     { "Tune" = "how-to/tune.md" },
     { "Make calls" = "how-to/call.md" },
     { "Use with FastAPI" = "how-to/fastapi.md" },
+    { "Use LangChain models" = "how-to/langchain.md" },
   { "Run background jobs" = "how-to/jobs.md" },
   { "Keep large results in S3" = "how-to/large-results.md" },
     { "Operate" = "how-to/operate.md" },

@@ -9,11 +9,11 @@ from __future__ import annotations
 import math
 import os
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import orjson
 from redis.connection import parse_url, to_bool
@@ -47,6 +47,167 @@ MIN_SALT_CHARS = 16
 _PREFIX_RE = re.compile(r"^[A-Za-z0-9_.-]{0,64}\Z")
 _KEY_PREFIX_RE = re.compile(r"^[A-Za-z0-9_.:-]{0,64}\Z")
 INT32_MAX = 2**31 - 1  # the longest TTL `EXPIRE` takes on every store engine (R3CF-14)
+# Store connections a worker needs beyond its slots: the receive loop, the result subscriber,
+# heartbeats and status reads (R3PF-8). Unverified: an estimate from the loops it runs.
+STORE_POOL_MARGIN = 10
+# The store given as parts (0.2.0 D3) instead of `LLMQ_STORE_URL` (names without `LLMQ_`).
+STORE_PARTS = ("STORE_HOST", "STORE_PORT", "STORE_DB", "STORE_TLS_ENABLED")
+# Settings that name one thing two ways (0.2.0 D1): the highest layer that sets any name of a
+# group picks the side, and the other side's names are dropped from every layer, so a default
+# `LLMQ_REGISTRY` never clashes with an environment's `LLMQ_REGISTRY_FILE`. One layer that
+# sets both sides is refused.
+CONFLICT_GROUPS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("STORE_URL",), STORE_PARTS),
+    (("REGISTRY",), ("REGISTRY_FILE",)),
+)
+_TRUE, _FALSE = ("true", "1", "yes", "on"), ("false", "0", "no", "off")
+
+
+def _set(value: Any) -> str | None:
+    """`value` as a setting's text, None when unset or empty (an empty value counts as unset)."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    text = str(value)
+    return text if text.strip() else None
+
+
+class Layers(Mapping[str, str]):
+    """`LLMQ_*` values from three layers: `secrets`, then `environ`, then `defaults` (0.2.0 D1).
+
+    The secret-then-environment order is the 0.1 one, unchanged; `defaults` (the app's own
+    values, for example from its config module) sit below both. `secret_names` maps a setting
+    to the secret that holds it under another name (`{'LLMQ_STORE_HOST': 'valkey_host'}`,
+    0.2.0 H7); the same order applies to it. Secrets are read on every lookup, so a rotated
+    one (the store password, the admin token) is seen without a restart. Settings that name
+    one thing two ways follow `CONFLICT_GROUPS`. A mapping, so `JobSettings.from_env` reads it.
+    """
+
+    def __init__(
+        self,
+        environ: Mapping[str, str] | None = None,
+        secrets: Callable[[str], str | None] | None = None,
+        defaults: Mapping[str, Any] | None = None,
+        secret_names: Mapping[str, str] | None = None,
+    ) -> None:
+        """Read `environ` (default `os.environ`, copied now) and the other layers."""
+        problems = [
+            f"defaults: {name!r} is not an LLMQ_* setting"
+            for name in defaults or {}
+            if not str(name).startswith(PREFIX)
+        ]
+        for name, secret in (secret_names or {}).items():
+            if not str(name).startswith(PREFIX):
+                problems.append(f"secret_names: {name!r} is not an LLMQ_* setting")
+            if not str(secret or "").strip():
+                problems.append(f"secret_names: {name} must name a secret")
+        if problems:
+            raise ConfigError("invalid LLMQ settings:\n  " + "\n  ".join(problems))
+        self._env = dict(os.environ if environ is None else environ)
+        self._secrets = secrets
+        self._defaults = {name: _set(value) for name, value in (defaults or {}).items()}
+        self._names = dict(secret_names or {})
+
+    @property
+    def environ(self) -> dict[str, str]:
+        """The environment layer (the copy taken at construction)."""
+        return self._env
+
+    def secret(self, name: str) -> str | None:
+        """Secret `name` (under its `secret_names` name), None when unset or empty."""
+        if self._secrets is None:
+            return None
+        return _set(self._secrets(self._names.get(name, name)))
+
+    def _values(self, name: str) -> tuple[str | None, str | None, str | None]:
+        return self.secret(name), _set(self._env.get(name)), self._defaults.get(name)
+
+    def _deciding(self, sides: tuple[tuple[str, ...], ...]) -> list[bool] | None:
+        """Which sides of a group the highest layer that sets any of its names sets."""
+        for layer in range(3):
+            found = [
+                any(self._values(PREFIX + n)[layer] is not None for n in side) for side in sides
+            ]
+            if any(found):
+                return found
+        return None
+
+    def _dropped(self, name: str) -> bool:
+        """True when `name` is on the side of its conflict group that a higher layer overrode."""
+        short = name.removeprefix(PREFIX)
+        for sides in CONFLICT_GROUPS:
+            if any(short in side for side in sides):
+                found = self._deciding(sides)
+                if found is None or all(found):
+                    return False  # both in one layer: reported by `conflicts`, nothing dropped
+                return short not in sides[found.index(True)]
+        return False
+
+    def conflicts(self) -> list[str]:
+        """The groups whose deciding layer sets both sides, by their first name (no prefix)."""
+        out = []
+        for sides in CONFLICT_GROUPS:
+            found = self._deciding(sides)
+            if found is not None and all(found):
+                out.append(sides[0][0])
+        return out
+
+    def get(self, name: str, default: Any = None) -> Any:
+        """The value of `name` from the highest layer that sets it, else `default`."""
+        if self._dropped(name):
+            return default
+        for value in self._values(name):
+            if value is not None:
+                return value
+        return default
+
+    def __getitem__(self, name: str) -> str:
+        """The value of `name`; `KeyError` when no layer sets it."""
+        value = self.get(name)
+        if value is None:
+            raise KeyError(name)
+        return str(value)
+
+    def __iter__(self) -> Iterator[str]:
+        """The names of the environment and the defaults (secrets cannot be listed)."""
+        return iter(dict.fromkeys([*self._env, *self._defaults]))
+
+    def __len__(self) -> int:
+        """How many names `__iter__` yields."""
+        return len(dict.fromkeys([*self._env, *self._defaults]))
+
+
+def read_bool(layers: Mapping[str, Any], name: str, default: bool, problems: list[str]) -> bool:
+    """Switch `LLMQ_<name>` (`true` / `false`, `on` / `off`, `yes` / `no`, `1` / `0`).
+
+    A bad value is added to `problems` and the default is returned.
+    """
+    raw = str(layers.get(PREFIX + name, "true" if default else "false")).strip().lower()
+    if raw not in _TRUE + _FALSE:
+        problems.append(f"{PREFIX}{name} must be true or false (on / off)")
+        return default
+    return raw in _TRUE
+
+
+def _parts_url(host: str, port: int, db: int, tls: bool, password: str | None) -> str:
+    """The store URL from its parts; the password percent-escaped (`@`, `/`, `:` are data)."""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"  # an IPv6 address
+    auth = f":{quote(password, safe='')}@" if password else ""
+    return f"{'rediss' if tls else 'redis'}://{auth}{host}:{port}/{db}"
+
+
+def _auto_pool(document: Any, hosts: tuple[str, ...]) -> tuple[int, str | None]:
+    """`LLMQ_STORE_MAX_CONNECTIONS=auto`: the boot registry's worker slots + `STORE_POOL_MARGIN`."""
+    from llm_queue.registry.validate import load_registry
+
+    try:
+        view = load_registry(document, allowed_hosts=hosts)
+    except ConfigError as exc:
+        return 200, f"LLMQ_STORE_MAX_CONNECTIONS=auto needs a valid registry: {exc}"
+    slots = sum(int(view.value(alias, "worker_slots")) for alias in view.registry.models)
+    return min(max(slots + STORE_POOL_MARGIN, 4), 100_000), None
 
 
 def _store_url(name: str, url: str, strict: bool) -> tuple[str, list[str]]:
@@ -84,7 +245,6 @@ def _store_url(name: str, url: str, strict: bool) -> tuple[str, list[str]]:
 
 
 TENANT_PURGE_PARTS = ("keys", "queued", "running")
-_TRUE, _FALSE = ("true", "1", "yes", "on"), ("false", "0", "no", "off")
 
 
 def _purge_settings(
@@ -157,6 +317,15 @@ class InfraSettings:
     store_url: str = field(repr=False)  # holds the password
     queue_store_url: str | None = field(default=None, repr=False)
     store_max_connections: int = 200
+    # LLMQ_STORE_MAX_CONNECTIONS=auto (0.2.0 D7): the size above is the boot registry's worker
+    # slots + STORE_POOL_MARGIN.
+    store_max_connections_auto: bool = False
+    # The store as parts (0.2.0 D3), when `LLMQ_STORE_URL` is not set; `store_url` is built from
+    # them (the password from LLMQ_STORE_PASSWORD, escaped).
+    store_host: str | None = None
+    store_port: int = 6379
+    store_db: int = 0
+    store_tls_enabled: bool = True
     key_prefix: str = "llmq"
     queue_prefix: str = ""
     registry: str | None = None
@@ -223,29 +392,24 @@ class InfraSettings:
         environ: Mapping[str, str] | None = None,
         *,
         secrets: Callable[[str], str | None] | None = None,
+        defaults: Mapping[str, Any] | None = None,
+        secret_names: Mapping[str, str] | None = None,
     ) -> InfraSettings:
-        """Read `LLMQ_*` from `environ` (default `os.environ`), secrets first when given."""
-        env = dict(os.environ if environ is None else environ)
+        """Read `LLMQ_*`: `secrets` first, then `environ` (`os.environ`), then `defaults`.
+
+        See `Layers`; `secret_names` maps a setting to the name of the secret that holds it.
+        """
+        layers = Layers(environ, secrets, defaults, secret_names)
+        env = layers.environ
 
         def get(name: str, default: Any = None) -> Any:
-            if secrets is not None:
-                value = secrets(PREFIX + name)
-                if value:
-                    return value
-            value = env.get(PREFIX + name)
             # An empty value counts as unset everywhere: compose's `${VAR:-}` writes one, and
             # `LLMQ_LEASE_SECS=` was an error while an empty LLMQ_ENVIRONMENT was not (R3CF-14).
-            if value is None or not str(value).strip():
-                return default
-            return value
+            return layers.get(PREFIX + name, default)
 
         def placeholder(name: str) -> str | None:
             # A registry placeholder names the variable in full (no LLMQ_ prefix).
-            if secrets is not None:
-                value = secrets(name)
-                if value:
-                    return value
-            return env.get(name)
+            return layers.secret(name) or env.get(name)
 
         problems: list[str] = []
         store = get("STORE_URL")
@@ -253,15 +417,15 @@ class InfraSettings:
         if environment == "production":
             environment = "prod"
         strict = environment not in DEV_ENVIRONMENTS
-        if not store:
-            problems.append(f"LLMQ_STORE_URL is required ({_SCHEMES_TEXT})")
-        urls: dict[str, str | None] = {}
-        for name in ("STORE_URL", "QUEUE_STORE_URL"):
-            raw = get(name)
-            urls[name] = None
-            if raw:
-                urls[name], found = _store_url(PREFIX + name, str(raw), strict)
-                problems += found
+        host = str(get("STORE_HOST", "") or "").strip() or None
+        if store and "STORE_URL" in layers.conflicts():
+            problems.append(
+                "set LLMQ_STORE_URL or the store parts ("
+                + ", ".join(PREFIX + n for n in STORE_PARTS)
+                + ") in one place, not both"
+            )
+        elif not store and not host:
+            problems.append(f"LLMQ_STORE_URL (or LLMQ_STORE_HOST) is required ({_SCHEMES_TEXT})")
         registry, registry_file = get("REGISTRY"), get("REGISTRY_FILE")
         hosts = tuple(
             h.strip() for h in str(get("BASE_URL_ALLOWED_HOSTS", "")).split(",") if h.strip()
@@ -274,11 +438,12 @@ class InfraSettings:
                     f"LLMQ_BASE_URL_ALLOWED_HOSTS entry `{host}` must be a bare host name "
                     "(no scheme, port or path), e.g. api.openai.com"
                 )
+        boot: Any = None  # the boot registry document, when it reads
         if registry and registry_file:
             problems.append("set one of LLMQ_REGISTRY and LLMQ_REGISTRY_FILE, not both")
         elif registry or registry_file:
             try:
-                document = orjson.loads(_read_document(registry, registry_file, placeholder))
+                document = boot = orjson.loads(_read_document(registry, registry_file, placeholder))
             except ConfigError as exc:
                 problems.append(str(exc))
             except ValueError as exc:  # orjson refuses what `json` took (NaN): R3CF-1
@@ -321,10 +486,7 @@ class InfraSettings:
         admin_header = str(get("ADMIN_HEADER", "X-LLMQ-Token") or "").strip()
         if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", admin_header):
             problems.append("LLMQ_ADMIN_HEADER must be a header name (letters, digits, `-`)")
-        hand_back = str(get("DRAIN_HANDBACK_ENABLED", "true")).strip().lower()
-        if hand_back not in _TRUE + _FALSE:
-            problems.append("LLMQ_DRAIN_HANDBACK_ENABLED must be true or false (on / off)")
-            hand_back = "true"
+        hand_back = read_bool(layers, "DRAIN_HANDBACK_ENABLED", True, problems)
         drain_file = str(get("DRAIN_FILE", "") or "").strip()
         mode = str(get("MODE", "both"))
         if mode not in ("both", "caller", "worker"):
@@ -406,10 +568,42 @@ class InfraSettings:
                 f"LLMQ_LEASE_SECS / 3 ({beat:g} s), plus a margin"
             )
         purge = _purge_settings(get, number, problems)
+        port = number("STORE_PORT", 6379, int, lo=1, hi=65_535)
+        db = number("STORE_DB", 0, int, zero=True)
+        tls = read_bool(layers, "STORE_TLS_ENABLED", True, problems)
+        urls: dict[str, str | None] = {}
+        for name in ("STORE_URL", "QUEUE_STORE_URL"):
+            raw = get(name)
+            urls[name] = None
+            if raw:
+                urls[name], found = _store_url(PREFIX + name, str(raw), strict)
+                problems += found
+        if not store and host:
+            # The password goes in the URL so every client built from it (the CLI's too) can
+            # log in; `LLMQueue.from_env` still reads LLMQ_STORE_PASSWORD fresh per connection.
+            parts = _parts_url(host, int(port), int(db), tls, get("STORE_PASSWORD"))
+            urls["STORE_URL"], found = _store_url("the store from LLMQ_STORE_HOST", parts, strict)
+            problems += found
+        pool_raw = str(get("STORE_MAX_CONNECTIONS", "") or "").strip().lower()
+        pool_auto = pool_raw == "auto"
+        if pool_auto:
+            pool = 200
+            if not (registry or registry_file):
+                problems.append("LLMQ_STORE_MAX_CONNECTIONS=auto needs LLMQ_REGISTRY(_FILE)")
+            elif boot is not None:
+                pool, found_pool = _auto_pool(boot, hosts)
+                problems += [found_pool] if found_pool else []
+        else:
+            pool = number("STORE_MAX_CONNECTIONS", 200, int, lo=4, hi=100_000)
         settings = cls(
             store_url=urls["STORE_URL"] or str(store or ""),
             queue_store_url=urls["QUEUE_STORE_URL"],
-            store_max_connections=number("STORE_MAX_CONNECTIONS", 200, int, lo=4, hi=100_000),
+            store_max_connections=pool,
+            store_max_connections_auto=pool_auto,
+            store_host=host,
+            store_port=port,
+            store_db=db,
+            store_tls_enabled=tls,
             key_prefix=str(key_prefix or "llmq"),
             queue_prefix=queue_prefix,
             registry=registry,
@@ -427,7 +621,7 @@ class InfraSettings:
             drain_secs=number(
                 "DRAIN_SECS", 25.0, zero=True, hi=3600
             ),  # stop(drain_secs=0) is valid
-            drain_handback_enabled=hand_back in _TRUE,
+            drain_handback_enabled=hand_back,
             drain_file=drain_file,
             drain_poll_secs=number("DRAIN_POLL_SECS", 1.0, lo=0.1, hi=60),
             local_limit_cap=number("LOCAL_LIMIT_CAP", 10, int, hi=100_000),

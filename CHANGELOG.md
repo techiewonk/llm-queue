@@ -45,8 +45,44 @@ public API (see STABILITY.md).
   drops the priority.
 - `LLMQueue.ready`: sync readiness (started, registry loaded, not draining, and in strict mode
   no evicting store); `llm_queue.queue_ready(enabled, llmq=None)` for an app's own probe.
+- `LLMQueue.from_env(defaults=...)` (D1): a third layer below `secrets=` and the environment,
+  for the app's own `LLMQ_*` values (`True` / `False` read as switches; a name without
+  `LLMQ_` is refused). The secret-then-environment order is unchanged. Conflict groups: the
+  highest layer that sets `LLMQ_STORE_URL` or a store part picks that form, and the highest
+  that sets `LLMQ_REGISTRY` or `LLMQ_REGISTRY_FILE` picks that one; the other form is ignored
+  in every layer, and one layer with both is refused. `llm_queue.engine.settings.Layers` is the
+  lookup; `InfraSettings.from_env` takes `defaults=` and `secret_names=` too.
+- `from_env(secret_names={"LLMQ_STORE_HOST": "valkey_host", ...})` (H7): read a setting from a
+  secret stored under another name; applies to the store passwords, `LLMQ_ADMIN_TOKEN`,
+  `LLMQ_JOB_*` and account secrets too.
+- The store as parts (D3): `LLMQ_STORE_HOST`, `LLMQ_STORE_PORT` (6379), `LLMQ_STORE_DB` (0),
+  `LLMQ_STORE_TLS_ENABLED` (true) and `LLMQ_STORE_PASSWORD` (percent-escaped) build the URL,
+  which gets the same strict TLS check as `LLMQ_STORE_URL`.
+- `LLMQ_STORE_MAX_CONNECTIONS=auto` (D7): the boot registry's `worker_slots` summed plus
+  `STORE_POOL_MARGIN` (10), within 4 to 100,000, computed once by `from_env`. A number works
+  as before (default 200).
+- Model factories (E1): `llm_queue.langchain.chat_model(model_id, *, registry=None, **kw)`
+  and `embeddings(...)` return the queued LangChain class for a model the
+  boot registry knows (by alias or model id; Bedrock or OpenAI-compatible adapter by the
+  model's provider, `**kw` passed through), else None, so `chat_model(...) or <direct model>`
+  keeps the app's direct path for a model outside the registry. `registry=` is a document,
+  JSON text, a path, an `LLMQueue` or None (`LLMQ_REGISTRY` / `LLMQ_REGISTRY_FILE`, read
+  without a store, placeholders expanded). No langchain module is imported for an unknown
+  model.
+  `aliases(registry)` maps model ids to aliases; `boot_registry(registry)` returns the parsed
+  registry. See [Use LangChain models](docs/how-to/langchain.md).
+- `LLMQueue.embed_one(model, text, **kw)` and `embed_one_sync(...)` (H8): one text's vector.
 
 ### Changed
+
+- `LLMQ_STORE_PASSWORD` / `LLMQ_QUEUE_STORE_PASSWORD` set in the environment are used without
+  `secrets=` (D3; 0.1.1 ignored them there and logged in with the URL's password, or none). They
+  are still read on every new connection and win over a password in the URL.
+- A missing store now reads `LLMQ_STORE_URL (or LLMQ_STORE_HOST) is required`.
+- `LLMQ_REGISTRY` in a secret and `LLMQ_REGISTRY_FILE` in the environment (or the other way)
+  were refused as "both set"; the conflict group now lets the secret's form win.
+- `STORE_POOL_MARGIN` moved from `llm_queue.core` to `llm_queue.engine.settings`; the internal
+  `core._SecretFirst` mapping was replaced by `Layers`.
 
 - `breaker_probe_secs` left unset is now the larger of 60 and the deployment's
   `attempt_timeout_secs`, so a registry with an attempt timeout above 60 s and no probe time
