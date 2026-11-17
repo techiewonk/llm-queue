@@ -226,10 +226,10 @@ async def test_rq15_a_full_target_counts_every_call_left(make: Make) -> None:
         await _close(tasks)
 
 
-async def test_settle_waiting_is_one_round_trip_per_batch(
+async def test_cancel_answers_waiting_calls_in_its_own_script(
     make: Make, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A cancel answers its waiting calls in one pipeline (one script per id, one trip)."""
+    """A cancel answers its waiting calls in the script that marks them, not per id."""
     engine, _ = await make(worker=False)
     tasks: list[asyncio.Task[Any]] = []
     admin = _admin(engine)

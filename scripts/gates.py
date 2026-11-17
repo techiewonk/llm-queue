@@ -1258,12 +1258,15 @@ GT2_TENANTS = 20
 
 
 async def _timed(fn: Callable[[], Awaitable[Any]], times: int = 1) -> tuple[float, Any]:
-    """Median milliseconds of `times` runs of `fn`, and its last result."""
+    """Median milliseconds of `times` runs of `fn`, and its last result.
+
+    `perf_counter`: Windows' `monotonic` ticks every 15.6 ms, so a 20 ms mark read 0, 16 or 31.
+    """
     spent, out = [], None
     for _ in range(times):
-        t0 = time.monotonic()
+        t0 = time.perf_counter()
         out = await fn()
-        spent.append((time.monotonic() - t0) * 1000)
+        spent.append((time.perf_counter() - t0) * 1000)
     return statistics.median(spent), out
 
 
@@ -1308,6 +1311,10 @@ async def gt2() -> bool:
                 break
             await asyncio.sleep(0.5)
         fill_secs = time.monotonic() - t0
+        # Each caller reads its result once `poll_secs` (5 s) after its send, the safety net.
+        # These callers share this process's loop with the admin: measured during the last
+        # 5 s of those reads, a list of 100 took 0.5 s of other callers' work. Wait them out.
+        await asyncio.sleep(engine.settings.poll_secs + 1)
         list_ms, page = await _timed(lambda: admin.list("chat", limit=100), 5)
         count_ms, counts = await _timed(lambda: admin.count("chat", tenant="tenant-0"), 3)
         move_ms, moved = await _timed(

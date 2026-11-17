@@ -17,6 +17,8 @@ from llm_queue.engine.admin import AdminContext, AdminServices
 from llm_queue.engine.admin.ops import Op
 from llm_queue.engine.audit import Audit
 from llm_queue.engine.keys import Keys
+from llm_queue.engine.requests import CANCEL_SETTLE
+from llm_queue.engine.requests_admin import _READ_ROWS
 from llm_queue.errors import ConfigError
 
 
@@ -161,36 +163,39 @@ class _Pipe:
 
 
 def _records(*rows: tuple[str | None, int]) -> list[Any]:
-    """`_records` replies: (job state, cancel mark) per id; no status record, no model."""
+    """`_READ_ROWS`' flat reply: per id its job fields (state only), no status, its mark."""
     out: list[Any] = []
     for state, mark in rows:
-        out += [{b"state": state.encode()} if state else {}, [None] * 5, mark]
+        out += [state.encode() if state else None, *[None] * 5, *[None] * 5, mark]
     return out
 
 
 async def test_cancel_by_ids_is_dry_by_default_filters_and_is_audited() -> None:
     """Q5 / D9: an operator cancel is audited; `state` waiting leaves running calls alone."""
     client = MagicMock()
-    script = AsyncMock(return_value=[[b"q", b"r"], 0])  # CANCEL: [ids marked, started]
-    client.register_script.return_value = script
-    client.xadd = AsyncMock()
     rows = [("queued", 0), ("running", 0), ("done", 0), ("queued", 1), (None, 0)]
-    settle = [b"running", 1, b"running", 1]  # both started meanwhile: nothing to settle
-    client.pipeline.side_effect = lambda **_: _Pipe(pipes)
-    pipes = [_records(*rows), _records(*rows), settle]
+    read = AsyncMock(return_value=_records(*rows))
+    cancel = AsyncMock()  # CANCEL_SETTLE, queued on the pipeline
+    client.register_script.side_effect = lambda text: (
+        read if text == _READ_ROWS else cancel if text.endswith(CANCEL_SETTLE) else AsyncMock()
+    )
+    client.xadd = AsyncMock()
+    settled = [[[b"q", b"r"], 0, [b"q"]]]  # CANCEL_SETTLE: ids marked, started, answered
+    client.pipeline.side_effect = lambda **_: _Pipe([settled])
     admin = _admin_over(client)
     ids = ["q", "r", "d", "c", "gone"]
 
     dry = await admin.requests.cancel(request_ids=ids, actor="ann")
     assert (dry["dry_run"], dry["matched"], dry["changed"]) == (True, 1, 0)
     assert dry["skipped"] == {"other_state": 1, "final": 2, "already_cancelling": 1}
-    script.assert_not_awaited()
+    cancel.assert_not_awaited()
     client.xadd.assert_not_awaited()
 
     done = await admin.requests.cancel(request_ids=ids, state="all", actor="ann", dry_run=False)
     assert (done["matched"], done["changed"]) == (2, 2)
     assert done["by_state"] == {"waiting": 1, "running": 1}
-    script.assert_awaited_once()
+    cancel.assert_awaited_once()
+    assert cancel.await_args.args[1][2] == ""  # only state: any call not final
     (key, fields), _ = client.xadd.await_args
     assert (key, fields["actor"], fields["op"]) == ("llmq:cfg:audit", "ann", "requests_cancel")
     assert orjson.loads(fields["diff"])[0]["after"]["matched"] == 2

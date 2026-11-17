@@ -59,6 +59,126 @@ _HASH_RE = re.compile(r"^[0-9a-f]{16}\Z")
 # Pauses before the moved calls' records are written again (separate queue store, RQ-8).
 _RECORD_RETRY_SECS = (0.2, 0.5, 1.0)
 _STORE_ERRORS = (StoreConnectionError, StoreTimeoutError, OSError)
+_JOB_FIELDS = ("state", "mid", "q", "direct", "user", "ixh")
+_STATUS_FIELDS = ("state", "model", "priority", "enqueued_at", "served_model")
+_ROW_WIDTH = len(_JOB_FIELDS) + len(_STATUS_FIELDS) + 1
+
+# The records of index rows, one script per batch (gate G-T2): three commands per id in a
+# pipeline cost about 25 us each of client packing and parsing, so a 100-row page took 47 ms.
+# KEYS: job, status, cancel of each call. ARGV: how many job fields, the job fields, then the
+# status fields. Reply, flat: per call its job fields, its status fields, then 1 / 0 for its
+# cancel mark (false: no such field). Read-only.
+_READ_ROWS = """
+local nj = tonumber(ARGV[1])
+local job_fields, status_fields = {}, {}
+for i = 2, #ARGV do
+  if i <= nj + 1 then
+    table.insert(job_fields, ARGV[i])
+  else
+    table.insert(status_fields, ARGV[i])
+  end
+end
+local out = {}
+for i = 1, #KEYS / 3 do
+  for _, v in ipairs(redis.call('HMGET', KEYS[3 * i - 2], unpack(job_fields))) do
+    out[#out + 1] = v
+  end
+  for _, v in ipairs(redis.call('HMGET', KEYS[3 * i - 1], unpack(status_fields))) do
+    out[#out + 1] = v
+  end
+  out[#out + 1] = redis.call('EXISTS', KEYS[3 * i])
+end
+return out
+"""
+
+# The next index entries of a model, merged by (deadline, id) over its tenants (gate G-T2: a page
+# of `list` in one round trip, not three). KEYS: the tenant index `tq` (a tenant's own index is
+# `tq:H`, the same hash tag). ARGV: the cursor's deadline ms ('' from the start) and request
+# id, how many entries, the most tenants read (`LLMQ_ADMIN_SCAN_MAX`), one tenant hash ('' for
+# every tenant). Each tenant is read a few entries at a time (more each time it runs out), so a
+# page reads about `count` entries, not `count` of every tenant (2,000 for 20 tenants, sorted:
+# 17 ms of script). Entries past their deadline are never read. Reply: the store's time (ms),
+# then the deadline, request id and tenant hash of each entry. Read-only.
+_PAGE = """
+-- Byte order, as a sorted set orders members of one score (Lua's `<` follows the locale).
+local function before(x, y)
+  for i = 1, math.min(#x, #y) do
+    local a, b = string.byte(x, i), string.byte(y, i)
+    if a ~= b then return a < b end
+  end
+  return #x < #y
+end
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local lower, after, count = now, nil, tonumber(ARGV[3])
+if ARGV[1] ~= '' and tonumber(ARGV[1]) >= now then
+  lower, after = tonumber(ARGV[1]), ARGV[2]
+end
+local tenants = {ARGV[5]}
+if ARGV[5] == '' then
+  tenants = redis.call('ZRANGEBYSCORE', KEYS[1], now, '+inf', 'LIMIT', 0, tonumber(ARGV[4]))
+end
+local step = math.ceil(count / math.max(1, #tenants)) + 1
+-- The tenant's next entry after the cursor (its `score`), reading more when it ran out.
+local function advance(s)
+  while true do
+    if s.pos > #s.buf then
+      if s.done then return false end
+      s.buf = redis.call('ZRANGEBYSCORE', s.key, lower, '+inf', 'WITHSCORES', 'LIMIT', s.offset,
+        s.step)
+      s.pos, s.offset, s.done = 1, s.offset + s.step, #s.buf < 2 * s.step
+      s.step = s.step * 2
+      if #s.buf == 0 then return false end
+    end
+    s.score = tonumber(s.buf[s.pos + 1])
+    -- Entries at the cursor's own deadline come in id order: those up to its id were read.
+    if s.score > lower or after == nil or before(after, s.buf[s.pos]) then return true end
+    s.pos = s.pos + 2
+  end
+end
+local live = {}
+for _, h in ipairs(tenants) do
+  local s = {key = KEYS[1] .. ':' .. h, h = h, buf = {}, pos = 1, offset = 0, step = step}
+  if advance(s) then live[#live + 1] = s end
+end
+local out = {now}
+while #out < 3 * count + 1 and #live > 0 do
+  local at = 1
+  for i = 2, #live do
+    local s, b = live[i], live[at]
+    if s.score < b.score or (s.score == b.score and before(s.buf[s.pos], b.buf[b.pos])) then
+      at = i
+    end
+  end
+  local s = live[at]
+  out[#out + 1] = s.buf[s.pos + 1]
+  out[#out + 1] = s.buf[s.pos]
+  out[#out + 1] = s.h
+  s.pos = s.pos + 2
+  if not advance(s) then table.remove(live, at) end
+end
+return out
+"""
+
+# Where waiting messages are, one script per batch on the queue store. KEYS: the normal queue's
+# `st` and `vis`, then the priority queue's. ARGV: class (`p` / `n`) and message id pairs.
+# Reply: the message's `st` and `vis` score per pair (false: none). Read-only.
+_READ_STAGES = """
+local out = {}
+for i = 1, #ARGV / 2 do
+  local at = ARGV[2 * i - 1] == 'p' and 2 or 0
+  out[2 * i - 1] = redis.call('HGET', KEYS[at + 1], ARGV[2 * i])
+  out[2 * i] = redis.call('ZSCORE', KEYS[at + 2], ARGV[2 * i])
+end
+return out
+"""
+
+# One field of many hashes (the running calls' grants). KEYS: the hashes. ARGV: the field.
+_READ_FIELD = """
+local out = {}
+for i = 1, #KEYS do out[i] = redis.call('HGET', KEYS[i], ARGV[1]) end
+return out
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,6 +411,10 @@ class RequestsAdmin:
         self._owner = owner or f"admin-{os.getpid()}"
         self._queues = StreamQueues(self._queue_client, keys)
         self._requests = RequestStore(state, keys, status_ttl_secs=status_ttl_secs)
+        self._read_rows = state.register_script(_READ_ROWS)
+        self._page_script = state.register_script(_PAGE)
+        self._read_field = state.register_script(_READ_FIELD)
+        self._read_stages = self._queue_client.register_script(_READ_STAGES)
         self._owned: builtins.list[Any] = []
 
     # ---------------------------------------------------------------- construction
@@ -365,8 +489,13 @@ class RequestsAdmin:
         scanned = 0
         last: tuple[float, str] | None = None
         names = await self._names(alias)
-        chunk = max(10, min(self.settings.batch, limit * 2))
-        async for rows in self._rows(view, alias, h, start, after_rid, chunk):
+        # Every row in flight is listed with `all`: read the page and no more (rows read twice
+        # the page before). A state filter skips some, so it reads ahead.
+        chunk = min(self.settings.batch, limit if state == "all" else max(10, limit * 2))
+        while True:
+            now_ms, rows = await self._page(alias, h, start, after_rid, chunk)
+            await self._records(rows)
+            await self._stages(view, alias, rows, now_ms)
             for row in rows:
                 scanned += 1
                 last = (row.score, row.rid)
@@ -377,7 +506,9 @@ class RequestsAdmin:
                         return RequestPage(items, _cursor(row.score, row.rid), scanned)
                 if scanned >= self.settings.scan_max:
                     return RequestPage(items, _cursor(*last), scanned)
-        return RequestPage(items, None, scanned)
+            if len(rows) < chunk or last is None:
+                return RequestPage(items, None, scanned)
+            start, after_rid = last
 
     @store_op
     async def count(
@@ -398,7 +529,7 @@ class RequestsAdmin:
         cancelling = scanned = 0
         oldest: float | None = None
         now = await self._now()
-        async for rows in self._rows(view, alias, h, float("-inf"), "", self.settings.batch):
+        async for rows in self._rows(view, alias, h, float("-inf"), "", self.settings.scan_max):
             for row in rows:
                 scanned += 1
                 summary = self._summary(view, alias, row, {}, now=now)
@@ -557,8 +688,9 @@ class RequestsAdmin:
             h = self.pick_tenant(tenant, tenant_hash)
             self._need_index(state)
             await self._refuse_above_cap(alias, h)
-            async for chunk in self._rows(view, alias, h, float("-inf"), "", self.settings.batch):
-                rows += chunk
+            scan = self.settings.scan_max  # every row at once: records in one round trip
+            async for chunk in self._rows(view, alias, h, float("-inf"), "", scan, stages=False):
+                rows += chunk  # a cancel reads only the records: state and mark, not stages
         chosen: builtins.list[_Row] = []
         for row in rows:
             row_state = self._state_of(row)
@@ -586,28 +718,39 @@ class RequestsAdmin:
         )
         if dry_run or not chosen:
             return report
-        only = {"waiting": "queued", "running": "running"}.get(state)
-        changed = 0
-        ids = [r.rid for r in chosen]
-        for start in range(0, len(ids), self.settings.batch):
-            batch = ids[start : start + self.settings.batch]
-            marked, moved_on = await self._requests.cancel_ids(
-                batch,
-                ttl_secs=self.status_ttl_secs,
-                channel=self.keys.cancel_channel,
-                only_state=only,
-            )
-            changed += len(marked)
-            if moved_on:
-                _bump(skipped, "started" if state == "waiting" else "not_running", moved_on)
-            if state != "running":
-                await self._settle_waiting(marked)
-            for rid in marked:  # only the calls it cancelled (RQ-13)
-                logger.info("call_cancel", request_id=rid, source="admin", by=actor)
+        # A call still `queued` once marked never starts: it is answered `cancelled` in the
+        # same script (a waiting call was only stopped when a worker next asked for it, which
+        # for a message deep in a queue can be minutes). One that started is left to its worker;
+        # with `state="running"` no queued call is marked, so none is answered.
+        marked, moved_on, answered = await self._requests.cancel_settle(
+            [r.rid for r in chosen],
+            ttl_secs=self.status_ttl_secs,
+            channel=self.keys.cancel_channel,
+            only_state={"waiting": "queued", "running": "running"}.get(state),
+            reply=Reply(
+                request_id="",
+                ok=False,
+                error="cancelled",
+                message="the call was cancelled by an admin",
+                meta=Meta(worker=self._owner),
+            ),
+            batch=self.settings.batch,
+        )
+        changed = len(marked)
+        if moved_on:
+            _bump(skipped, "started" if state == "waiting" else "not_running", moved_on)
+        for rid in marked:  # only the calls it cancelled (RQ-13)
+            logger.info("call_cancel", request_id=rid, source="admin", by=actor)
         if self._metrics is not None:
             self._metrics.count("llmq_cancels_total", float(changed), source="admin")
         report = _replace(report, changed=changed, skipped=skipped)
-        await self._audit(report)
+        try:
+            await self._audit(report)
+        finally:
+            # Last, after the audit: callers woken in this process (an admin beside an app)
+            # run their result reads on this loop, and the audit waited behind 10,000 of them.
+            # Not woken (a store error here), they find their results by the result sweep.
+            await self._requests.wake(answered, batch=self.settings.batch)
         return report
 
     @store_op
@@ -641,7 +784,7 @@ class RequestsAdmin:
         target = "p" if priority else "n"
         skipped: dict[str, int] = {}
         chosen: builtins.list[_Row] = []
-        async for rows in self._rows(view, alias, h, float("-inf"), "", self.settings.batch):
+        async for rows in self._rows(view, alias, h, float("-inf"), "", self.settings.scan_max):
             for row in rows:
                 if row.stage is None or row.stage == "running":
                     continue  # final, gone or running: not a waiting call
@@ -844,11 +987,14 @@ class RequestsAdmin:
         start: float,
         after_rid: str,
         chunk: int,
+        *,
+        stages: bool = True,
     ) -> AsyncIterator[builtins.list[_Row]]:
         """Index entries after (`start`, `after_rid`), oldest deadline first, with records.
 
         One tenant: its `tq:H` in chunks. Every tenant: the tenants in `tq`, their entries
-        merged by (deadline, id). Entries past their deadline are never read.
+        merged by (deadline, id). Entries past their deadline are never read. `stages=False`
+        leaves `stage` unread (None).
         """
         now_ms = (await self._now()) * 1000
         tenants = await self._tenants(alias, h, now_ms)
@@ -896,13 +1042,39 @@ class RequestsAdmin:
                     heapq.heappush(heap, (buffers[t][0][0], buffers[t][0][1], t, 0))
             if len(out) >= chunk:
                 await self._records(out)
-                await self._stages(view, alias, out)
+                if stages:
+                    await self._stages(view, alias, out, now_ms)
                 yield out
                 out = []
         if out:
             await self._records(out)
-            await self._stages(view, alias, out)
+            if stages:
+                await self._stages(view, alias, out, now_ms)
             yield out
+
+    async def _page(
+        self, alias: str, h: str | None, start: float, after_rid: str, count: int
+    ) -> tuple[float, builtins.list[_Row]]:
+        """The store's time (ms) and the next `count` index entries after (`start`, `after_rid`).
+
+        One script (`_PAGE`), merged by (deadline, id) over every tenant (or `h`'s alone), as
+        `_rows` merges them: a page of `list` read the time, the tenants and each tenant's
+        next entries in three round trips, and parsed `count` entries of every tenant.
+        """
+        raw = await self._page_script(
+            [self.keys.tenant_index(alias)],
+            [
+                "" if start == float("-inf") else int(start),
+                after_rid,
+                count,
+                self.settings.scan_max,
+                h or "",
+            ],
+        )
+        rows = [
+            _Row(float(raw[i]), _text(raw[i + 1]), _text(raw[i + 2])) for i in range(1, len(raw), 3)
+        ]
+        return float(raw[0]), rows
 
     async def _rows_by_id(self, ids: Sequence[str]) -> builtins.list[_Row]:
         rows = [_Row(float("nan"), rid, NO_TENANT) for rid in ids]
@@ -921,30 +1093,65 @@ class RequestsAdmin:
                 row.stage = "running" if row.job.get("state") == "running" else "queued"
         return rows
 
-    async def _records(self, rows: Sequence[_Row]) -> None:
-        """Fill each row's job, status and cancel mark (one pipelined round trip per batch)."""
-        k = self.keys
-        for start in range(0, len(rows), self.settings.batch):
-            part = rows[start : start + self.settings.batch]
-            async with self._state.pipeline(transaction=False) as pipe:
-                for row in part:
-                    pipe.hgetall(k.request(row.rid, "job"))
-                    pipe.hmget(
-                        k.status(row.rid),
-                        ["state", "model", "priority", "enqueued_at", "served_model"],
-                    )
-                    pipe.exists(k.request(row.rid, "cancel"))
-                replies = await pipe.execute()
-            for i, row in enumerate(part):
-                job, status, cancel = replies[3 * i : 3 * i + 3]
-                row.job = _decode(job)
-                names = ("state", "model", "priority", "enqueued_at", "served_model")
-                row.status = {n: _text(v) for n, v in zip(names, status, strict=True) if v}
-                row.cancelling = bool(cancel)
-                row.mid = row.job.get("mid", "")
-                row.cls = row.job.get("q", "")
+    async def _scripted(
+        self,
+        client: redis.asyncio.Redis,
+        script: Any,
+        items: Sequence[Any],
+        keys: Callable[[Sequence[Any]], builtins.list[str]],
+        args: Callable[[Sequence[Any]], builtins.list[Any]],
+    ) -> builtins.list[Any]:
+        """One read script per `LLMQ_ADMIN_BATCH` items, all in one round trip; replies joined.
 
-    async def _stages(self, view: ResolvedRegistry, alias: str, rows: Sequence[_Row]) -> None:
+        A batch bounds how long one script holds the store; a round trip per batch let 10,000
+        rows take 20 (gate G-T2). One batch is called directly: a pipeline of scripts first
+        checks they are loaded, a round trip of its own.
+        """
+        step = self.settings.batch
+        if len(items) <= step:
+            return builtins.list(await script(keys(items), args(items))) if items else []
+        async with client.pipeline(transaction=False) as pipe:
+            for at in range(0, len(items), step):
+                part = items[at : at + step]
+                await script(keys(part), args(part), client=pipe)
+            replies = await pipe.execute()
+        return [v for reply in replies for v in reply]
+
+    async def _records(self, rows: Sequence[_Row]) -> None:
+        """Fill each row's job, status and cancel mark (`_READ_ROWS`, one round trip)."""
+        k = self.keys
+        flat = await self._scripted(
+            self._state,
+            self._read_rows,
+            rows,
+            lambda part: [
+                key
+                for row in part
+                for key in (
+                    k.request(row.rid, "job"),
+                    k.status(row.rid),
+                    k.request(row.rid, "cancel"),
+                )
+            ],
+            lambda _: [len(_JOB_FIELDS), *_JOB_FIELDS, *_STATUS_FIELDS],
+        )
+        nj = len(_JOB_FIELDS)
+        for i, row in enumerate(rows):
+            at = i * _ROW_WIDTH
+            job, status = flat[at : at + nj], flat[at + nj : at + _ROW_WIDTH - 1]
+            row.job = {n: _text(v) for n, v in zip(_JOB_FIELDS, job, strict=True) if v}
+            row.status = {n: _text(v) for n, v in zip(_STATUS_FIELDS, status, strict=True) if v}
+            row.cancelling = bool(flat[at + _ROW_WIDTH - 1])
+            row.mid = row.job.get("mid", "")
+            row.cls = row.job.get("q", "")
+
+    async def _stages(
+        self,
+        view: ResolvedRegistry,
+        alias: str,
+        rows: Sequence[_Row],
+        now_ms: float | None = None,
+    ) -> None:
         """The stage of each row: from its job, its message's records and its grant."""
         waiting = [
             r
@@ -954,13 +1161,20 @@ class RequestsAdmin:
         running = [r for r in rows if r.job.get("state") == "running"]
         base = self.queue_prefix + view.queue_name(alias)
         if waiting:
-            async with self._queue_client.pipeline(transaction=False) as pipe:
-                for r in waiting:
-                    queue = f"{base}-priority" if r.cls == "p" else base
-                    pipe.hget(self.keys.queue(queue, "st"), r.mid)
-                    pipe.zscore(self.keys.queue(queue, "vis"), r.mid)
-                replies = await pipe.execute()
-            now_ms = (await self._now()) * 1000
+            queues = [
+                self.keys.queue(q, part)
+                for q in (base, f"{base}-priority")
+                for part in ("st", "vis")
+            ]
+            replies = await self._scripted(
+                self._queue_client,
+                self._read_stages,
+                waiting,
+                lambda _: queues,
+                lambda part: [v for r in part for v in ("p" if r.cls == "p" else "n", r.mid)],
+            )
+            if now_ms is None:
+                now_ms = (await self._now()) * 1000
             for i, r in enumerate(waiting):
                 st, vis = replies[2 * i], replies[2 * i + 1]
                 if st is not None and _text(st) == "h":
@@ -970,11 +1184,16 @@ class RequestsAdmin:
                 else:
                     r.stage = "queued"
         if running:
-            async with self._state.pipeline(transaction=False) as pipe:
-                for r in running:
-                    served = r.status.get("served_model") or alias
-                    pipe.hget(self.keys.model(served, f"inprog:{r.rid}"), "dep")
-                deps = await pipe.execute()
+            deps = await self._scripted(
+                self._state,
+                self._read_field,
+                running,
+                lambda part: [
+                    self.keys.model(r.status.get("served_model") or alias, f"inprog:{r.rid}")
+                    for r in part
+                ],
+                lambda _: ["dep"],
+            )
             for r, dep in zip(running, deps, strict=True):
                 r.stage = "running"
                 r.deployment = _text(dep) if dep is not None else None
@@ -1025,41 +1244,6 @@ class RequestsAdmin:
         if not self.settings.tenant_names:
             return {}
         return _decode(await self._state.hgetall(self.keys.tenant_names(alias)))
-
-    async def _settle_waiting(self, request_ids: Sequence[str]) -> None:
-        """End the cancelled calls that never started: their callers get `cancelled` now.
-
-        A waiting call is only stopped when a worker next asks for it (PICK_TAKE sees the mark),
-        which for a message deep in a queue can be minutes. Once the mark is set no worker can
-        start the call, so a call still `queued` with a mark is answered here (the same final
-        reply a worker writes; written once). Its message is acked by the worker that takes it
-        (PICK_TAKE answers `done`). A call that started meanwhile is left to its worker.
-        """
-        if not request_ids:
-            return
-        k = self.keys
-        async with self._state.pipeline(transaction=False) as pipe:
-            for rid in request_ids:
-                pipe.hget(k.request(rid, "job"), "state")
-                pipe.exists(k.request(rid, "cancel"))
-            replies = await pipe.execute()
-        ended = [
-            Reply(
-                request_id=rid,
-                ok=False,
-                error="cancelled",
-                message="the call was cancelled by an admin",
-                meta=Meta(worker=self._owner),
-            )
-            for i, rid in enumerate(request_ids)
-            if replies[2 * i] is not None
-            and _text(replies[2 * i]) == "queued"
-            and replies[2 * i + 1]
-        ]
-        # One pipelined round trip per batch: one per id made a 50k cancel 50k round trips.
-        await self._requests.put_results(
-            ended, final_state="cancelled", status={"error": "cancelled"}
-        )
 
     async def _moved_records(self, moved: Sequence[tuple[str, str]], cls: str) -> None:
         """Separate queue store: the moved calls' job `mid` / `q` and status `priority`.
