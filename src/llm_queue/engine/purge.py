@@ -677,7 +677,11 @@ class PurgeService:
         for start in range(0, len(chosen), self.settings.batch):
             batch = chosen[start : start + self.settings.batch]
             done += await store.cancel(
-                batch, ttl_secs=self._status_ttl_secs, channel=self.keys.cancel_channel
+                batch,
+                ttl_secs=self._status_ttl_secs,
+                channel=self.keys.cancel_channel,
+                # A call granted between the read and the script stays running (T2 only_state).
+                only_state=None if "running" in parts else "queued",
             )
             for rid in batch:
                 logger.info("call_cancel", request_id=rid, source="purge", by=self._owner)

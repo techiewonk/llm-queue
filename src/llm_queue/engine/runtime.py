@@ -75,7 +75,7 @@ from llm_queue.engine.queue import (
     StreamQueues,
 )
 from llm_queue.engine.requests import IndexEntry, RequestStore
-from llm_queue.engine.requests_admin import AdminSettings
+from llm_queue.engine.requests_admin import AdminSettings, RequestsAdmin
 from llm_queue.engine.status import AlertEvaluator, StatusReader
 from llm_queue.engine.store_checks import UNKNOWN as UNKNOWN_POLICY
 from llm_queue.engine.store_checks import check_store, eviction_policy, eviction_warning
@@ -437,7 +437,7 @@ class _Held:
     def position(self) -> float:
         """Queue position as a number (direct calls: their registration time)."""
         if self.message is not None:
-            return position_of(self.message.id)
+            return position_of(self.message.place)  # a moved call keeps its place (Q9)
         return float(self.position_ms * 1000)
 
 
@@ -636,6 +636,21 @@ class Engine:
             hash_id=self.hash_id,
             metrics=self.metrics,
             status_ttl_secs=self.settings.status_ttl_secs,
+            owner=self.worker_id,
+        )
+        # The admin side of requests (0.2.0 T2): list, count, get, cancel, reprioritize, extend
+        # by model and tenant; `llmq.admin.requests` wraps it.
+        self.requests_admin = RequestsAdmin(
+            state,
+            queue_client=queue_store,
+            keys=self.keys,
+            registry=registry,
+            queue_prefix=self.settings.queue_prefix,
+            hash_id=self.hash_id,
+            settings=self.settings.admin,
+            status_ttl_secs=self.settings.status_ttl_secs,
+            caller_margin_secs=self.settings.caller_margin_secs,
+            metrics=self.metrics,
             owner=self.worker_id,
         )
         self._tasks: list[asyncio.Task[None]] = []
@@ -2654,6 +2669,14 @@ class Engine:
                 self.queues.fail(message, self._queue_settings(self.registry.current, alias)),
             )
             return False
+        try:
+            priority = message.queue == self._queue_name(self.registry.current, alias, True)
+        except KeyError:  # removed by a reload meanwhile: the name's suffix says the class
+            priority = message.queue.endswith("-priority")
+        if env.priority != priority:
+            # The class is the queue's, not the body's: a reprioritize moves the message and
+            # never rewrites its body (0.2.0 T2).
+            env = env.model_copy(update={"priority": priority})
         current = self._held.get(env.request_id)
         if current is not None:
             # Already held here (RESCAN A1): its hold lapsed and the same message came back, or

@@ -388,23 +388,29 @@ return value
 """
 RESULT_DROP = _DROP_READ + "return 1\n"
 
-# KEYS: job, cancel of each call. ARGV: cancel ttl secs, cancel channel, then the request ids.
-# Cancel wins (owner decision Q3): any caller's cancel stops the call for every caller on its id,
-# with no read of the callers set in a round trip of its own (R3RC-1: that read-then-write never
-# cancelled a shared id, or cancelled a caller that attached in between). A call already final
-# is left alone, so a later run of its id (Q2) is not cancelled by a stale mark. An attach after
-# the mark waits on the same call and gets its `cancelled` reply. Reply: how many were marked.
+# KEYS: job, cancel of each call. ARGV: cancel ttl secs, cancel channel, only state ('' any
+# call not final; `queued`: only while its job is still `queued`, 0.2.0 T2), then the request
+# ids. Cancel wins (owner decision Q3): any caller's cancel stops the call for every caller on
+# its id, with no read of the callers set in a round trip of its own (R3RC-1: that
+# read-then-write never cancelled a shared id, or cancelled a caller that attached in between).
+# A call already final is left alone, so a later run of its id (Q2) is not cancelled by a stale
+# mark. An attach after the mark waits on the same call and gets its `cancelled` reply. Reply:
+# {marked, skipped because they started (only state `queued`)}.
 CANCEL = """
-local n = 0
+local n, started = 0, 0
 for i = 1, #KEYS / 2 do
   local state = redis.call('HGET', KEYS[2 * i - 1], 'state')
   if state ~= 'done' and state ~= 'failed' and state ~= 'expired' and state ~= 'cancelled' then
-    X.set(KEYS[2 * i], '1', tonumber(ARGV[1]) * 1000)
-    redis.call('PUBLISH', ARGV[2], ARGV[2 + i])
-    n = n + 1
+    if ARGV[3] ~= '' and state ~= ARGV[3] then
+      started = started + 1
+    else
+      X.set(KEYS[2 * i], '1', tonumber(ARGV[1]) * 1000)
+      redis.call('PUBLISH', ARGV[2], ARGV[3 + i])
+      n = n + 1
+    end
   end
 end
-return n
+return {n, started}
 """
 
 # KEYS: status. ARGV: state, ttl, then field / value pairs (see `_STATUS_FN`).
@@ -866,20 +872,43 @@ class RequestStore:
                 await asyncio.sleep(pause)
         return None  # not reached: the last pass returns or raises
 
-    async def cancel(self, request_ids: Sequence[str], *, ttl_secs: int, channel: str) -> int:
+    async def cancel(
+        self,
+        request_ids: Sequence[str],
+        *,
+        ttl_secs: int,
+        channel: str,
+        only_state: str | None = None,
+    ) -> int:
         """Mark calls cancelled and announce each on `channel`, in one script; how many.
 
         Cancel wins for a shared id (Q3, R3RC-1): every caller of it gets `cancelled`. A call
-        already final is skipped.
+        already final is skipped. `only_state="queued"`: only calls still waiting are marked
+        (a call granted meanwhile is left running; `cancel_counts` says how many).
         """
+        marked, _ = await self.cancel_counts(
+            request_ids, ttl_secs=ttl_secs, channel=channel, only_state=only_state
+        )
+        return marked
+
+    async def cancel_counts(
+        self,
+        request_ids: Sequence[str],
+        *,
+        ttl_secs: int,
+        channel: str,
+        only_state: str | None = None,
+    ) -> tuple[int, int]:
+        """`cancel`, returning (marked, skipped because they were no longer in `only_state`)."""
         if not request_ids:
-            return 0
+            return 0, 0
         keys = [
             k
             for rid in request_ids
             for k in (self.keys.request(rid, "job"), self.keys.request(rid, "cancel"))
         ]
-        return int(await self._cancel(keys, [ttl_secs, channel, *request_ids]))
+        reply = await self._cancel(keys, [ttl_secs, channel, only_state or "", *request_ids])
+        return int(reply[0]), int(reply[1])
 
     async def set_status(self, request_id: str, state: str, **fields: Any) -> bool:
         """Write a status (False when a final state was already there)."""

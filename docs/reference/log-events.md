@@ -16,7 +16,7 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `bad_dead_letter` | warning | engine/runtime.py |
 | `bad_message` | warning | engine/runtime.py |
 | `bell_failed` | warning | engine/runtime.py |
-| `call_cancel` | info | engine/cli.py, engine/purge.py, engine/runtime.py |
+| `call_cancel` | info | engine/cli.py, engine/purge.py, engine/requests_admin.py, engine/runtime.py |
 | `caller_gone` | warning | engine/runtime.py |
 | `cancel_after_stop` | warning | engine/runtime.py |
 | `cancel_cleanup_failed` | warning | engine/runtime.py |
@@ -73,6 +73,7 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `job_upkeep_failed` | warning | engine/jobs.py |
 | `key_expiry_changed` | warning | engine/runtime.py |
 | `key_expiry_publish_failed` | warning | engine/runtime.py |
+| `llmq_admin` | info | engine/requests_admin.py |
 | `llmq_call_finished` | info | engine/runtime.py |
 | `llmq_purge` | info | engine/purge.py |
 | `llmq_registry_audit` | info | registry/store.py |
@@ -123,6 +124,7 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `release_claims_failed` | warning | engine/runtime.py |
 | `release_return_failed` | warning | engine/runtime.py |
 | `replicas_short` | warning | engine/store_guard.py |
+| `request_moved` | info | engine/requests_admin.py |
 | `request_unusable` | error | engine/runtime.py |
 | `result_drop_skipped` | warning | engine/requests.py |
 | `result_reader_error` | warning | engine/runtime.py |

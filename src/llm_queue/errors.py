@@ -96,6 +96,16 @@ class PurgeRefused(LLMQueueError):
     """
 
 
+class AdminRefused(LLMQueueError):
+    """An admin operation refused as asked; nothing was changed (0.2.0 T2).
+
+    E.g. running calls asked for while the request index is off, or an operation that would
+    read more than `LLMQ_ADMIN_SCAN_MAX` index entries. HTTP 409 (`bad_request`).
+    """
+
+    _category = "bad_request"
+
+
 class MissingExtra(ConfigError, ImportError):  # named for what it is
     """An optional feature's dependencies are not installed; names the extra to install.
 

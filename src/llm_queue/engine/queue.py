@@ -67,11 +67,23 @@ return send(KEYS[1], ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3]), ARGV[4])
 """
 )
 
-# K: the keys of one queue, in `_PARTS` order.
+# K: the keys of one queue, in `_PARTS` order. A message moved by a reprioritize (`MOVE`) has a
+# `pos` field after its body: the id it had when it was sent (its place and deadline, 0.2.0 T2);
+# a dead letter keeps it.
 _DLQ = """
-local function to_dlq(K, id, body, fails, keep_ms)
-  local dlq_id = redis.call('XADD', K[6], 'MINID', '~', tostring(now - keep_ms), '*',
-    'body', body, 'src', id, 'fails', fails)
+local function field_of(fields, name)
+  for k = 1, #fields, 2 do if fields[k] == name then return fields[k + 1] end end
+  return nil
+end
+local function to_dlq(K, id, body, fails, keep_ms, pos)
+  local dlq_id
+  if pos and pos ~= '' then
+    dlq_id = redis.call('XADD', K[6], 'MINID', '~', tostring(now - keep_ms), '*',
+      'body', body, 'src', id, 'fails', fails, 'pos', pos)
+  else
+    dlq_id = redis.call('XADD', K[6], 'MINID', '~', tostring(now - keep_ms), '*',
+      'body', body, 'src', id, 'fails', fails)
+  end
   redis.call('XDEL', K[1], id)
   redis.call('ZREM', K[2], id)
   redis.call('HDEL', K[3], id)
@@ -88,7 +100,8 @@ end
 """
 
 # Up to `want` messages of one queue (keys K), oldest first, whether new or visible again; a
-# lapsed hold counts one failure. Returns taken {id, generation, body, ...}, dead {id, body, ...}
+# lapsed hold counts one failure. Returns taken {id, generation, body, pos ('' unless moved),
+# ...}, dead {id, body, ...}
 # and the dead letters' entry ids in the dead-letter stream.
 #
 # Only the oldest few due ids are picked out, in one pass (FL-8): the whole window of up to 1000
@@ -127,13 +140,13 @@ local fresh = redis.call('XRANGE', K[1], start, '+', 'COUNT', want)
 local taken, gone, gone_at = {}, {}, {}
 local i, j = 1, 1
 local last_new = nil
-while #taken < want * 3 and (i <= #due or j <= #fresh) do
+while #taken < want * 4 and (i <= #due or j <= #fresh) do
   if partial and i > #due then break end
   local pick_due
   if i > #due then pick_due = false
   elseif j > #fresh then pick_due = true
   else pick_due = older(due[i], fresh[j][1]) end
-  local id, body
+  local id, body, pos
   if pick_due then
     id = due[i]
     i = i + 1
@@ -145,10 +158,11 @@ while #taken < want * 3 and (i <= #due or j <= #fresh) do
       redis.call('HDEL', K[5], id)
     else
       body = entry[1][2][2]
+      pos = field_of(entry[1][2], 'pos') or ''
       if redis.call('HGET', K[5], id) == 'h' then
         local fails = redis.call('HINCRBY', K[4], id, 1)
         if maxr > 0 and fails >= maxr then
-          table.insert(gone_at, to_dlq(K, id, body, fails, keep))
+          table.insert(gone_at, to_dlq(K, id, body, fails, keep, pos))
           table.insert(gone, id)
           table.insert(gone, body)
           body = nil
@@ -158,6 +172,7 @@ while #taken < want * 3 and (i <= #due or j <= #fresh) do
   else
     id = fresh[j][1]
     body = fresh[j][2][2]
+    pos = field_of(fresh[j][2], 'pos') or ''
     last_new = id
     j = j + 1
   end
@@ -168,7 +183,8 @@ while #taken < want * 3 and (i <= #due or j <= #fresh) do
     table.insert(taken, id)
     table.insert(taken, tostring(gen))
     table.insert(taken, body)
-    if #taken >= want * 3 then break end
+    table.insert(taken, pos)
+    if #taken >= want * 4 then break end
   end
 end
 if last_new then redis.call('HSET', K[7], 'cursor', last_new) end
@@ -271,6 +287,7 @@ if claim ~= '' then
               table.insert(taken, id)
               table.insert(taken, gen)
               table.insert(taken, entry[1][2][2])
+              table.insert(taken, field_of(entry[1][2], 'pos') or '')
             end
           end
         end
@@ -284,7 +301,7 @@ local dead, dead_at = {}, {}
 local function record(q, taken)
   if claim == '' or (#taken == 0 and #dead_at == 0) then return end
   local t, base, bell = {}, '', ''
-  for i = 1, #taken, 3 do
+  for i = 1, #taken, 4 do
     table.insert(t, taken[i])
     table.insert(t, taken[i + 1])
   end
@@ -417,7 +434,10 @@ local fails = redis.call('HINCRBY', KEYS[4], ARGV[1], 1)
 local maxr = tonumber(ARGV[4])
 if maxr > 0 and fails >= maxr then
   local entry = redis.call('XRANGE', KEYS[1], ARGV[1], ARGV[1])
-  if #entry > 0 then to_dlq(KEYS, ARGV[1], entry[1][2][2], fails, tonumber(ARGV[5])) end
+  if #entry > 0 then
+    to_dlq(KEYS, ARGV[1], entry[1][2][2], fails, tonumber(ARGV[5]),
+      field_of(entry[1][2], 'pos'))
+  end
   return 'dead'
 end
 redis.call('HSET', KEYS[5], ARGV[1], 'r')
@@ -495,6 +515,98 @@ return {moved, dropped, redis.call('XLEN', KEYS[6])}
 """
 )
 
+# Reprioritize (0.2.0 T2): move waiting messages from one queue to another (a model's normal and
+# priority queues). KEYS: the 7 keys of the source, then the 7 of the target. ARGV: retention ms,
+# the target's max waiting (0: no limit), the target's doorbell, byte cap, the key prefix (the
+# job records live in this store) or '' (they live elsewhere: checked and updated by the
+# caller), the target class (`p` / `n`), then request id / message id pairs. A message held by
+# a worker (`st` = h) is skipped (`held`, owner D7: never taken from a worker), as is one
+# returned with a delay still to run (`delayed`), one gone (`gone`) and, with the records here,
+# one whose call is no longer queued (`started`), being cancelled (`cancelling`) or was sent
+# again under another id (`moved`). The copy is appended to the target with `pos` = the id the
+# call was first sent with, so its deadline, `max_wait_secs` and place among waiting calls stay
+# (owner Q9); `fails` goes along; the source entry and its records go. The run stops when the
+# target is full (`full`, the rest too) or past the byte cap (the rest is left for the next run).
+# Reply: {moved {rid, new id, ...}, skipped {rid, reason, ...}, pairs looked at}.
+MOVE = (
+    _NOW
+    + _DLQ
+    + _RING_FN
+    + """
+local S, D = {}, {}
+for i = 1, 7 do S[i] = KEYS[i]; D[i] = KEYS[7 + i] end
+local retention, limit, bell = tonumber(ARGV[1]), tonumber(ARGV[2]), ARGV[3]
+local cap, prefix, cls = tonumber(ARGV[4]), ARGV[5], ARGV[6]
+local moved, skipped, bytes, looked = {}, {}, 0, 0
+local depth = redis.call('XLEN', D[1])
+local function skip(rid, why)
+  table.insert(skipped, rid)
+  table.insert(skipped, why)
+end
+for a = 7, #ARGV, 2 do
+  local rid, mid = ARGV[a], ARGV[a + 1]
+  local why = nil
+  local st = redis.call('HGET', S[5], mid)
+  if st == 'h' then why = 'held' end
+  if not why and st == 'r' then
+    local vis = redis.call('ZSCORE', S[2], mid)
+    if vis and tonumber(vis) > now then why = 'delayed' end
+  end
+  local job, status
+  if not why and prefix ~= '' then
+    job = prefix .. ':{r:' .. rid .. '}:job'
+    status = prefix .. ':{r:' .. rid .. '}:status'
+    local f = redis.call('HMGET', job, 'state', 'mid')
+    if f[1] ~= 'queued' then why = 'started'
+    elseif redis.call('EXISTS', prefix .. ':{r:' .. rid .. '}:cancel') == 1 then why = 'cancelling'
+    elseif f[2] ~= mid then why = 'moved' end
+  end
+  local fields, body
+  if not why then
+    local entry = redis.call('XRANGE', S[1], mid, mid)
+    if #entry > 0 then
+      fields = entry[1][2]
+      body = field_of(fields, 'body')
+    end
+    if not body then why = 'gone' end
+  end
+  if why then
+    skip(rid, why)
+  else
+    if limit > 0 and depth >= limit then
+      for b = a, #ARGV, 2 do skip(ARGV[b], 'full') end
+      looked = (#ARGV - 6) / 2
+      break
+    end
+    if bytes > 0 and bytes + #body > cap then break end
+    bytes = bytes + #body
+    local pos = field_of(fields, 'pos') or mid
+    local new = redis.call('XADD', D[1], 'MINID', '~', tostring(now - retention), '*',
+      'body', body, 'pos', pos)
+    depth = depth + 1
+    local fails = redis.call('HGET', S[4], mid)
+    if fails then redis.call('HSET', D[4], new, fails) end
+    redis.call('XDEL', S[1], mid)
+    redis.call('ZREM', S[2], mid)
+    redis.call('HDEL', S[3], mid)
+    redis.call('HDEL', S[4], mid)
+    redis.call('HDEL', S[5], mid)
+    if job then
+      redis.call('HSET', job, 'mid', new, 'q', cls)
+      if redis.call('EXISTS', status) == 1 then
+        redis.call('HSET', status, 'priority', cls == 'p' and '1' or '0')
+      end
+    end
+    table.insert(moved, rid)
+    table.insert(moved, new)
+  end
+  looked = (a - 5) / 2
+end
+if #moved > 0 then ring(bell) end
+return {moved, skipped, looked}
+"""
+)
+
 # ARGV: doorbell key. A token back on a doorbell, with SEND's cap and TTL: a bare RPUSH on an
 # expired bell made one with no TTL that outlived a removed model (EN-13).
 RING = """
@@ -518,11 +630,23 @@ class Message:
     generation: int
     body: bytes
     received_ms: int = 0
+    # The id the call had when it was sent, when a reprioritize moved it to another queue
+    # (0.2.0 T2, the stream field `pos`); '' for a message in its first queue.
+    pos: str = ""
+
+    @property
+    def place(self) -> str:
+        """The stream id of the call's original send: its place in line among its class."""
+        return self.pos or self.id
 
     @property
     def position_ms(self) -> int:
-        """The store's time at send, in ms (deadlines and ages are measured from it)."""
-        return int(self.id.split("-", 1)[0])
+        """The store's time at send, in ms (deadlines and ages are measured from it).
+
+        A moved message keeps its original send time (`pos`), so its deadline, `max_wait_secs`
+        and its order among waiting calls stay what they were (owner Q9).
+        """
+        return int(self.place.split("-", 1)[0])
 
 
 @dataclass(frozen=True, slots=True)
@@ -532,6 +656,19 @@ class DeadLetter:
     queue: str
     id: str
     body: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class MoveResult:
+    """What one `move` did.
+
+    `moved`: (request id, new message id); `skipped`: (request id, reason); `looked`: how many
+    pairs it looked at (the rest wait for the next run: the byte cap).
+    """
+
+    moved: tuple[tuple[str, str], ...]
+    skipped: tuple[tuple[str, str], ...]
+    looked: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -582,6 +719,7 @@ class StreamQueues:
         self._trim_dead_many = client.register_script(pre + TRIM_DEAD_MANY)
         self._ring = client.register_script(pre + RING)
         self._reclaim = client.register_script(pre + RECLAIM)
+        self._move = client.register_script(pre + MOVE)
 
     async def _send_and_wait(
         self, queue: str, args: list[bytes | int | str], replicas: int, wait_ms: int
@@ -821,6 +959,45 @@ class StreamQueues:
             logger.warning("redrive_stopped_full", queue=queue, left=int(left))
         return int(moved)
 
+    async def move(
+        self,
+        source: str,
+        target: str,
+        pairs: Sequence[tuple[str, str]],
+        *,
+        target_class: str,
+        retention_secs: int = RETENTION_SECS,
+        max_waiting: int = 0,
+        max_bytes: int = 8 * 1024 * 1024,
+        prefix: str = "",
+    ) -> MoveResult:
+        """Move waiting messages (request id, message id) from `source` to `target` (`MOVE`).
+
+        `prefix`: the key prefix when the calls' job records live in this store (they are
+        checked and updated in the same script), else '' (the caller does both). Pairs past
+        the byte cap are not looked at: `looked` says how many were.
+        """
+        if not pairs:
+            return MoveResult((), (), 0)
+        args: list[Any] = [
+            retention_secs * 1000,
+            max_waiting,
+            self.bell(target),
+            max_bytes,
+            prefix,
+            target_class,
+        ]
+        for rid, mid in pairs:
+            args += [rid, mid]
+        moved, skipped, looked = await self._move(
+            [*self.queue_keys(source), *self.queue_keys(target)], args
+        )
+        return MoveResult(
+            tuple((_text(moved[i]), _text(moved[i + 1])) for i in range(0, len(moved), 2)),
+            tuple((_text(skipped[i]), _text(skipped[i + 1])) for i in range(0, len(skipped), 2)),
+            int(looked),
+        )
+
     async def trim_dead(self, queue: str, keep_secs: int) -> int:
         """Drop dead letters older than `keep_secs` (on a timer); returns how many went."""
         return int(await self._trim_dead(self.queue_keys(queue), [int(keep_secs) * 1000]))
@@ -869,7 +1046,15 @@ def _receive_args(count: int, settings: QueueSettings) -> list[int | str]:
 
 
 def _messages(queue: str, taken: Sequence[Any], now_ms: int) -> list[Message]:
+    """Messages of a receive reply: id, generation, body and `pos` ('' unless moved) each."""
     return [
-        Message(queue, _text(taken[i]), int(taken[i + 1]), _bytes(taken[i + 2]), now_ms)
-        for i in range(0, len(taken), 3)
+        Message(
+            queue,
+            _text(taken[i]),
+            int(taken[i + 1]),
+            _bytes(taken[i + 2]),
+            now_ms,
+            _text(taken[i + 3]) if taken[i + 3] else "",
+        )
+        for i in range(0, len(taken), 4)
     ]
