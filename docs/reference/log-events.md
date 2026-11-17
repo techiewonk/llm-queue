@@ -135,6 +135,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `replicas_short` | warning | engine/store_guard.py |
 | `request_extended` | info | engine/requests_admin.py |
 | `request_moved` | info | engine/requests_admin.py |
+| `request_records_stale` | error | engine/requests_admin.py |
 | `request_unusable` | error | engine/runtime.py, engine/local.py |
 | `result_drop_skipped` | warning | engine/requests.py |
 | `result_reader_error` | warning | engine/runtime.py |

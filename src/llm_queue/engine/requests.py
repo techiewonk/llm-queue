@@ -172,15 +172,26 @@ _INDEX_FN = """
 local function index_add(job, ix, ixs, rid, h, keep_ms, mid, cls, names, name)
   local now = X.now()
   local dl = now + keep_ms
+  -- A takeover by a caller of another tenant: the old tenant's entry goes (RQ-9), or the call
+  -- was listed twice and the old tenant's cancel reached it.
+  local old = redis.call('HGET', job, 'ix')
+  if old and old ~= ix then redis.call('ZREM', old, rid) end
   redis.call('HSET', job, 'ix', ix, 'ixh', h, 'mid', mid, 'q', cls)
   redis.call('ZADD', ix, dl, rid)
   redis.call('ZREMRANGEBYSCORE', ix, '-inf', '(' .. now)
   redis.call('ZADD', ixs, 'GT', dl, h)
+  local has_names = names and names ~= ''
+  if has_names then
+    -- Tenants whose last call lapsed leave the names hash with the index (RQ-14): it only
+    -- grew while traffic went on.
+    local lapsed = redis.call('ZRANGEBYSCORE', ixs, '-inf', '(' .. now)
+    if #lapsed > 0 then redis.call('HDEL', names, unpack(lapsed)) end
+  end
   redis.call('ZREMRANGEBYSCORE', ixs, '-inf', '(' .. now)
   local ms = keep_ms + 60000
   if X.pttl(ix) < ms then X.expire(ix, ms) end
   if X.pttl(ixs) < ms then X.expire(ixs, ms) end
-  if names and names ~= '' and name and name ~= '' then
+  if has_names and name and name ~= '' then
     redis.call('HSET', names, h, name)
     if X.pttl(names) < ms then X.expire(names, ms) end
   end
@@ -395,9 +406,9 @@ RESULT_DROP = _DROP_READ + "return 1\n"
 # read-then-write never cancelled a shared id, or cancelled a caller that attached in between).
 # A call already final is left alone, so a later run of its id (Q2) is not cancelled by a stale
 # mark. An attach after the mark waits on the same call and gets its `cancelled` reply. Reply:
-# {marked, skipped because they started (only state `queued`)}.
+# {the ids marked, how many were skipped because they started (only state `queued`)}.
 CANCEL = """
-local n, started = 0, 0
+local marked, started = {}, 0
 for i = 1, #KEYS / 2 do
   local state = redis.call('HGET', KEYS[2 * i - 1], 'state')
   if state ~= 'done' and state ~= 'failed' and state ~= 'expired' and state ~= 'cancelled' then
@@ -406,11 +417,11 @@ for i = 1, #KEYS / 2 do
     else
       X.set(KEYS[2 * i], '1', tonumber(ARGV[1]) * 1000)
       redis.call('PUBLISH', ARGV[2], ARGV[3 + i])
-      n = n + 1
+      table.insert(marked, ARGV[3 + i])
     end
   end
 end
-return {n, started}
+return {marked, started}
 """
 
 # Extend a call's deadline (0.2.0 T2, owner D6). KEYS: job, callers, status. ARGV: the new
@@ -731,6 +742,37 @@ class RequestStore:
             await self._delete_object(data[len(MARKER) :].decode())
         return bool(written)
 
+    async def put_results(
+        self, replies: Sequence[Reply], *, final_state: str, status: Mapping[str, Any]
+    ) -> int:
+        """`put_result` of many small replies in one pipelined round trip; how many written.
+
+        For final replies the store makes up itself (an admin cancel answering waiting calls):
+        one script per id, one round trip for all (a 50k cancel made 50k serial round trips).
+        """
+        if not replies:
+            return 0
+        async with self._client.pipeline(transaction=False) as pipe:
+            for reply in replies:
+                job, callers, status_key, result = self._req(reply.request_id)
+                await self._put(
+                    [result, job, callers, status_key],
+                    [
+                        reply.dumps(),
+                        self.result_ttl_secs,
+                        final_state,
+                        self.status_ttl_secs,
+                        f"{self.keys.prefix}:done:",
+                        reply.request_id,
+                        "1",
+                        self.status_ttl_secs,
+                        *_pairs(status),
+                    ],
+                    client=pipe,
+                )
+            written = await pipe.execute()
+        return sum(1 for w in written if w)
+
     async def put_result_settled(
         self,
         reply: Reply,
@@ -966,15 +1008,29 @@ class RequestStore:
         only_state: str | None = None,
     ) -> tuple[int, int]:
         """`cancel`, returning (marked, skipped because they were no longer in `only_state`)."""
+        marked, started = await self.cancel_ids(
+            request_ids, ttl_secs=ttl_secs, channel=channel, only_state=only_state
+        )
+        return len(marked), started
+
+    async def cancel_ids(
+        self,
+        request_ids: Sequence[str],
+        *,
+        ttl_secs: int,
+        channel: str,
+        only_state: str | None = None,
+    ) -> tuple[list[str], int]:
+        """`cancel`, returning (the ids it marked, how many were no longer in `only_state`)."""
         if not request_ids:
-            return 0, 0
+            return [], 0
         keys = [
             k
             for rid in request_ids
             for k in (self.keys.request(rid, "job"), self.keys.request(rid, "cancel"))
         ]
         reply = await self._cancel(keys, [ttl_secs, channel, only_state or "", *request_ids])
-        return int(reply[0]), int(reply[1])
+        return [_text(rid) for rid in reply[0]], int(reply[1])
 
     async def extend(self, request_id: str, *, deadline_ms: int, margin_secs: float) -> str:
         """Move a call's deadline to `deadline_ms` (store ms) everywhere it lives (`EXTEND`).

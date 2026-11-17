@@ -2075,6 +2075,7 @@ class Engine:
             except NotReplicated as exc:
                 # On the primary, not on enough replicas: sent anyway (owner Q9).
                 self.replica_wait.short("calls", self.metrics, str(exc))
+                message_id = exc.message_id  # recorded, so admins find the message (RQ-7)
                 break
             except BaseException as exc:
                 # One cleanup for every failure, cancels included: four handlers awaited the

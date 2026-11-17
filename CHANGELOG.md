@@ -245,6 +245,15 @@ index (below).
   `retention_secs` as well as `timeout_max_secs`, and needs the request index. An attempt's
   first-response budget is now `attempt_timeout_secs` alone; the call's deadline is the
   outer timer's.
+- Request admin: a send short of `queue_wait_replicas` keeps its message id (`list` showed
+  none and reprioritize skipped the call as `direct`); a separate queue store's moved calls
+  have their records written again after a store error (`request_records_stale` when that
+  keeps failing); a takeover under another tenant leaves the old tenant's index; lapsed
+  tenants leave the names hash (`tqn`); `requests.count` with the index off is refused, not
+  zeros; the no-tenant status block reads the fairness numbers fairness writes; a cancel logs
+  `call_cancel` only for the calls it cancelled and answers waiting calls in one round trip per
+  batch; a reprioritize stopped by a full target counts every call left in `skipped.full`;
+  `requests.get` of a call whose model was removed returns its records, not a `KeyError`.
 - Drain API (plan A1-A5). `pause_receiving()` stays sync and callable from any thread;
   `resume_receiving()` undoes it (ready again when started; `LLMQueueError` after `stop()`);
   `await drain(drain_secs=None)` pauses and waits for running calls and jobs (it does not

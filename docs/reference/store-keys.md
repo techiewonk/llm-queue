@@ -873,7 +873,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | zset |
 | Store | state |
 | Schema | The calls in flight of tenant `H` on model `ALIAS` (0.2.0 T1): member = request id, score = the call's deadline (store ms: now + call time + `caller_margin_secs`; an extend raises it). `H` = the keyed hash of the call's tenant (`LLMQ_DEFAULT_TENANT` included), `-` for no tenant; the user id is never a fallback here. `ALIAS` = the model whose queue holds the call (after the disabled-model fallback). |
-| Written by | `index_add` (`_INDEX_FN`, `requests.py`) in `REGISTER_SEND` (queued, shared store) and `CONFIRM` (separate queue store or replica wait; direct runs; takeovers update the score): `ZADD`, then entries past their deadline are pruned (`ZREMRANGEBYSCORE`). `EXTEND` (`ZADD XX`). |
+| Written by | `index_add` (`_INDEX_FN`, `requests.py`) in `REGISTER_SEND` (queued, shared store) and `CONFIRM` (separate queue store or replica wait; direct runs; takeovers update the score, and a takeover under another tenant `ZREM`s the call from the old tenant's key): `ZADD`, then entries past their deadline are pruned (`ZREMRANGEBYSCORE`). `EXTEND` (`ZADD XX`). |
 | Read by | `RequestsAdmin` (`requests_admin.py`: list, count, cancel, reprioritize); tenant purge `queued` / `running` (`purge.py`); `status(model, tenant=...)` (`status.py`). Readers count only scores in the future and drop ids whose job is final or gone. |
 | Lifetime (native) | 60 s past the latest deadline in it; a write only lengthens it (`X.pttl` check). |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
@@ -890,7 +890,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Store | state |
 | Schema | The tenants with calls in flight on model `ALIAS`: member = tenant hash `H` (or `-`), score = the latest deadline of any of its calls (`ZADD GT`). |
 | Written by | `index_add` (as `tq:H`), entries past their deadline pruned on each add; `EXTEND` (`ZADD GT`). |
-| Read by | `RequestsAdmin.list` / `count` without a tenant; `status()` `tenants.active`. |
+| Read by | `RequestsAdmin.list` / `count` without a tenant; `status()` `tenants.active`. A status of the no-tenant block (`-`) reads fairness under the hash of the shared no-tenant name, as fairness writes it. |
 | Lifetime (native) | 60 s past its latest deadline; a write only lengthens it. |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime. Never evictable. |
 | Count | 1 per model with calls in flight; one member per tenant. |
@@ -905,7 +905,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | hash |
 | Store | state |
 | Schema | Only with `LLMQ_TENANT_NAMES_ENABLED=true` (owner Q5): tenant hash `H` -> the tenant's name, so admin lists and status can show it. Off, no name is stored anywhere (messages carry hashes only). |
-| Written by | `index_add` (`HSET`, with the index). |
+| Written by | `index_add` (`HSET`, with the index); tenants whose entries in `tq` lapsed are removed (`HDEL`) on each add, as `tq` prunes them. |
 | Read by | `RequestsAdmin` (`tenant_name` of summaries), `status(model, tenant=...)`. |
 | Lifetime (native) | As `tq`. |
 | Swept mode | Indexed in `P:ttl`. Never evictable. |

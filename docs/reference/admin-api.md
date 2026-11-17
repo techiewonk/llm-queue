@@ -155,8 +155,11 @@ settings (`registry.set`); jobs are sent by the app (`llmq.send_job`), their dea
 under `AdminServices.from_env()` and the CLI. A tenant is given by name (`tenant`, hashed with
 `LLMQ_ID_HASH_SALT`, never stored) or by hash (`tenant_hash`, 16 hex, or `-` for calls with no
 tenant). With `LLMQ_REQUEST_INDEX_ENABLED=false`, looking calls up by model and tenant answers
-`AdminRefused` (HTTP 409, CLI exit 1); `requests.get` and `requests.cancel` by request ids still
-work. An operation that would read more than `LLMQ_ADMIN_SCAN_MAX` index entries is refused the
+`AdminRefused` (HTTP 409, CLI exit 1), `requests.count` and `requests.extend` included (a count
+of zeros would read as "nothing waiting"); `requests.get` and `requests.cancel` by request ids
+still work. A cancel logs `call_cancel` only for the calls it cancelled, and answers the waiting
+ones in one pipelined round trip per `LLMQ_ADMIN_BATCH`. A reprioritize stopped by a full target
+counts every call it did not reach in `skipped.full`. An operation that would read more than `LLMQ_ADMIN_SCAN_MAX` index entries is refused the
 same way.
 
 ## `GET /` and `llm-queue ops`

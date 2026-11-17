@@ -16,9 +16,10 @@ from typing import TYPE_CHECKING, Any
 from llm_queue._logging import get_logger
 from llm_queue.engine._codec import text as _text
 from llm_queue.engine.expiry import native
-from llm_queue.engine.fairness import fairness_for
+from llm_queue.engine.fairness import fairness_for, tenant_hash_of
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import StreamQueues
+from llm_queue.engine.requests_admin import NO_TENANT as NO_INDEX_TENANT
 from llm_queue.errors import ConfigError
 from llm_queue.registry.settings import ALERT_DEFAULTS
 
@@ -195,7 +196,12 @@ class StatusReader:
         if setting.get("mode", "off") != "off":
             if now_secs is None:
                 now_secs = int((await self._client.time())[0])
-            out["fairness"] = await self._tenant_fairness(view, alias, tenant_hash, now_secs)
+            # Calls with no tenant are `-` in the index; fairness counts those with no user
+            # either under the hash of its no-tenant name (RQ-11: `-` always read defaults).
+            fair_h = tenant_hash
+            if tenant_hash == NO_INDEX_TENANT:
+                fair_h = tenant_hash_of(None, None, self.requests.hash_id)
+            out["fairness"] = await self._tenant_fairness(view, alias, fair_h, now_secs)
         return out
 
     async def _tenant_fairness(

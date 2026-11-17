@@ -12,6 +12,7 @@ routes and an admin worker share it without an engine (`RequestsAdmin.from_env`)
 
 from __future__ import annotations
 
+import asyncio
 import builtins
 import contextlib
 import heapq
@@ -23,6 +24,8 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, Self
 
 import orjson
+from redis.exceptions import ConnectionError as StoreConnectionError
+from redis.exceptions import TimeoutError as StoreTimeoutError
 
 from llm_queue._logging import get_logger
 from llm_queue.engine._codec import text as _text
@@ -53,6 +56,9 @@ MAX_CANCEL_IDS = 1_000  # request ids one cancel may name
 MAX_ID_CHARS = 256  # characters of one request id a cancel may name
 SAMPLE_IDS = 20  # ids a change report lists
 _HASH_RE = re.compile(r"^[0-9a-f]{16}\Z")
+# Pauses before the moved calls' records are written again (separate queue store, RQ-8).
+_RECORD_RETRY_SECS = (0.2, 0.5, 1.0)
+_STORE_ERRORS = (StoreConnectionError, StoreTimeoutError, OSError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,7 +283,7 @@ class RequestsAdmin:
         self.keys = keys
         self.registry = registry
         self.queue_prefix = queue_prefix
-        self._hash = hash_id
+        self.hash_id = hash_id  # the keyed hash of a tenant or user id
         self.settings = settings or AdminSettings()
         self.status_ttl_secs = status_ttl_secs
         self.caller_margin_secs = caller_margin_secs
@@ -406,11 +412,13 @@ class RequestsAdmin:
     ) -> RequestCounts:
         """Calls in flight of `model` (and one tenant) by state and stage.
 
-        Reads every index entry up to `LLMQ_ADMIN_SCAN_MAX` (`truncated` above it).
+        Reads every index entry up to `LLMQ_ADMIN_SCAN_MAX` (`truncated` above it). Needs the
+        request index: with it off nothing is counted, so `AdminRefused` (not zeros).
         """
         view = await self._view()
         alias = view.registry.alias_of(model)
         h = self.pick_tenant(tenant, tenant_hash)
+        self._need_index("in-flight")
         indexed = await self._indexed(alias, h)
         by_state = dict.fromkeys(("waiting", "running"), 0)
         by_stage: dict[str, int] = dict.fromkeys(STAGES, 0)
@@ -609,18 +617,18 @@ class RequestsAdmin:
         ids = [r.rid for r in chosen]
         for start in range(0, len(ids), self.settings.batch):
             batch = ids[start : start + self.settings.batch]
-            marked, moved_on = await self._requests.cancel_counts(
+            marked, moved_on = await self._requests.cancel_ids(
                 batch,
                 ttl_secs=self.status_ttl_secs,
                 channel=self.keys.cancel_channel,
                 only_state=only,
             )
-            changed += marked
+            changed += len(marked)
             if moved_on:
                 _bump(skipped, "started" if state == "waiting" else "not_running", moved_on)
             if state != "running":
-                await self._settle_waiting(batch)
-            for rid in batch:
+                await self._settle_waiting(marked)
+            for rid in marked:  # only the calls it cancelled (RQ-13)
                 logger.info("call_cancel", request_id=rid, source="admin", by=actor)
         if self._metrics is not None:
             self._metrics.count("llmq_cancels_total", float(changed), source="admin")
@@ -710,6 +718,9 @@ class RequestsAdmin:
             for _, why in result.skipped:
                 _bump(skipped, why)
             if any(why == "full" for _, why in result.skipped):
+                # The calls of later batches are not moved either (RQ-15: they went uncounted).
+                if rest := len(pairs) - at - len(part):
+                    _bump(skipped, "full", rest)
                 break
             at += max(1, result.looked)
         report = _replace(report, changed=changed, skipped=skipped)
@@ -801,7 +812,7 @@ class RequestsAdmin:
         if tenant is not None:
             if not tenant:
                 raise ConfigError("tenant must not be empty")
-            return self._hash(tenant)
+            return self.hash_id(tenant)
         if tenant_hash is not None and tenant_hash != NO_TENANT and not _HASH_RE.match(tenant_hash):
             raise ConfigError("tenant_hash must be 16 hex characters, or - for no tenant")
         return tenant_hash
@@ -1048,29 +1059,55 @@ class RequestsAdmin:
         reply a worker writes; written once). Its message is acked by the worker that takes it
         (PICK_TAKE answers `done`). A call that started meanwhile is left to its worker.
         """
+        if not request_ids:
+            return
         k = self.keys
         async with self._state.pipeline(transaction=False) as pipe:
             for rid in request_ids:
                 pipe.hget(k.request(rid, "job"), "state")
                 pipe.exists(k.request(rid, "cancel"))
             replies = await pipe.execute()
-        for i, rid in enumerate(request_ids):
-            state, marked = replies[2 * i], replies[2 * i + 1]
-            if state is None or _text(state) != "queued" or not marked:
-                continue
-            reply = Reply(
+        ended = [
+            Reply(
                 request_id=rid,
                 ok=False,
                 error="cancelled",
                 message="the call was cancelled by an admin",
                 meta=Meta(worker=self._owner),
             )
-            await self._requests.put_result(
-                reply, final_state="cancelled", status={"error": "cancelled"}
-            )
+            for i, rid in enumerate(request_ids)
+            if replies[2 * i] is not None
+            and _text(replies[2 * i]) == "queued"
+            and replies[2 * i + 1]
+        ]
+        # One pipelined round trip per batch: one per id made a 50k cancel 50k round trips.
+        await self._requests.put_results(
+            ended, final_state="cancelled", status={"error": "cancelled"}
+        )
 
     async def _moved_records(self, moved: Sequence[tuple[str, str]], cls: str) -> None:
-        """Separate queue store: the moved calls' job `mid` / `q` and status `priority`."""
+        """Separate queue store: the moved calls' job `mid` / `q` and status `priority`.
+
+        Written from `MOVE`'s reply, tried again on a store error (RQ-8): the messages already
+        moved, and a record left on the old message showed the call in the wrong class and made
+        a later reprioritize skip it as `gone`. Still failing, it is logged with the ids.
+        """
+        for pause in (*_RECORD_RETRY_SECS, None):
+            try:
+                await self._write_moved(moved, cls)
+                return
+            except _STORE_ERRORS as exc:
+                if pause is None:
+                    logger.error(
+                        "request_records_stale",
+                        request_ids=[rid for rid, _ in moved][:SAMPLE_IDS],
+                        count=len(moved),
+                        error_type=type(exc).__name__,
+                    )
+                    return
+                await asyncio.sleep(pause)
+
+    async def _write_moved(self, moved: Sequence[tuple[str, str]], cls: str) -> None:
         async with self._state.pipeline(transaction=False) as pipe:
             for rid, new in moved:
                 pipe.hset(self.keys.request(rid, "job"), mapping={"mid": new, "q": cls})
