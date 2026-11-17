@@ -137,6 +137,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `result_sweep_failed` | warning | engine/runtime.py |
 | `return_failed` | warning | engine/runtime.py |
 | `second_llm_queue_started` | warning | core.py |
+| `secrets_refresh_failed` | warning | secrets.py (the last values are kept) |
 | `shutdown_give_back_failed` | warning | engine/runtime.py |
 | `start_rollback_failed` | warning | core.py |
 | `state_store_promoted` | error | engine/runtime.py |

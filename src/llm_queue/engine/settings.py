@@ -61,6 +61,17 @@ CONFLICT_GROUPS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("REGISTRY",), ("REGISTRY_FILE",)),
 )
 _TRUE, _FALSE = ("true", "1", "yes", "on"), ("false", "0", "no", "off")
+# Where secrets come from is never itself read from a secret (llm_queue.secrets.SETTINGS).
+_SECRETS_SETTINGS = frozenset(
+    PREFIX + n
+    for n in (
+        "SECRETS_SOURCE",
+        "SECRET_NAMES",
+        "SECRETS_REGION",
+        "SECRETS_CACHE_SECS",
+        "SECRETS_TIMEOUT_SECS",
+    )
+)
 
 
 def _set(value: Any) -> str | None:
@@ -74,14 +85,18 @@ def _set(value: Any) -> str | None:
 
 
 class Layers(Mapping[str, str]):
-    """`LLMQ_*` values from three layers: `secrets`, then `environ`, then `defaults` (0.2.0 D1).
+    """`LLMQ_*` values from three layers: secrets, then `environ`, then `defaults` (0.2.0 D1).
 
-    The secret-then-environment order is the 0.1 one, unchanged; `defaults` (the app's own
-    values, for example from its config module) sit below both. `secret_names` maps a setting
-    to the secret that holds it under another name (`{'LLMQ_STORE_HOST': 'valkey_host'}`,
-    0.2.0 H7); the same order applies to it. Secrets are read on every lookup, so a rotated
-    one (the store password, the admin token) is seen without a restart. Settings that name
-    one thing two ways follow `CONFLICT_GROUPS`. A mapping, so `JobSettings.from_env` reads it.
+    The secret layer is the `secrets` callable when given, else the sources
+    `LLMQ_SECRETS_SOURCE` names (`llm_queue.secrets`), else nothing. `defaults` (the app's own
+    values, for example from its config module) sit below the environment. `secret_names` and
+    `LLMQ_SECRET_NAMES` (merged, the argument wins per setting) map a setting to the key that
+    holds it in the secrets (`{'LLMQ_STORE_HOST': 'valkey_host'}`, 0.2.0 H7). The secrets
+    settings themselves (`llm_queue.secrets.SETTINGS`) are read from the environment and the
+    defaults only. Secrets are read on every lookup (a source caches for
+    `LLMQ_SECRETS_CACHE_SECS`), so a rotated one (the store password, the admin token) is seen
+    without a restart. Settings that name one thing two ways follow `CONFLICT_GROUPS`. A
+    mapping, so `JobSettings.from_env` reads it.
     """
 
     def __init__(
@@ -91,34 +106,113 @@ class Layers(Mapping[str, str]):
         defaults: Mapping[str, Any] | None = None,
         secret_names: Mapping[str, str] | None = None,
     ) -> None:
-        """Read `environ` (default `os.environ`, copied now) and the other layers."""
+        """Read `environ` (default `os.environ`, copied now) and the other layers.
+
+        A configured secrets source is read once here: `ConfigError` names one that cannot be.
+        """
+        from llm_queue import secrets as sources
+
         problems = [
             f"defaults: {name!r} is not an LLMQ_* setting"
             for name in defaults or {}
             if not str(name).startswith(PREFIX)
         ]
+        self._env = dict(os.environ if environ is None else environ)
+        raw_defaults = dict(defaults or {})
+
+        def setting(name: str) -> Any:
+            value = _set(self._env.get(name))
+            return value if value is not None else raw_defaults.get(name)
+
+        names, found = sources.parse_secret_names(setting(sources.NAMES_VAR))
+        problems += found
         for name, secret in (secret_names or {}).items():
-            if not str(name).startswith(PREFIX):
-                problems.append(f"secret_names: {name!r} is not an LLMQ_* setting")
             if not str(secret or "").strip():
                 problems.append(f"secret_names: {name} must name a secret")
+            else:
+                names[str(name)] = str(secret)
+        for name in names:
+            if not name.startswith(PREFIX):
+                problems.append(f"secret names: {name!r} is not an LLMQ_* setting")
+            elif name in sources.SETTINGS:
+                problems.append(f"secret names: {name} is read from the environment, not a secret")
+        cache = sources.read_number(
+            setting(sources.CACHE_VAR),
+            sources.CACHE_VAR,
+            sources.CACHE_SECS,
+            0,
+            sources.MAX_CACHE_SECS,
+            problems,
+        )
+        timeout = sources.read_number(
+            setting(sources.TIMEOUT_VAR),
+            sources.TIMEOUT_VAR,
+            sources.TIMEOUT_SECS,
+            sources.MIN_TIMEOUT_SECS,
+            sources.MAX_TIMEOUT_SECS,
+            problems,
+        )
+        spec = str(_set(setting(sources.SOURCE_VAR)) or "none").strip()
+        region = _set(setting(sources.REGION_VAR))
         if problems:
             raise ConfigError("invalid LLMQ settings:\n  " + "\n  ".join(problems))
-        self._env = dict(os.environ if environ is None else environ)
+        self.secrets_source = spec
+        self.secrets_region = region.strip() if region else None
+        self.secrets_cache_secs = cache
+        self.secrets_timeout_secs = timeout
+        if secrets is None:
+            # Code `secrets=` wins over LLMQ_SECRETS_SOURCE (which is then not read at all).
+            try:
+                secrets = sources.secrets_from_config(
+                    spec,
+                    environ=self._env,
+                    region=self.secrets_region,
+                    cache_secs=cache,
+                    timeout_secs=timeout,
+                )
+            except ConfigError as exc:
+                raise ConfigError(f"invalid LLMQ settings:\n  {exc}") from None
         self._secrets = secrets
-        self._defaults = {name: _set(value) for name, value in (defaults or {}).items()}
-        self._names = dict(secret_names or {})
+        self._defaults = {name: _set(value) for name, value in raw_defaults.items()}
+        self._names = names
 
     @property
     def environ(self) -> dict[str, str]:
         """The environment layer (the copy taken at construction)."""
         return self._env
 
+    @property
+    def secrets(self) -> Callable[[str], str | None] | None:
+        """The secret layer's lookup (by the secret's own key), None when there is none."""
+        return self._secrets
+
+    @property
+    def secret_names(self) -> dict[str, str]:
+        """Settings read from the secrets under another key (merged names)."""
+        return dict(self._names)
+
+    def describe_secrets(self) -> dict[str, Any]:
+        """Where secrets come from (kinds and ids) and which settings are mapped: no values."""
+        reader = self._secrets
+        describe = getattr(reader, "describe", None)
+        if reader is None:
+            shown: dict[str, Any] = {"sources": []}
+        elif callable(describe):
+            shown = dict(describe())
+        else:
+            shown = {"sources": ["code"]}  # an app's own `secrets=` callable
+        shown["names"] = sorted(self._names)
+        return shown
+
     def secret(self, name: str) -> str | None:
-        """Secret `name` (under its `secret_names` name), None when unset or empty."""
-        if self._secrets is None:
+        """Secret `name` (under its mapped key), None when unset or empty."""
+        if self._secrets is None or name in _SECRETS_SETTINGS:
             return None
         return _set(self._secrets(self._names.get(name, name)))
+
+    def lookup(self, name: str) -> str | None:
+        """`name` from the secrets, else the environment (placeholders, account secrets)."""
+        return self.secret(name) or _set(self._env.get(name))
 
     def _values(self, name: str) -> tuple[str | None, str | None, str | None]:
         return self.secret(name), _set(self._env.get(name)), self._defaults.get(name)
@@ -381,7 +475,16 @@ class InfraSettings:
     purge_batch: int = 500
     tenant_purge_default: str = "keys"  # comma list of TENANT_PURGE_PARTS
     tenant_index: bool = False
-    # Where registry placeholders are read (`secrets=` first, then the environment `from_env`
+    # Where secrets come from (llm_queue.secrets): the source spec as written, its sources
+    # (kind and id; `code` for a `secrets=` callable), the settings mapped to other secret keys
+    # (names only), the region, the cache time and the AWS timeouts.
+    secrets_source: str = "none"
+    secret_sources: tuple[str, ...] = ()
+    secret_names: tuple[str, ...] = ()
+    secrets_region: str | None = None
+    secrets_cache_secs: float = 300.0
+    secrets_timeout_secs: float = 10.0
+    # Where registry placeholders are read (the secrets first, then the environment `from_env`
     # read); None: `os.environ`. Never shown or compared.
     placeholder_lookup: Callable[[str], str | None] | None = field(
         default=None, repr=False, compare=False
@@ -401,22 +504,26 @@ class InfraSettings:
         defaults: Mapping[str, Any] | None = None,
         secret_names: Mapping[str, str] | None = None,
     ) -> InfraSettings:
-        """Read `LLMQ_*`: `secrets` first, then `environ` (`os.environ`), then `defaults`.
+        """Read `LLMQ_*`: the secrets first, then `environ` (`os.environ`), then `defaults`.
 
-        See `Layers`; `secret_names` maps a setting to the name of the secret that holds it.
+        The secrets are `secrets` when given, else the sources `LLMQ_SECRETS_SOURCE` names.
+        See `Layers`; `secret_names` maps a setting to the key of the secret that holds it.
         """
-        layers = Layers(environ, secrets, defaults, secret_names)
-        env = layers.environ
+        return cls.from_layers(Layers(environ, secrets, defaults, secret_names))
+
+    @classmethod
+    def from_layers(cls, layers: Layers) -> InfraSettings:
+        """Read `LLMQ_*` from built `Layers` (so one secrets source serves every reader)."""
 
         def get(name: str, default: Any = None) -> Any:
             # An empty value counts as unset everywhere: compose's `${VAR:-}` writes one, and
             # `LLMQ_LEASE_SECS=` was an error while an empty LLMQ_ENVIRONMENT was not (R3CF-14).
             return layers.get(PREFIX + name, default)
 
-        def placeholder(name: str) -> str | None:
-            # A registry placeholder names the variable in full (no LLMQ_ prefix).
-            return layers.secret(name) or env.get(name)
-
+        # A registry placeholder names the variable in full (no LLMQ_ prefix): the secrets,
+        # then the environment.
+        placeholder = layers.lookup
+        secrets_shown = layers.describe_secrets()
         problems: list[str] = []
         store = get("STORE_URL")
         environment = str(get("ENVIRONMENT", "") or "").strip().lower() or "unset"
@@ -659,6 +766,12 @@ class InfraSettings:
             ttl_sweep_batch=number("TTL_SWEEP_BATCH", 500, int, lo=1, hi=5_000),
             ttl_sweep_rounds=number("TTL_SWEEP_ROUNDS", 100, int, lo=1, hi=10_000),
             **purge,
+            secrets_source=layers.secrets_source,
+            secret_sources=tuple(secrets_shown["sources"]),
+            secret_names=tuple(secrets_shown["names"]),
+            secrets_region=layers.secrets_region,
+            secrets_cache_secs=layers.secrets_cache_secs,
+            secrets_timeout_secs=layers.secrets_timeout_secs,
             placeholder_lookup=placeholder,
         )
         if problems:

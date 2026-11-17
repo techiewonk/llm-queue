@@ -75,6 +75,12 @@ def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> 
         admin_writes_enabled=s.admin_writes_enabled,
         registry_version=doc.get("registry_version"),
         models=sorted(doc.get("models") or {}),
+        # Kinds and ids of the secrets sources and the mapped setting names: never a value.
+        secrets={
+            "sources": list(s.secret_sources),
+            "names": list(s.secret_names),
+            "cache_secs": s.secrets_cache_secs,
+        },
     )
     return out
 

@@ -14,7 +14,6 @@ refuse with `AdminRefused`.
 from __future__ import annotations
 
 import contextlib
-import os
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, Self
 
@@ -43,7 +42,7 @@ from llm_queue.engine.audit import Audit
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.purge import PurgeService, PurgeSettings, keyed_hash
 from llm_queue.engine.queue import StreamQueues
-from llm_queue.engine.settings import InfraSettings
+from llm_queue.engine.settings import InfraSettings, Layers
 from llm_queue.engine.status import StatusReader
 
 if TYPE_CHECKING:
@@ -128,15 +127,19 @@ class AdminServices:
         *,
         secrets: Callable[[str], str | None] | None = None,
     ) -> AdminServices:
-        """Standalone services from `LLMQ_*` (CLI, admin workers); close with `aclose()`."""
+        """Standalone services from `LLMQ_*` (CLI, admin workers); close with `aclose()`.
+
+        Settings and store passwords are read as `LLMQueue.from_env` reads them: `secrets`
+        when given, else the sources `LLMQ_SECRETS_SOURCE` names, then the environment.
+        """
         from llm_queue.engine.store_client import secret_store_client
         from llm_queue.registry.store import RegistryStore
         from llm_queue.tuning import Tuning
 
-        env = dict(os.environ if environ is None else environ)
-        settings = InfraSettings.from_env(env, secrets=secrets)
+        layers = Layers(environ, secrets)
+        settings = InfraSettings.from_layers(layers)
         cap, options = settings.store_max_connections, Tuning().store
-        lookup = secrets or env.get
+        lookup = layers.get
         state = secret_store_client(settings.store_url, lookup, "LLMQ_STORE_PASSWORD", cap, options)
         queue_client = (
             secret_store_client(
