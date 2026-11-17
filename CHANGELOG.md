@@ -33,6 +33,13 @@ public API (see STABILITY.md).
   replies and on a `queue_streaming` stream's last chunk. `model_name`, `finish_reason` and
   `stopReason` stay where LangChain puts them.
 
+### Fixed
+
+- `QueuedChatBedrockConverse` without `model_alias` (only `model_id`) treated every reply as a
+  model fallback (C3): the served alias never equals the model id, so each reply paid a
+  registry lookup to fill `model_name`. A fallback is now read from the engine's
+  `Meta.fallback == "model"`.
+
 ## [0.1.1] - 2026-11-17
 
 The first release that installs without `--pre`: `pip install llm-queue` (or

@@ -446,3 +446,63 @@ async def test_c2_whole_replies_carry_llmq_and_response_metadata(which: str) -> 
     assert message.response_metadata["llmq"] == META
     assert message.response_metadata["ResponseMetadata"] == BOTO_META
     assert not set(META) & set(message.response_metadata)
+
+
+def _registry_spy(looked_up: list[str]) -> Any:
+    def model(alias: str) -> Any:
+        looked_up.append(alias)
+        return SimpleNamespace(model_id="other.model-v1:0")
+
+    return SimpleNamespace(current=SimpleNamespace(model=model))
+
+
+def _human(text: str) -> Any:
+    from langchain_core.messages import HumanMessage
+
+    return HumanMessage(text)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_c3_no_fallback_without_model_alias(streaming: bool) -> None:
+    """C3: with only `model_id`, the served alias always differed from it: every reply looked
+    like a model fallback and paid a registry lookup. Only the engine's `fallback` says so now.
+    """
+    pytest.importorskip("langchain_aws")
+    from llm_queue.langchain.bedrock import QueuedChatBedrockConverse
+
+    looked_up: list[str] = []
+    queue = FakeQueue(_bedrock_events())
+    queue.registry = _registry_spy(looked_up)
+    model = QueuedChatBedrockConverse(
+        model_id=BEDROCK_ID, region_name="us-east-1", llmq=queue, queue_streaming=streaming
+    )
+    if streaming:
+        whole = functools.reduce(operator.add, await _collect(model))
+        assert whole.response_metadata["model_name"] == BEDROCK_ID
+    else:
+        result = await model._agenerate([_human("hi")])  # the ChatResult `_parse` built
+        assert (result.llm_output or {}).get("model_name") in (None, BEDROCK_ID)
+    assert looked_up == []
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_c3_a_model_fallback_reports_the_model_that_answered(streaming: bool) -> None:
+    pytest.importorskip("langchain_aws")
+    from llm_queue.langchain.bedrock import QueuedChatBedrockConverse
+
+    looked_up: list[str] = []
+    fallback = {**META, "served_model": "other", "fallback": "model"}
+    events = [e for e in _bedrock_events() if "llmq" not in e]
+    queue = FakeQueue([*events, {"llmq": {"usage": USAGE, "meta": fallback}}])
+    queue.meta = fallback
+    queue.registry = _registry_spy(looked_up)
+    model = QueuedChatBedrockConverse(
+        model_id=BEDROCK_ID, region_name="us-east-1", llmq=queue, queue_streaming=streaming
+    )
+    if streaming:
+        whole = functools.reduce(operator.add, await _collect(model))
+        assert whole.response_metadata["model_name"] == "other.model-v1:0"
+    else:
+        result = await model._agenerate([_human("hi")])  # the ChatResult `_parse` built
+        assert (result.llm_output or {})["model_name"] == "other.model-v1:0"
+    assert looked_up == ["other"]
