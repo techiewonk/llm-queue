@@ -1168,7 +1168,8 @@ class LLMQueue:
         actor: `actor(request)`, else the claimed `LLMQ_ADMIN_ACTOR_HEADER` (`X-LLMQ-Actor`)
         audited as `token:<value>`. `drain_routes=True` adds `GET /drain`, `POST /drain` and
         `POST /resume` for this process (a pod with several processes drains through
-        `LLMQ_DRAIN_FILE`); `metrics_route=True` adds an open `GET /metrics`.
+        `LLMQ_DRAIN_FILE`); `metrics_route=True` adds an open `GET /metrics`. Outside dev each
+        token must be at least 32 characters (`ConfigError` here, read once to check).
         """
         from llm_queue.engine.http import status_router
 
@@ -1192,6 +1193,7 @@ class LLMQueue:
             wait_cap_secs=float(s.http_purge_wait_secs) if s else 60.0,
             dlq_bodies=bool(s.admin_dlq_bodies_enabled) if s else False,
             index_cache_secs=float(s.admin_index_cache_secs) if s else 2.0,
+            strict=bool(s.strict) if s else False,
         )
 
     def describe(self) -> dict[str, Any]:

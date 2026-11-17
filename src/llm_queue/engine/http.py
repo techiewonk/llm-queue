@@ -50,6 +50,9 @@ RETRY_AFTER_SECS = 1
 MAX_ID_CHARS = 256
 MAX_EDIT_PATHS = 100
 MAX_ACTOR_CHARS = 128
+# Strict mode (review B-21, owner Q12): an admin token is the only guard on the write routes and
+# can be guessed online, so each configured token must be at least this long.
+MIN_TOKEN_CHARS = 32
 Token = str | Callable[[], str | None] | None
 
 
@@ -195,13 +198,16 @@ async def call(admin: AdminServices, op: Op, kwargs: Mapping[str, Any]) -> Respo
     return 200, result
 
 
-def admin_token_dependency(token: Token, header: str, *, read_token: Token = None) -> Any:
+def admin_token_dependency(
+    token: Token, header: str, *, read_token: Token = None, min_chars: int = 0
+) -> Any:
     """A FastAPI dependency: the request's `header` must equal `token` or `read_token`.
 
     Compared in constant time. A callable is read on every request (a rotated secret needs no
     restart), on a worker thread: it may reach a secrets source (`LLMQ_SECRETS_SOURCE`), whose
     refresh must not block the event loop. With neither configured (empty or None) every
-    request is refused (fail closed).
+    request is refused (fail closed), and so is a token shorter than `min_chars` (a rotation
+    to a short token after the mount check).
     """
     import asyncio
     import hmac
@@ -220,7 +226,7 @@ def admin_token_dependency(token: Token, header: str, *, read_token: Token = Non
         read = values() if not (callable(token) or callable(read_token)) else None
         if read is None:
             read = await asyncio.to_thread(values)
-        accepted = [t for t in read if t]
+        accepted = [t for t in read if t and len(t) >= min_chars]
         # Every token is compared, so the time does not tell which one matched.
         matched = [hmac.compare_digest(given, t.encode()) for t in accepted]
         if not any(matched):
@@ -235,6 +241,16 @@ def _configured(token: Token) -> bool:
     if token is None:
         return False
     return bool(token() if callable(token) else token)
+
+
+def _short_tokens(**tokens: Token) -> list[str]:
+    """The names of the configured tokens shorter than `MIN_TOKEN_CHARS` (never a value)."""
+    out = []
+    for name, token in tokens.items():
+        value = token() if callable(token) else token
+        if value and len(str(value)) < MIN_TOKEN_CHARS:
+            out.append(name)
+    return out
 
 
 def status_router(
@@ -253,6 +269,7 @@ def status_router(
     wait_cap_secs: float = 60.0,
     dlq_bodies: bool = False,
     index_cache_secs: float = 2.0,
+    strict: bool = False,
 ) -> Any:
     """A FastAPI `APIRouter` of the admin operations (`pip install 'llm-queue[http]'`).
 
@@ -264,7 +281,8 @@ def status_router(
     with the token guard and no `actor`, `token:<actor_header value>` (`token:unknown` without
     it). `wait_cap_secs` caps any `wait_secs` an HTTP client asks for; `dlq_bodies` lets
     `GET /dlq/{id}?unsafe=true` return message bodies; `GET /` reuses its summary for
-    `index_cache_secs`.
+    `index_cache_secs`. `strict` (outside dev) refuses to mount with a token (resolved, when a
+    callable) shorter than `MIN_TOKEN_CHARS`, and later refuses requests against one.
     """
     try:
         from fastapi import APIRouter, Depends, Request
@@ -277,6 +295,12 @@ def status_router(
     # would be read as a query field. Publish the name once it is imported.
     globals()["Request"] = Request
 
+    if strict and (short := _short_tokens(admin_token=admin_token, read_token=read_token)):
+        raise ConfigError(
+            f"admin tokens must be at least {MIN_TOKEN_CHARS} characters outside dev: "
+            + ", ".join(short)
+        )
+    min_chars = MIN_TOKEN_CHARS if strict else 0
     reads_by_token = _configured(admin_token) or _configured(read_token)
     writes_by_token = _configured(admin_token)
     guarded = [Depends(d) if callable(d) else d for d in dependencies]
@@ -300,11 +324,17 @@ def status_router(
     read_deps = list(guarded)
     if reads_by_token:
         read_deps.append(
-            Depends(admin_token_dependency(admin_token, token_header, read_token=read_token))
+            Depends(
+                admin_token_dependency(
+                    admin_token, token_header, read_token=read_token, min_chars=min_chars
+                )
+            )
         )
     write_deps = list(guarded)
     if writes_by_token:
-        write_deps.append(Depends(admin_token_dependency(admin_token, token_header)))
+        write_deps.append(
+            Depends(admin_token_dependency(admin_token, token_header, min_chars=min_chars))
+        )
 
     def who(request: Any) -> str:
         if actor is not None:

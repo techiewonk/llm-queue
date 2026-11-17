@@ -10,8 +10,8 @@ Leave `LLMQ_ENVIRONMENT` unset or set it to your environment's name (`prod`, `st
 `dev`, `local`, `test` and `ci` relax the checks. Strict mode requires TLS stores with
 certificate and host-name checks, an `LLMQ_ID_HASH_SALT` of 16 characters or more, an explicit
 `LLMQ_KEY_PREFIX` (so two environments on one store never share queues), allowed `base_url`
-hosts and `https` for `LLMQ_BEDROCK_ENDPOINT_URL` / `LLMQ_STS_ENDPOINT_URL` (any host), and it
-refuses debug capture. See [Environment variables](../reference/environment.md#llmq_environment-strict-or-dev).
+hosts, `https` for `LLMQ_BEDROCK_ENDPOINT_URL` / `LLMQ_STS_ENDPOINT_URL` (any host) and admin
+tokens of 32 characters or more, and it refuses debug capture. See [Environment variables](../reference/environment.md#llmq_environment-strict-or-dev).
 
 `verify=False` (or `use_ssl=False`) in an account's `credentials=` is allowed in every mode, with a
 `bedrock_tls_verify_off` warning: use it only against a local fake.
@@ -85,6 +85,11 @@ app.include_router(
 - Two tokens, both optional and read on every request (rotation needs no restart), carried in
   `LLMQ_ADMIN_HEADER` (`X-LLMQ-Token`): `LLMQ_ADMIN_READ_TOKEN` opens the read routes only;
   `LLMQ_ADMIN_TOKEN` opens reads and writes. The app's `dependencies` apply on top of them.
+  When strict, each token must be at least 32 characters (a shared token can be guessed
+  online, and nothing rate-limits the 403s): `http_router()` / `install()` read each token once
+  at mount (a callable too) and refuse a short one with a `ConfigError`; a token rotated to a
+  short value later is refused per request. Generate one with
+  `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
 - **Reads are guarded too.** `/registry` lists account names, regions, model ids, `base_url`s
   and routing blocks (only role ARNs and secret references are redacted). With no token and no
   `dependencies` the router mounts only the open routes and logs

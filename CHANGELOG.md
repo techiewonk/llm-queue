@@ -44,6 +44,11 @@ by default on every surface. No old name is kept:
 | `GET /drain` open | `GET /drain` needs a read guard |
 | Read routes mounted open with no guard (a warning) | Not mounted: with no token and no `dependencies` only the probes and `/metrics` are (warning `admin_routes_unauthenticated`), unless `insecure_reads=True` |
 
+In a strict environment `LLMQ_ADMIN_TOKEN` and `LLMQ_ADMIN_READ_TOKEN` (or the tokens passed
+to `http_router()`, a callable's value included) must be at least 32 characters: a shorter one
+stops the mount with a `ConfigError`, and a token rotated to a shorter value is refused per
+request.
+
 New settings: `LLMQ_ADMIN_READ_TOKEN` (read routes only), `LLMQ_ADMIN_WRITES_ENABLED` (false),
 `LLMQ_ADMIN_ACTOR_HEADER` (`X-LLMQ-Actor`: a write under the token guard is audited as
 `token:<value>`, `token:unknown` without it), `LLMQ_ADMIN_INDEX_CACHE_SECS` (2),
