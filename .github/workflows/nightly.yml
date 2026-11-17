@@ -1,4 +1,5 @@
-# Nightly: the slow drills CI cannot run on every push (scenarios, gates, a 10-minute soak),
+# Nightly: the slow drills CI cannot run on every push (scenarios, gates, a 10-minute soak,
+# the eviction drill and the store failover drills on Valkey and Redis 7.4),
 # and the engine integration tests with key expiry `swept` (CI runs them with `auto`).
 # All on fakellm and the Docker stack; no real LLM and no secrets.
 name: nightly
@@ -22,7 +23,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        drill: [scenarios, gates, soak10]
+        # evict: both eviction policies on their own Docker Valkey (~5 min); failover: the three
+        # store failover drills on Valkey 8.1 and on Redis 7.4 (~3 min each) (gap G18).
+        drill: [scenarios, gates, soak10, evict, failover, failover-redis74]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
         with:
@@ -39,6 +42,12 @@ jobs:
         run: uv run python scripts/gates.py --quick
       - if: matrix.drill == 'soak10'
         run: uv run python scripts/soak.py --minutes 10
+      - if: matrix.drill == 'evict'
+        run: uv run python scripts/evict_drill.py --calls 500
+      - if: matrix.drill == 'failover'
+        run: uv run python scripts/failover.py
+      - if: matrix.drill == 'failover-redis74'
+        run: uv run python scripts/failover.py --image redis:7.4-alpine
       - if: failure()
         run: docker compose -f docker/compose.yaml logs --no-color
       - if: always()
