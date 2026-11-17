@@ -704,10 +704,10 @@ def test_a_failed_refresh_is_retried_after_thirty_seconds_not_a_cache_period(
         assert reader("k") == "v1"  # kept
     assert "secrets_refresh_failed" in caplog.text
     source.fail = False
-    clock.now += 29
+    clock.now += 30 * (1 - secrets_module.RETRY_JITTER) - 1
     assert reader("k") == "v1"
-    clock.now += 1
-    assert reader("k") == "v3"  # tried again after min(300, 30) s
+    clock.now += 30 * 2 * secrets_module.RETRY_JITTER + 1
+    assert reader("k") == "v3"  # tried again after min(300, 30) s, +-20 % (review S-2)
 
 
 def test_the_admin_token_guard_reads_a_secret_off_the_event_loop() -> None:

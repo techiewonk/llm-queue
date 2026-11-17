@@ -213,17 +213,14 @@ def _set(value: Any) -> str | None:
 class Layers(Mapping[str, str]):
     """`LLMQ_*` values from three layers: secrets, then `environ`, then `defaults` (0.2.0 D1).
 
-    The secret layer is the `secrets` callable when given, else the sources
-    `LLMQ_SECRETS_SOURCE` names (`llm_queue.secrets`), else nothing. `defaults` (the app's own
-    values, for example from its config module) sit below the environment. `secret_names` and
-    `LLMQ_SECRET_NAMES` (merged, the argument wins per setting) map a setting to the key that
-    holds it in the secrets (`{'LLMQ_STORE_HOST': 'valkey_host'}`, 0.2.0 H7). The secrets
-    settings themselves (`llm_queue.secrets.SETTINGS`) are read from the environment and the
-    defaults only. Secrets are read on every lookup (a source caches for
-    `LLMQ_SECRETS_CACHE_SECS`), so a rotated one (the store password, the admin token) is seen
-    without a restart. Settings that name one thing two ways follow `CONFLICT_GROUPS`. A
-    mapping, so `JobSettings.from_env` reads it.
+    Secrets are `secrets`, else `LLMQ_SECRETS_SOURCE`'s sources, read on every lookup (a
+    rotation needs no restart); docs/reference/environment.md "Where values come from".
     """
+
+    # `secret_names` and `LLMQ_SECRET_NAMES` (merged, the argument wins) map a setting to its
+    # key in the secrets (0.2.0 H7). The secrets settings themselves are read from the
+    # environment and the defaults only. Settings that name one thing two ways follow
+    # `CONFLICT_GROUPS`. A mapping, so `JobSettings.from_env` reads it.
 
     def __init__(
         self,
@@ -316,6 +313,12 @@ class Layers(Mapping[str, str]):
     def secret_names(self) -> dict[str, str]:
         """Settings read from the secrets under another key (merged names)."""
         return dict(self._names)
+
+    def invalidate_secrets(self) -> None:
+        """Have the secret layer read its sources again (`SecretReader.invalidate`), if it can."""
+        invalidate = getattr(self._secrets, "invalidate", None)
+        if callable(invalidate):
+            invalidate()
 
     def describe_secrets(self) -> dict[str, Any]:
         """Where secrets come from (kinds and ids) and which settings are mapped: no values."""
@@ -592,12 +595,11 @@ def _read_document(
 ) -> str:
     """The registry JSON from the variable or the file, refused when it repeats a key.
 
-    `${NAME}` placeholders are expanded with `lookup` (default: `os.environ`) after parsing,
-    so the repeated-key check sees the document as written and the expanded text is checked
-    again (`registry.interpolate`; credentials are refused). A file ending `.yaml` / `.yml` is
-    read as YAML (extra `yaml`). Text without placeholders is returned as it is. `used`
-    collects the names the placeholders read.
+    `${NAME}` placeholders are expanded with `lookup` after parsing (credentials refused);
+    a `.yaml` / `.yml` file is read as YAML. `used` collects the names read.
     """
+    # Parsing first lets the repeated-key check see the document as written; the expanded
+    # text is checked again. Text without placeholders is returned as it is.
     yaml_file = False
     if registry:
         text = registry
@@ -1035,11 +1037,8 @@ class InfraSettings:
     def registry_document(self) -> str:
         """The registry JSON from `LLMQ_REGISTRY` or the file `LLMQ_REGISTRY_FILE`.
 
-        Placeholders expanded (see `_read_document`). Tenant names in `fairness.weights` /
-        `quotas` are replaced by their keyed hashes (`LLMQ_ID_HASH_SALT`, owner D2): only
-        hashes reach the store, matching the hashes a call's message carries. `ConfigError`
-        when neither is set, the file cannot be read, the text is not JSON (or YAML), an object
-        repeats a key or a placeholder names an unset variable without a default.
+        Placeholders expanded; tenant names in `fairness` replaced by their keyed hashes (D2),
+        so only hashes reach the store. `ConfigError` when it cannot be read or parsed.
         """
         from llm_queue.engine.fairness import hash_tenant_names
 
