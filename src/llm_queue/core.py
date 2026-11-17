@@ -334,6 +334,14 @@ class LLMQueue:
             properties={"pod": worker_id or socket.gethostname(), "version": __version__},
         )
 
+        # One `static_cap` budget, concurrency cap and probe per process: the started engine
+        # and the sync calls' private engine share them (review L-4).
+        local_limits = LocalLimits(
+            process_count=settings.local_process_count,
+            concurrency=settings.local_concurrency,
+            timings=tuning.engine,
+        )
+
         def build(cap: int = settings.store_max_connections) -> Engine:
             # The password is read through the layers on every new connection (rotation):
             # a secret, else the environment (0.1.1 ignored it there without `secrets=`).
@@ -411,6 +419,7 @@ class LLMQueue:
                 metrics=sink,
                 offload=offload,
                 offload_bytes=offload_bytes,
+                local_limits=local_limits,
             )
 
         sync_cap = min(SYNC_STORE_CONNECTIONS, settings.store_max_connections)
@@ -462,7 +471,11 @@ class LLMQueue:
             timings=tuning.engine,
             admin=AdminSettings.from_infra(settings),  # the tenant metric labels
         )
-        limits = LocalLimits(process_count=settings.local_process_count, timings=tuning.engine)
+        limits = LocalLimits(
+            process_count=settings.local_process_count,
+            concurrency=settings.local_concurrency,
+            timings=tuning.engine,
+        )
         pool_kwargs: dict[str, Any] = {
             "bedrock_endpoint_url": settings.bedrock_endpoint_url,
             "sts_endpoint_url": settings.sts_endpoint_url,

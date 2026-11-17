@@ -498,6 +498,102 @@ async def test_stop_drains_then_fails_calls_still_running(rig: Rig) -> None:
     assert time.monotonic() - started < 3
 
 
+async def test_stop_and_drain_wait_for_the_call_not_the_handler(slow_rig: Rig) -> None:
+    """Review L-1: a handler that goes on after its 400 ms call no longer holds the drain."""
+    llmq = await slow_rig.started()
+    finished = asyncio.Event()
+
+    async def handler() -> None:
+        assert (await llmq.converse("small", CHAT)).ok
+        finished.set()
+        await asyncio.sleep(30)  # e.g. streaming its own answer to the client
+
+    task = asyncio.create_task(handler())
+    try:
+        await asyncio.sleep(0.1)
+        started = time.monotonic()
+        assert await llmq.drain(drain_secs=3)  # idle as soon as the call ended
+        assert finished.is_set()
+        assert time.monotonic() - started < 0.4 + 0.5
+        second = asyncio.create_task(handler())
+        await asyncio.sleep(0.1)
+        started = time.monotonic()
+        await llmq.stop(drain_secs=3)
+        assert time.monotonic() - started < 0.4 + 0.5
+        assert not second.done()  # the handler itself was never cancelled
+        second.cancel()
+    finally:
+        task.cancel()
+
+
+async def test_a_caller_cancel_after_a_shutdown_stays_a_cancel(rig: Rig) -> None:
+    """Review L-8: only the calls the shutdown cancels fail `worker_shutdown`."""
+    await _scenario(rig, {f"{SMALL}@r1": {"hang": True}})
+    llmq = await rig.started()
+    executor = llmq._engine.executor  # type: ignore[union-attr]
+    await executor.shutdown()  # nothing running: it cancels nothing
+    call = asyncio.create_task(llmq.converse("small", CHAT, timeout_secs=30))
+    await asyncio.sleep(0.2)
+    call.cancel()  # the client went away
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert not executor.running
+
+
+async def test_a_probe_that_fails_before_the_provider_frees_the_breaker(rig: Rig) -> None:
+    """Review L-3: the request builder raising on the probe left the breaker waiting forever."""
+    await _scenario(rig, {f"{SMALL}@r1": {"error_rate_5xx": 1.0}})
+    llmq = await rig.started(
+        {
+            "small": {
+                "rpm": 60,
+                "breaker_threshold": 1,
+                "breaker_cooldown_secs": 0.2,
+                "max_attempts": 1,
+            }
+        }
+    )
+    with pytest.raises(CallFailed):
+        await llmq.converse("small", CHAT)
+    assert (await llmq.status("small"))["deployments"][0]["breaker"] == "open"
+    await asyncio.sleep(0.3)  # half open: the next grant is the probe
+    executor = llmq._engine.executor  # type: ignore[union-attr]
+    build = executor._params
+
+    def broken(view: Any, alias: str, env: Any, dep: str | None) -> dict[str, Any]:
+        if dep is not None:
+            raise RuntimeError("request builder failed")
+        return build(view, alias, env, dep)
+
+    executor._params = broken
+    with pytest.raises(RuntimeError):
+        await llmq.converse("small", CHAT)
+    executor._params = build
+    rig.fake.scenario.patch_model(f"{SMALL}@r1", {"error_rate_5xx": 0.0})
+    reply = await llmq.converse("small", CHAT, max_wait_secs=1)  # the probe is free again
+    assert reply.ok
+    dep = (await llmq.status("small"))["deployments"][0]
+    assert dep["breaker"] == "closed"
+    assert dep["rpm"]["used"] == 2  # the failed call and this one: the broken grant came back
+
+
+async def test_async_and_sync_engines_share_one_concurrency_cap(slow_rig: Rig) -> None:
+    """Review L-4: the sync calls' private engine and the started one, one cap of 1."""
+    llmq = slow_rig.queue(LLMQ_LOCAL_CONCURRENCY="1")
+    sync_call = asyncio.create_task(asyncio.to_thread(llmq.converse_sync, "small", CHAT))
+    for _ in range(100):  # the private engine is built, then its call takes the slot
+        if llmq._sync is not None and llmq._sync._engine.limits.slots("small").in_use:
+            break
+        await asyncio.sleep(0.02)
+    await llmq.start()
+    status = await llmq.status("small")
+    assert status["concurrency"] == {"limit": 1, "in_use": 1}  # the sync call's slot
+    started = time.monotonic()
+    assert (await llmq.converse("small", CHAT)).ok
+    assert (await sync_call).ok
+    assert time.monotonic() - started > 0.55  # it waited for the sync call's slot
+
+
 async def test_local_mode_reads_a_secrets_source_like_queue_mode(rig: Rig, tmp_path: Path) -> None:
     """Review L-7: an account's `api_key_ref` and both admin tokens from a `file:` source."""
     volume = tmp_path / "llmq-secrets"

@@ -103,6 +103,7 @@ from llm_queue.tuning import EngineTimings
 if TYPE_CHECKING:
     import redis.asyncio
 
+    from llm_queue.engine.local import LocalLimits
     from llm_queue.registry import Deployment, ResolvedRegistry
     from llm_queue.registry.store import RegistryStore
 
@@ -853,8 +854,12 @@ class Engine:
         metrics: Metrics | None = None,
         offload: ResultOffload | None = None,
         offload_bytes: int | None = None,
+        local_limits: LocalLimits | None = None,
     ) -> None:
-        """Wire the stores; nothing runs until `start`."""
+        """Wire the stores; nothing runs until `start`.
+
+        `local_limits` (the `static_cap` budgets and cap) is shared by the engines of a process.
+        """
         self.settings = settings or EngineSettings()
         # Two heartbeats at least (owner Q4): one late or lost renewal no longer makes a live
         # caller look gone (R3FM-1, R3RC-3). Send and attach refresh it too (REGISTER).
@@ -1014,11 +1019,13 @@ class Engine:
         # `store_down: static_cap` runs here, on the executor of local mode (0.2.0).
         self.local = LocalExecutor(
             providers,
-            LocalLimits(
-                process_count=self.settings.local_process_count, timings=self.settings.timings
+            local_limits
+            or LocalLimits(
+                process_count=self.settings.local_process_count,
+                concurrency=self.settings.local_concurrency,
+                timings=self.settings.timings,
             ),
             view=lambda: self.registry.current,
-            concurrency=self.settings.local_concurrency,
             worker_id=self.worker_id,
             metrics=self.metrics,
             hash_id=self.hash_id,

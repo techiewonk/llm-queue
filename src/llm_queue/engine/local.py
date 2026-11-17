@@ -82,7 +82,9 @@ class _Bucket:
     The admission script's rules (`engine/_admission_lua.py`), on wall seconds: `smooth`
     lets a burst of `max(1, floor(limit x rate_burst))` units through, then one unit every
     `60 / limit` s; `fixed` counts per calendar minute. `limit` is already divided by the
-    process count, so it may be below 1.
+    process count, so it may be below 1: one unit above `limit` still passes in a minute with
+    nothing taken, and `fixed` then carries what went over into the next minutes as a debt
+    (`limit` paid off each minute), so no process goes over its share on average (L-2).
     """
 
     __slots__ = ("burst", "limit", "mode", "n", "tat", "used", "used_min", "win")
@@ -108,10 +110,12 @@ class _Bucket:
             return 60.0
         if self.mode == "fixed":
             minute = int(now // 60)
-            n = self.n if self.win == minute else 0.0
+            n = self._carried(minute)
             if n + cost <= self.limit or (n == 0 and cost > self.limit):
                 return 0.0
-            return (minute + 1) * 60 - now
+            # Whole minutes until the count (debt paid off by `limit` a minute) lets it in.
+            over = n if cost > self.limit else n + cost - self.limit
+            return (minute + max(1, math.ceil(over / self.limit))) * 60 - now
         per = 60.0 / self.limit
         tat = max(self.tat, now)
         if cost > self._size():
@@ -123,10 +127,18 @@ class _Bucket:
         self._count(cost, now)
         if self.mode == "fixed":
             minute = int(now // 60)
-            self.n = (self.n if self.win == minute else 0.0) + cost
+            self.n = self._carried(minute) + cost
             self.win = minute
             return
         self.tat = max(self.tat, now) + cost * 60.0 / self.limit
+
+    def _carried(self, minute: int) -> float:
+        """`fixed`: the count of `minute`; a later minute starts with what is still owed."""
+        if self.win == minute:
+            return self.n
+        if self.win < 0 or minute < self.win or self.limit <= 0:
+            return 0.0
+        return max(0.0, self.n - self.limit * (minute - self.win))
 
     def give(self, units: float, now: float) -> None:
         """Give back `units` (negative: charge more), as FINISH settles a grant."""
@@ -137,8 +149,8 @@ class _Bucket:
             minute = int(now // 60)
             if self.win == minute:
                 self.n = max(0.0, self.n - units)
-            elif units < 0:  # an overrun is charged to the new minute
-                self.win, self.n = minute, -units
+            elif units < 0:  # an overrun is charged to the new minute (on top of any debt)
+                self.win, self.n = minute, self._carried(minute) - units
             return
         value = max(self.tat, now) - units * 60.0 / self.limit
         self.tat = max(value, now) if units > 0 else value
@@ -148,8 +160,7 @@ class _Bucket:
         if self.limit <= 0:
             return 0.0
         if self.mode == "fixed":
-            n = self.n if self.win == int(now // 60) else 0.0
-            return max(0.0, self.limit - n)
+            return max(0.0, self.limit - self._carried(int(now // 60)))
         per = 60.0 / self.limit
         return max(0.0, (now + self._size() * per - max(self.tat, now)) / per)
 
@@ -211,14 +222,23 @@ class LocalLimits:
     """The local executor's state of one process: budgets, breakers, health, sticky, retries.
 
     Shared by every executor of the process (the started engine and the private engine of
-    the sync calls), so a process has one budget whichever path its calls take. Plain data
-    under one lock: no event loop owns it.
+    the sync calls), so a process has one budget, one concurrency cap per model and one
+    breaker probe per deployment whichever path its calls take. Plain data under one thread
+    lock: no event loop owns it.
     """
 
-    def __init__(self, *, process_count: int = 1, timings: EngineTimings | None = None) -> None:
-        """`process_count` divides every rpm / tpm (pods x processes sharing a quota)."""
+    def __init__(
+        self,
+        *,
+        process_count: int = 1,
+        concurrency: int = 10,
+        timings: EngineTimings | None = None,
+    ) -> None:
+        """`process_count` divides every rpm / tpm; `concurrency` caps calls per model."""
         self.process_count = max(1, int(process_count))
+        self.concurrency = max(1, int(concurrency))
         self.timings = timings or EngineTimings()
+        self._slots: dict[str, _PrioritySlots] = {}
         self.lock = threading.Lock()
         self.buckets: dict[tuple[str, ...], _Bucket] = {}
         self.breakers: dict[tuple[str, str], _Breaker] = {}
@@ -267,15 +287,46 @@ class LocalLimits:
 
     def try_take(self, budgets: Sequence[_Budget], cost_r: float, cost_t: float) -> float:
         """Charge every budget when all fit and return 0; else the longest wait, nothing taken."""
-        now = time.time()
         with self.lock:
-            pairs = [(self._bucket(b), cost_r if b.kind == "r" else cost_t) for b in budgets]
-            wait = max((bucket.wait(cost, now) for bucket, cost in pairs), default=0.0)
-            if wait > 0:
-                return wait
-            for bucket, cost in pairs:
-                bucket.take(cost, now)
-            return 0.0
+            return self._try_take(budgets, cost_r, cost_t, time.time())
+
+    def _try_take(
+        self, budgets: Sequence[_Budget], cost_r: float, cost_t: float, now: float
+    ) -> float:
+        pairs = [(self._bucket(b), cost_r if b.kind == "r" else cost_t) for b in budgets]
+        wait = max((bucket.wait(cost, now) for bucket, cost in pairs), default=0.0)
+        if wait > 0:
+            return wait
+        for bucket, cost in pairs:
+            bucket.take(cost, now)
+        return 0.0
+
+    def claim(
+        self, alias: str, dep: str, budgets: Sequence[_Budget], cost_r: float, cost_t: float
+    ) -> tuple[bool, bool, float, bool]:
+        """Take a grant on `dep` in one step: (granted, usable, wait secs, is the probe).
+
+        Usable, budget and the half-open probe are decided under one lock, so two engines of
+        the process never both take the one probe (review L-4).
+        """
+        with self.lock:
+            ok, secs, probe = self._usable(alias, dep, time.monotonic())
+            if not ok:
+                return False, False, secs, False
+            secs = self._try_take(budgets, cost_r, cost_t, time.time())
+            if secs > 0:
+                return False, True, secs, False
+            if probe:
+                self.breaker(alias, dep).probing = True
+            return True, True, 0.0, probe
+
+    def slots(self, alias: str) -> _PrioritySlots:
+        """The concurrency cap of one model in this process (every engine shares it)."""
+        with self.lock:
+            slots = self._slots.get(alias)
+            if slots is None:
+                slots = self._slots[alias] = _PrioritySlots(self.concurrency)
+            return slots
 
     def give(self, budgets: Sequence[_Budget], requests: float, tokens_: float) -> None:
         """Give back what an attempt did not use (a negative amount charges more)."""
@@ -309,26 +360,23 @@ class LocalLimits:
 
     def usable(self, alias: str, dep: str) -> tuple[bool, float, bool]:
         """(usable now, seconds until it may be, whether this use is the breaker's probe)."""
-        now = time.monotonic()
         with self.lock:
-            health = self.health_of(alias, dep)
-            if health.disabled_until > now:
-                return False, health.disabled_until - now, False
-            cb = self.breaker(alias, dep)
-            if cb.thr_until > now:
-                return False, cb.thr_until - now, False
-            if cb.state == "open":
-                if now < cb.until:
-                    return False, cb.until - now, False
-                if cb.probing:
-                    return False, self.timings.admission_probe_wait_ms / 1000, False
-                return True, 0.0, True
-            return True, 0.0, False
+            return self._usable(alias, dep, time.monotonic())
 
-    def start_probe(self, alias: str, dep: str) -> None:
-        """Mark the half-open breaker's one probe as in flight."""
-        with self.lock:
-            self.breaker(alias, dep).probing = True
+    def _usable(self, alias: str, dep: str, now: float) -> tuple[bool, float, bool]:
+        health = self.health_of(alias, dep)
+        if health.disabled_until > now:
+            return False, health.disabled_until - now, False
+        cb = self.breaker(alias, dep)
+        if cb.thr_until > now:
+            return False, cb.thr_until - now, False
+        if cb.state == "open":
+            if now < cb.until:
+                return False, cb.until - now, False
+            if cb.probing:
+                return False, self.timings.admission_probe_wait_ms / 1000, False
+            return True, 0.0, True
+        return True, 0.0, False
 
     def settle(
         self,
@@ -462,16 +510,22 @@ class LocalLimits:
 
 
 class _PrioritySlots:
-    """A model's calls in flight in this process: `size` at once, priority callers first."""
+    """A model's calls in flight in this process: `size` at once, priority callers first.
+
+    Shared by the engines of the process, each on its own event loop: the state is under a
+    thread lock, and a freed slot is handed to the next waiter on that waiter's loop.
+    """
 
     def __init__(self, size: int) -> None:
         self.size = size
         self.in_use = 0
-        self._waiters: dict[bool, deque[asyncio.Future[None]]] = {True: deque(), False: deque()}
+        self._lock = threading.Lock()
+        self._waiters: dict[bool, deque[_Waiter]] = {True: deque(), False: deque()}
 
     def waiting(self, priority: bool) -> int:
         """Callers of one class waiting for a slot."""
-        return sum(1 for f in self._waiters[priority] if not f.done())
+        with self._lock:
+            return len(self._waiters[priority])
 
     @contextlib.asynccontextmanager
     async def held(self, priority: bool) -> AsyncIterator[None]:
@@ -483,30 +537,47 @@ class _PrioritySlots:
             self._release()
 
     async def _acquire(self, priority: bool) -> None:
-        if self.in_use < self.size and not (self.waiting(True) or self.waiting(False)):
-            self.in_use += 1
-            return
-        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        self._waiters[priority].append(future)
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            if self.in_use < self.size and not (self._waiters[True] or self._waiters[False]):
+                self.in_use += 1
+                return
+            waiter: _Waiter = (loop, loop.create_future())
+            self._waiters[priority].append(waiter)
+        future = waiter[1]
         try:
             await future
         except asyncio.CancelledError:
-            if future.done() and not future.cancelled():
+            with self._lock:
+                queued = waiter in self._waiters[priority]
+                if queued:
+                    self._waiters[priority].remove(waiter)
+            if not queued and future.done() and not future.cancelled():
                 self._release()  # handed a slot just as it was cancelled: pass it on
-            else:
-                with contextlib.suppress(ValueError):
-                    self._waiters[priority].remove(future)
-            raise
+            raise  # a hand-off still on its way sees the cancelled future and passes it on
 
     def _release(self) -> None:
-        for cls in (True, False):
-            queue = self._waiters[cls]
-            while queue:
-                future = queue.popleft()
-                if not future.done():
-                    future.set_result(None)  # the slot passes on: `in_use` stays
-                    return
-        self.in_use -= 1
+        with self._lock:
+            for cls in (True, False):
+                queue = self._waiters[cls]
+                while queue:
+                    loop, future = queue.popleft()
+                    try:
+                        loop.call_soon_threadsafe(self._hand, future)
+                    except RuntimeError:  # that waiter's loop is closed: the next one
+                        continue
+                    return  # the slot passes on: `in_use` stays
+            self.in_use -= 1
+
+    def _hand(self, future: asyncio.Future[None]) -> None:
+        """On the waiter's loop: give it the slot, or pass it on when it was cancelled."""
+        if future.done():
+            self._release()
+        else:
+            future.set_result(None)
+
+
+_Waiter = tuple[asyncio.AbstractEventLoop, "asyncio.Future[None]"]
 
 
 # ================================================================ one call
@@ -571,7 +642,6 @@ class LocalExecutor:
         limits: LocalLimits,
         *,
         view: Callable[[], ResolvedRegistry],
-        concurrency: int = 10,
         worker_id: str = "",
         metrics: Metrics | None = None,
         hash_id: Callable[[str], str] = lambda value: value,
@@ -581,7 +651,8 @@ class LocalExecutor:
     ) -> None:
         """`view` reads the current registry; `params` builds a provider request.
 
-        `tenant_label` maps a call's tenant hash to its metric label (`TenantLabels`).
+        `tenant_label` maps a call's tenant hash to its metric label (`TenantLabels`). The
+        concurrency cap and the budgets are `limits`'s, shared by every engine of the process.
 
         `params` defaults to `request_params`; the queue engine passes its own `_params` (read
         at each call, so a test may replace it).
@@ -589,22 +660,25 @@ class LocalExecutor:
         self.providers = providers
         self.limits = limits
         self._view = view
-        self.concurrency = concurrency
         self.worker_id = worker_id
         self.metrics: Metrics = metrics or NullSink()
         self.hash_id = hash_id
         self.tenant_label = tenant_label
         self._params = params or request_params
-        self._slots: dict[str, _PrioritySlots] = {}
-        self.running: set[asyncio.Task[Any]] = set()
-        self._shutdown = False
+        # Calls in flight: each call's own end (resolved when `run` returns) -> the task that
+        # runs it. The drain waits for the calls, never the caller's task, which may go on
+        # long after its call (review L-1); the task is kept only to cancel the call.
+        self.running: dict[asyncio.Future[None], asyncio.Task[Any] | None] = {}
+        self._shutdown_cancelled: set[asyncio.Future[None]] = set()
+
+    @property
+    def concurrency(self) -> int:
+        """Calls in flight per model in this process (`LLMQ_LOCAL_CONCURRENCY`)."""
+        return self.limits.concurrency
 
     def slots(self, alias: str) -> _PrioritySlots:
         """The concurrency cap of one model in this process."""
-        slots = self._slots.get(alias)
-        if slots is None:
-            slots = self._slots[alias] = _PrioritySlots(self.concurrency)
-        return slots
+        return self.limits.slots(alias)
 
     async def wait_running(self, timeout_secs: float) -> bool:
         """Wait up to `timeout_secs` for every call in flight; True when none is left."""
@@ -613,13 +687,18 @@ class LocalExecutor:
         return not self.running
 
     async def shutdown(self) -> None:
-        """Cancel the calls still running (after the drain); each fails `worker_shutdown`."""
-        self._shutdown = True
-        tasks = [t for t in self.running if not t.done()]
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.wait(tasks, timeout=_STOP_WAIT_SECS)
+        """Cancel the calls still running (after the drain); each fails `worker_shutdown`.
+
+        Only a call cancelled here fails `worker_shutdown`; a caller's own cancel (a client
+        that went away) stays a plain cancel, during a shutdown too (review L-8).
+        """
+        calls = {end: task for end, task in self.running.items() if task is not None}
+        for end, task in calls.items():
+            if not task.done():
+                self._shutdown_cancelled.add(end)
+                task.cancel()
+        if calls:
+            await asyncio.wait(set(calls), timeout=_STOP_WAIT_SECS)
 
     # ---------------------------------------------------------------- run
 
@@ -641,8 +720,8 @@ class LocalExecutor:
         now = loop.time()
         call = _Call(env, path, now, now + env.timeout_secs, sink)
         task = asyncio.current_task()
-        if task is not None:
-            self.running.add(task)
+        end: asyncio.Future[None] = loop.create_future()
+        self.running[end] = task
         timer = asyncio.timeout_at(call.deadline)
         try:
             async with timer, self.slots(alias).held(env.priority):
@@ -653,13 +732,14 @@ class LocalExecutor:
             last = f" (last error: {call.last_kind})" if call.last_kind else ""
             self._fail(call, alias, "deadline_exceeded", f"no reply in time{last}", cause=exc)
         except asyncio.CancelledError:
-            if not self._shutdown or task is None:
+            if end not in self._shutdown_cancelled or task is None:
                 raise
             task.uncancel()
             self._fail(call, alias, "worker_shutdown", "the queue stopped before the call ended")
         finally:
-            if task is not None:
-                self.running.discard(task)
+            self.running.pop(end, None)
+            self._shutdown_cancelled.discard(end)
+            end.set_result(None)
 
     async def _attempts(self, view: ResolvedRegistry, alias: str, call: _Call) -> Reply:
         """Pick, attempt and retry until a reply or a final failure (`_fail` raises)."""
@@ -955,19 +1035,12 @@ class LocalExecutor:
         candidates.sort(key=lambda d: (alias, d.key) in failed)  # stable: tried ones last
         wait, usable = math.inf, False
         for dep in candidates:
-            ok, secs, probe = self.limits.usable(alias, dep.key)
-            if not ok:
-                wait = min(wait, secs)
-                continue
-            usable = usable or dep.group != "fallback"
             budgets = self.limits.budgets(view, alias, dep)
-            secs = self.limits.try_take(budgets, 1, estimate.total)
-            if secs > 0:
-                wait = min(wait, secs)
-                continue
-            if probe:
-                self.limits.start_probe(alias, dep.key)
-            return _Grant(alias, dep, budgets, estimate, probe)
+            granted, ok, secs, probe = self.limits.claim(alias, dep.key, budgets, 1, estimate.total)
+            if granted:
+                return _Grant(alias, dep, budgets, estimate, probe)
+            usable = usable or (ok and dep.group != "fallback")
+            wait = min(wait, secs)
         return wait, usable
 
     def _model_fallback(
@@ -1022,18 +1095,40 @@ class LocalExecutor:
     # ---------------------------------------------------------------- one attempt
 
     async def _attempt(self, view: ResolvedRegistry, grant: _Grant, call: _Call) -> _Result:
-        """One provider attempt on a granted deployment, and what it teaches the budgets."""
-        env = call.env
+        """One provider attempt on a granted deployment, and what it teaches the budgets.
+
+        From the grant to the end, one `finally` settles it: whatever raises (the request
+        builder, a cancel), the probe ends and the budget is given back (review L-3).
+        """
         alias, dep, estimate = grant.alias, grant.dep, grant.estimate
         call.last_dep = (alias, dep.key)
-        settled = False
+        state = {"settled": False, "sent": False}
 
         def settle(outcome: str, refund: tokens.Refund, **learn: Any) -> None:
-            nonlocal settled
-            settled = True
+            state["settled"] = True
             self.limits.give(grant.budgets, refund.requests, refund.tokens)
             self.limits.settle(view, alias, dep.key, outcome, **learn)
 
+        try:
+            return await self._attempt_granted(view, grant, call, settle, state)
+        finally:
+            if not state["settled"]:
+                if state["sent"]:  # cancelled at the provider (deadline, shutdown): charged
+                    self.limits.settle(view, alias, dep.key, "none")
+                else:  # never reached the provider: everything back
+                    settle("none", tokens.refund(estimate, "throttle"))
+
+    async def _attempt_granted(
+        self,
+        view: ResolvedRegistry,
+        grant: _Grant,
+        call: _Call,
+        settle: Callable[..., None],
+        state: dict[str, bool],
+    ) -> _Result:
+        """`_attempt`'s body: `settle` once with what the attempt taught, `state["sent"]`."""
+        env = call.env
+        alias, dep, estimate = grant.alias, grant.dep, grant.estimate
         try:
             params = self._params(view, alias, env, dep.key)
         except inference.InferenceRejected as exc:
@@ -1065,19 +1160,17 @@ class LocalExecutor:
                 await out(event)
 
         where = (alias, dep.key)
+        api = _api_kwargs(provider, view, alias)
         with self.limits.lock:
             self.limits.in_flight[where] = self.limits.in_flight.get(where, 0) + 1
+        state["sent"] = True
         try:
-            result = await provider.call(
-                served_op, params, route, timing, sink=sink, **_api_kwargs(provider, view, alias)
-            )
+            result = await provider.call(served_op, params, route, timing, sink=sink, **api)
         except Exception as exc:
             return self._failed(view, grant, call, exc, provider, route, started, settle)
         finally:
             with self.limits.lock:
                 self.limits.in_flight[where] -= 1
-            if not settled:  # cancelled (the call's deadline, a shutdown): the probe ends
-                self.limits.settle(view, alias, dep.key, "none")
         latency = (time.monotonic() - started) * 1000
         self.metrics.observe("llmq_provider_seconds", latency / 1000, **labels)
         used = tokens.used_tokens(
@@ -1402,13 +1495,14 @@ class LocalEngine:
             salt, value.encode(), hashlib.sha256
         ).hexdigest()[:16]
         self.limits = limits or LocalLimits(
-            process_count=self.settings.local_process_count, timings=self.settings.timings
+            process_count=self.settings.local_process_count,
+            concurrency=self.settings.local_concurrency,
+            timings=self.settings.timings,
         )
         self.executor = LocalExecutor(
             providers,
             self.limits,
             view=lambda: self.registry.current,
-            concurrency=self.settings.local_concurrency,
             worker_id=self.worker_id,
             metrics=self.metrics,
             hash_id=self.hash_id,

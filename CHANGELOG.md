@@ -73,6 +73,13 @@ index (below).
   `"reason": "local_mode"`. `llmq.admin.status`, `ops.index` (`GET /`), `describe`, `drain.*`,
   `registry.get` and `tenants.hash` answer from the process. Local mode reads its settings and secrets like queue mode. See
   [Queue and local modes](docs/how-to/modes.md), with the switch ladder from the queue to local mode.
+  The concurrency cap, budgets and breaker probe are one per process, shared by the started
+  engine and the sync calls' private engine. `stop()` and `drain()` wait for each call, not
+  for the request handler that made it; only calls the shutdown cancels fail
+  `worker_shutdown` (a caller's own cancel stays a cancel). A `fixed` window whose
+  per-process share is below one unit a minute, or one estimate above it, carries what went
+  over into the next minutes as a debt. A breaker probe that fails before the provider (the
+  request cannot be built) ends the probe and gives its budget back.
 - Configurable secrets (`llm_queue.secrets`): `LLMQ_SECRETS_SOURCE` is an ordered list of
   sources (`aws-secretsmanager:<secret-id>` with one JSON secret, `file:<path>` for a
   Kubernetes secret volume, a `.json` or a `.env` file, `env`, `none` by default) with
