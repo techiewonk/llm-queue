@@ -21,6 +21,7 @@ import orjson
 
 from llm_queue._logging import get_logger
 from llm_queue.engine._codec import text as _text
+from llm_queue.engine.audit import Audit
 from llm_queue.engine.expiry import native
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import StreamQueues
@@ -29,7 +30,7 @@ from llm_queue.engine.settings import TENANT_PURGE_PARTS, InfraSettings, Layers
 from llm_queue.engine.store_guard import store_op
 from llm_queue.errors import AdminRefused, ConfigError
 from llm_queue.ids import keyed_hash
-from llm_queue.registry._lua import AUDIT_MAX_ENTRIES
+from llm_queue.registry.store import check_actor
 
 if TYPE_CHECKING:
     import redis.asyncio
@@ -197,49 +198,19 @@ class PurgeService:
         environ: Mapping[str, str] | None = None,
         *,
         secrets: Callable[[str], str | None] | None = None,
+        defaults: Mapping[str, Any] | None = None,
+        secret_names: Mapping[str, str] | None = None,
     ) -> PurgeService:
         """A standalone service from `LLMQ_*` (an admin worker); close it with `aclose()`.
 
-        Settings and store passwords are read as `LLMQueue.from_env` reads them: `secrets`
-        when given, else the sources `LLMQ_SECRETS_SOURCE` names, then the environment.
+        Read as `LLMQueue.from_env` reads its settings (same arguments): `secrets` when given,
+        else the sources `LLMQ_SECRETS_SOURCE` names, then `environ`, then `defaults`.
         """
-        from llm_queue.engine.store_client import secret_store_client
-        from llm_queue.registry.store import RegistryStore
-        from llm_queue.tuning import Tuning
+        from llm_queue.engine.admin.context import AdminContext
 
-        layers = Layers(environ, secrets)
-        settings = InfraSettings.from_layers(layers)
-        cap, options = settings.store_max_connections, Tuning().store
-        lookup = layers.get
-        state = secret_store_client(settings.store_url, lookup, "LLMQ_STORE_PASSWORD", cap, options)
-        queue_client = (
-            secret_store_client(
-                settings.queue_store_url, lookup, "LLMQ_QUEUE_STORE_PASSWORD", cap, options
-            )
-            if settings.queue_store_url
-            else None
-        )
-        config = None
-        if settings.registry or settings.registry_file:
-            config = orjson.loads(settings.registry_document())
-        registry = RegistryStore(
-            state,
-            settings.key_prefix,
-            config=config,
-            live_edit=settings.registry_live_edit,
-            allowed_hosts=settings.base_url_allowed_hosts,
-            audit_retention_days=settings.audit_retention_days,
-        )
-        service = cls(
-            state,
-            registry,
-            queue_client=queue_client,
-            queue_prefix=settings.queue_prefix,
-            settings=PurgeSettings.from_infra(settings),
-            salt=settings.id_hash_salt or "",
-            status_ttl_secs=settings.status_ttl_secs,
-        )
-        service._owned = [c for c in (queue_client, state) if c is not None]
+        ctx = AdminContext.from_layers(Layers(environ, secrets, defaults, secret_names))
+        service = ctx.purge
+        service._owned = ctx.owned
         return service
 
     async def aclose(self) -> None:
@@ -268,6 +239,7 @@ class PurgeService:
         Queues go only when empty unless `force`. `AdminRefused` while the registry still has
         the model, unless `force`.
         """
+        check_actor(actor)
         view = await self._view()
         if alias in view.registry.models and not force:
             raise AdminRefused(
@@ -295,6 +267,7 @@ class PurgeService:
         for its running calls to end; still running then, nothing is deleted and the report
         says why. `AdminRefused` while the registry still has it, unless `force`.
         """
+        check_actor(actor)
         view = await self._view()
         if deployment in self._deployments(view, alias) and not force:
             raise AdminRefused(
@@ -329,6 +302,7 @@ class PurgeService:
         (cancel every call); the last two read the request index of each model (T3), so they
         need `LLMQ_REQUEST_INDEX_ENABLED` (on by default), else `AdminRefused`.
         """
+        check_actor(actor)
         parts = self.settings.tenant_default if remove is None else frozenset(remove)
         unknown = parts - set(TENANT_PURGE_PARTS)
         if unknown or not parts:
@@ -362,6 +336,7 @@ class PurgeService:
         `wait` / `wait_secs` as in `deployment` (defaults `LLMQ_PURGE_WAIT[_SECS]`), per
         deployment.
         """
+        check_actor(actor)
         view = await self._view()
         known = set(view.registry.models)
         aliases = await self._aliases_in_store()
@@ -839,19 +814,15 @@ class PurgeService:
         }
         if parts:
             counts["targets"] = list(parts)
-        diff = [{"path": f"purge.{report.target}", "before": None, "after": counts}]
-        await self._state.xadd(
-            self.registry.audit_key,
-            {
-                "actor": report.actor,
-                "op": f"purge_{report.kind}",
-                "version": "",
-                "diff": orjson.dumps(diff),
-                "ts": f"{time.time():.6f}",  # wall time, like the Lua audit entries
-            },
-            maxlen=AUDIT_MAX_ENTRIES,
-            approximate=True,
+        await Audit(self._state, self.registry.audit_key).write(
+            kind="purge",
+            actor=report.actor,
+            op=f"purge_{report.kind}",
+            path=f"purge.{report.target}",
+            before=None,
+            after=counts,
         )
+        # The purge's own line too, with what it deleted (`llmq_admin` has the counts).
         logger.info(
             "llmq_purge",
             kind=report.kind,

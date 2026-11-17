@@ -43,7 +43,8 @@ logger = get_logger(__name__)
 
 AUDIT_RETENTION_DAYS = 90
 SECRET_FIELDS = frozenset({"role_arn", "external_id_ref", "api_key_ref"})
-_ACTOR_MAX = 200
+# The longest audit actor, on every surface and every write (review B-06).
+ACTOR_MAX_CHARS = 128
 # First retry of a lost publish / edit waits up to 40 ms, doubling per try (jittered, CO-10).
 _CONFLICT_BACKOFF_SECS = 0.02
 # ... and never more than this: uncapped, try 21 of a publish could wait 0.02 * 2**21 s, about
@@ -308,8 +309,8 @@ def check_actor(actor: str) -> str:
     Audit rows and log lines print it as given; a newline or escape sequence there could forge
     a second entry or rewrite a terminal.
     """
-    if not actor.strip() or len(actor) > _ACTOR_MAX:
-        raise ConfigError(f"the audit actor must be 1 to {_ACTOR_MAX} characters")
+    if not actor.strip() or len(actor) > ACTOR_MAX_CHARS:
+        raise ConfigError(f"the audit actor must be 1 to {ACTOR_MAX_CHARS} characters")
     if any(ord(c) < 32 or 127 <= ord(c) < 160 for c in actor):
         raise ConfigError("the audit actor must not contain control characters")
     return actor
@@ -1010,7 +1011,7 @@ class RegistryStore:
         check_actor(actor)
         kept = await self.kept(version)
         note = f" (rollback to {version})"
-        composed = actor[: _ACTOR_MAX - len(note)] + note  # a long actor went past the limit
+        composed = actor[: ACTOR_MAX_CHARS - len(note)] + note  # a long actor went past the limit
         for attempt in range(self._edit_retries):
             if attempt:
                 await self._backoff(attempt)

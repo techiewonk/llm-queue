@@ -24,6 +24,7 @@ from llm_queue.registry.settings import SETTINGS
 from llm_queue.registry.store import (
     _CONFLICT_BACKOFF_MAX_SECS,
     _PROTECTED_WHY,
+    ACTOR_MAX_CHARS,
     PublishResult,
     RegistryConflict,
     RegistryStore,
@@ -338,10 +339,13 @@ async def test_rollback_retries_when_a_deploy_publishes_in_between(
         return PublishResult("published", doc["registry_version"])
 
     monkeypatch.setattr(store, "publish", publish)
-    result = await store.rollback(1, actor="x" * 200)
+    result = await store.rollback(1, actor="x" * ACTOR_MAX_CHARS)
     assert result == PublishResult("published", 4)
     assert [v for v, _ in published] == [3, 4]
-    assert all(len(actor) <= 200 and actor.endswith("(rollback to 1)") for _, actor in published)
+    assert all(
+        len(actor) <= ACTOR_MAX_CHARS and actor.endswith("(rollback to 1)")
+        for _, actor in published
+    )
 
 
 async def test_rollback_of_a_corrupt_history_entry_is_a_config_error(

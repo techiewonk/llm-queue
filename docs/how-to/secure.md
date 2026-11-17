@@ -94,9 +94,10 @@ app.include_router(
   `X-LLMQ-Admin` header or a JSON body cross-site without a CORS preflight, so a page an admin
   visits cannot post an edit with the admin's cookies.
 - Every write is a dry run unless its body says `"dry_run": false`, and is audited under an
-  actor: `actor(request)` (the authenticated name, never a client-supplied value; 1-200
-  characters without control characters), else, with the token, `token:<X-LLMQ-Actor>`
-  (`token:unknown` without the header). A shared token has no identity: the `X-LLMQ-Actor`
+  actor: `actor(request)` (the authenticated name, never a client-supplied value; 1-128
+  characters without control characters, checked by every write before it acts), else, with
+  the token, `token:<X-LLMQ-Actor>` (the claimed name cut to fit 128; `token:unknown` without
+  the header). A shared token has no identity: the `X-LLMQ-Actor`
   value is a claimed name, labelled as such; apps with real auth pass `actor=`.
 - `GET /dlq/{entry_id}?unsafe=true` returns message bodies (prompts) only with
   `LLMQ_ADMIN_DLQ_BODIES_ENABLED=true`.

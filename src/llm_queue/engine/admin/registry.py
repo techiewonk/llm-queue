@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 from llm_queue.engine.admin.context import AdminContext
 from llm_queue.engine.fairness import hash_tenant_names, hash_tenant_path
 from llm_queue.errors import ConfigError
-from llm_queue.registry.store import SECRET_FIELDS, audit_diff
+from llm_queue.registry.store import SECRET_FIELDS, audit_diff, check_actor
 
 if TYPE_CHECKING:
     from llm_queue.registry.resolve import ResolvedRegistry
@@ -263,6 +263,7 @@ class ModelsAdmin:
         """
         if wait_secs < 0:
             raise ConfigError("wait_secs must be 0 or more")
+        check_actor(actor)
         out = await self._switch(model, False, actor=actor, dry_run=dry_run)
         alias = out["model"]
         out["waiting"] = await self._waiting(alias)
@@ -270,7 +271,7 @@ class ModelsAdmin:
         if dry_run:
             return out
         await self._ctx.audit.write(
-            actor=actor, op="model_drain", path=f"models.{alias}", before=None,
+            kind="models", actor=actor, op="model_drain", path=f"models.{alias}", before=None,
             after={"enabled": False, "waiting": out["waiting"], "wait_secs": wait_secs},
         )  # fmt: skip
         if wait_secs <= 0:

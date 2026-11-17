@@ -23,19 +23,19 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, Self
 
-import orjson
 from redis.exceptions import ConnectionError as StoreConnectionError
 from redis.exceptions import TimeoutError as StoreTimeoutError
 
 from llm_queue._logging import get_logger
 from llm_queue.engine._codec import text as _text
+from llm_queue.engine.audit import Audit
 from llm_queue.engine.envelope import Meta, Reply
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import RETENTION_SECS, StreamQueues
 from llm_queue.engine.requests import FINAL_STATES, RequestStore
 from llm_queue.engine.store_guard import store_op
 from llm_queue.errors import AdminRefused, ConfigError
-from llm_queue.registry._lua import AUDIT_MAX_ENTRIES
+from llm_queue.registry.store import check_actor
 
 if TYPE_CHECKING:
     import redis.asyncio
@@ -301,48 +301,21 @@ class RequestsAdmin:
         environ: Mapping[str, str] | None = None,
         *,
         secrets: Callable[[str], str | None] | None = None,
+        defaults: Mapping[str, Any] | None = None,
+        secret_names: Mapping[str, str] | None = None,
     ) -> RequestsAdmin:
         """A standalone service from `LLMQ_*` (CLI, admin worker); close it with `aclose()`.
 
-        Settings and store passwords are read as `LLMQueue.from_env` reads them.
+        Read as `LLMQueue.from_env` reads its settings (same arguments): `secrets` when given,
+        else the sources `LLMQ_SECRETS_SOURCE` names, then `environ`, then `defaults`.
         """
-        from llm_queue.engine.settings import InfraSettings, Layers
-        from llm_queue.engine.store_client import secret_store_client
-        from llm_queue.ids import keyed_hash
-        from llm_queue.registry.store import RegistryStore
-        from llm_queue.tuning import Tuning
+        from llm_queue.engine.admin.context import AdminContext
+        from llm_queue.engine.settings import Layers
 
-        layers = Layers(environ, secrets)  # `secrets`, else LLMQ_SECRETS_SOURCE, then the env
-        settings = InfraSettings.from_layers(layers)
-        cap, options = settings.store_max_connections, Tuning().store
-        lookup = layers.get
-        state = secret_store_client(settings.store_url, lookup, "LLMQ_STORE_PASSWORD", cap, options)
-        queue_client = (
-            secret_store_client(
-                settings.queue_store_url, lookup, "LLMQ_QUEUE_STORE_PASSWORD", cap, options
-            )
-            if settings.queue_store_url
-            else None
-        )
-        registry = RegistryStore(
-            state,
-            settings.key_prefix,
-            live_edit=settings.registry_live_edit,
-            allowed_hosts=settings.base_url_allowed_hosts,
-            audit_retention_days=settings.audit_retention_days,
-        )
-        salt = settings.id_hash_salt or ""
-        service = cls(
-            state,
-            queue_client=queue_client,
-            keys=Keys(settings.key_prefix),
-            registry=registry,
-            queue_prefix=settings.queue_prefix,
-            hash_id=lambda value: keyed_hash(salt, value),
-            settings=AdminSettings.from_infra(settings),
-            status_ttl_secs=settings.status_ttl_secs,
-        )
-        service._owned = [c for c in (queue_client, state) if c is not None]
+        ctx = AdminContext.from_layers(Layers(environ, secrets, defaults, secret_names))
+        assert ctx.requests is not None  # `from_layers` builds it
+        service = ctx.requests
+        service._owned = ctx.owned
         return service
 
     async def aclose(self) -> None:
@@ -555,6 +528,7 @@ class RequestsAdmin:
         (the default) writes nothing; a real one writes one audit entry with counts, named
         `op` (`purge_queue` when `llmq.admin.purge.queue` asks).
         """
+        check_actor(actor)
         self._check_state(state)
         if request_ids is not None and (tenant is not None or tenant_hash is not None):
             raise ConfigError("give request_ids, or a model and tenant: not both")
@@ -656,6 +630,7 @@ class RequestsAdmin:
         `max_wait_secs` and its place among waiting calls by arrival (`pos`, owner Q9).
         `limit`: at most this many (oldest first). Dry run by default.
         """
+        check_actor(actor)
         view = await self._view()
         alias = view.registry.alias_of(model)
         h = self.pick_tenant(tenant, tenant_hash)
@@ -740,6 +715,7 @@ class RequestsAdmin:
         deadline not later than the current one (the call's own timeout included) is
         `skipped.already`. Needs the request index (`AdminRefused` when off). Dry run by default.
         """
+        check_actor(actor)
         if not timeout_secs > 0:
             raise ConfigError("timeout_secs must be above 0")
         self._need_index("extended")
@@ -1124,27 +1100,8 @@ class RequestsAdmin:
             "sample_ids": report.sample_ids,
         }
         path = f"requests.{report.model or '*'}.{report.tenant or '*'}"
-        diff = [{"path": path, "before": None, "after": after}]
-        await self._state.xadd(
-            self.registry.audit_key,
-            {
-                "actor": report.actor,
-                "op": report.op,
-                "version": "",
-                "diff": orjson.dumps(diff),
-                "ts": f"{time.time():.6f}",
-            },
-            maxlen=AUDIT_MAX_ENTRIES,
-            approximate=True,
-        )
-        logger.info(
-            "llmq_admin",
-            op=report.op,
-            actor=report.actor,
-            model=report.model,
-            tenant=report.tenant,
-            matched=report.matched,
-            changed=report.changed,
+        await Audit(self._state, self.registry.audit_key).write(
+            kind="requests", actor=report.actor, op=report.op, path=path, before=None, after=after
         )
 
 

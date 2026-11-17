@@ -13,6 +13,7 @@ from llm_queue.engine.admin.context import AdminContext
 from llm_queue.engine.admin.requests import RequestsAdapter
 from llm_queue.engine.queue import RETENTION_SECS
 from llm_queue.errors import ConfigError
+from llm_queue.registry.store import check_actor
 
 MAX_DLQ_COUNT = 10_000
 MAX_DLQ_IDS = 1000
@@ -185,6 +186,7 @@ class DlqAdmin:
         dry_run: bool = True,
     ) -> dict[str, Any]:
         """Send up to `count` dead letters back to their queue (a body-less one is dropped)."""
+        check_actor(actor)
         if not 1 <= count <= MAX_DLQ_COUNT:
             raise ConfigError(f"count must be 1-{MAX_DLQ_COUNT}")
         queue, keep = await self._queue(model, job, priority)
@@ -194,8 +196,8 @@ class DlqAdmin:
                     "dry_run": True}  # fmt: skip
         moved = await self._ctx.queues.redrive(queue, count, keep)
         await self._ctx.audit.write(
-            actor=actor, op="dlq_redrive", path=f"dlq.{queue}", before={"dead_letters": dead},
-            after={"moved": moved},
+            kind="dlq", actor=actor, op="dlq_redrive", path=f"dlq.{queue}",
+            before={"dead_letters": dead}, after={"moved": moved},
         )  # fmt: skip
         return {"queue": queue, "moved": moved, "dead_letters": dead - moved, "dry_run": False}
 
@@ -210,6 +212,7 @@ class DlqAdmin:
         dry_run: bool = True,
     ) -> dict[str, Any]:
         """Delete every dead letter of a queue, or only `entry_ids`."""
+        check_actor(actor)
         queue, _ = await self._queue(model, job, priority)
         client = self._ctx.queues.client
         key = self._ctx.keys.queue(queue, "dlq")
@@ -228,7 +231,7 @@ class DlqAdmin:
             await self._ctx.queues.purge_dead(queue)
             deleted = dead
         await self._ctx.audit.write(
-            actor=actor, op="dlq_purge", path=f"dlq.{queue}", before=None,
+            kind="dlq", actor=actor, op="dlq_purge", path=f"dlq.{queue}", before=None,
             after={"deleted": deleted, "by_id": entry_ids is not None},
         )  # fmt: skip
         return {"queue": queue, "deleted": deleted, "dry_run": False}
@@ -339,14 +342,15 @@ class PurgeAdmin:
 
     async def unschedule(self, target: str, *, actor: str, dry_run: bool = True) -> dict[str, Any]:
         """Drop one scheduled auto purge (`alias` or `alias/account/name`)."""
+        check_actor(actor)
         if dry_run:
             listed = {row["target"] for row in await self._ctx.purge.scheduled()}
             return {"target": target, "cancelled": target in listed, "dry_run": True}
         cancelled = await self._ctx.purge.cancel_scheduled(target)
         if cancelled:
             await self._ctx.audit.write(
-                actor=actor, op="purge_unschedule", path=f"purge.{target}", before="scheduled",
-                after=None,
+                kind="purge", actor=actor, op="purge_unschedule", path=f"purge.{target}",
+                before="scheduled", after=None,
             )  # fmt: skip
         return {"target": target, "cancelled": cancelled, "dry_run": False}
 

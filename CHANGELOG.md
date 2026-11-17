@@ -273,6 +273,16 @@ index (below).
   `?tenant=` (400) and take `tenant_hash` (the CLI and Python still take a name and hash it
   locally); `POST /tenants/hash` needs the write guard, as with the hashes the reads show it
   would tell a read token which tenant a hash is.
+- Every admin write checks its actor before it acts (1-128 characters, no control
+  characters): dead letters, purges, unschedule, drains, model drains and request changes took
+  any text before, and only registry writes checked it (at 200 characters, while HTTP cut at
+  128). Every audit entry outside the registry's own script goes through one writer
+  (`Audit.write`), which logs one `llmq_admin` line with a `kind`; purges also keep their
+  `llmq_purge` line.
+- `AdminServices.from_env`, `RequestsAdmin.from_env` and `PurgeService.from_env` take
+  `defaults=` and `secret_names=` like `LLMQueue.from_env`, and share one wiring
+  (`AdminContext.from_layers(layers)`): an admin worker could not reproduce an app configured
+  through `defaults=`.
 - Drain API (plan A1-A5). `pause_receiving()` stays sync and callable from any thread;
   `resume_receiving()` undoes it (ready again when started; `LLMQueueError` after `stop()`);
   `await drain(drain_secs=None)` pauses and waits for running calls and jobs (it does not

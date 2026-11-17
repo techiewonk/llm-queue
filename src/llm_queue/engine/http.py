@@ -36,7 +36,7 @@ from llm_queue.errors import (
     StoreUnavailable,
     UnknownModel,
 )
-from llm_queue.registry.store import RegistryConflict
+from llm_queue.registry.store import ACTOR_MAX_CHARS, RegistryConflict
 
 if TYPE_CHECKING:
     from llm_queue.engine.admin import AdminServices
@@ -49,7 +49,6 @@ RETRY_AFTER_SECS = 1
 # Bounds on what a client sends before anything reads the store or diffs the registry (FO-15).
 MAX_ID_CHARS = 256
 MAX_EDIT_PATHS = 100
-MAX_ACTOR_CHARS = 128
 TENANT_IN_URL = (
     "a tenant name stays out of URLs: pass tenant_hash (get it with `llm-queue tenants hash "
     "NAME` or POST /tenants/hash)"
@@ -313,7 +312,9 @@ def status_router(
     def who(request: Any) -> str:
         if actor is not None:
             return f"http:{actor(request)}"
-        claimed = request.headers.get(actor_header, "").strip()[:MAX_ACTOR_CHARS]
+        # Cut to fit `token:` within the one actor limit (review B-06): control characters
+        # in a claimed name are refused by the audit's `check_actor` (400).
+        claimed = request.headers.get(actor_header, "").strip()[: ACTOR_MAX_CHARS - 6]
         return f"token:{claimed or 'unknown'}"
 
     def reply(result: Response) -> Any:

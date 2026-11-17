@@ -17,8 +17,12 @@ Transport rules (authentication, the CSRF header, status codes and exit codes) a
   run runs every check the real change runs and reports what it would do; nothing is written.
 - Every real write is **audited**: one entry in the registry's audit stream (`audit list`,
   `GET /audit`) with `actor`, `op`, the path it touched and its counts (never a tenant name),
-  and one `llmq_admin` log line. Registry edits and publishes are audited by the registry's own
-  script (`op` `edit` / `publish`).
+  and one `llmq_admin` log line (`kind`: `requests`, `purge`, `dlq`, `drain`, `models`), all
+  through one writer (`engine/audit.py`); a purge also logs `llmq_purge` with what it deleted.
+  Registry edits and publishes are audited by the registry's own script (`op` `edit` /
+  `publish`).
+- The actor is 1-128 characters without control characters, on every surface; every write
+  checks it before it acts (`ConfigError`, HTTP 400), dry runs too.
 - The actor is `--actor` (default the OS user) on the CLI, `http:<actor(request)>` with the
   app's `actor=` function, or `token:<X-LLMQ-Actor>` with the admin token and no `actor=`
   (`token:unknown` without the header: a claimed name, marked as such).

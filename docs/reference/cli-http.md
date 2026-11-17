@@ -18,7 +18,8 @@ llm-queue --actor ann requests cancel --id r-1 --yes   # cancels, audited as ann
   settings and no store.
 - `--actor NAME` (before the resource) records who made a change in the audit; without it the
   OS user is used, looked up only by commands that write (`uid:<n>` when the user has no passwd
-  entry, as in a container run under a bare UID). 1-200 characters without control characters.
+  entry, as in a container run under a bare UID). 1-128 characters without control characters,
+  checked by every write before it acts (registry, requests, dead letters, purges, drains).
 - A command that changes something is a **dry run unless given `--yes`**: it prints what it
   would do. There is no `--dry-run` flag.
 - Values of `registry set path=value` are JSON when they parse (`400`, `true`, `["a"]`), else

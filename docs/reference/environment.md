@@ -36,8 +36,11 @@ Three layers, highest first: **the secrets**, then **`environ`**, then **`defaul
   name. It is merged over `LLMQ_SECRET_NAMES` (the argument wins per setting). The order of the
   layers stays the same.
 
-The CLI (`llm-queue`), `AdminServices.from_env` and `PurgeService.from_env` read the same
-layers, so `LLMQ_SECRETS_SOURCE` applies to them too.
+The CLI (`llm-queue`), `AdminServices.from_env`, `RequestsAdmin.from_env` and
+`PurgeService.from_env` read the same layers, so `LLMQ_SECRETS_SOURCE` applies to them too. The
+three `from_env` take `LLMQueue.from_env`'s `secrets=`, `defaults=` and `secret_names=`, and
+build on one wiring (`AdminContext.from_layers`), so an admin worker reproduces an app that
+configures through `defaults=`.
 
 Two groups name one thing two ways: `LLMQ_STORE_URL` or the store parts (`LLMQ_STORE_HOST`,
 `LLMQ_STORE_PORT`, `LLMQ_STORE_DB`, `LLMQ_STORE_TLS_ENABLED`), and `LLMQ_REGISTRY` or
