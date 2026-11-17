@@ -155,6 +155,11 @@ class InfraSettings:
     lease_secs: float = 60.0
     caller_ttl_secs: int = 30
     drain_secs: float = 25.0  # inside the default Kubernetes grace period of 30 s
+    # Drain (0.2.0 A1, A4): a pause hands held calls back at once (owner Q2); a file whose
+    # appearance pauses every process of the pod (empty: off), polled this often.
+    drain_handback_enabled: bool = True  # LLMQ_DRAIN_HANDBACK_ENABLED
+    drain_file: str = ""  # LLMQ_DRAIN_FILE
+    drain_poll_secs: float = 1.0  # LLMQ_DRAIN_POLL_SECS
     local_limit_cap: int = 10
     metrics_sink: str = "emf"
     mode: str = "both"
@@ -287,6 +292,11 @@ class InfraSettings:
         admin_header = str(get("ADMIN_HEADER", "X-LLMQ-Token") or "").strip()
         if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", admin_header):
             problems.append("LLMQ_ADMIN_HEADER must be a header name (letters, digits, `-`)")
+        hand_back = str(get("DRAIN_HANDBACK_ENABLED", "true")).strip().lower()
+        if hand_back not in _TRUE + _FALSE:
+            problems.append("LLMQ_DRAIN_HANDBACK_ENABLED must be true or false (on / off)")
+            hand_back = "true"
+        drain_file = str(get("DRAIN_FILE", "") or "").strip()
         mode = str(get("MODE", "both"))
         if mode not in ("both", "caller", "worker"):
             problems.append("LLMQ_MODE must be both, caller or worker")
@@ -388,6 +398,9 @@ class InfraSettings:
             drain_secs=number(
                 "DRAIN_SECS", 25.0, zero=True, hi=3600
             ),  # stop(drain_secs=0) is valid
+            drain_handback_enabled=hand_back in _TRUE,
+            drain_file=drain_file,
+            drain_poll_secs=number("DRAIN_POLL_SECS", 1.0, lo=0.1, hi=60),
             local_limit_cap=number("LOCAL_LIMIT_CAP", 10, int, hi=100_000),
             metrics_sink=sink,
             mode=mode,

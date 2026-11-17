@@ -117,7 +117,10 @@ For a store with replicas, also set `min-replicas-to-write` on the primary: a wr
 | `LLMQ_RESULT_TTL_SECS` | 300 | above 0 to 2147483647 (whole) | How long a stored result lives; at least `Tuning.engine.result_recheck_secs` (60), or start-up fails |
 | `LLMQ_RESULT_DEDUPE_SECS` | 0 | 0 to 2147483647 (whole) | Keep a result with a library-made id this long after it was read (0: delete on read) |
 | `LLMQ_STATUS_TTL_SECS` | 1800 | 1 to 2147483647 (whole) | How long a call's status record lives; `start()` warns about a model whose timeout is longer |
-| `LLMQ_DRAIN_SECS` | 25 | 0 to 3600 | Default `drain_secs` of `stop()` (0 returns held work at once); fits the Kubernetes default grace period of 30 s (see [Operate](../how-to/operate.md#deploys-and-restarts)) |
+| `LLMQ_DRAIN_SECS` | 25 | 0 to 3600 | Default `drain_secs` of `stop()` and `drain()` (0 returns held work at once); fits the Kubernetes default grace period of 30 s (see [Operate](../how-to/operate.md#deploys-and-restarts)) |
+| `LLMQ_DRAIN_HANDBACK_ENABLED` | true | true or false | `pause_receiving()` returns the calls held here waiting for budget to the queue at once, for another pod; false keeps them here until `stop()` (0.1.1 behaviour). See [Drain](../how-to/operate.md#drain-a-pod) |
+| `LLMQ_DRAIN_FILE` | empty | a path | A file whose appearance (an mtime newer than the queue's construction, minus 1 s) pauses every process of the pod; a resumed process pauses again only when it is touched anew. Empty: off. For a preStop hook in a pod with several processes |
+| `LLMQ_DRAIN_POLL_SECS` | 1 | 0.1 to 60 | How often each process checks `LLMQ_DRAIN_FILE` |
 | `LLMQ_LOCAL_LIMIT_CAP` | 10 | above 0 to 100000 (whole) | Calls per process and model run without the store under `store_down: static_cap` |
 
 ## Purge

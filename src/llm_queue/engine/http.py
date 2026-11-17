@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from llm_queue._logging import get_logger
 from llm_queue.engine.store_guard import STORE_DOWN
-from llm_queue.errors import ConfigError, MissingExtra, PurgeRefused, UnknownModel
+from llm_queue.errors import ConfigError, LLMQueueError, MissingExtra, PurgeRefused, UnknownModel
 from llm_queue.registry.store import (
     _SECRET_FIELDS,  # one set for the audit and this view, so a new secret is hidden in both
     LiveEditRefused,
@@ -307,8 +307,17 @@ def status_router(
     allow_writes: bool = False,
     actor: Callable[[Any], str] | None = None,
     metrics_route: bool = False,
+    drain_routes: bool = False,
+    drain: Any = None,
 ) -> Any:
     """A FastAPI `APIRouter` with the handlers (`pip install 'llm-queue[http]'`).
+
+    `drain_routes` (0.2.0 A5): `POST /drain` pauses receiving, `POST /resume` undoes it, both
+    behind `dependencies` (required, else `ConfigError`) and the `X-LLMQ-Admin` header; `GET
+    /drain` is open and only reads `draining`, `since`, `held` and `running`. `drain` is what
+    they act on (`pause_receiving`, `resume_receiving`, `drain_status`): the `LLMQueue`
+    (jobs too), default the engine. They reach one process; multi-process pods use
+    `LLMQ_DRAIN_FILE`.
 
     `metrics_route`: also `GET /metrics`, the Prometheus exposition of a `metrics_sink=
     prometheus` engine (needs the `metrics` extra), open like the health routes so a scraper
@@ -338,6 +347,11 @@ def status_router(
         raise ConfigError("allow_writes=True needs actor= (who made the edit, for the audit)")
     if allow_writes and not dependencies:
         raise ConfigError("allow_writes=True needs dependencies= (the app's admin check)")
+    if drain_routes and not dependencies:
+        # An open POST /drain lets anyone who reaches the app take the pod out of service.
+        raise ConfigError(
+            "drain_routes=True needs dependencies= or an admin token (who may drain the pod)"
+        )
     if not dependencies:
         # `/registry` lists accounts, regions, model ids and base URLs: open to anyone who
         # reaches the app unless it sits behind its own auth (FO-14).
@@ -421,6 +435,34 @@ def status_router(
         return reply(
             await handlers.block(actor=who(request), region=region, account=account, on=on)
         )
+
+    if drain_routes:
+        target = drain if drain is not None else engine
+
+        @router.get("/drain")
+        async def drain_status() -> Any:
+            return reply((200, target.drain_status()))
+
+        @router.post("/drain", dependencies=guarded)
+        async def drain_pause(request: Request) -> Any:
+            refused = admin_header(request)
+            if refused:
+                return reply(refused)
+            target.pause_receiving()
+            logger.info("drain_requested", by=who(request))
+            return reply((200, target.drain_status()))
+
+        @router.post("/resume", dependencies=guarded)
+        async def drain_resume(request: Request) -> Any:
+            refused = admin_header(request)
+            if refused:
+                return reply(refused)
+            try:
+                target.resume_receiving()
+            except LLMQueueError as exc:  # stopped: it cannot take work again
+                return reply((409, {"error": str(exc)}))
+            logger.info("drain_resumed", by=who(request))
+            return reply((200, target.drain_status()))
 
     if allow_writes:
         purges = PurgeHandlers(engine, allow_writes=True)

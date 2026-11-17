@@ -362,8 +362,23 @@ class JobRunner:
             self._tasks.append(asyncio.create_task(self._loop(name)))
 
     def pause(self) -> None:
-        """Take no new jobs; running ones go on (`stop()` follows)."""
+        """Take no new jobs; running ones go on (`stop()` or `resume()` follows)."""
         self._paused = True
+
+    def resume(self) -> None:
+        """Undo `pause`: take jobs again (0.2.0 A2); after `stop()` the loops are gone anyway."""
+        self._paused = False
+
+    @property
+    def running(self) -> int:
+        """Jobs running in this process now."""
+        return len(self._running)
+
+    async def wait_running(self, timeout_secs: float) -> bool:
+        """Wait up to `timeout_secs` for the running jobs; True when none is left."""
+        if self._running:
+            await asyncio.wait(set(self._running), timeout=max(0.0, timeout_secs))
+        return not self._running
 
     async def stop(self, drain_secs: float = 10.0) -> None:
         """Stop receiving, let running jobs finish (up to `drain_secs`), then stop.
