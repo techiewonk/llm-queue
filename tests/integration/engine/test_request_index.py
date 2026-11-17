@@ -298,6 +298,30 @@ async def test_failure_expiry_and_cancel_remove_the_entry(make: Make) -> None:
     await _wait_for(empty, 10)
 
 
+async def test_a_cancel_seen_twice_still_ends_a_hung_running_call(make: Make) -> None:
+    """The channel and the key check both cancelled the run task; the second cancel landed in
+    its cleanup, so no reply was written and the caller waited out its deadline (a flake of
+    the test above, about one run in four)."""
+    engine, _ = await make(
+        {"small": {"timeout_secs": 30, "attempt_timeout_secs": 20}}, {"defaults": {"hang": True}}
+    )
+    task = asyncio.create_task(engine.call("small", CHAT, tenant_id="acme", timeout_secs=30))
+
+    async def running() -> bool:
+        return any(h.run is not None and not h.run.done() for h in engine._held.values())
+
+    await _wait_for(running, 10)
+    rid = next(iter(engine._held))
+    started = asyncio.get_running_loop().time()
+    await engine.cancel(rid)
+    for _ in range(20):  # the heartbeat's key check, racing the channel's notice
+        await engine._check_cancels()
+        await asyncio.sleep(0)
+    with pytest.raises(CallFailed, match="cancelled"):
+        await task
+    assert asyncio.get_running_loop().time() - started < 5
+
+
 async def test_dead_letter_removes_the_entry(make: Make) -> None:
     engine, _ = await make(worker=False)
     h = engine.hash_id("acme")

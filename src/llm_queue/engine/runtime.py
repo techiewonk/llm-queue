@@ -2215,9 +2215,11 @@ class Engine:
                 continue
             # Flagged even before its run task started: a cancel read between the grant and
             # the task's first step was dropped, and the attempt ran to its end unless the
-            # heartbeat's key check (a third of the lease) caught it first.
+            # heartbeat's key check (a third of the lease) caught it first. Cancelled once: a
+            # second cancel landed in `_run`'s cleanup and killed it before the reply was written.
+            already = held.cancelled
             held.cancelled = True
-            if held.run is not None and not held.run.done():
+            if not already and held.run is not None and not held.run.done():
                 held.run.cancel()
 
     async def _check_cancels(self) -> None:
@@ -2233,8 +2235,10 @@ class Engine:
         flags = await self.state.mget(keys)
         missed = False
         for held, flag in zip(running, flags, strict=True):
-            if flag is not None and held.run is not None and not held.run.done():
-                missed = missed or not held.cancelled  # the channel never announced it
+            if flag is None or held.cancelled:  # not cancelled, or cancelled already (once)
+                continue
+            if held.run is not None and not held.run.done():
+                missed = True  # the channel never announced it
                 held.cancelled = True
                 held.run.cancel()
         self._cancel_misses = self._cancel_misses + 1 if missed else 0
@@ -3723,16 +3727,15 @@ class Engine:
                 raise
             # Cancelled by a caller: give the grant back, reply `cancelled`. A stream that sent
             # chunks ends with an error entry first: its caller waited out its idle timer with
-            # no `partial_text`, and the flush timer wrote one more batch (R3ST-3).
-            try:
-                partial = await self._end_stream(held, "cancelled", "the call was cancelled")
-                await self._give_back(held)
-                await self._finish_call(
-                    held, "cancelled", "cancelled", final="cancelled", partial=partial
-                )
-            except Exception as exc:
-                logger.warning("cancel_failed", request_id=held.envelope.request_id, error=str(exc))
-                await self._release(held)
+            # no `partial_text`, and the flush timer wrote one more batch (R3ST-3). Shielded: a
+            # second cancel of this task (the channel and the key check both saw the cancel)
+            # killed the cleanup, and the call stayed `running` until its caller's deadline.
+            settle = asyncio.create_task(self._settle_cancelled(held))
+            self._settling.add(settle)
+            settle.add_done_callback(self._settling.discard)
+            while not settle.done():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.shield(settle)
         except Exception as exc:
             # A store outage, a store refusal (OOM) or a bug mid-call. Never leave the call held
             # with nobody working on it (the heartbeat would hide its message for good): give
@@ -3755,6 +3758,18 @@ class Engine:
         finally:
             if slots is not None and (event := self._wake.get(held.envelope.model)) is not None:
                 event.set()  # a worker slot is free: the model's loop receives at once
+
+    async def _settle_cancelled(self, held: _Held) -> None:
+        """End a call cancelled while it ran: grant back, `cancelled` to every caller."""
+        try:
+            partial = await self._end_stream(held, "cancelled", "the call was cancelled")
+            await self._give_back(held)
+            await self._finish_call(
+                held, "cancelled", "cancelled", final="cancelled", partial=partial
+            )
+        except Exception as exc:
+            logger.warning("cancel_failed", request_id=held.envelope.request_id, error=str(exc))
+            await self._release(held)
 
     async def _attempts(self, held: _Held, decision: Decision, attempt: int, alias: str) -> None:
         throttles = 0
