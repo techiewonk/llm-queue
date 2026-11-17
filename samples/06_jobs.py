@@ -3,11 +3,11 @@
 Register the job function in every worker process before `start()`, with `concurrency` to cap
 its runs per process; any process can send a job. A job that raises is retried with a growing
 delay, so make it safe to run twice (upsert by `current_job().job_id`); when the retries run
-out it is dead-lettered. `job_dead_letters` lists the dead jobs and `redrive_jobs` sends them
-back once the cause is fixed. LLM calls made inside a job go through the same queue and
-budgets as user calls, at normal priority. Jobs return nothing: this sample learns "done"
-through an in-process `asyncio.Queue`, which works only because sender and worker are one
-process.
+out it is dead-lettered. `llmq.admin.dlq.list(job=...)` lists the dead jobs and
+`llmq.admin.dlq.redrive(job=...)` sends them back once the cause is fixed. LLM calls made
+inside a job go through the same queue and budgets as user calls, at normal priority. Jobs
+return nothing: this sample learns "done" through an in-process `asyncio.Queue`, which works
+only because sender and worker are one process.
 
 The retry settings here are cut to a second so the dead letter shows quickly; an app keeps
 the defaults (5 s doubling to 5 min, for about an hour).
@@ -65,15 +65,16 @@ async def main() -> None:
         async with asyncio.timeout(30):
             while not dead:
                 await asyncio.sleep(0.2)
-                dead = await llmq.job_dead_letters("sync_feed")
+                dead = (await llmq.admin.dlq.list(job="sync_feed"))["letters"]
         print(f"dead letter: job {dead[0]['job_id']}, fails {dead[0]['fails']}")
 
         feed["down"] = False  # the cause is fixed: run the dead jobs again
-        print(f"redriven: {await llmq.redrive_jobs('sync_feed')}")
+        redrive = await llmq.admin.dlq.redrive(job="sync_feed", actor="sample", dry_run=False)
+        print(f"redriven: {redrive['moved']}")
         rerun = await asyncio.wait_for(done.get(), timeout=30)
         print(f"after redrive: {rerun}")
         assert rerun["feed"] == "nse"
-        assert not await llmq.job_dead_letters("sync_feed")
+        assert not (await llmq.admin.dlq.list(job="sync_feed"))["letters"]
     finally:
         await llmq.stop()
 

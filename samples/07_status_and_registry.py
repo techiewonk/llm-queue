@@ -1,9 +1,10 @@
 """Operate: status of models and calls, and live registry edits (admin pages, runbooks).
 
 `status(model)` shows waiting calls, calls in progress and each deployment's RPM / TPM used
-and left this minute. `request_status(id)` follows one call. `registry.set` changes a safe
-setting live in every pod (audited); `registry.log` lists the changes. The CLI `llm-queue`
-and the HTTP router (`llmq.http_router()`, extra `[http]`) expose the same.
+and left this minute. `request_status(id)` follows one call. `llmq.admin.registry.set` changes
+a safe setting live in every pod (audited; a dry run unless `dry_run=False`);
+`llmq.admin.audit.list` lists the changes. The CLI `llm-queue` and the HTTP router
+(`llmq.http_router()`, extra `[http]`) expose the same operations.
 
 Per-tenant fairness is a registry setting too, off by default: `"quota"` caps each tenant's
 rpm / tpm, `"share"` splits the budget by weight and lends what is unused, `"fair_queue"`
@@ -44,25 +45,29 @@ async def main() -> None:
             )
         print(f"waiting={model['waiting']} in_progress={model['in_progress']}")
 
-        before = llmq.registry.current.value("gpt20b", "rpm")
-        await llmq.registry.set({"rpm": 45}, model="gpt20b", actor="sample")
-        print(f"gpt20b rpm {before} -> {llmq.registry.current.value('gpt20b', 'rpm')} (live)")
-        for entry in await llmq.registry.log(count=3):
+        registry = llmq.admin.registry
+        before = registry.current.value("gpt20b", "rpm")
+        plan = await registry.set({"rpm": 45}, model="gpt20b", actor="sample")  # a dry run
+        print(f"plan: {plan['diff']}")
+        await registry.set({"rpm": 45}, model="gpt20b", actor="sample", dry_run=False)
+        print(f"gpt20b rpm {before} -> {registry.current.value('gpt20b', 'rpm')} (live)")
+        for entry in (await llmq.admin.audit.list(3))["entries"]:
             print(f"  audit: {entry}")
-        await llmq.registry.set({"rpm": before}, model="gpt20b", actor="sample")
+        await registry.set({"rpm": before}, model="gpt20b", actor="sample", dry_run=False)
 
         # Fairness, live: at most 30 calls a minute per tenant, then off again (None deletes
         # the model's own setting, back to the registry default "off").
-        await llmq.registry.set(
-            {"fairness": {"mode": "quota", "rpm": 30}}, model="gpt20b", actor="sample"
-        )
+        await registry.set(
+            {"fairness": {"mode": "quota", "rpm": 30}}, model="gpt20b", actor="sample",
+            dry_run=False,
+        )  # fmt: skip
         try:
             with request_context(tenant_id="acme"):
                 await llmq.converse("gpt20b", REQUEST)
             print(f"fairness on: {(await llmq.status('gpt20b'))['fairness']}")
         finally:
-            await llmq.registry.set({"fairness": None}, model="gpt20b", actor="sample")
-        mode = llmq.registry.current.value("gpt20b", "fairness")["mode"]
+            await registry.set({"fairness": None}, model="gpt20b", actor="sample", dry_run=False)
+        mode = registry.current.value("gpt20b", "fairness")["mode"]
         print(f"fairness {mode}: in status: {'fairness' in await llmq.status('gpt20b')}")
         assert call["state"] == "done"
         print(f"health: {await llmq.health()}")

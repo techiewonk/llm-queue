@@ -58,7 +58,7 @@ async def main() -> None:
         # under its own name: `chat_stream` yields chat completion chunks, with the text in
         # `chunk["choices"][0]["delta"]["content"]`. samples/registry.json has only Bedrock
         # models, so this runs only when the registry names one.
-        models = llmq.registry.current.registry.models
+        models = llmq.admin.registry.current.registry.models
         openai_chat = [a for a, m in models.items() if m.provider == "openai" and m.type == "chat"]
         for alias in openai_chat[:1]:
             chat_request = {"messages": [{"role": "user", "content": "Say hi."}]}

@@ -1,10 +1,12 @@
-"""Mount the queue's status, registry and health routes on a FastAPI app (admin pages, probes).
+"""Mount the queue's admin, status and health routes on a FastAPI app (admin pages, probes).
 
-`llmq.http_router()` returns an `APIRouter` (extra `http`). `/health/live` and `/health/ready`
-take no auth (Kubernetes probes); every other route runs the app's admin dependencies. Writes
-(live registry edits, region / account blocks) stay off unless `allow_writes=True`; they take a
-JSON body and need the `X-LLMQ-Admin` header (a browser cannot send it cross-site). A preStop
-hook calls `llmq.pause_receiving()`: readiness fails and no new queued work starts.
+`llmq.http_router()` returns an `APIRouter` (extra `http`) with every admin operation
+(docs/reference/admin-api.md); `GET /` lists them with a live summary. `/health/live` and
+`/health/ready` take no auth (Kubernetes probes); every other route runs the app's admin
+dependencies (or an admin token). Writes (live registry edits, region / account blocks, purges)
+stay off unless `allow_writes=True`; they take a JSON body, need the `X-LLMQ-Admin` header (a
+browser cannot send it cross-site) and are a dry run unless the body says `"dry_run": false`.
+A preStop hook calls `llmq.pause_receiving()`: readiness fails and no new queued work starts.
 `metrics_route=True` adds `GET /metrics`, the Prometheus exposition of a Prometheus sink (extra
 `metrics`), open like the probes so a scraper can read it.
 
@@ -96,8 +98,11 @@ async def main() -> None:
              "inferenceConfig": {"maxTokens": 200}},
         )  # fmt: skip
         found = await client.get(f"/llm-queue/requests/{reply.request_id}", headers=admin)
-        print(f"GET /requests/{{id}} -> {found.json()['state']}")
-        assert found.json()["state"] == "done"
+        print(f"GET /requests/{{id}} -> {found.json()['status']['state']}")
+        assert found.json()["status"]["state"] == "done"
+
+        index = (await client.get("/llm-queue/", headers=admin)).json()
+        print(f"GET / -> {len(index['routes'])} routes, registry v{index['registry']['version']}")
 
         metrics = await client.get("/llm-queue/metrics")  # no admin header: a scraper's GET
         series = [line for line in metrics.text.splitlines() if line.startswith("llmq_")]
@@ -109,33 +114,28 @@ async def main() -> None:
         for dep in status["deployments"]:
             print(f"  {dep['name']}: rpm {dep['rpm']['used']}/{dep['rpm']['limit']}")
 
-        no_header = await client.post(
-            "/llm-queue/registry", params={"model": "gpt20b"}, json={"rpm": 50}, headers=admin
-        )
+        edit = {"values": {"rpm": 50}, "model": "gpt20b"}
+        no_header = await client.post("/llm-queue/registry", json=edit, headers=admin)
         print(f"POST /registry without X-LLMQ-Admin -> {no_header.status_code}")
         assert no_header.status_code == 403
 
-        edit = await client.post(
-            "/llm-queue/registry",
-            params={"model": "gpt20b"},
-            json={"rpm": 50},
-            headers=writer,
+        plan = await client.post("/llm-queue/registry", json=edit, headers=writer)
+        print(f"POST /registry rpm=50 (dry run) -> {plan.json()['diff']}")
+        assert plan.json()["dry_run"] is True
+        done = await client.post(
+            "/llm-queue/registry", json={**edit, "dry_run": False}, headers=writer
         )
-        print(f"POST /registry rpm=50 -> {edit.json()['diff']}")
-        assert edit.status_code == 200
-        await client.post(
-            "/llm-queue/registry",
-            params={"model": "gpt20b"},
-            json={"rpm": 60},
-            headers=writer,
-        )  # put the sample value back
+        print(f"POST /registry rpm=50 -> {done.json()['diff']}")
+        assert done.status_code == 200
+        back = {"values": {"rpm": 60}, "model": "gpt20b", "dry_run": False}
+        await client.post("/llm-queue/registry", json=back, headers=writer)  # the sample value
 
         region = status["deployments"][0]["name"].split("/")[-1]
-        for on in (True, False):  # an emergency block of a region, then lifted
+        for path in ("/blocks", "/blocks/remove"):  # an emergency block of a region, lifted
             block = await client.post(
-                "/llm-queue/registry/block", json={"region": region, "on": on}, headers=writer
+                f"/llm-queue{path}", json={"region": region, "dry_run": False}, headers=writer
             )
-            print(f"POST /registry/block {region} on={on} -> {block.status_code}")
+            print(f"POST {path} {region} -> {block.json()['blocked_regions']}")
             assert block.status_code == 200
 
         await client.get("/drain")  # what the preStop httpGet sends
