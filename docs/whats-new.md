@@ -22,7 +22,7 @@ curl -H "X-LLMQ-Token: $READ_TOKEN" https://app/llmq/   # every route and a live
 `LLMQ_ADMIN_READ_TOKEN` opens the read routes, `LLMQ_ADMIN_TOKEN` reads and writes. Old names
 (`llmq.purge`, `llmq.registry`, `llmq.cancel`, `job_dead_letters`, `redrive_jobs`,
 `PurgeRefused`, CLI `request` / `cancel` / `block` / `drain` / `registry gc` ...) are gone: the
-mapping is in [Upgrade](how-to/upgrade.md#from-011-to-020-the-admin-api). The examples in the
+mapping is in [Upgrade](how-to/upgrade.md#5-the-admin-api). The examples in the
 0.1.0b3 section below use the names of that release. Read [Admin API](reference/admin-api.md).
 
 Calls in flight are indexed by model and tenant (`LLMQ_REQUEST_INDEX_ENABLED`, on), so one
