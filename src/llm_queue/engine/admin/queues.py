@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -16,6 +17,7 @@ from llm_queue.errors import ConfigError
 
 MAX_DLQ_COUNT = 10_000
 MAX_DLQ_IDS = 1000
+_ENTRY_ID = re.compile(r"\d+-\d+")  # a stream entry id, as XADD makes them
 
 
 class StatusAdmin:
@@ -159,6 +161,7 @@ class DlqAdmin:
         unsafe: bool = False,
     ) -> dict[str, Any] | None:
         """One dead letter; its body (prompts, payloads) only with `unsafe`. None if gone."""
+        _check_entry_ids([entry_id])
         queue, _ = await self._queue(model, job, priority)
         key = self._ctx.keys.queue(queue, "dlq")
         entries = await self._ctx.queues.client.xrange(key, entry_id, entry_id, count=1)
@@ -210,6 +213,8 @@ class DlqAdmin:
         dry_run: bool = True,
     ) -> dict[str, Any]:
         """Delete every dead letter of a queue, or only `entry_ids`."""
+        if entry_ids is not None:
+            _check_entry_ids(entry_ids)
         queue, _ = await self._queue(model, job, priority)
         client = self._ctx.queues.client
         key = self._ctx.keys.queue(queue, "dlq")
@@ -368,3 +373,13 @@ class TenantsAdmin:
         if not tenant:
             raise ConfigError("give a tenant name")
         return {"tenant_hash": self._ctx.hash_id(tenant)}
+
+
+def _check_entry_ids(ids: Sequence[str]) -> None:
+    """`ConfigError` (400) for an id that is not a stream entry id (`<ms>-<seq>`, B-07).
+
+    The store refused it with a raw `ResponseError`, which reached HTTP clients as a 500.
+    """
+    bad = [i for i in ids if not _ENTRY_ID.fullmatch(i)]
+    if bad:
+        raise ConfigError(f"not a dead letter id (`<ms>-<seq>`, e.g. 1700000000000-0): {bad[:5]}")

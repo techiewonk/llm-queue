@@ -1137,7 +1137,7 @@ class LLMQueue:
         `POST /resume` for this process (a pod with several processes drains through
         `LLMQ_DRAIN_FILE`); `metrics_route=True` adds an open `GET /metrics`.
         """
-        from llm_queue.engine.http import status_router
+        from llm_queue.engine.http import BODY_MAX_BYTES, status_router
 
         s = self.settings
         env_token = getattr(self, "_admin_token", None)
@@ -1159,6 +1159,7 @@ class LLMQueue:
             wait_cap_secs=float(s.http_purge_wait_secs) if s else 60.0,
             dlq_bodies=bool(s.admin_dlq_bodies_enabled) if s else False,
             index_cache_secs=float(s.admin_index_cache_secs) if s else 2.0,
+            body_max_bytes=int(s.admin_body_max_bytes) if s else BODY_MAX_BYTES,
         )
 
     def describe(self) -> dict[str, Any]:

@@ -18,9 +18,13 @@ and `allow_writes`. With no guard at all only the open routes are mounted, unles
 from __future__ import annotations
 
 import inspect
+import json
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
+
+import orjson
+from redis.exceptions import ResponseError
 
 from llm_queue._logging import get_logger
 from llm_queue.engine.admin.context import NotLoaded
@@ -50,6 +54,12 @@ RETRY_AFTER_SECS = 1
 MAX_ID_CHARS = 256
 MAX_EDIT_PATHS = 100
 MAX_ACTOR_CHARS = 128
+# One value of a JSON body (a registry edit's `values` entry), serialised (B-08).
+MAX_VALUE_BYTES = 65_536
+# A POST body above this answers 413 (B-08, `LLMQ_ADMIN_BODY_MAX_BYTES`).
+BODY_MAX_BYTES = 1_048_576
+# Store answers that mean "refusing for a while", not "bad request".
+_STORE_REFUSALS = ("BUSY", "LOADING", "MASTERDOWN", "MISCONF", "NOREPLICAS", "OOM", "READONLY")
 Token = str | Callable[[], str | None] | None
 
 
@@ -59,7 +69,8 @@ def error_response(exc: BaseException) -> Response:
     `UnknownModel` 404; `RegistryConflict` 409 retryable; `AdminRefused` 409; a missing
     registry or a store outage 503; a store-only operation of a local-mode queue
     (`LocalModeRefused`) 503 with `reason: local_mode`; any other `ConfigError` (bad input,
-    refused edit) 400; another `LLMQueueError` (a stopped queue) 409.
+    refused edit) 400; another `LLMQueueError` (a stopped queue) 409; a store refusal of the
+    request itself (redis `ResponseError`, B-07) 400, of writes for a while 503.
     """
     if isinstance(exc, UnknownModel):
         return 404, {"error": str(exc)}
@@ -77,6 +88,11 @@ def error_response(exc: BaseException) -> Response:
         return 400, {"error": str(exc)}
     if isinstance(exc, LLMQueueError):
         return 409, {"error": str(exc)}
+    if isinstance(exc, ResponseError):
+        words = str(exc).split(maxsplit=1)
+        if words and words[0].upper() in _STORE_REFUSALS:
+            return 503, {"error": "state store unavailable"}
+        return 400, {"error": f"the store refused the request: {exc}"}
     raise exc
 
 
@@ -107,8 +123,16 @@ def _too_long(value: Any) -> bool:
     if isinstance(value, list):
         return any(_too_long(v) for v in value)
     if isinstance(value, dict):
-        return any(_too_long(k) for k in value)
+        return any(_too_long(k) or _too_big(v) for k, v in value.items())
     return False
+
+
+def _too_big(value: Any) -> bool:
+    """True when one body value is above `MAX_VALUE_BYTES` serialised (B-08)."""
+    try:
+        return len(orjson.dumps(value)) > MAX_VALUE_BYTES
+    except TypeError:
+        return True
 
 
 def _from_query(param: Param, raw: list[str]) -> Any:
@@ -231,6 +255,21 @@ def admin_token_dependency(token: Token, header: str, *, read_token: Token = Non
     return guard
 
 
+async def _read_body(request: Any, limit: int) -> bytes | None:
+    """The request body, None once it is above `limit` bytes (read no further; B-08)."""
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        return None
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _configured(token: Token) -> bool:
     if token is None:
         return False
@@ -253,6 +292,7 @@ def status_router(
     wait_cap_secs: float = 60.0,
     dlq_bodies: bool = False,
     index_cache_secs: float = 2.0,
+    body_max_bytes: int = BODY_MAX_BYTES,
 ) -> Any:
     """A FastAPI `APIRouter` of the admin operations (`pip install 'llm-queue[http]'`).
 
@@ -351,8 +391,11 @@ def status_router(
                 except ValueError:
                     return reply((400, {"error": f"bad {name} ({_signature(op)})"}))
         else:
+            raw = await _read_body(request, body_max_bytes)
+            if raw is None:
+                return reply((413, {"error": f"the body is above {body_max_bytes} bytes"}))
             try:
-                body = await request.json() if await request.body() else {}
+                body = json.loads(raw) if raw else {}
             except ValueError:
                 return reply((400, {"error": "the body must be a JSON object"}))
             if not isinstance(body, dict):
