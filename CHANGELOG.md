@@ -73,6 +73,10 @@ index (below).
   (`enabled: false`), `health()` / `describe()` say so, `llmq_disabled` is logged once at start,
   and the drain file still fails readiness. The fifth step of the switch ladder
   (docs/how-to/modes.md).
+- One `llmq_configured` info line at every `start()` with the log-safe `describe()` summary
+  (0.2.0 D2): how the process is set up, with no password, salt, token, tenant name or
+  registry body. A `describe()` that fails there logs `llmq_configured_failed` and the start
+  goes on.
 - Local execution mode: `LLMQ_EXECUTION_MODE=local` (default `queue`) runs every call in its
   own process straight against the provider, with the same API, classes, LangChain adapters
   and `install()`, and never contacts the store (no store client is built; `LLMQ_STORE_URL`
@@ -201,6 +205,9 @@ index (below).
 
 ### Removed
 
+- `describe()` / `GET /describe` / `llm-queue describe` no longer show `default_tenant` (the
+  name, review B-04): they show `default_tenant_hash`, and the name only with
+  `LLMQ_TENANT_NAMES_ENABLED=true`.
 - `queue_ready(enabled, llmq=None)` loses `enabled`: it is `queue_ready(llmq=None)`. The app's own
   flag is replaced by `LLMQ_ENABLED=false`, whose queue is ready unless draining.
 - `LLMQ_TENANT_INDEX` and its cross-model index `P:tenant:H:reqs` (with

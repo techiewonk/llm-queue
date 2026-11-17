@@ -81,6 +81,8 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `key_expiry_publish_failed` | warning | engine/runtime.py |
 | `llmq_admin` | info | engine/audit.py, engine/requests_admin.py |
 | `llmq_call_finished` | info | engine/runtime.py |
+| `llmq_configured` | info | core.py (once per `start()`, every mode: the `describe()` summary: version, worker id, roles, environment, store `scheme://host:port` (no password), prefixes, key expiry, pool, metrics sink, registry version and models, `default_tenant_hash`; never a salt, token, tenant name or registry body) |
+| `llmq_configured_failed` | warning | core.py (`describe()` raised at start, e.g. a registry file changed since `from_env`; the start goes on) |
 | `llmq_disabled` | info | disabled.py (`LLMQ_ENABLED=false`: once at `start()`, with `describe()`: version, `enabled: false`, environment, whether a drain file is watched) |
 | `llmq_purge` | info | engine/purge.py |
 | `llmq_registry_audit` | info | registry/store.py |

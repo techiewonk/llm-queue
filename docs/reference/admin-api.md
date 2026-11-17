@@ -114,6 +114,7 @@ settings (`registry.set`); jobs are sent by the app (`llmq.send_job`), their dea
 
 | Op | Parameters (default) | Answer |
 |---|---|---|
+| `process.describe` | | `{version, worker_id, enabled, execution_mode, secrets, mode, environment, store, separate_queue_store, key_prefix, queue_prefix, key_expiry, store_max_connections, metrics_sink, default_tenant_hash, admin_writes_enabled, registry_version, models}` (no password, salt, token or registry body; `default_tenant` too only with `LLMQ_TENANT_NAMES_ENABLED`); logged once at start as `llmq_configured`. Off: `{version, enabled: false, environment, drain_file}` |
 | `status.get` | `model` (all), `tenant` / `tenant_hash` (with a model) | `StatusReport`, or `ModelStatus` of one model (with `tenants` and `request_index`); with a tenant also `tenant: {tenant, waiting, running, by_stage, oldest_wait_secs, fairness}` |
 | `registry.get` | `model` (whole document) | `{registry, changes, live_edits}`, secrets shown as `[redacted]` |
 | `registry.versions` | | `{versions: [int], current: int}` |

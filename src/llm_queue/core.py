@@ -658,6 +658,16 @@ class LLMQueue:
             )
             self._drain_watcher.start()
         self.started = True
+        self._log_configured()
+
+    def _log_configured(self) -> None:
+        """One `llmq_configured` line with `describe()` (0.2.0 D2); never fails the start."""
+        try:
+            summary = self.describe()
+        except Exception as exc:  # a registry file changed or broken since from_env
+            logger.warning("llmq_configured_failed", error=repr(exc))
+            return
+        logger.info("llmq_configured", **summary)
 
     async def _wait_for_start(self) -> None:
         """Let a `start()` running on this loop finish (or roll back) before stopping (FC-3).

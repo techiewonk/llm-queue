@@ -14,6 +14,7 @@ from llm_queue._version import __version__
 from llm_queue.engine.admin.context import AdminContext
 from llm_queue.engine.admin.ops import OPERATIONS, op_row
 from llm_queue.engine.admin.registry import usable
+from llm_queue.engine.purge import keyed_hash
 from llm_queue.engine.settings import InfraSettings
 from llm_queue.engine.store_guard import STORE_DOWN
 from llm_queue.errors import LLMQueueError
@@ -53,8 +54,19 @@ class DrainAdmin:
             )
 
 
+def _default_tenant(s: InfraSettings) -> dict[str, Any]:
+    """`LLMQ_DEFAULT_TENANT` as its keyed hash; the name too only with tenant names on (B-04)."""
+    name = s.default_tenant
+    out: dict[str, Any] = {
+        "default_tenant_hash": keyed_hash(s.id_hash_salt or "", name) if name else None
+    }
+    if s.tenant_names_enabled:
+        out["default_tenant"] = name
+    return out
+
+
 def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> dict[str, Any]:
-    """Settings for a log line: no password, salt, token or registry body."""
+    """Settings for a log line: no password, salt, token or registry body; tenant as a hash."""
     out: dict[str, Any] = {"version": __version__, "worker_id": worker_id}
     s = settings
     if s is None:
@@ -77,7 +89,7 @@ def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> 
             local_process_count=s.local_process_count,
             local_concurrency=s.local_concurrency,
             metrics_sink=s.metrics_sink,
-            default_tenant=s.default_tenant,
+            **_default_tenant(s),
             admin_writes_enabled=s.admin_writes_enabled,
             registry_version=doc.get("registry_version"),
             models=sorted(doc.get("models") or {}),
@@ -94,7 +106,7 @@ def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> 
         key_expiry=s.key_expiry,
         store_max_connections=s.store_max_connections,
         metrics_sink=s.metrics_sink,
-        default_tenant=s.default_tenant,
+        **_default_tenant(s),
         admin_writes_enabled=s.admin_writes_enabled,
         registry_version=doc.get("registry_version"),
         models=sorted(doc.get("models") or {}),
