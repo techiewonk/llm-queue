@@ -6,6 +6,7 @@ RESULT_PUT and SETTLE_DONE scripts answer what the first run did.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import orjson
@@ -269,3 +270,44 @@ async def test_a3_the_last_deployment_that_takes_calls_is_never_disabled(make: M
     fake.scenario.patch_model(f"{GPT}@r1", {"force_error": None})
     reply = await engine.call("big", CHAT)
     assert reply.meta.deployment == "aws-a/r1"
+
+
+# ---------------------------------------------------------------- A-4 (G3)
+
+
+async def test_a4_a_cancel_during_an_admission_in_flight_gives_the_grant_back(
+    make: Make, store: redis.asyncio.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A-4: a cancel landing while PICK_TAKE was in flight leaked the grant it made.
+
+    Its slot stayed taken up to a lease and its budget was never refunded. The script runs
+    here, then its reply never comes (the cancel lands first); the grant now goes back at once.
+    """
+    engine, _ = await make({"small": {"rpm": 100, "rate_window": "smooth"}})
+    real = engine.admission.pick_take
+    granted = asyncio.Event()
+
+    async def pick_take(ask: Any, changes: Any) -> Any:
+        decision = await real(ask, changes)
+        if ask.request_id == "a4":
+            granted.set()
+            await asyncio.Event().wait()  # the reply is lost in flight: only a cancel ends it
+        return decision
+
+    monkeypatch.setattr(engine.admission, "pick_take", pick_take)
+    task = asyncio.create_task(
+        engine.call("small", CHAT, request_id="a4", timeout_secs=20, force_direct=True)
+    )
+    await asyncio.wait_for(granted.wait(), 10)
+    rate = engine.keys.rate("small", "aws-a/r1")
+    inprog = f"{engine.keys.prefix}:{{m:small}}:inprog"
+    assert int(await store.hget(rate, "seen_calls") or 0) == 1
+    assert await store.zcard(inprog) == 1
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    loop = asyncio.get_running_loop()
+    until = loop.time() + 1.0  # the lease is 3 s: a sweep would free only the slot, later
+    while await store.zcard(inprog) or int(await store.hget(rate, "seen_calls") or 0):
+        assert loop.time() < until, "the grant was not given back"
+        await asyncio.sleep(0.05)
+    assert "a4" not in engine._held

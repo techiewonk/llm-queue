@@ -2483,6 +2483,12 @@ class Engine:
                 decision = await self._direct_wait(held)
             if decision is not None:
                 await self._run(held, decision, 1, alias)
+        except asyncio.CancelledError:
+            if held.run is None and held.grants:
+                # Cancelled while its admission was in flight (A-4): the grant goes back now,
+                # not a lease later (its slot) or never (its budget).
+                self._spawn(self._release(held), "cancel_give_back")
+            raise
         except Exception as exc:
             if held.answered:
                 # A step after the stored success raised (A-1): the caller reads the success;
@@ -3446,19 +3452,19 @@ class Engine:
         if tpm_refuses(view, alias, (c.key for c in ask.candidates), estimate.total):
             await self._finish_call(held, "request_too_large", "the call is above the token budget")
             return None
-        decision = await self.admission.pick_take(ask, self.registry.changes)
+        decision = await self._pick_take(held, ask)
         if decision.kind == "wait" and not held.refused:  # once per call, not per poll (O4)
             held.refused = True
             self.metrics.count("llmq_admission_refusals_total", model=alias, reason=decision.reason)
         if decision.kind == "stale_config" and await self._registry_step(
             self._reload_registry(decision.changes), "reload"
         ):
-            decision = await self.admission.pick_take(ask, self.registry.changes)
+            decision = await self._pick_take(held, ask)
         # The store lost the numbers: restore, then once more.
         if decision.kind == "no_config" and await self._registry_step(
             self.registry.refresh(), "refresh"
         ):
-            decision = await self.admission.pick_take(ask, self.registry.changes)
+            decision = await self._pick_take(held, ask)
         held.check_callers = False  # checked once, on its first admission
         if ask.fairness is not None and await self._tenant_step(alias, held, ask, decision):
             return None
@@ -3500,6 +3506,18 @@ class Engine:
         if decision.kind == "none":
             return await self._none_usable(view, alias, held, attempt, failed)
         return decision
+
+    async def _pick_take(self, held: _Held, ask: Ask) -> Decision:
+        """PICK_TAKE for a call; a cancel landing while it is in flight keeps its maybe-grant.
+
+        The script may have granted before the cancel (A-4): the owner joins `held.grants`, so
+        the cancel's give-back sends an owner-checked UNDO (a no-op when nothing was granted).
+        """
+        try:
+            return await self.admission.pick_take(ask, self.registry.changes)
+        except asyncio.CancelledError:
+            held.grants.add((ask.alias, ask.owner))
+            raise
 
     async def _tenant_step(self, alias: str, held: _Held, ask: Ask, decision: Decision) -> bool:
         """Tenant fairness after an admission: keep the fair round, count, settle a quota refusal.
@@ -3681,7 +3699,7 @@ class Engine:
             )
             if ask is None:
                 continue
-            decision = await self.admission.pick_take(ask, self.registry.changes)
+            decision = await self._pick_take(held, ask)
             if decision.kind == "granted":
                 # The run (and its grant in `held.grants`) first; the status is informational,
                 # written behind. A failed status write before it left the grant neither run
