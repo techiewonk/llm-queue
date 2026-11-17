@@ -64,7 +64,7 @@ from llm_queue.engine.expiry import TTL_SWEEP, Expiry, decide
 from llm_queue.engine.fairness import Fairness, fairness_for, tenant_hash_of
 from llm_queue.engine.health import Health
 from llm_queue.engine.keys import Keys
-from llm_queue.engine.metrics import GaugeSet, Metrics, NullSink
+from llm_queue.engine.metrics import GaugeSet, Metrics, NullSink, TenantLabels
 from llm_queue.engine.offload import ResultOffload
 from llm_queue.engine.purge import PurgeService, PurgeSettings
 from llm_queue.engine.queue import (
@@ -655,6 +655,8 @@ class Engine:
             metrics=self.metrics,
             owner=self.worker_id,
         )
+        # The `tenant` label of llmq_calls_total / llmq_wait_seconds (0.2.0 T6, owner Q10).
+        self._tenant_label = TenantLabels(self.settings.admin.metrics_tenants, self.hash_id)
         self._tasks: list[asyncio.Task[None]] = []
         self._running: set[asyncio.Task[None]] = set()
         self._held: dict[str, _Held] = {}
@@ -707,7 +709,15 @@ class Engine:
         self.ready = False
         self._direct_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.health = Health(state, self.keys)
-        self.status_reader = StatusReader(state, self.keys, self.queues, self.settings.queue_prefix)
+        self.status_reader = StatusReader(
+            state,
+            self.keys,
+            self.queues,
+            self.settings.queue_prefix,
+            requests=self.requests_admin,
+            request_index=self.settings.admin.request_index,
+            scan_max=self.settings.admin.scan_max,
+        )
         self.alerts = AlertEvaluator(state, self.keys)
         # Each part writes expiries in its store's mode (owner K4; set again at start).
         self.requests.expiry = self.alerts.expiry = self.purge.expiry = self.expiry
@@ -4284,7 +4294,10 @@ class Engine:
         start_secs = held.position_ms / 1000.0
         wait = max(0.0, held.first_seen_secs - start_secs)
         now = self.clock.now()
-        self.metrics.observe("llmq_wait_seconds", wait, model=env.model, priority=priority)
+        tenant = self._tenant_label(env.tenant_id)  # LLMQ_METRICS_TENANTS (0.2.0 T6)
+        self.metrics.observe(
+            "llmq_wait_seconds", wait, model=env.model, priority=priority, tenant=tenant
+        )
         admit = max(0.0, held.granted_secs - start_secs) if held.granted_secs else None
         if admit is not None:
             self.metrics.observe(
@@ -4325,7 +4338,13 @@ class Engine:
         were in no counter and no record.
         """
         labels = {"model": alias, "account": account or "-", "region": region or "-"}
-        self.metrics.count("llmq_calls_total", 1.0, outcome=outcome, **labels)
+        self.metrics.count(
+            "llmq_calls_total",
+            1.0,
+            outcome=outcome,
+            tenant=self._tenant_label(env.tenant_id),
+            **labels,
+        )
         if meta is not None:
             self.metrics.count("llmq_tokens_input_total", float(meta.tokens_in or 0), **labels)
             self.metrics.count("llmq_tokens_output_total", float(meta.tokens_out or 0), **labels)
@@ -4367,11 +4386,27 @@ class Engine:
         )
         await self.state.set(self.keys.request(request_id, "debug"), body, ex=3600)
 
-    async def status(self, model: str | None = None) -> dict[str, Any]:
-        """Status of one model, or of everything (plan §3.12)."""
+    async def status(
+        self,
+        model: str | None = None,
+        *,
+        tenant: str | None = None,
+        tenant_hash: str | None = None,
+    ) -> dict[str, Any]:
+        """Status of one model, or of everything (plan §3.12).
+
+        With `tenant` (a raw name, hashed here) or `tenant_hash` (`-`: no tenant), the model's
+        report adds that tenant's block (0.2.0 T4); a tenant needs a model (`ConfigError`).
+        """
         view = self.registry.current
+        if tenant is not None and tenant_hash is not None:
+            raise ConfigError("give tenant or tenant_hash, not both")
+        h = self.hash_id(tenant) if tenant is not None else tenant_hash
         if model is not None:
-            return await self.status_reader.model(view, view.registry.alias_of(model))
+            alias = view.registry.alias_of(model)
+            return await self.status_reader.model(view, alias, tenant_hash=h)
+        if h is not None:
+            raise ConfigError("a tenant's status needs a model")
         return await self.status_reader.report(view)
 
     async def request_status(self, request_id: str) -> dict[str, Any]:

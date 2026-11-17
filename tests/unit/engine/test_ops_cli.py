@@ -79,7 +79,7 @@ def test_fo8_main_returns_the_exit_code(
 async def test_q5_cancel_is_confirmed_logged_and_audited() -> None:
     """Q5: an operator could not cancel a call; the CLI cancel is audited with the actor."""
     client = MagicMock()
-    script = AsyncMock(return_value=2)
+    script = AsyncMock(return_value=[2, 0])  # CANCEL: marked, skipped (0.2.0)
     client.register_script.return_value = script
     client.xadd = AsyncMock()
     tool = cli.Cli(InfraSettings(store_url="redis://x"), client, "ann")

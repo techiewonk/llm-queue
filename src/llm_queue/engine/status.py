@@ -16,13 +16,16 @@ from typing import TYPE_CHECKING, Any
 from llm_queue._logging import get_logger
 from llm_queue.engine._codec import text as _text
 from llm_queue.engine.expiry import native
+from llm_queue.engine.fairness import fairness_for
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import StreamQueues
+from llm_queue.errors import ConfigError
 from llm_queue.registry.settings import ALERT_DEFAULTS
 
 if TYPE_CHECKING:
     import redis.asyncio
 
+    from llm_queue.engine.requests_admin import RequestsAdmin
     from llm_queue.registry import ResolvedRegistry
 
 logger = get_logger(__name__)
@@ -65,20 +68,41 @@ class StatusReader:
     """Read-only view of one environment's stores."""
 
     def __init__(
-        self, client: redis.asyncio.Redis, keys: Keys, queues: StreamQueues, queue_prefix: str = ""
+        self,
+        client: redis.asyncio.Redis,
+        keys: Keys,
+        queues: StreamQueues,
+        queue_prefix: str = "",
+        *,
+        requests: RequestsAdmin | None = None,
+        request_index: bool = True,
+        scan_max: int = 100_000,
     ) -> None:
-        """Keep the clients; every report reads the store fresh."""
+        """Keep the clients; every report reads the store fresh.
+
+        `requests` (the engine's `RequestsAdmin`) counts one tenant's calls for
+        `model(..., tenant_hash=...)`; `request_index` says whether calls are indexed
+        (`LLMQ_REQUEST_INDEX_ENABLED`); `scan_max` caps the tenants read per model.
+        """
         self._client = client
         self.keys = keys
         self.queues = queues
         self.queue_prefix = queue_prefix
+        self.requests = requests
+        self.request_index = request_index
+        self.scan_max = scan_max
         self._model_status = client.register_script(_MODEL_STATUS)
 
-    async def model(self, view: ResolvedRegistry, alias: str) -> dict[str, Any]:
+    async def model(
+        self, view: ResolvedRegistry, alias: str, *, tenant_hash: str | None = None
+    ) -> dict[str, Any]:
         """One model: queues, calls in progress, and every deployment's numbers.
 
         All deployment reads are one script (one command per model): read one by one, 20
-        models x 30 deployments took 6.5 s (plan B91 asks for 200 ms; now 47 ms).
+        models x 30 deployments took 6.5 s (plan B91 asks for 200 ms; now 47 ms). `tenants`
+        counts the tenants with calls in flight and their indexed calls (0.2.0 T4, hashes
+        never shown); with `tenant_hash` (`-`: calls with no tenant) a `tenant` block adds
+        that tenant's calls by stage and its fairness numbers.
         """
         name = self.queue_prefix + view.queue_name(alias)
         deps = view.deployments(alias)
@@ -123,7 +147,88 @@ class StatusReader:
         fairness = view.value(alias, "fairness")
         if fairness.get("mode", "off") != "off":
             report["fairness"] = await self._fairness(alias, fairness, now_secs)
+        report["request_index"] = self.request_index
+        report["tenants"] = await self._tenants(alias, now_secs)
+        if tenant_hash is not None:
+            report["tenant"] = await self.tenant(view, alias, tenant_hash, now_secs)
         return report
+
+    async def _tenants(self, alias: str, now_secs: int) -> dict[str, int]:
+        """Tenants with calls in flight on the model and their indexed calls (counts only)."""
+        now_ms = now_secs * 1000
+        hashes = await self._client.zrangebyscore(
+            self.keys.tenant_index(alias), now_ms, "+inf", start=0, num=self.scan_max
+        )
+        calls = 0
+        if hashes:
+            async with self._client.pipeline(transaction=False) as pipe:
+                for h in hashes:
+                    pipe.zcount(self.keys.request_index(alias, _text(h)), now_ms, "+inf")
+                calls = sum(int(n) for n in await pipe.execute())
+        return {"active": len(hashes), "indexed_calls": calls}
+
+    async def tenant(
+        self, view: ResolvedRegistry, alias: str, tenant_hash: str, now_secs: int | None = None
+    ) -> dict[str, Any]:
+        """One tenant on one model (T4): its calls by stage, oldest wait, fairness numbers.
+
+        `tenant` is the hash (`tenant_name` only with `LLMQ_TENANT_NAMES_ENABLED`); `waiting`
+        counts every waiting stage, `held` the waiting ones a worker holds for budget.
+        Unknown tenant: zeros. Needs the engine's `RequestsAdmin` (`requests=`).
+        """
+        if self.requests is None:
+            raise ConfigError("a tenant's status needs the request index service (requests=)")
+        counts = await self.requests.count(alias, tenant_hash=tenant_hash)
+        out: dict[str, Any] = {
+            "tenant": tenant_hash,
+            "waiting": counts.by_state["waiting"],
+            "held": counts.by_stage["held"],
+            "running": counts.by_state["running"],
+            "cancelling": counts.cancelling,
+            "oldest_wait_secs": counts.oldest_wait_secs,
+            "truncated": counts.truncated,
+        }
+        if self.requests.settings.tenant_names:
+            name = await self._client.hget(self.keys.tenant_names(alias), tenant_hash)
+            out["tenant_name"] = _text(name) if name is not None else None
+        setting = view.value(alias, "fairness")
+        if setting.get("mode", "off") != "off":
+            if now_secs is None:
+                now_secs = int((await self._client.time())[0])
+            out["fairness"] = await self._tenant_fairness(view, alias, tenant_hash, now_secs)
+        return out
+
+    async def _tenant_fairness(
+        self, view: ResolvedRegistry, alias: str, h: str, now_secs: int
+    ) -> dict[str, Any]:
+        """The tenant's fairness numbers: weight (share), quota and its use, slots, activity."""
+        setting = view.value(alias, "fairness")
+        window = str(view.value(alias, "rate_window"))
+        fair = fairness_for(setting, h, window=window)
+        model = self.keys.model
+        now_ms = now_secs * 1000
+        async with self._client.pipeline(transaction=False) as pipe:
+            pipe.hget(model(alias, "tf:w"), h)
+            pipe.hmget(model(alias, f"tf:t:{h}"), ["r_win", "r_n", "t_win", "t_n"])
+            pipe.zcount(model(alias, f"tf:s:{h}"), now_ms, "+inf")
+            pipe.zscore(model(alias, "tf:act"), h)
+            weight, (r_win, r_n, t_win, t_n), slots, seen = await pipe.execute()
+        minute = now_secs // 60
+        used = None
+        if window == "fixed":
+            used = {
+                "calls": int(_num(r_n)) if _num(r_win, -1) == minute else 0,
+                "tokens": int(_num(t_n)) if _num(t_win, -1) == minute else 0,
+            }
+        active_ms = int(float(setting.get("active_secs", 60)) * 1000)
+        return {
+            "mode": setting["mode"],
+            "weight": _num(weight) if weight is not None else (fair.weight if fair else 1.0),
+            "quota": {"rpm": fair.rpm if fair else None, "tpm": fair.tpm if fair else None},
+            "used_this_minute": used,
+            "slots_in_use": int(slots),
+            "active": seen is not None and float(seen) >= now_ms - active_ms,
+        }
 
     async def _fairness(
         self, alias: str, setting: Mapping[str, Any], now_secs: int

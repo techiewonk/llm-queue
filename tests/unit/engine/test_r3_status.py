@@ -67,6 +67,9 @@ class _Client:
         first = self.first_ids.get(key)
         return [(first, {})] if first else []
 
+    async def zrangebyscore(self, key: str, *_: Any, **__: Any) -> list[bytes]:
+        return []  # no tenant has calls in flight (0.2.0 T4)
+
 
 class _Queues:
     """`StreamQueues.depth` with fixed numbers per queue name."""

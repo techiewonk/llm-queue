@@ -10,6 +10,7 @@ import json
 
 import pytest
 
+from llm_queue.engine.metrics import TenantLabels
 from llm_queue.engine.purge import keyed_hash
 from llm_queue.engine.requests_admin import AdminSettings
 from llm_queue.engine.settings import InfraSettings, parse_metrics_tenants
@@ -73,6 +74,17 @@ def test_metrics_tenants_cap() -> None:
     assert any("at most 50" in p for p in problems)
     pairs, problems = parse_metrics_tenants(" a , b=lb ,, ")
     assert (pairs, problems) == ((("a", "a"), ("b", "lb")), [])
+
+
+def test_tenant_metric_labels() -> None:
+    """T6: listed tenants get their label, others `other`, no tenant `-`; names not kept."""
+    labels = TenantLabels([("acme", "acme"), ("globex", "t2")], lambda v: f"h-{v}")
+    assert labels("h-acme") == "acme"
+    assert labels("h-globex") == "t2"
+    assert labels("h-initech") == "other"
+    assert labels(None) == "-"
+    assert labels("") == "-"
+    assert "acme" not in repr(labels.__slots__)
 
 
 def test_registry_tenant_names_are_hashed_when_read() -> None:
