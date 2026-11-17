@@ -73,11 +73,11 @@ async def purge_tenant(tenant_id: str, dry_run: bool = True, user=Depends(admin_
 |---|---|---|
 | `model(alias, force=False)` | Every `P:{m:alias}:*` key; its queues (`llm-<alias>`, its `queue.name` now or in a kept registry version, and `-priority`) and doorbells. A queue still holding messages is skipped unless `force` | While the registry still has the model, unless `force` |
 | `deployment(alias, "account/name", force=False, wait=None, wait_secs=None)` | `rate:D`, `ac:D`, `cb:D`, `lease:D:p\|n`, `terr:D`, `thr:D:*`; fields `D\|*` of `health` and `D`, `rr\|D`, `cw\|D` of `rot`; `sticky:*` keys pointing at it | While the registry still has the deployment, unless `force` |
-| `tenant(tenant_id, remove=None, models=None)` | In every model (or `models`): `tf:t:<h>`, `tf:s:<h>`, the tenant in `tf:act` and `tf:w` (the weight sum `~sum` is corrected in the same script, so other tenants' shares are right at once) | `remove` with `queued` / `running` while `LLMQ_TENANT_INDEX` is off |
+| `tenant(tenant_id, remove=None, models=None)` | In every model (or `models`): `tf:t:<h>`, `tf:s:<h>`, the tenant in `tf:act` and `tf:w` (the weight sum `~sum` is corrected in the same script, so other tenants' shares are right at once) | `remove` with `queued` / `running` while the request index is off (`LLMQ_REQUEST_INDEX_ENABLED=false`) |
 | `removed(force=False, wait=None)` | `model` for every model with state in the store (or queues in a kept registry version) that the registry no longer has, and `deployment` for every such deployment of a live model | Never |
 
 Every deleted key is also removed from the expiry index `P:ttl`. Keys go with `UNLINK` in
-pipelined batches of `LLMQ_PURGE_BATCH` (500).
+pipelined batches of `LLMQ_ADMIN_BATCH` (500).
 
 ### Running calls on a deployment
 
@@ -98,10 +98,10 @@ the audit name only the hash.
 | `queued` | Cancels the tenant's calls still waiting (not running) |
 | `running` | Cancels every call of the tenant, running ones included |
 
-`queued` and `running` need the per-tenant request index: `LLMQ_TENANT_INDEX=true` makes each
-new call add its id to `P:tenant:<hash>:reqs` (one extra write per call). Only calls made after
-it was turned on are indexed. Without it, asking for them raises `PurgeRefused` naming the
-setting. Cancels go through the normal cancel path (every caller gets `cancelled`) and are
+`queued` and `running` read the request index of each model (`P:{m:ALIAS}:tq:<hash>`, on by
+default: `LLMQ_REQUEST_INDEX_ENABLED`), written by the scripts that send and end each call
+(no extra round trip). With the index off, asking for them raises `PurgeRefused` naming the
+setting. The index itself is not deleted: each cancelled call leaves it with its final write. Cancels go through the normal cancel path (every caller gets `cancelled`) and are
 logged `call_cancel` with `source=purge`.
 
 ## Automatic purge
@@ -173,8 +173,8 @@ nothing of that deployment is deleted; purge again later, or send `"wait": false
 | `LLMQ_PURGE_WAIT` | true | A deployment purge waits for its running calls |
 | `LLMQ_PURGE_WAIT_SECS` | 300 | ... at most this long |
 | `LLMQ_HTTP_PURGE_WAIT_SECS` | 60 | The longest an HTTP purge (deployment, gc) waits for running calls |
-| `LLMQ_PURGE_BATCH` | 500 | Keys per `UNLINK` batch |
+| `LLMQ_ADMIN_BATCH` | 500 | Keys per `UNLINK` batch (and ids per admin pipeline) |
 | `LLMQ_TENANT_PURGE_DEFAULT` | `keys` | What a tenant purge removes |
-| `LLMQ_TENANT_INDEX` | false | Index each call by tenant (needed for `queued` / `running`) |
+| `LLMQ_REQUEST_INDEX_ENABLED` | true | Index each call by model and tenant (needed for `queued` / `running`) |
 
 Ranges are in [Environment variables](../reference/environment.md#purge).

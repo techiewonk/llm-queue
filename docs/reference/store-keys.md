@@ -158,6 +158,9 @@ mode `TTL_SWEEP` deletes every due key in `P:ttl`. Alerts (`P:alert:*`) and debu
 | Request records | `P:{r:ID}:callers` | set | state | Same as `job` (set with it on every write). | indexed in `P:ttl` |
 | Request records | `P:{r:ID}:status` | hash | state | `LLMQ_STATUS_TTL_SECS` (1800 s); a write never shortens it (`requests.py:231`). A final state is never replaced (`:218-222`). | indexed in `P:ttl` |
 | Request records | `P:{r:ID}:cancel` | string | state | `LLMQ_STATUS_TTL_SECS` (1800 s). | indexed in `P:ttl` |
+| Request index | `P:{m:ALIAS}:tq:H` | zset | state | 60 s past its latest entry's deadline; a write only lengthens it (`index_add`, `requests.py`). | indexed in `P:ttl` |
+| Request index | `P:{m:ALIAS}:tq` | zset | state | 60 s past its latest tenant's deadline; a write only lengthens it. | indexed in `P:ttl` |
+| Request index | `P:{m:ALIAS}:tqn` | hash | state | Only with `LLMQ_TENANT_NAMES_ENABLED`: as `tq`. | indexed in `P:ttl` |
 | Results & streaming | `P:{r:ID}:res` | string | state | `LLMQ_RESULT_TTL_SECS` (300 s), fixed from the write. After the first read of a library-made id: `LLMQ_RESULT_DEDUPE_SECS` when above 0, else 2 s (`TAKE_GRACE_MS`, `requests.py:324,329-334`). An app-supplied id keeps 300 s. An offloaded marker is dropped after the offload read (`RESULT_DROP`, `requests.py:301-312,337`). | indexed in `P:ttl` |
 | Results & streaming | `P:{r:ID}:chunks` | stream | state | `LLMQ_RESULT_TTL_SECS` + the call's timeout (`runtime.py:3617`), set again on each write. After `end`: `END_TTL_SECS` (30 s, `streaming.py:29,194`). | indexed in `P:ttl` |
 | Results & streaming | `P:offload` | string | state | Fixed 7 days (`OFFLOAD_FLAG_SECS`, `requests.py:53`), set again on each start and offloaded write. | indexed in `P:ttl` |
@@ -190,7 +193,6 @@ mode `TTL_SWEEP` deletes every due key in `P:ttl`. Alerts (`P:alert:*`) and debu
 | Key expiry & purge | `P:ttl` | zset | state and queue | No TTL. Members leave when swept or purged. | no expiry |
 | Key expiry & purge | `P:purge` | zset | state | No TTL. A member leaves when its purge ran or its target came back (`purge.py:483`), or by `cancel_scheduled()` `purge.py:438-443`. | no expiry |
 | Key expiry & purge | `P:lock:purge` | string | state | Fixed 120 s, or until the holder releases it at the end of its tick (`purge.py:485`). | native (on purpose) |
-| Key expiry & purge | `P:tenant:H:reqs` | zset | state | The longest call in it + 60 s; a write only lengthens it (`grow=True`, `purge.py:510`). | indexed in `P:ttl` |
 
 ## Store policy matrix
 
@@ -207,13 +209,14 @@ mode. `noeviction` is the same in both modes. `allkeys-*` evicts any key in eith
 | Health & breaker | Kept | Open breakers close, backoffs end, disabled deployments come back: calls hit failing deployments | Kept | As volatile native, `health` too when it has no TTL |
 | Tenant fairness | Kept | A tenant can pass its share or quota for up to a minute | Kept | As volatile native |
 | Request records | Kept | `job` lost: duplicate provider runs. `cancel` lost: a cancelled call runs | Kept | As volatile native |
+| Request index | Kept | `tq:H` / `tq` lost: admin lists, counts, cancels, moves and tenant purges miss the calls made before until they end (each new call indexes again). `tqn` lost: names not shown | Kept | As volatile native |
 | Results & streaming | Kept | `res` lost: the caller fails `deadline_exceeded`. `P:offload` lost: a pod without offload can start | Kept | As volatile native |
 | Queues (streams) | Kept | Kept, except `P:rcv:*` (minor) | Kept | Waiting calls lost, held calls stuck, duplicate deliveries, failure counts reset |
 | Doorbells & wakeups | Kept | Workers wake at their poll pause (1 s). Harmless | Kept | As volatile native |
 | Jobs | Kept | `id:JOBID` lost: a job sent twice runs twice | Kept | As volatile native |
 | Process liveness & locks | Kept | `caller` lost: a live caller's calls are dropped as `caller_gone`. Locks: duplicate work only | `caller` kept. Locks and `P:health:WORKER` keep native TTLs and may go: duplicate work only | `epoch` lost too: every pod runs its store-reset path |
 | Alerts & misc | Kept | Harmless | Alert markers kept; `debug` may go. Harmless | Harmless |
-| Key expiry & purge | Kept | `P:tenant:H:reqs` lost: a tenant purge cannot cancel older calls. `P:lock:purge`: duplicate work only | `P:lock:purge` may go: duplicate work only | `P:ttl` lost: indexed keys never expire (memory grows). `P:purge` lost: scheduled auto purges forgotten |
+| Key expiry & purge | Kept | `P:lock:purge`: duplicate work only | `P:lock:purge` may go: duplicate work only | `P:ttl` lost: indexed keys never expire (memory grows). `P:purge` lost: scheduled auto purges forgotten |
 
 - **`noeviction`** keeps every key. A full store refuses writes (`OOM`); the library treats a
   write refusal (`OOM`, `MISCONF`, `NOREPLICAS`, `READONLY`) as the store being down
@@ -273,14 +276,15 @@ gets `swept`.
 | `LLMQ_KEY_EXPIRY` | `auto` (`settings.py:281`) | how every expiry is kept: native TTLs or the index `P:ttl` (`auto`: native on `noeviction`, else swept). Lifetimes stay the same |
 | `LLMQ_TTL_SWEEP_BATCH` / `LLMQ_TTL_SWEEP_ROUNDS` | 500 / 100 (`settings.py:392-393`; 1-5000 / 1-10000) | how many due keys one sweep deletes (at most 500 x 100 = 50000 per 10 s by default); a bigger backlog waits for the next sweep |
 | `LLMQ_PURGE_GRACE_SECS` | 900 s | `P:purge` due times |
-| `LLMQ_TENANT_INDEX` | false | writes `P:tenant:H:reqs` at all |
+| `LLMQ_REQUEST_INDEX_ENABLED` | true | writes `tq:H`, `tq` and the job's `ix` / `ixh` / `mid` / `q` at all |
+| `LLMQ_TENANT_NAMES_ENABLED` | false | writes `tqn` at all |
 
 Fixed in code (no setting): `DAY_MS` 1 day (`rot`, `ac`, `cb`, `health`, `tf:fq`); 180 s
 (`retries:MINUTE`); 120 s (`reset_minute`); 60 s (doorbells, `chunkwake`, the jobs dedupe claim
 before confirmation); 30 s (`END_TTL_SECS` after a stream's end, the jobs `consumer` mark);
 7 days (`P:offload`); 1 day (alert markers); 1 hour (`debug`); 5 s (`P:health:WORKER`,
 `lock:probe`); 45 s (`lock:alerts`); 120 s (`lock:purge`); the longest call + 60 s
-(`P:tenant:H:reqs`).
+(`tq:H`, `tq`, `tqn`).
 
 ## Pub/sub channels and blocking reads
 
@@ -802,7 +806,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 |---|---|
 | Type | hash |
 | Store | state |
-| Schema | The claim record: `state` (`queued`, `running`, `done`, `failed`, `expired`, `cancelled`), `user` (keyed hash of the user or session id, `runtime.py:1487`), `params` (params hash, `envelope.py:161`), `caller` (worker id of the sender), `confirmed` (`0`/`1`), `created` (store secs), `app` (`1`: app-supplied id), `direct` (`1`: run in the caller's process), `owner` (`WORKER@TAG` running it), `hb` (ms of its last heartbeat). |
+| Schema | The claim record: `state` (`queued`, `running`, `done`, `failed`, `expired`, `cancelled`), `user` (keyed hash of the user or session id, `runtime.py:1487`), `params` (params hash, `envelope.py:161`), `caller` (worker id of the sender), `confirmed` (`0`/`1`), `created` (store secs), `app` (`1`: app-supplied id), `direct` (`1`: run in the caller's process), `owner` (`WORKER@TAG` running it), `hb` (ms of its last heartbeat). With the request index on (0.2.0 T1): `ix` (its `tq:H` key name), `ixh` (`H`), `mid` (its stream message id, `''` for a direct run; a reprioritize moves it), `q` (class `p` / `n`). |
 | Written by | `register` `requests.py:69-160`; `REGISTER_SEND` `requests.py:180-188`; `CONFIRM` `requests.py:196-202`; `RESULT_PUT` `requests.py:245-248`; `SETTLE_DONE` `requests.py:274-277`; `PICK_TAKE` `_admission_lua.py:789-793`; `release_claim` `:955-964`; `RENEW` `:1013-1019`; `REREGISTER` `:1096-1101`. |
 | Read by | `register` `requests.py:71`; `PICK_TAKE` `_admission_lua.py:372,396-397,413`; `RESULT_TAKE` / `_DROP_READ` `requests.py:302,329`; `CANCEL` `requests.py:348`; `_RESULTS_EXIST` `runtime.py:263`; `_lost` `runtime.py:2237-2248`. |
 | Lifetime (native) | Created with 30 s (`unconfirmed_secs`, `requests.py:380`). After the send: the call's deadline + `LLMQ_STATUS_TTL_SECS` (1800 s) (`requests.py:509,527`). After the result: `LLMQ_STATUS_TTL_SECS` (`requests.py:247`). A record a worker's claim made: `Tuning.engine.job_ttl_ms` (3600 s, `_admission_lua.py:792,1100`); `RENEW` pushes it back to `job_ttl_ms` when under 2 leases are left (`:1018`). |
@@ -859,6 +863,56 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | If evicted (`volatile-*`, native mode) | The cancel is lost: a queued call can still be granted and run; a running attempt that missed the pub/sub message is not stopped by the key check. |
 | If evicted (`allkeys-*`) | Same as volatile. |
 | Deleted by | TTL; a new run of the id `requests.py:102,126`. |
+
+### Request index
+
+#### `P:{m:ALIAS}:tq:H`
+
+| | |
+|---|---|
+| Type | zset |
+| Store | state |
+| Schema | The calls in flight of tenant `H` on model `ALIAS` (0.2.0 T1): member = request id, score = the call's deadline (store ms: now + call time + `caller_margin_secs`; an extend raises it). `H` = the keyed hash of the call's tenant (`LLMQ_DEFAULT_TENANT` included), `-` for no tenant; the user id is never a fallback here. `ALIAS` = the model whose queue holds the call (after the disabled-model fallback). |
+| Written by | `index_add` (`_INDEX_FN`, `requests.py`) in `REGISTER_SEND` (queued, shared store) and `CONFIRM` (separate queue store or replica wait; direct runs; takeovers update the score): `ZADD`, then entries past their deadline are pruned (`ZREMRANGEBYSCORE`). `EXTEND` (`ZADD XX`). |
+| Read by | `RequestsAdmin` (`requests_admin.py`: list, count, cancel, reprioritize); tenant purge `queued` / `running` (`purge.py`); `status(model, tenant=...)` (`status.py`). Readers count only scores in the future and drop ids whose job is final or gone. |
+| Lifetime (native) | 60 s past the latest deadline in it; a write only lengthens it (`X.pttl` check). |
+| Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
+| Count | 1 per model and tenant with calls in flight; one member (~60 B) per call until its final write. |
+| If evicted (`volatile-*`, native mode) | Admin operations and tenant purges miss the calls made before until they end; new calls are indexed again. |
+| If evicted (`allkeys-*`) | Same as volatile. |
+| Deleted by | `index_drop` in `RESULT_PUT` / `SETTLE_DONE` (`ZREM` of the call, every final state); a model purge (SCAN `{m:ALIAS}:*`); TTL. |
+
+#### `P:{m:ALIAS}:tq`
+
+| | |
+|---|---|
+| Type | zset |
+| Store | state |
+| Schema | The tenants with calls in flight on model `ALIAS`: member = tenant hash `H` (or `-`), score = the latest deadline of any of its calls (`ZADD GT`). |
+| Written by | `index_add` (as `tq:H`), entries past their deadline pruned on each add; `EXTEND` (`ZADD GT`). |
+| Read by | `RequestsAdmin.list` / `count` without a tenant; `status()` `tenants.active`. |
+| Lifetime (native) | 60 s past its latest deadline; a write only lengthens it. |
+| Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime. Never evictable. |
+| Count | 1 per model with calls in flight; one member per tenant. |
+| If evicted (`volatile-*`, native mode) | All-tenant lists and the active tenant count miss tenants until their next call. |
+| If evicted (`allkeys-*`) | Same as volatile. |
+| Deleted by | A model purge; TTL. Members lapse by score (pruned on add, filtered on read). |
+
+#### `P:{m:ALIAS}:tqn`
+
+| | |
+|---|---|
+| Type | hash |
+| Store | state |
+| Schema | Only with `LLMQ_TENANT_NAMES_ENABLED=true` (owner Q5): tenant hash `H` -> the tenant's name, so admin lists and status can show it. Off, no name is stored anywhere (messages carry hashes only). |
+| Written by | `index_add` (`HSET`, with the index). |
+| Read by | `RequestsAdmin` (`tenant_name` of summaries), `status(model, tenant=...)`. |
+| Lifetime (native) | As `tq`. |
+| Swept mode | Indexed in `P:ttl`. Never evictable. |
+| Count | 1 per model with named tenants in flight. |
+| If evicted (`volatile-*`, native mode) | Names are not shown until the tenant's next call. |
+| If evicted (`allkeys-*`) | Same as volatile. |
+| Deleted by | A model purge; TTL. |
 
 ### Results & streaming
 
@@ -1385,22 +1439,6 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | If evicted (`volatile-*`, native mode) | Two processes may run one tick at once. The purges are idempotent and `ZADD NX` keeps the first due time. Harmless. |
 | If evicted (`allkeys-*`) | Same as volatile. |
 | Deleted by | `_UNLOCK` (only by its holder); TTL. |
-
-#### `P:tenant:H:reqs`
-
-| | |
-|---|---|
-| Type | zset |
-| Store | state |
-| Schema | Only with `LLMQ_TENANT_INDEX=true`. A tenant's calls: member = request id, score = the call's deadline (store ms: now + call time + `caller_margin_secs`). `H` = the tenant hash admission uses (`tf:t:H`). |
-| Written by | `index_call` `purge.py:489-511` from `_index_tenant` `runtime.py:1567-1583` on each new call: `ZADD`, then entries past their deadline are pruned (`ZREMRANGEBYSCORE`). |
-| Read by | Tenant purge `purge.py:636-641` (to cancel `queued` / `running` calls). |
-| Lifetime (native) | The longest call in it + 60 s; a write only lengthens it (`grow=True`, `purge.py:510`). |
-| Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
-| Count | 1 per tenant with calls in flight; one member per call until its deadline. |
-| If evicted (`volatile-*`, native mode) | A tenant purge cannot cancel the calls made before: they run to the end. |
-| If evicted (`allkeys-*`) | Same as volatile. |
-| Deleted by | Tenant purge (`purge.py:659-660`); TTL. |
 
 ## Not verified
 

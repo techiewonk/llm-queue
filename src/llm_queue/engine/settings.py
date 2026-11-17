@@ -90,7 +90,7 @@ _TRUE, _FALSE = ("true", "1", "yes", "on"), ("false", "0", "no", "off")
 def _purge_settings(
     get: Callable[..., Any], number: Callable[..., Any], problems: list[str]
 ) -> dict[str, Any]:
-    """The purge settings (`LLMQ_AUTO_PURGE` ... `LLMQ_TENANT_INDEX`) as `InfraSettings` fields.
+    """The purge settings (`LLMQ_AUTO_PURGE` ... `LLMQ_TENANT_PURGE_DEFAULT`) as fields.
 
     Kept apart from `from_env`'s body so the purge feature reads as one block.
     """
@@ -98,7 +98,6 @@ def _purge_settings(
     for name, field_name, default in (
         ("AUTO_PURGE", "auto_purge", "true"),
         ("PURGE_WAIT", "purge_wait", "true"),
-        ("TENANT_INDEX", "tenant_index", "false"),
     ):
         raw = str(get(name, default)).strip().lower()
         if raw not in _TRUE + _FALSE:
@@ -108,7 +107,6 @@ def _purge_settings(
     out["purge_grace_secs"] = number("PURGE_GRACE_SECS", 900.0, zero=True, hi=604_800)
     out["purge_wait_secs"] = number("PURGE_WAIT_SECS", 300.0, zero=True, hi=86_400)
     out["http_purge_wait_secs"] = number("HTTP_PURGE_WAIT_SECS", 60.0, zero=True, hi=3_600)
-    out["purge_batch"] = number("PURGE_BATCH", 500, int, lo=1, hi=10_000)
     parts = {p.strip().lower() for p in str(get("TENANT_PURGE_DEFAULT", "keys")).split(",")}
     parts.discard("")
     if not parts or parts - set(TENANT_PURGE_PARTS):
@@ -118,6 +116,69 @@ def _purge_settings(
         parts = {"keys"}
     out["tenant_purge_default"] = ",".join(p for p in TENANT_PURGE_PARTS if p in parts)
     return out
+
+
+# `LLMQ_METRICS_TENANTS`: at most this many tenants get a label of their own (cardinality).
+METRICS_TENANTS_MAX = 50
+_LABEL_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}\Z")
+
+
+def _switch(get: Callable[..., Any], name: str, default: bool, problems: list[str]) -> bool:
+    """A true / false variable (`on` / `off`, `1` / `0`, `yes` / `no` too)."""
+    raw = str(get(name, "true" if default else "false")).strip().lower()
+    if raw not in _TRUE + _FALSE:
+        problems.append(f"LLMQ_{name} must be true or false (on / off)")
+        return default
+    return raw in _TRUE
+
+
+def parse_metrics_tenants(text: str) -> tuple[tuple[tuple[str, str], ...], list[str]]:
+    """`LLMQ_METRICS_TENANTS` (`acme,globex=t2`) as (tenant name, label) pairs, and problems.
+
+    A bare name is its own label. Labels are `[A-Za-z0-9_.-]{1,64}`, distinct, and never `other`
+    or `-` (the values of unlisted tenants and of calls with no tenant).
+    """
+    pairs: list[tuple[str, str]] = []
+    problems: list[str] = []
+    for item in (part.strip() for part in text.split(",")):
+        if not item:
+            continue
+        name, _, label = item.partition("=")
+        name, label = name.strip(), (label.strip() or name.strip())
+        if not name or not _LABEL_RE.match(label) or label in ("other", "-"):
+            problems.append(
+                f"LLMQ_METRICS_TENANTS entry `{item}` must be `name` or `name=label` with a label "
+                "of 1-64 letters, digits, `_`, `.` or `-` (not `other` or `-`)"
+            )
+            continue
+        pairs.append((name, label))
+    if len(pairs) > METRICS_TENANTS_MAX:
+        problems.append(f"LLMQ_METRICS_TENANTS must list at most {METRICS_TENANTS_MAX} tenants")
+    names = [n for n, _ in pairs]
+    labels = [label for _, label in pairs]
+    if len(set(names)) != len(names) or len(set(labels)) != len(labels):
+        problems.append("LLMQ_METRICS_TENANTS must not repeat a tenant or a label")
+    return tuple(pairs), problems
+
+
+def _admin_settings(
+    get: Callable[..., Any], number: Callable[..., Any], problems: list[str]
+) -> dict[str, Any]:
+    """The request index and admin settings (design 0.2.0 T1, T2, T6) as `InfraSettings` fields."""
+    tenants, found = parse_metrics_tenants(str(get("METRICS_TENANTS", "") or ""))
+    problems.extend(found)
+    return {
+        "request_index_enabled": _switch(get, "REQUEST_INDEX_ENABLED", True, problems),
+        "tenant_names_enabled": _switch(get, "TENANT_NAMES_ENABLED", False, problems),
+        "admin_batch": number("ADMIN_BATCH", 500, int, lo=1, hi=10_000),
+        "admin_scan_max": number("ADMIN_SCAN_MAX", 100_000, int, lo=1_000, hi=10_000_000),
+        "requests_list_max": number("REQUESTS_LIST_MAX", 1_000, int, lo=1, hi=10_000),
+        "requests_move_batch": number("REQUESTS_MOVE_BATCH", 50, int, lo=1, hi=500),
+        "requests_move_bytes": number(
+            "REQUESTS_MOVE_BYTES", 8_388_608, int, lo=65_536, hi=67_108_864
+        ),
+        "metrics_tenants": tenants,
+    }
 
 
 def _read_document(
@@ -198,9 +259,17 @@ class InfraSettings:
     purge_wait: bool = True
     purge_wait_secs: float = 300.0
     http_purge_wait_secs: float = 60.0  # LLMQ_HTTP_PURGE_WAIT_SECS
-    purge_batch: int = 500
     tenant_purge_default: str = "keys"  # comma list of TENANT_PURGE_PARTS
-    tenant_index: bool = False
+    # The request index and admin operations (0.2.0 T): see `AdminSettings` (requests_admin.py).
+    request_index_enabled: bool = True  # LLMQ_REQUEST_INDEX_ENABLED
+    tenant_names_enabled: bool = False  # LLMQ_TENANT_NAMES_ENABLED: names stored beside hashes
+    admin_batch: int = 500  # LLMQ_ADMIN_BATCH: ids per pipeline / script in admin ops and purges
+    admin_scan_max: int = 100_000  # LLMQ_ADMIN_SCAN_MAX
+    requests_list_max: int = 1_000  # LLMQ_REQUESTS_LIST_MAX
+    requests_move_batch: int = 50  # LLMQ_REQUESTS_MOVE_BATCH
+    requests_move_bytes: int = 8_388_608  # LLMQ_REQUESTS_MOVE_BYTES
+    # LLMQ_METRICS_TENANTS: (tenant name, label) pairs; raw names stay in this process only.
+    metrics_tenants: tuple[tuple[str, str], ...] = field(default=(), repr=False)
     # Where registry placeholders are read (`secrets=` first, then the environment `from_env`
     # read); None: `os.environ`. Never shown or compared.
     placeholder_lookup: Callable[[str], str | None] | None = field(
@@ -396,6 +465,7 @@ class InfraSettings:
                 f"LLMQ_LEASE_SECS / 3 ({beat:g} s), plus a margin"
             )
         purge = _purge_settings(get, number, problems)
+        admin = _admin_settings(get, number, problems)
         settings = cls(
             store_url=urls["STORE_URL"] or str(store or ""),
             queue_store_url=urls["QUEUE_STORE_URL"],
@@ -436,6 +506,7 @@ class InfraSettings:
             ttl_sweep_batch=number("TTL_SWEEP_BATCH", 500, int, lo=1, hi=5_000),
             ttl_sweep_rounds=number("TTL_SWEEP_ROUNDS", 100, int, lo=1, hi=10_000),
             **purge,
+            **admin,
             placeholder_lookup=placeholder,
         )
         if problems:

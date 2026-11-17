@@ -128,8 +128,8 @@ Nothing was deleted. It is a direct `LLMQueueError`, not a `ConfigError`. Raised
 - `model(alias)` names a model the stored registry still has (pass `force=True`, or remove it
   from the registry first);
 - `deployment(alias, "account/name")` names a deployment the stored registry still has (same);
-- `tenant(..., remove=...)` asks for `queued` or `running` while `LLMQ_TENANT_INDEX` is off (the
-  per-tenant call index is needed to find the calls).
+- `tenant(..., remove=...)` asks for `queued` or `running` while the request index is off
+  (`LLMQ_REQUEST_INDEX_ENABLED=false`: the index is needed to find the calls).
 
 A dry run (`plan_*`, `dry_run=True`) raises it too, so a plan shows the refusal before you
 purge. The HTTP routes answer 409 with `{"error": ...}` and no `Retry-After`; the CLI prints the

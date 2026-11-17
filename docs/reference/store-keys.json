@@ -424,7 +424,7 @@
     "key": "P:{r:ID}:job",
     "type": "hash",
     "store": "state",
-    "schema": "The claim record: `state` (`queued`, `running`, `done`, `failed`, `expired`, `cancelled`), `user` (keyed hash of the user or session id, `runtime.py:1487`), `params` (params hash, `envelope.py:161`), `caller` (worker id of the sender), `confirmed` (`0`/`1`), `created` (store secs), `app` (`1`: app-supplied id), `direct` (`1`: run in the caller's process), `owner` (`WORKER@TAG` running it), `hb` (ms of its last heartbeat).",
+    "schema": "The claim record: `state` (`queued`, `running`, `done`, `failed`, `expired`, `cancelled`), `user` (keyed hash of the user or session id, `runtime.py:1487`), `params` (params hash, `envelope.py:161`), `caller` (worker id of the sender), `confirmed` (`0`/`1`), `created` (store secs), `app` (`1`: app-supplied id), `direct` (`1`: run in the caller's process), `owner` (`WORKER@TAG` running it), `hb` (ms of its last heartbeat). With the request index on (0.2.0 T1): `ix` (its `tq:H` key name), `ixh` (`H`), `mid` (its stream message id, `''` for a direct run; a reprioritize moves it), `q` (class `p` / `n`).",
     "written_by": "`register` `requests.py:69-160`; `REGISTER_SEND` `requests.py:180-188`; `CONFIRM` `requests.py:196-202`; `RESULT_PUT` `requests.py:245-248`; `SETTLE_DONE` `requests.py:274-277`; `PICK_TAKE` `_admission_lua.py:789-793`; `release_claim` `:955-964`; `RENEW` `:1013-1019`; `REREGISTER` `:1096-1101`.",
     "read_by": "`register` `requests.py:71`; `PICK_TAKE` `_admission_lua.py:372,396-397,413`; `RESULT_TAKE` / `_DROP_READ` `requests.py:302,329`; `CANCEL` `requests.py:348`; `_RESULTS_EXIST` `runtime.py:263`; `_lost` `runtime.py:2237-2248`.",
     "lifetime": "Created with 30 s (`unconfirmed_secs`, `requests.py:380`). After the send: the call's deadline + `LLMQ_STATUS_TTL_SECS` (1800 s) (`requests.py:509,527`). After the result: `LLMQ_STATUS_TTL_SECS` (`requests.py:247`). A record a worker's claim made: `Tuning.engine.job_ttl_ms` (3600 s, `_admission_lua.py:792,1100`); `RENEW` pushes it back to `job_ttl_ms` when under 2 leases are left (`:1018`).",
@@ -478,6 +478,51 @@
     "evicted_volatile": "The cancel is lost: a queued call can still be granted and run; a running attempt that missed the pub/sub message is not stopped by the key check.",
     "evicted_allkeys": "Same as volatile.",
     "deleted_by": "TTL; a new run of the id `requests.py:102,126`."
+  },
+  {
+    "group": "Request index",
+    "key": "P:{m:ALIAS}:tq:H",
+    "type": "zset",
+    "store": "state",
+    "schema": "The calls in flight of tenant `H` on model `ALIAS` (0.2.0 T1): member = request id, score = the call's deadline (store ms: now + call time + `caller_margin_secs`; an extend raises it). `H` = the keyed hash of the call's tenant, `-` for no tenant (never the user id).",
+    "written_by": "`index_add` (`_INDEX_FN`, `requests.py`) in `REGISTER_SEND` and `CONFIRM` (separate queue store, replica wait, direct runs, takeovers); lapsed entries pruned. `EXTEND` (`ZADD XX`).",
+    "read_by": "`RequestsAdmin` (`requests_admin.py`); tenant purge `queued` / `running` (`purge.py`); `status(model, tenant=...)` (`status.py`).",
+    "lifetime": "60 s past the latest deadline in it; a write only lengthens it.",
+    "swept": "Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable.",
+    "count": "1 per model and tenant with calls in flight; one member per call.",
+    "evicted_volatile": "Admin operations and tenant purges miss the calls made before until they end.",
+    "evicted_allkeys": "Same as volatile.",
+    "deleted_by": "`index_drop` in `RESULT_PUT` / `SETTLE_DONE` (every final state); a model purge; TTL."
+  },
+  {
+    "group": "Request index",
+    "key": "P:{m:ALIAS}:tq",
+    "type": "zset",
+    "store": "state",
+    "schema": "The tenants with calls in flight on model `ALIAS`: member = tenant hash `H` (or `-`), score = the latest deadline of its calls (`ZADD GT`).",
+    "written_by": "`index_add` (as `tq:H`); `EXTEND` (`ZADD GT`).",
+    "read_by": "`RequestsAdmin.list` / `count` without a tenant; `status()` `tenants.active`.",
+    "lifetime": "60 s past its latest deadline; a write only lengthens it.",
+    "swept": "Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable.",
+    "count": "1 per model with calls in flight; one member per tenant.",
+    "evicted_volatile": "All-tenant lists miss tenants until their next call.",
+    "evicted_allkeys": "Same as volatile.",
+    "deleted_by": "A model purge; TTL."
+  },
+  {
+    "group": "Request index",
+    "key": "P:{m:ALIAS}:tqn",
+    "type": "hash",
+    "store": "state",
+    "schema": "Only with `LLMQ_TENANT_NAMES_ENABLED=true` (owner Q5): tenant hash -> name.",
+    "written_by": "`index_add` (`HSET`).",
+    "read_by": "`RequestsAdmin` (`tenant_name`), `status(model, tenant=...)`.",
+    "lifetime": "As `tq`.",
+    "swept": "Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable.",
+    "count": "1 per model with named tenants in flight.",
+    "evicted_volatile": "Names are not shown until the tenant's next call.",
+    "evicted_allkeys": "Same as volatile.",
+    "deleted_by": "A model purge; TTL."
   },
   {
     "group": "Results & streaming",
@@ -958,20 +1003,5 @@
     "evicted_volatile": "Two processes may run one tick at once. The purges are idempotent and `ZADD NX` keeps the first due time. Harmless.",
     "evicted_allkeys": "Same as volatile.",
     "deleted_by": "`_UNLOCK` (only by its holder); TTL."
-  },
-  {
-    "group": "Key expiry & purge",
-    "key": "P:tenant:H:reqs",
-    "type": "zset",
-    "store": "state",
-    "schema": "Only with `LLMQ_TENANT_INDEX=true`. A tenant's calls: member = request id, score = the call's deadline (store ms: now + call time + `caller_margin_secs`). `H` = the tenant hash admission uses (`tf:t:H`).",
-    "written_by": "`index_call` `purge.py:489-511` from `_index_tenant` `runtime.py:1567-1583` on each new call: `ZADD`, then entries past their deadline are pruned (`ZREMRANGEBYSCORE`).",
-    "read_by": "Tenant purge `purge.py:636-641` (to cancel `queued` / `running` calls).",
-    "lifetime": "The longest call in it + 60 s; a write only lengthens it (`grow=True`, `purge.py:510`).",
-    "swept": "Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable.",
-    "count": "1 per tenant with calls in flight; one member per call until its deadline.",
-    "evicted_volatile": "A tenant purge cannot cancel the calls made before: they run to the end.",
-    "evicted_allkeys": "Same as volatile.",
-    "deleted_by": "Tenant purge (`purge.py:659-660`); TTL."
   }
 ]

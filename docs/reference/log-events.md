@@ -154,7 +154,6 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `sweep_failed` | warning | engine/runtime.py |
 | `sync_call_on_event_loop` | warning | core.py |
 | `sync_engine_close_failed` | warning | core.py |
-| `tenant_index_failed` | warning | engine/runtime.py |
 | `ttl_sweep_failed` | warning | engine/runtime.py |
 | `undo_skipped` | warning | engine/admission.py |
 | `waiting_calls_lost` | warning | engine/runtime.py |

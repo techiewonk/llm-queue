@@ -74,7 +74,8 @@ from llm_queue.engine.queue import (
     QueueSettings,
     StreamQueues,
 )
-from llm_queue.engine.requests import RequestStore
+from llm_queue.engine.requests import IndexEntry, RequestStore
+from llm_queue.engine.requests_admin import AdminSettings
 from llm_queue.engine.status import AlertEvaluator, StatusReader
 from llm_queue.engine.store_checks import UNKNOWN as UNKNOWN_POLICY
 from llm_queue.engine.store_checks import check_store, eviction_policy, eviction_warning
@@ -248,7 +249,9 @@ class EngineSettings:
     # `static_cap` then answer at once instead of re-trying the store (1.5-21.5 s per call).
     outage_memo_secs: float = 3.0
     timings: EngineTimings = field(default_factory=EngineTimings)  # `Tuning.engine`
-    purge: PurgeSettings = field(default_factory=PurgeSettings)  # LLMQ_*PURGE*, TENANT_INDEX
+    purge: PurgeSettings = field(default_factory=PurgeSettings)  # LLMQ_*PURGE*
+    # The request index and admin operations (LLMQ_REQUEST_INDEX_ENABLED, LLMQ_ADMIN_*, ...).
+    admin: AdminSettings = field(default_factory=AdminSettings)
 
 
 # ARGV: key prefix, request ids... Reply: {the 0-based indexes of the ids with a stored result,
@@ -1509,6 +1512,7 @@ class Engine:
         # Queues in the state store: register, send and confirm are one script (3 round trips
         # before). Not with `queue_wait_replicas`: that send needs its own WAIT.
         combined = not direct and self.queues_shared and not self.replica_wait.replicas_for("calls")
+        index = self._index_entry(envelope, alias, priority, call_secs)
 
         async def register() -> tuple[str, bool]:
             """The registration's outcome, and whether the call was sent with it.
@@ -1544,6 +1548,7 @@ class Engine:
                     max_waiting=settings.max_waiting,
                     retention_secs=settings.retention_secs,
                     keep_secs=call_secs,
+                    index=index,
                 )
             except QueueFull as exc:
                 raise CallFailed(
@@ -1552,8 +1557,6 @@ class Engine:
             return found.outcome, found.outcome in ("new", "takeover")
 
         outcome, sent = await register()
-        if outcome in ("new", "takeover"):
-            await self._index_tenant(envelope, call_secs)
         waiter = self._waiters.setdefault(rid, asyncio.get_running_loop().create_future())
         loop = asyncio.get_running_loop()
         until = loop.time() + call_secs + self.settings.caller_margin_secs
@@ -1561,10 +1564,10 @@ class Engine:
             run: asyncio.Task[None] | None = None  # the direct run, watched while waiting
             if outcome in ("new", "takeover") and not sent:
                 if direct:
-                    await self.requests.confirm(rid, keep_secs=call_secs, direct=True)
+                    await self.requests.confirm(rid, keep_secs=call_secs, direct=True, index=index)
                     run = self._start_direct(envelope)
                 else:
-                    await self._send(rid, envelope, view, alias, priority, call_secs)
+                    await self._send(rid, envelope, view, alias, priority, call_secs, index)
             reply = await self._wait_result(
                 rid,
                 waiter,
@@ -1580,23 +1583,39 @@ class Engine:
             # The send this caller attached to never happened: register again.
             outcome, sent = await register()
 
-    async def _index_tenant(self, envelope: Envelope, call_secs: float) -> None:
-        """`LLMQ_TENANT_INDEX`: note a new call under its tenant, for a tenant purge (K2).
+    def _index_entry(
+        self, envelope: Envelope, alias: str, priority: bool, call_secs: float
+    ) -> IndexEntry | None:
+        """Where the call goes in the request index of its model and tenant (T1); None when off.
 
-        A failed write never fails the call: the purge only misses that call.
+        Written by the script that confirms the call (no round trip of its own), removed by
+        the one that writes its final state. The tenant is the call's tenant only (never the
+        user id, unlike fairness): `-` for none.
         """
-        if not self.settings.purge.tenant_index:
-            return
-        try:
-            await self.purge.index_call(
-                envelope.tenant_id,
-                envelope.user_id,
-                envelope.request_id,
-                now_ms=int(self.clock.now() * 1000),
-                keep_ms=int((call_secs + self.settings.caller_margin_secs) * 1000),
-            )
-        except Exception as exc:
-            logger.warning("tenant_index_failed", request_id=envelope.request_id, error=repr(exc))
+        admin = self.settings.admin
+        if not admin.request_index:
+            return None
+        tenant = self._index_tenant_hash(envelope)
+        keys: tuple[str, ...] = (
+            self.keys.request_index(alias, tenant),
+            self.keys.tenant_index(alias),
+        )
+        name = ""
+        if admin.tenant_names and tenant != "-" and envelope.tenant_name:
+            # Q5: the name stays out of the message; only this opt-in key holds it.
+            name = envelope.tenant_name
+            keys += (self.keys.tenant_names(alias),)
+        return IndexEntry(
+            keys=keys,
+            tenant_hash=tenant,
+            keep_ms=int((call_secs + self.settings.caller_margin_secs) * 1000),
+            cls="p" if priority else "n",
+            name=name,
+        )
+
+    def _index_tenant_hash(self, envelope: Envelope) -> str:
+        """The call's tenant as the index names it: its keyed hash, or `-` for none."""
+        return self.hash_id(envelope.tenant_id) if envelope.tenant_id else "-"
 
     async def embed(
         self,
@@ -1629,6 +1648,7 @@ class Engine:
         alias: str,
         priority: bool,
         keep_secs: float,
+        index: IndexEntry | None = None,
     ) -> None:
         """Put the message on its queue and confirm the record; undo the record on failure.
 
@@ -1648,6 +1668,7 @@ class Engine:
         # store took the client's whole budget, about 21 s, before the failover (R3FM-3). A
         # shared store keeps the client's own timeouts (the call has no other path).
         floor_secs = self.settings.timings.health_probe_secs
+        message_id = ""  # unknown when too few replicas acknowledged (the send stands)
         while True:
             try:
                 try:
@@ -1656,7 +1677,7 @@ class Engine:
                         left = give_up - loop.time()
                         bound = left if left > 0 else floor_secs
                     async with asyncio.timeout(bound):
-                        await self.queues.send(
+                        message_id = await self.queues.send(
                             self._queue_name(view, alias, priority),
                             body,
                             settings,
@@ -1695,7 +1716,9 @@ class Engine:
                     raise _QueueDown from exc
                 raise
         try:
-            await self.requests.confirm(rid, keep_secs=keep_secs)
+            await self.requests.confirm(
+                rid, keep_secs=keep_secs, index=index, message_id=message_id
+            )
         except STORE_ERRORS as exc:  # the message is on the queue: never run it a second time
             logger.warning("confirm_failed", request_id=rid, error=str(exc))
 

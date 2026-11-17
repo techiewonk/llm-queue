@@ -33,6 +33,21 @@ class Keys:
         """Circuit breaker of one deployment (hash)."""
         return self.model(alias, f"cb:{deployment}")
 
+    def request_index(self, alias: str, tenant_hash: str) -> str:
+        """The calls in flight of one tenant on one model (zset: request id -> deadline ms).
+
+        `tenant_hash` is the tenant's keyed hash, or `-` for calls with no tenant (T1).
+        """
+        return self.model(alias, f"tq:{tenant_hash}")
+
+    def tenant_index(self, alias: str) -> str:
+        """The tenants with calls in flight on one model (zset: hash -> latest deadline ms)."""
+        return self.model(alias, "tq")
+
+    def tenant_names(self, alias: str) -> str:
+        """Tenant names beside their hashes (hash), only with `LLMQ_TENANT_NAMES_ENABLED`."""
+        return self.model(alias, "tqn")
+
     # ---------------------------------------------------------------- per request
 
     def request(self, request_id: str, name: str) -> str:

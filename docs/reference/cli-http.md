@@ -20,7 +20,7 @@ write (`uid:<n>` when the user has no passwd entry, as in a container run under 
 | `llm-queue registry gc --yes\|--dry-run [--force] [--no-wait]` | Purge the store state of every model and deployment the registry no longer has (`PurgeService.removed`); queues only when empty unless `--force`; `--no-wait` does not wait for a removed deployment's running calls. Prints the purge report |
 | `llm-queue purge model M --yes\|--dry-run [--force]` | Purge a removed model: its keys, queues (empty ones unless `--force`) and doorbells. Refused while the registry has it, unless `--force` |
 | `llm-queue purge deployment M D --yes\|--dry-run [--force] [--no-wait] [--wait-secs S]` | Purge a removed deployment (`account/name`) of model M; waits for its running calls (`LLMQ_PURGE_WAIT`, `LLMQ_PURGE_WAIT_SECS`) |
-| `llm-queue purge tenant T --yes\|--dry-run [--remove keys,queued,running] [--models M1,M2]` | Purge a tenant's fairness state (default `LLMQ_TENANT_PURGE_DEFAULT`); `queued` / `running` cancel its calls and need `LLMQ_TENANT_INDEX` |
+| `llm-queue purge tenant T --yes\|--dry-run [--remove keys,queued,running] [--models M1,M2]` | Purge a tenant's fairness state (default `LLMQ_TENANT_PURGE_DEFAULT`); `queued` / `running` cancel its calls (from the request index, `LLMQ_REQUEST_INDEX_ENABLED`) |
 | `llm-queue registry schema` | The registry document's JSON Schema ([Registry document](registry.md#json-schema)); needs no store and no `LLMQ_*` settings |
 | `llm-queue block --region R` / `--account A` | Stop using a region or an account |
 | `llm-queue unblock --region R` / `--account A` | Use it again |

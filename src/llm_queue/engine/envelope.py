@@ -121,6 +121,20 @@ class Envelope(BaseModel):
     vectors: bool = False
     # `encode_params(params)` when the caller already ran it (the size cap): reused by `dumps`.
     _params_json: tuple[bytes, bool] | None = PrivateAttr(default=None)
+    # The caller's raw tenant name, kept in the caller's memory only (never in `dumps`): the
+    # request index stores it beside the hash when `LLMQ_TENANT_NAMES_ENABLED` (owner Q5).
+    _tenant_name: str | None = PrivateAttr(default=None)
+
+    def keep_tenant_name(self, name: str | None) -> None:
+        """Remember the raw tenant name in this process (`tenant_id` carries only its hash)."""
+        private = self.__pydantic_private__
+        assert private is not None
+        private["_tenant_name"] = name
+
+    @property
+    def tenant_name(self) -> str | None:
+        """The raw tenant name `keep_tenant_name` kept here (None on a received message)."""
+        return (self.__pydantic_private__ or {}).get("_tenant_name")
 
     def keep_params_json(self, encoded: tuple[bytes, bool]) -> None:
         """Reuse `encode_params(self.params)` in `dumps` (FO-21); the params must not change.

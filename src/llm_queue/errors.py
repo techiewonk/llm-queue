@@ -91,7 +91,8 @@ class PurgeRefused(LLMQueueError):
     """A purge that would delete state still in use, or that needs a setting that is off.
 
     E.g. a model still in the registry without `force`, or a tenant purge of queued / running
-    calls while `LLMQ_TENANT_INDEX` is off. Nothing was deleted.
+    calls while the request index is off (`LLMQ_REQUEST_INDEX_ENABLED=false`). Nothing was
+    deleted.
     """
 
 

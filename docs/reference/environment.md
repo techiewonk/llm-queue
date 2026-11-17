@@ -95,6 +95,23 @@ For a store with replicas, also set `min-replicas-to-write` on the primary: a wr
 | `LLMQ_ADMIN_TOKEN` | none | text (a secret) | Guards the router's routes except the probes and `/metrics`: the request's `LLMQ_ADMIN_HEADER` must equal it (constant-time). Read on every request, so a rotated secret needs no restart. Unset: only the app's `dependencies` guard the routes |
 | `LLMQ_ADMIN_HEADER` | `X-LLMQ-Token` | a header name | The header that carries the admin token |
 | `LLMQ_METRICS_SINK` | `emf` | `emf`, `prometheus`, `none` | `emf` (CloudWatch embedded metrics), `prometheus` (extra `metrics`) or `none`. One sink per process |
+| `LLMQ_METRICS_TENANTS` | empty | at most 50 entries `name` or `name=label`, label `[A-Za-z0-9_.-]{1,64}` (not `other` or `-`) | Tenants that get their own `tenant` label on `llmq_calls_total` and `llmq_wait_seconds` (`globex=t2` shows `globex` as `t2`, so a dashboard need not show the name); every other tenant is `other`, a call with no tenant `-`. The label is always there, so cardinality stays fixed. Names are matched by their keyed hash: no name reaches the store |
+
+## Requests by model and tenant
+
+Every call in flight is indexed under its model and tenant hash (`P:{m:ALIAS}:tq:H`, see
+[store keys](store-keys.md)) by the scripts that send and end it, so an operator can list,
+count, cancel, reprioritize and extend one tenant's calls on one model.
+
+| Variable | Default | Range | Meaning |
+|---|---|---|---|
+| `LLMQ_REQUEST_INDEX_ENABLED` | true | true or false (`on` / `off`) | Index each in-flight call under its model and tenant hash so admins can list, count, cancel, reprioritize and extend by tenant, and a tenant purge can cancel its calls; off saves about 30 us of store time per call and no admin operation can find calls by tenant |
+| `LLMQ_TENANT_NAMES_ENABLED` | false | true or false (`on` / `off`) | Also store each tenant's name beside its hash (`P:{m:ALIAS}:tqn`) so admin lists and status can show it; off, the store holds hashes only (messages always carry only the hashes) |
+| `LLMQ_ADMIN_BATCH` | 500 | 1 to 10000 (whole) | Ids per pipeline or cancel script in admin operations, and keys per pipelined `UNLINK` batch of a purge |
+| `LLMQ_ADMIN_SCAN_MAX` | 100000 | 1000 to 10000000 (whole) | Most index entries one admin operation reads; above it a write is refused and a count is truncated |
+| `LLMQ_REQUESTS_LIST_MAX` | 1000 | 1 to 10000 (whole) | Largest `limit` of a requests list |
+| `LLMQ_REQUESTS_MOVE_BATCH` | 50 | 1 to 500 (whole) | Messages per reprioritize script run |
+| `LLMQ_REQUESTS_MOVE_BYTES` | 8388608 | 65536 to 67108864 (whole) | Message bytes copied per reprioritize script run (bodies are copied inside the store) |
 
 ## Registry
 
@@ -132,9 +149,7 @@ What a purge does by default; each method argument overrides its setting. See
 | `LLMQ_PURGE_WAIT` | true | true or false | A deployment purge waits for the deployment's running calls to end first |
 | `LLMQ_PURGE_WAIT_SECS` | 300 | 0 to 86400 | ... for at most this long; still running then, nothing is deleted and the report says why |
 | `LLMQ_HTTP_PURGE_WAIT_SECS` | 60 | 0 to 3600 | The longest a purge over HTTP (`/purge/deployment`, `/registry/gc`) waits for running calls; a larger or omitted `wait_secs` is capped to it |
-| `LLMQ_PURGE_BATCH` | 500 | 1 to 10000 (whole) | Keys per pipelined `UNLINK` batch |
-| `LLMQ_TENANT_PURGE_DEFAULT` | `keys` | comma list of `keys`, `queued`, `running` | What a tenant purge removes: its fairness keys, its calls still waiting (cancelled), all its calls (cancelled). `queued` / `running` need `LLMQ_TENANT_INDEX` |
-| `LLMQ_TENANT_INDEX` | false | true or false | Keep a per-tenant index of calls (`P:tenant:<hash>:reqs`, one extra write per call) so a tenant purge can cancel them; off, asking for `queued` / `running` raises `PurgeRefused` |
+| `LLMQ_TENANT_PURGE_DEFAULT` | `keys` | comma list of `keys`, `queued`, `running` | What a tenant purge removes: its fairness keys, its calls still waiting (cancelled), all its calls (cancelled). `queued` / `running` read the request index of each model; with `LLMQ_REQUEST_INDEX_ENABLED=false` they raise `PurgeRefused` |
 
 ## Endpoint overrides
 

@@ -161,15 +161,48 @@ end
 
 REGISTER = _REGISTER_FN + "return register(ARGV[10], ARGV[11])\n"
 
-# KEYS: REGISTER's, then the queue's keys (stream first, `_PARTS` order). ARGV: REGISTER's, then
-# body, max waiting, retention ms, doorbell key, keep secs, caller ttl, lease ms. Register, send
-# a new call and confirm it in one round trip when the queues share the state store (three
-# before). A full queue drops the record it just made. Reply: {outcome}, {outcome, message id}
-# or {'full', depth}.
+# The request index per model and tenant (0.2.0 T1): `P:{m:ALIAS}:tq:H` (request id -> the
+# call's deadline, store ms) and `P:{m:ALIAS}:tq` (tenant hash -> its latest deadline). Written
+# in the script that confirms a call (no extra round trip), removed by the script that writes
+# its final state. Lapsed entries are pruned on each add; the keys live 60 s past their latest
+# deadline (grow-only). The job record keeps where its entry is: `ix` (the `tq:H` key), `ixh`
+# (H), `mid` (the stream message id, '' for a direct run) and `q` (class `p` / `n`). `names`
+# (optional): `P:{m:ALIAS}:tqn`, the tenant's name beside its hash (`LLMQ_TENANT_NAMES_ENABLED`).
+_INDEX_FN = """
+local function index_add(job, ix, ixs, rid, h, keep_ms, mid, cls, names, name)
+  local now = X.now()
+  local dl = now + keep_ms
+  redis.call('HSET', job, 'ix', ix, 'ixh', h, 'mid', mid, 'q', cls)
+  redis.call('ZADD', ix, dl, rid)
+  redis.call('ZREMRANGEBYSCORE', ix, '-inf', '(' .. now)
+  redis.call('ZADD', ixs, 'GT', dl, h)
+  redis.call('ZREMRANGEBYSCORE', ixs, '-inf', '(' .. now)
+  local ms = keep_ms + 60000
+  if X.pttl(ix) < ms then X.expire(ix, ms) end
+  if X.pttl(ixs) < ms then X.expire(ixs, ms) end
+  if names and names ~= '' and name and name ~= '' then
+    redis.call('HSET', names, h, name)
+    if X.pttl(names) < ms then X.expire(names, ms) end
+  end
+end
+local function index_drop(job, rid)
+  local ix = redis.call('HGET', job, 'ix')
+  if ix then redis.call('ZREM', ix, rid) end
+end
+"""
+
+# KEYS: REGISTER's, then the queue's keys (stream first, `_PARTS` order), then (index on) the
+# request index `tq:H`, the tenant index `tq` and (names on) `tqn`. ARGV: REGISTER's, then body,
+# max waiting, retention ms, doorbell key, keep secs, caller ttl, lease ms, then (index on) the
+# tenant hash, the index keep ms, the class (`p` / `n`) and the tenant name ('' for none).
+# Register, send a new call and confirm it in one round trip when the queues share the state
+# store (three before). A full queue drops the record it just made and indexes nothing. Reply:
+# {outcome}, {outcome, message id} or {'full', depth}.
 REGISTER_SEND = (
     _NOW_MS
     + SEND_FN
     + _REGISTER_FN
+    + _INDEX_FN
     + """
 local outcome = register(ARGV[15], ARGV[16])
 if outcome ~= 'new' and outcome ~= 'takeover' then return {outcome} end
@@ -186,20 +219,34 @@ end
 redis.call('HSET', KEYS[1], 'confirmed', '1')
 X.expire(KEYS[1], tonumber(ARGV[14]) * 1000)
 X.expire(KEYS[2], tonumber(ARGV[14]) * 1000)
+if #KEYS >= 13 then
+  local rid = string.match(KEYS[1], ':{r:(.*)}:job$')
+  index_add(KEYS[1], KEYS[12], KEYS[13], rid, ARGV[17], tonumber(ARGV[18]), sent[2], ARGV[19],
+    KEYS[14], ARGV[20])
+end
 return {outcome, sent[2]}
 """
 )
 
-# KEYS: job, callers. ARGV: keep secs, '1' for a direct run. The send succeeded: the record
-# lives until the deadline plus the status TTL. A direct run is marked: if its process dies,
-# REGISTER takes the record over (AMEND FE-5).
-CONFIRM = """
+# KEYS: job, callers, then (index on) `tq:H`, `tq` and (names on) `tqn`. ARGV: keep secs, '1'
+# for a direct run, then (index on) the tenant hash, index keep ms, message id ('' direct),
+# class, request id, tenant name. The send succeeded: the record lives until the deadline plus
+# the status TTL, and the call is indexed. A direct run is marked: if its process dies,
+# REGISTER takes the record over (AMEND FE-5), and its confirm indexes it again.
+CONFIRM = (
+    _INDEX_FN
+    + """
 redis.call('HSET', KEYS[1], 'confirmed', '1')
 if ARGV[2] == '1' then redis.call('HSET', KEYS[1], 'direct', '1') end
 X.expire(KEYS[1], tonumber(ARGV[1]) * 1000)
 X.expire(KEYS[2], tonumber(ARGV[1]) * 1000)
+if #KEYS >= 4 then
+  index_add(KEYS[1], KEYS[3], KEYS[4], ARGV[7], ARGV[3], tonumber(ARGV[4]), ARGV[5], ARGV[6],
+    KEYS[5], ARGV[8])
+end
 return 1
 """
+)
 
 # KEYS: job, callers, status. ARGV: caller. The send failed: drop the unconfirmed record.
 ABANDON = """
@@ -237,12 +284,15 @@ end
 # channel prefix (`<prefix>:done:`), request id, then '1' to write the status too (its TTL and
 # field / value pairs follow). Writes the result only if none exists, marks the claim final,
 # writes the final status and wakes every caller waiting on this id (one round trip; the
-# status was a second). Reply: 1 written, 0 a result already existed.
+# status was a second). The call leaves the request index (T1). Reply: 1 written, 0 a result
+# already existed.
 RESULT_PUT = (
     _STATUS_FN
+    + _INDEX_FN
     + """
 local written = X.set(KEYS[1], ARGV[1], tonumber(ARGV[2]) * 1000, true)
 if redis.call('EXISTS', KEYS[2]) == 1 then
+  index_drop(KEYS[2], ARGV[6])
   redis.call('HSET', KEYS[2], 'state', ARGV[3])
   X.expire(KEYS[2], tonumber(ARGV[4]) * 1000)
 end
@@ -269,9 +319,11 @@ SETTLE_DONE = (
     _COMMON
     + _SETTLE
     + _STATUS_FN
+    + _INDEX_FN
     + """
 local written = X.set(KEYS[1], ARGV[4], tonumber(ARGV[5]) * 1000, true)
 if redis.call('EXISTS', KEYS[2]) == 1 then
+  index_drop(KEYS[2], ARGV[9])
   redis.call('HSET', KEYS[2], 'state', ARGV[6])
   X.expire(KEYS[2], tonumber(ARGV[7]) * 1000)
 end
@@ -364,6 +416,24 @@ class Registration:
     """What `register` found: new, attached, takeover, done, expired, conflict or cancelled."""
 
     outcome: str
+    message_id: str = ""  # `register_send`: the id of the message it sent ('' when none)
+
+
+@dataclass(frozen=True, slots=True)
+class IndexEntry:
+    """Where a call goes in the request index (T1): its model's keys and its tenant.
+
+    `keys`: the request index `tq:H`, the tenant index `tq` and, with tenant names on, `tqn`.
+    `tenant_hash` is H (`-` for no tenant), `keep_ms` how long the entry counts (the call's
+    deadline from now), `cls` its class (`p` / `n`), `name` the tenant name ('' unless names
+    are on).
+    """
+
+    keys: tuple[str, ...]
+    tenant_hash: str
+    keep_ms: int
+    cls: str
+    name: str = ""
 
 
 class RequestStore:
@@ -484,14 +554,20 @@ class RequestStore:
         max_waiting: int,
         retention_secs: int,
         keep_secs: float,
+        index: IndexEntry | None = None,
     ) -> Registration:
         """`register`, and for a new (or taken over) call its send and `confirm`, in one call.
 
         Only when the queue lives in this store. `QueueFull` above `max_waiting` (the record
-        just made is dropped, as `abandon` did).
+        just made is dropped, as `abandon` did). With `index`, a sent call is indexed in the
+        same script (T1).
         """
+        index_keys: list[str] = list(index.keys) if index else []
+        index_args: list[Any] = (
+            [index.tenant_hash, index.keep_ms, index.cls, index.name] if index else []
+        )
         reply = await self._register_send(
-            [*self._req(request_id), *queue_keys],
+            [*self._req(request_id), *queue_keys, *index_keys],
             [
                 user_hash,
                 params_hash,
@@ -509,23 +585,37 @@ class RequestStore:
                 int(keep_secs) + self.status_ttl_secs,
                 self.caller_ttl_secs,
                 self.lease_ms,
+                *index_args,
             ],
         )
         outcome = _text(reply[0])
         if outcome == "full":
             raise QueueFull(queue, int(reply[1]))
-        return Registration(outcome)
+        return Registration(outcome, _text(reply[1]) if len(reply) > 1 else "")
 
-    async def confirm(self, request_id: str, *, keep_secs: float, direct: bool = False) -> None:
+    async def confirm(
+        self,
+        request_id: str,
+        *,
+        keep_secs: float,
+        direct: bool = False,
+        index: IndexEntry | None = None,
+        message_id: str = "",
+    ) -> None:
         """The send succeeded: keep the record until the deadline plus the status TTL.
 
         `direct`: the call runs in this process, not from a queue; marked so that a caller of
-        the id takes the record over if this process dies (AMEND FE-5).
+        the id takes the record over if this process dies (AMEND FE-5). With `index`, the call
+        is indexed in the same script (T1); `message_id` is its stream message ('' direct).
         """
         job, callers, _, _ = self._req(request_id)
-        await self._confirm(
-            [job, callers], [int(keep_secs) + self.status_ttl_secs, "1" if direct else "0"]
-        )
+        args: list[Any] = [int(keep_secs) + self.status_ttl_secs, "1" if direct else "0"]
+        keys = [job, callers]
+        if index is not None:
+            keys += list(index.keys)
+            args += [index.tenant_hash, index.keep_ms, message_id, index.cls, request_id]
+            args.append(index.name)
+        await self._confirm(keys, args)
 
     async def abandon(self, request_id: str, *, caller: str) -> None:
         """The send failed: remove this caller's unconfirmed record."""
