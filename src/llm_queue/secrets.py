@@ -53,6 +53,7 @@ TIMEOUT_VAR = "LLMQ_SECRETS_TIMEOUT_SECS"
 SETTINGS = (SOURCE_VAR, NAMES_VAR, REGION_VAR, CACHE_VAR, TIMEOUT_VAR)
 SOURCE_KINDS = ("aws-secretsmanager", "file", "env", "none")
 CACHE_SECS = 300.0  # LLMQ_SECRETS_CACHE_SECS default
+RETRY_SECS = 30.0  # a failed refresh is tried again after min(cache_secs, this)
 MAX_CACHE_SECS = 86_400.0
 TIMEOUT_SECS = 10.0  # LLMQ_SECRETS_TIMEOUT_SECS default: connect and read, each
 MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS = 1.0, 300.0
@@ -257,20 +258,26 @@ class EnvSource:
 class _Cached:
     """One source's values and when they were read."""
 
-    __slots__ = ("lock", "read_at", "source", "values")
+    __slots__ = ("flag", "lock", "read_at", "refreshing", "source", "values")
 
     def __init__(self, source: SecretSource) -> None:
         self.source = source
         self.values: Mapping[str, str] | None = None
         self.read_at = 0.0
         self.lock = threading.Lock()
+        self.refreshing = False  # a background refresh runs (`SecretReader._values`)
+        self.flag = threading.Lock()  # guards `refreshing` only: never held during a read
 
 
 class SecretReader:
     """A `secrets=` lookup over ordered sources, each cached for `cache_secs`.
 
     Callable as `reader(name) -> str | None`. Thread-safe: one refresh per source at a time
-    (the store password is read from worker threads on new connections).
+    (the store password is read from worker threads on new connections). On a thread running
+    an event loop an expired source is never read inline: the last values are served while a
+    background thread reads it again (stale while revalidate), so a slow Secrets Manager call
+    cannot stall the loop. A failed refresh keeps the last values and is tried again after
+    min(`cache_secs`, 30 s).
     """
 
     def __init__(
@@ -324,7 +331,25 @@ class SecretReader:
     def _values(self, cached: _Cached) -> Mapping[str, str] | None:
         if cached.values is not None and self._fresh(cached):
             return cached.values
+        if cached.values is not None and self.cache_secs > 0 and _on_event_loop():
+            self._refresh_later(cached)
+            return cached.values
         return self._refresh(cached, strict=cached.values is None)
+
+    def _refresh_later(self, cached: _Cached) -> None:
+        """Read `cached` again on a daemon thread (at most one at a time per source)."""
+        with cached.flag:  # not `lock`: a refresh holds that for the whole read
+            if cached.refreshing:
+                return
+            cached.refreshing = True
+
+        def run() -> None:
+            try:
+                self._refresh(cached, strict=False)
+            finally:
+                cached.refreshing = False
+
+        threading.Thread(target=run, name="llmq-secrets-refresh", daemon=True).start()
 
     def _fresh(self, cached: _Cached) -> bool:
         return self.cache_secs > 0 and self._clock() - cached.read_at < self.cache_secs
@@ -340,11 +365,23 @@ class SecretReader:
                 if strict:
                     raise
                 logger.warning("secrets_refresh_failed", source=cached.source.label, error=str(exc))
-                cached.read_at = self._clock()  # retried after another cache period
+                # Fresh again for min(cache_secs, RETRY_SECS): retried soon, not a period later.
+                cached.read_at = self._clock() - self.cache_secs + min(self.cache_secs, RETRY_SECS)
                 return cached.values
             cached.values = values
             cached.read_at = self._clock()
             return values
+
+
+def _on_event_loop() -> bool:
+    """Whether this thread is running an asyncio event loop."""
+    import asyncio
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
 
 
 def expand_spec(spec: str, environ: Mapping[str, str] | None = None) -> str:

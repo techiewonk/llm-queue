@@ -80,7 +80,9 @@ index (below).
   object, merged under `secret_names=`) maps settings to the secret's own keys;
   `LLMQ_SECRETS_REGION`, `LLMQ_SECRETS_CACHE_SECS` (300; 0 reads on every lookup) and
   `LLMQ_SECRETS_TIMEOUT_SECS` (10). A source that cannot be read at start is a `ConfigError`
-  naming it; a refresh that fails later keeps the last values (`secrets_refresh_failed`). The
+  naming it; a refresh that fails later keeps the last values (`secrets_refresh_failed`) and is
+  tried again after min(cache, 30 s); on the event loop an expired source serves its last values
+  while a thread reads it again, and the admin routes' token check reads it off the loop. The
   source serves every reader: settings, store passwords on each new connection, the admin
   token, `LLMQ_JOB_*`, account secrets, registry placeholders, the CLI,
   `AdminServices.from_env` and `PurgeService.from_env`. In code: `secrets_from_config(spec)`, `SecretReader` and the

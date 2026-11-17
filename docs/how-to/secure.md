@@ -44,8 +44,10 @@ admin token never sit in a manifest or the environment (see
   `ConfigError` naming the source; values never appear in an error, a log line, `repr` or
   `describe()` (which shows the source kinds, secret ids and mapped names only);
 - values are cached for `LLMQ_SECRETS_CACHE_SECS` (300), so a rotation reaches new store
-  connections within that time without a restart; a failed refresh keeps the last values and
-  logs `secrets_refresh_failed`.
+  connections within that time without a restart; on the event loop (the admin token check,
+  new store connections) the last values serve while a background thread refreshes, so a slow
+  Secrets Manager call never stalls requests; a failed refresh keeps the last values, logs
+  `secrets_refresh_failed` and is tried again after min(cache, 30 s).
 
 ## 3. Restrict `base_url`
 

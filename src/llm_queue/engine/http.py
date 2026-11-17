@@ -199,8 +199,11 @@ def admin_token_dependency(token: Token, header: str, *, read_token: Token = Non
     """A FastAPI dependency: the request's `header` must equal `token` or `read_token`.
 
     Compared in constant time. A callable is read on every request (a rotated secret needs no
-    restart). With neither configured (empty or None) every request is refused (fail closed).
+    restart), on a worker thread: it may reach a secrets source (`LLMQ_SECRETS_SOURCE`), whose
+    refresh must not block the event loop. With neither configured (empty or None) every
+    request is refused (fail closed).
     """
+    import asyncio
     import hmac
 
     from fastapi import HTTPException, Request
@@ -209,14 +212,22 @@ def admin_token_dependency(token: Token, header: str, *, read_token: Token = Non
         got = source() if callable(source) else source
         return str(got) if got else None
 
+    def values() -> list[str | None]:
+        return [value(token), value(read_token)]
+
     async def guard(request: Request) -> None:
         given = request.headers.get(header, "").encode()
-        accepted = [t for t in (value(token), value(read_token)) if t]
+        read = values() if not (callable(token) or callable(read_token)) else None
+        if read is None:
+            read = await asyncio.to_thread(values)
+        accepted = [t for t in read if t]
         # Every token is compared, so the time does not tell which one matched.
         matched = [hmac.compare_digest(given, t.encode()) for t in accepted]
         if not any(matched):
             raise HTTPException(status_code=403, detail="forbidden")
 
+    # FastAPI resolves annotations in this module's globals, where the optional import is not.
+    guard.__annotations__["request"] = Request
     return guard
 
 

@@ -6,8 +6,10 @@ handed in through the client factory hook.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -646,3 +648,91 @@ def test_module_constants_match_the_settings_module() -> None:
     from llm_queue.engine import settings
 
     assert frozenset(secrets_module.SETTINGS) == settings._SECRETS_SETTINGS
+
+
+# Never block the event loop (review S-1) -----------------------------------------------------
+
+
+class _Slow:
+    """A source whose second and later reads wait on `gate`; `fail` makes them raise."""
+
+    kind = "slow"
+    label = "slow"
+
+    def __init__(self) -> None:
+        self.gate = threading.Event()
+        self.loads = 0
+        self.fail = False
+
+    def load(self) -> dict[str, str]:
+        self.loads += 1
+        if self.loads > 1:
+            self.gate.wait(5)
+            if self.fail:
+                raise ConfigError("slow: throttled")
+        return {"k": f"v{self.loads}"}
+
+
+async def test_an_expired_source_is_refreshed_off_the_loop_while_the_last_value_serves() -> None:
+    source = _Slow()
+    clock = Clock()
+    reader = SecretReader([source], cache_secs=60, clock=clock)
+    reader.check()
+    clock.now += 60
+    assert reader("k") == "v1"  # stale, at once: the refresh runs on a thread
+    assert reader("k") == "v1"  # one refresh at a time
+    source.gate.set()
+    for _ in range(100):
+        if reader("k") == "v2":
+            break
+        await asyncio.sleep(0.01)
+    assert reader("k") == "v2"
+    assert source.loads == 2
+
+
+def test_a_failed_refresh_is_retried_after_thirty_seconds_not_a_cache_period(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    source = _Slow()
+    source.gate.set()
+    clock = Clock()
+    reader = SecretReader([source], cache_secs=300, clock=clock)
+    reader.check()
+    clock.now += 300
+    source.fail = True
+    with caplog.at_level(logging.WARNING, logger="llm_queue"):
+        assert reader("k") == "v1"  # kept
+    assert "secrets_refresh_failed" in caplog.text
+    source.fail = False
+    clock.now += 29
+    assert reader("k") == "v1"
+    clock.now += 1
+    assert reader("k") == "v3"  # tried again after min(300, 30) s
+
+
+def test_the_admin_token_guard_reads_a_secret_off_the_event_loop() -> None:
+    from fastapi import Depends, FastAPI
+    from fastapi.testclient import TestClient
+
+    from llm_queue.engine.http import admin_token_dependency
+
+    lookups: list[int] = []
+    handlers: list[int] = []
+
+    def token() -> str:
+        lookups.append(threading.get_ident())
+        return "s3cret"
+
+    app = FastAPI()
+    guard = admin_token_dependency(token, "X-LLMQ-Token")
+
+    @app.get("/x", dependencies=[Depends(guard)])
+    async def x() -> dict[str, bool]:
+        handlers.append(threading.get_ident())  # async: runs on the loop's thread
+        return {"ok": True}
+
+    with TestClient(app) as client:
+        assert client.get("/x", headers={"X-LLMQ-Token": "s3cret"}).status_code == 200
+        assert client.get("/x", headers={"X-LLMQ-Token": "nope"}).status_code == 403
+    assert len(lookups) == 2
+    assert handlers[0] not in lookups  # the lookup ran on a worker thread
