@@ -12,7 +12,7 @@ confirmed in the code or by a measurement.
 | Attempts, retries, throttles, token estimates | [Attempts and retries](attempts.md) |
 | Breaker, store outages and every failure row | [Failures and recovery](resilience.md) |
 | Every key in the store | [Storage](storage.md) and [Store keys](../reference/store-keys.md) |
-| What is tested and measured, and how | [Tested scenarios](tested-scenarios.md) |
+| Every scenario the library handles, the test that proves it, and how each check runs | [Tested scenarios](tested-scenarios.md) |
 
 ## Purpose and boundaries
 
