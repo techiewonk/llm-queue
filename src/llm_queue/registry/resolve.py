@@ -7,6 +7,7 @@ validator, the admission script inputs and `llm-queue settings get`.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -26,6 +27,11 @@ from llm_queue.registry.settings import (
 
 LIBRARY = "library"
 _LEVEL_LABEL = {R: "deployment", M: "model", A: "account", D: "defaults"}
+# A budget set as the provider's quota and the share of it to use (`quota_rpm` x `budget_pct`):
+# the budget each one stands for. One level sets one form (`registry.schema` refuses both).
+QUOTA_OF = {"rpm": "quota_rpm", "tpm": "quota_tpm"}
+# The breaker probe's library default when the attempt timeout is not longer (D4).
+BREAKER_PROBE_FLOOR_SECS = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,14 +158,32 @@ class ResolvedRegistry:
                     merged.update(part)
                     level = _LEVEL_LABEL[code]
             return Effective(_complete(name, merged), level)
+        quota = QUOTA_OF.get(name)
         for code, values in layers:
             if name in values:
                 return Effective(_complete(name, values[name]), _LEVEL_LABEL[code])
+            if quota is not None and quota in values:
+                share = self.effective(alias, "budget_pct", deployment).value
+                return Effective(budget_from_quota(values[quota], share), _LEVEL_LABEL[code])
         return Effective(self._library_default(entry, name, deployment), LIBRARY)
 
     def value(self, model: str, name: str, deployment: str | None = None) -> Any:
         """Shortcut for `effective(...).value`."""
         return self.effective(model, name, deployment).value
+
+    def quota(self, model: str, name: str, deployment: str | None = None) -> int | None:
+        """The provider quota behind budget `name` (`rpm` / `tpm`), or None.
+
+        None when the budget is set directly (or not at all): only the level the budget comes
+        from counts, so a deployment's `rpm` hides a model's `quota_rpm`.
+        """
+        alias = self.registry.alias_of(model)
+        for _, values in self._layers(alias, deployment):
+            if name in values:
+                return None
+            if QUOTA_OF[name] in values:
+                return int(values[QUOTA_OF[name]])
+        return None
 
     def _library_default(self, entry: ModelEntry, name: str, deployment: str | None) -> Any:
         spec = SETTINGS[name]
@@ -167,6 +191,12 @@ class ResolvedRegistry:
             # A `tpm` on an embedding model turns token limiting on (plan §3.19).
             has_tpm = self.effective(entry.alias, "tpm", deployment).value is not None
             return "both" if has_tpm else "rpm"
+        if name == "breaker_probe_secs":
+            # A probe must outlive one attempt, or a second probe gets through while the first
+            # still runs (`registry.validate` refuses an explicit lower value). Derived, so a
+            # long `attempt_timeout_secs` alone no longer fails the load (D4).
+            attempt = self.effective(entry.alias, "attempt_timeout_secs", deployment).value
+            return max(BREAKER_PROBE_FLOOR_SECS, float(attempt))
         if spec.by_type is not None:
             return spec.by_type(entry.type)
         return spec.default
@@ -195,6 +225,14 @@ class ResolvedRegistry:
         if deployment.profile_id is not None:
             return not deployment.routes_to or not set(deployment.routes_to) <= set(allowed)
         return deployment.region not in allowed
+
+
+def budget_from_quota(quota: float, share: float) -> int:
+    """`floor(quota x share)`: the budget a `quota_rpm` / `quota_tpm` and `budget_pct` give.
+
+    Rounded to 6 places first, so `100 x 0.29` (28.999999999999996 as a double) is 29.
+    """
+    return math.floor(round(quota * share, 6))
 
 
 def _complete(name: str, value: Any) -> Any:

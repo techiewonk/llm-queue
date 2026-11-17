@@ -7,6 +7,30 @@ public API (see STABILITY.md).
 
 ## [Unreleased]
 
+### Added
+
+- Registry placeholders: the boot document (`LLMQ_REGISTRY` / `LLMQ_REGISTRY_FILE`) may hold
+  `${NAME}` and `${NAME:-default}` in any string value, read from `secrets=` and then the
+  environment; `$${` is a literal `${`. A string that is one whole placeholder and expands to
+  a JSON list, object, number or boolean becomes that value. An unset name without a default
+  stops the start, naming the variable and its JSON path. Expansion runs on the parsed
+  document, so a value cannot break the JSON, and repeated keys are still refused. Stored
+  documents and live edits are never expanded.
+- YAML registry files: a `LLMQ_REGISTRY_FILE` ending `.yaml` / `.yml` is read as YAML (new
+  extra `llm-queue[yaml]`), with repeated keys refused like in JSON.
+- `residency.allowed_regions: "auto"`: every region the document's deployments use (and their
+  profiles route to), recomputed on each load. The list form is unchanged.
+- `quota_rpm`, `quota_tpm` and `budget_pct` (default 1; above 0 to 1): give a deployment's
+  provider quota and the share to use; the budget is `floor(quota x budget_pct)`. Setting
+  `rpm` and `quota_rpm` (or `tpm` and `quota_tpm`) on one level is refused, as is a share that
+  rounds a quota down to 0. `ResolvedRegistry.quota()` returns the quota behind a budget.
+
+### Changed
+
+- `breaker_probe_secs` left unset is now the larger of 60 and the deployment's
+  `attempt_timeout_secs`, so a registry with an attempt timeout above 60 s and no probe time
+  loads instead of being refused. An explicit value below the attempt timeout is still refused.
+
 ## [0.1.1] - 2026-11-17
 
 The first release that installs without `--pre`: `pip install llm-queue` (or

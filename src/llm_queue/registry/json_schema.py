@@ -163,7 +163,7 @@ def registry_schema() -> dict[str, Any]:
             },
         }
     )
-    residency = _object({"allowed_regions": _STRINGS})
+    residency = _object({"allowed_regions": {"anyOf": [_STRINGS, {"const": "auto"}]}})
     account = _object(
         {
             "kind": {"enum": sorted(doc.ACCOUNT_KINDS)},

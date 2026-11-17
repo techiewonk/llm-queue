@@ -148,6 +148,9 @@ of every setting and the level it came from.
 | `enabled` | account, model, deployment | true | true or false | False: no new calls (a live edit; `llm-queue drain` sets it) |
 | `rpm` | defaults, model, deployment | none | 1 or more (whole) | Requests per minute of one deployment; none: no RPM budget |
 | `tpm` | defaults, model, deployment | none | 1 or more (whole) | Tokens per minute of one deployment; none: no TPM budget. Must hold one call's reservation (max output x `tpm_output_weight`) |
+| `quota_rpm` | defaults, model, deployment | none | 1 or more (whole) | The provider's RPM quota of one deployment, instead of `rpm`: the budget is floor(`quota_rpm` x `budget_pct`). Setting both `rpm` and `quota_rpm` on one level is refused |
+| `quota_tpm` | defaults, model, deployment | none | 1 or more (whole) | The provider's TPM quota, instead of `tpm`: the budget is floor(`quota_tpm` x `budget_pct`). Not beside `tpm` on one level |
+| `budget_pct` | all four | 1 | above 0 to 1 | Share of `quota_rpm` / `quota_tpm` to use (0.9: keep 10 % for other users of the quota); no effect on a plain `rpm` / `tpm` |
 | `rate_limits` | all four | chat `both`, embedding `rpm` | `both`, `rpm`, `tpm`, `off` | Which budgets apply. An embedding model with a `tpm` defaults to `both` |
 | `tpm_output_weight` | all four | 1 | 1 to 1000 | Output tokens count this many times against TPM |
 | `tpm_count_cached` | all four | false | true or false | Cache reads count against TPM |
@@ -172,7 +175,7 @@ of every setting and the level it came from.
 | `breaker_threshold` | all four | 5 | 1 to 10000 (whole) | Failures within `breaker_window_secs` that open a deployment's breaker |
 | `breaker_cooldown_secs` | all four | 15 | above 0 to 86400 | How long an open breaker stays open before a probe call |
 | `breaker_window_secs` | all four | 60 | above 0 to 86400 | Failures count toward the threshold only within this window |
-| `breaker_probe_secs` | all four | 60 | above 0 to 86400 | A probe call that never reported back stops blocking others after this; at least `attempt_timeout_secs` |
+| `breaker_probe_secs` | all four | 60, or the attempt timeout when longer | above 0 to 86400 | A probe call that never reported back stops blocking others after this; at least `attempt_timeout_secs`. Unset, it is the larger of 60 and the deployment's `attempt_timeout_secs`; an explicit lower value is refused |
 | `balance` | defaults, model | `ordered` | `ordered`, `round_robin`, `weighted`, `headroom` or `custom:<name>` | How a deployment is picked among the usable ones |
 | `balance_opts` | defaults, model | see fields | object, fields below | *merged*: options of the strategy |
 | `balance_priority` | model | none | as `balance` | The strategy for priority calls; none: `balance` |
@@ -279,8 +282,9 @@ deprecation warning, until 0.2.
 Besides each setting's range, a document is refused (with the path) for: a TPM below one call's
 reservation (`max output x tpm_output_weight`); a fallback cycle of any length (unless every
 step requires headroom); a fallback target whose residency is not within the source model's;
-residency that leaves a model with no deployment; `breaker_probe_secs` below
-`attempt_timeout_secs`; a fallback `after_secs` that could never fire inside `timeout_secs`;
+residency that leaves a model with no deployment; an explicit `breaker_probe_secs` below
+`attempt_timeout_secs`; `rpm` and `quota_rpm` (or `tpm` and `quota_tpm`) on one level, or a
+quota x `budget_pct` that rounds down to 0; a fallback `after_secs` that could never fire inside `timeout_secs`;
 `NaN`, infinities and numbers above their bound; names with a trailing newline or padding;
 malformed role ARNs; queue names that are not plain or start with `jobs-`; an embedding model
 whose family cannot be told (set `family`).

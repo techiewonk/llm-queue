@@ -19,6 +19,7 @@ import pytest
 from llm_queue.engine.jobs import JobSettings
 from llm_queue.engine.settings import InfraSettings
 from llm_queue.errors import ConfigError
+from llm_queue.registry import load_registry
 from llm_queue.registry import settings as st
 from llm_queue.registry.resolve import _complete
 from llm_queue.tuning import Tuning
@@ -191,6 +192,26 @@ def test_object_setting_field_is_documented(name: str) -> None:
         assert _range(cell), f"{name}: write its range as `LO to HI` (see the page)"
     _check_choices(name, check, cell)
     _check_range(name, cell, lambda v: check(v) is not None)
+
+
+def test_breaker_probe_default_is_documented_as_derived() -> None:
+    """D4: unset, the probe time follows a longer attempt timeout; the row says so."""
+    _levels, default, _cell, _meaning = REGISTRY_ROWS["breaker_probe_secs"]
+    assert default == "60, or the attempt timeout when longer"
+    doc = {
+        "registry_version": 1,
+        "defaults": {"attempt_timeout_secs": 100, "timeout_secs": 300},
+        "accounts": {"aws": {"kind": "aws"}},
+        "models": {
+            "m": {
+                "type": "chat",
+                "provider": "bedrock",
+                "model_id": "openai.gpt-oss-20b-1:0",
+                "deployments": {"aws": {"confirmed": ["ap-south-1"]}},
+            }
+        },
+    }
+    assert load_registry(doc).value("m", "breaker_probe_secs", "aws/ap-south-1") == 100
 
 
 def test_registry_tables_list_nothing_else() -> None:

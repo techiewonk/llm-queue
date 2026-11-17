@@ -75,6 +75,8 @@ metrics = ["prometheus-client>=0.20,<1"]
 # Status / registry / health routes for a FastAPI app (`LLMQueue.http_router`).
 # 0.115.3+: Starlette with the multipart DoS fixes (CVE-2024-47874).
 http = ["fastapi>=0.115.3,<1"]
+# A registry file in YAML (`LLMQ_REGISTRY_FILE=registry.yaml`), for comments.
+yaml = ["pyyaml>=6,<7"]
 # A faster event loop on Linux / macOS (`llm_queue.run(main)` picks it up); no Windows build.
 uvloop = ["uvloop>=0.21,<1; sys_platform != 'win32'"]
 
@@ -156,7 +158,7 @@ warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 
 [[tool.mypy.overrides]]
-module = ["moto.*", "fastapi", "fastapi.*", "uvloop"]
+module = ["moto.*", "fastapi", "fastapi.*", "uvloop", "yaml"]
 ignore_missing_imports = true
 
 # FastAPI is an optional extra: its decorators are untyped when it is not installed.

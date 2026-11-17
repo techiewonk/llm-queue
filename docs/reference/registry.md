@@ -157,7 +157,7 @@ What each part does:
 | `live_edit` | no | `safe`, `all` or `off`; unset, each process's `LLMQ_REGISTRY_LIVE_EDIT` applies (deploy only) |
 | `defaults` | no | Setting values for every model (the `defaults` level) |
 | `routing` | no | Live switches, [below](#routing) |
-| `residency` | no | `{"allowed_regions": [...]}`: the only regions any deployment may use |
+| `residency` | no | `{"allowed_regions": [...]}` or `{"allowed_regions": "auto"}`: the only regions any deployment may use ([below](#residency)) |
 | `accounts` | yes | At least one account, by name |
 | `models` | yes | At least one model, by alias |
 
@@ -191,7 +191,7 @@ keys.
 | `provider` | Required. `bedrock`, `openai`, or a provider added with `register_account_kind` |
 | `model_id` | Required. The provider's model id (or an inference profile ARN), without padding |
 | `deployments` | Required. Where the model runs, by account ([below](#deployments)); at least one confirmed region |
-| `residency` | `{"allowed_regions": [...]}` for this model; it replaces the top-level list |
+| `residency` | `{"allowed_regions": [...]}` (or `"auto"`) for this model; it replaces the top-level list |
 | `family` | Embedding models only: `titan`, `cohere`, `openai` or a family added with `register_embedding_family`. It is the request and reply shape. Unset: `openai` for the `openai` provider, else guessed from `model_id` (case-insensitive). Required when the id names no family, or the load fails |
 | any setting | Model-level settings, written next to the fields above (the `model` level) |
 
@@ -233,7 +233,31 @@ kill switch, and its reply lists what it kept.
 
 | Field | Meaning |
 |---|---|
-| `allowed_regions` | The regions deployments may use. A deployment outside the list is not used, and a model left with no deployment is an error. An inference profile is allowed only when every `routes_to` region is |
+| `allowed_regions` | The regions deployments may use. A deployment outside the list is not used, and a model left with no deployment is an error. An inference profile is allowed only when every `routes_to` region is. `"auto"`: every region the document uses (each deployment's region and each profile's `routes_to`, confirmed and fallback, across all models), recomputed on every load |
+
+## Placeholders and YAML
+
+The boot document (`LLMQ_REGISTRY` or `LLMQ_REGISTRY_FILE`; never a stored document or a live
+edit) may hold placeholders in any string value. They are expanded after the document is
+parsed, so a value with quotes or newlines cannot break the JSON, and a repeated key is refused
+both as written and after expansion.
+
+| Form | Meaning |
+|---|---|
+| `${NAME}` | The value of `NAME`, from `secrets=` first, then the environment. Unset: the load fails, naming `NAME` and the JSON path |
+| `${NAME:-default}` | `default` when `NAME` is unset or empty (as in a shell); `default` may be JSON with braces |
+| `$${` | A literal `${` |
+
+A string that is exactly one placeholder becomes a typed value when the text it expands to is a
+JSON list, object, number or `true` / `false`: `"${EMBED_REGIONS:-[\"ap-south-1\"]}"` is a list,
+`"${CHAT_RPM:-100}"` a number. To keep a number as text, give the variable a quoted JSON string
+(`ACCOUNT_ID='"012345678901"'`). Inside a longer string the value is inserted as text. Expanded
+text is not expanded again, keys are never expanded, and values never appear in an error
+message. A value expanded into the document is published to the store with it, so keep
+credentials in the `*_ref` fields, not in placeholders.
+
+A `LLMQ_REGISTRY_FILE` ending in `.yaml` or `.yml` is read as YAML, for comments (install
+`llm-queue[yaml]`); repeated keys, non-text keys and `.nan` / `.inf` are refused.
 
 ## Defaults and fairness
 

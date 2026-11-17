@@ -81,6 +81,46 @@ Every variable with its default is in [Environment variables](../reference/envir
 
 Invalid documents are refused with every problem listed at once.
 
+### A registry file with placeholders
+
+Keep the registry beside the code and leave what changes per environment to variables. A file
+ending `.yaml` takes comments (`pip install 'llm-queue[yaml]'`); JSON works the same way.
+
+```yaml
+# registry.yaml  (LLMQ_REGISTRY_FILE=registry.yaml)
+registry_version: ${REGISTRY_VERSION:-1}
+residency: {allowed_regions: auto}          # every region used below
+accounts:
+  aws-main: {kind: aws}
+models:
+  gpt120b:
+    type: chat
+    provider: bedrock
+    model_id: ${CHAT_MODEL_ID:-openai.gpt-oss-120b-1:0}
+    quota_rpm: 500                          # the account's quota ...
+    quota_tpm: 400000
+    budget_pct: 0.9                         # ... of which this app uses 90 %
+    deployments:
+      aws-main:
+        confirmed: ${CHAT_REGIONS:-["ap-south-1"]}
+  embed-cohere:
+    type: embedding
+    provider: bedrock
+    model_id: cohere.embed-english-v3
+    rpm: ${EMBED_RPM:-2000}
+    embed_batch_size: 96
+    deployments:
+      aws-main:
+        confirmed: ${EMBED_REGIONS:-["ap-south-1"]}
+```
+
+`${NAME}` reads `from_env(secrets=)` and then the environment; `${NAME:-default}` falls back to
+the default; an unset name without one stops the start, naming the variable and where it is. A
+value that is a whole placeholder and reads as a JSON list, object, number or boolean becomes
+that value (`EMBED_REGIONS='["ap-south-1","ap-south-2"]'` is a list). In YAML, an unquoted
+`${...}` is already a string. Only this boot document is expanded; live edits are stored as
+written. Details: [Placeholders and YAML](../reference/registry.md#placeholders-and-yaml).
+
 ### Accounts
 
 ```json

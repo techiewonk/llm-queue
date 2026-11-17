@@ -141,6 +141,13 @@
           "description": "Levels: defaults, account, model, deployment.",
           "default": 60.0
         },
+        "budget_pct": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "description": "Levels: defaults, account, model, deployment.",
+          "default": 1.0
+        },
         "converse_api": {
           "enum": [
             "converse",
@@ -559,6 +566,18 @@
           "description": "Levels: defaults, model.",
           "default": 100
         },
+        "quota_rpm": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "Levels: defaults, model, deployment."
+        },
+        "quota_tpm": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "Levels: defaults, model, deployment."
+        },
         "rate_burst": {
           "type": "number",
           "minimum": 0,
@@ -773,11 +792,18 @@
       "type": "object",
       "properties": {
         "allowed_regions": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            {
+              "const": "auto"
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -878,6 +904,13 @@
               "maximum": 86400,
               "description": "Levels: defaults, account, model, deployment.",
               "default": 60.0
+            },
+            "budget_pct": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 1,
+              "description": "Levels: defaults, account, model, deployment.",
+              "default": 1.0
             },
             "default_output_tokens": {
               "type": "integer",
@@ -1225,11 +1258,18 @@
           "type": "object",
           "properties": {
             "allowed_regions": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "minLength": 1
-              }
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                {
+                  "const": "auto"
+                }
+              ]
             }
           },
           "additionalProperties": false
@@ -1315,6 +1355,13 @@
                       "maximum": 86400,
                       "description": "Levels: defaults, account, model, deployment.",
                       "default": 60.0
+                    },
+                    "budget_pct": {
+                      "type": "number",
+                      "exclusiveMinimum": 0,
+                      "maximum": 1,
+                      "description": "Levels: defaults, account, model, deployment.",
+                      "default": 1.0
                     },
                     "default_output_tokens": {
                       "type": "integer",
@@ -1530,6 +1577,18 @@
                     "params": {
                       "type": "object",
                       "description": "Levels: deployment."
+                    },
+                    "quota_rpm": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9007199254740991,
+                      "description": "Levels: defaults, model, deployment."
+                    },
+                    "quota_tpm": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9007199254740991,
+                      "description": "Levels: defaults, model, deployment."
                     },
                     "rate_burst": {
                       "type": "number",
@@ -1780,6 +1839,13 @@
           "maximum": 86400,
           "description": "Levels: defaults, account, model, deployment.",
           "default": 60.0
+        },
+        "budget_pct": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "description": "Levels: defaults, account, model, deployment.",
+          "default": 1.0
         },
         "converse_api": {
           "enum": [
@@ -2277,6 +2343,18 @@
           "description": "Levels: defaults, model.",
           "default": 100
         },
+        "quota_rpm": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "Levels: defaults, model, deployment."
+        },
+        "quota_tpm": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "Levels: defaults, model, deployment."
+        },
         "rate_burst": {
           "type": "number",
           "minimum": 0,
@@ -2541,6 +2619,13 @@
           "description": "Levels: defaults, account, model, deployment.",
           "default": 60.0
         },
+        "budget_pct": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "description": "Levels: defaults, account, model, deployment.",
+          "default": 1.0
+        },
         "default_output_tokens": {
           "type": "integer",
           "minimum": 1,
@@ -2755,6 +2840,18 @@
         "params": {
           "type": "object",
           "description": "Levels: deployment."
+        },
+        "quota_rpm": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "Levels: defaults, model, deployment."
+        },
+        "quota_tpm": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "Levels: defaults, model, deployment."
         },
         "rate_burst": {
           "type": "number",
