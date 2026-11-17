@@ -74,7 +74,7 @@ from llm_queue.engine.queue import (
     QueueSettings,
     StreamQueues,
 )
-from llm_queue.engine.requests import IndexEntry, RequestStore
+from llm_queue.engine.requests import IndexEntry, RequestStore, extend_notice
 from llm_queue.engine.requests_admin import AdminSettings, RequestsAdmin
 from llm_queue.engine.status import AlertEvaluator, StatusReader
 from llm_queue.engine.store_checks import UNKNOWN as UNKNOWN_POLICY
@@ -432,6 +432,8 @@ class _Held:
     # Tenant fairness (fair_queue): the call's round per model, so a re-ask keeps its place.
     fair_rounds: dict[str, float] = field(default_factory=dict)
     tenant_waited: bool = False  # a share wait was counted for this call
+    # An admin extend (0.2.0 T2): the call's new deadline, store ms (0: none seen).
+    extended_ms: int = 0
 
     @property
     def position(self) -> float:
@@ -672,6 +674,10 @@ class Engine:
         self._closed = False  # `stop()` cancelled the background tasks: start no new one
         self._paused = False
         self._local_callers: dict[str, int] = {}  # request id -> coroutines waiting on it here
+        # Admin extends of calls waited on here (0.2.0 T2): request id -> the new deadline as
+        # this loop's time, and the timers of the waiting calls to reschedule.
+        self._extended_until: dict[str, float] = {}
+        self._call_timeouts: dict[str, set[asyncio.Timeout]] = {}
         self._wake: dict[str, asyncio.Event] = {}  # model -> wakes its receive loop
         self._beat_ok_mono = time.monotonic()  # last heartbeat that reached the store
         self._store_trouble_mono = -1e9  # monotonic time this process last saw the store fail
@@ -1182,6 +1188,7 @@ class Engine:
             else:
                 self._local_callers.pop(rid, None)
                 self._waiters.pop(rid, None)
+                self._extended_until.pop(rid, None)
             if not self._waiters:
                 self._idle.set()
 
@@ -1203,8 +1210,12 @@ class Engine:
         # down the store_down path with a fresh timeout, and the soak saw 135 answers come
         # after their deadline (20 s store block, 30 s calls).
         deadline = asyncio.get_running_loop().time() + call_secs + self.settings.caller_margin_secs
+        timer: asyncio.Timeout | None = None
         try:
-            async with asyncio.timeout_at(deadline):
+            async with asyncio.timeout_at(deadline) as timer:
+                # An admin extend moves this timer (`_extend_caller`, 0.2.0 T2).
+                self._call_timeouts.setdefault(rid, set()).add(timer)
+                self._apply_extend(rid, timer)
                 if (
                     self._store_waiting
                     and not stream
@@ -1275,6 +1286,43 @@ class Engine:
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.wait({cleanup}, timeout=max(0.0, remaining))
             raise
+        finally:
+            timers = self._call_timeouts.get(rid)
+            if timers is not None and timer is not None:
+                timers.discard(timer)
+                if not timers:
+                    self._call_timeouts.pop(rid, None)
+
+    def _apply_extend(self, rid: str, timer: asyncio.Timeout) -> None:
+        """Move a waiting call's timer to its extended deadline, when one was announced."""
+        until = self._extended_until.get(rid)
+        when = timer.when()
+        if until is not None and when is not None and until > when:
+            timer.reschedule(until)
+
+    def _extend_caller(self, rid: str, deadline_ms: int) -> None:
+        """An admin extended a call waited on here: move its timers, wake it to re-read.
+
+        `deadline_ms` is the worker's new deadline (store ms); the caller waits its margin
+        more, as it did for the first deadline.
+        """
+        if rid not in self._local_callers:
+            return
+        loop = asyncio.get_running_loop()
+        until = loop.time() + deadline_ms / 1000 - self.clock.now()
+        until += self.settings.caller_margin_secs
+        if until <= self._extended_until.get(rid, 0.0):
+            return
+        self._extended_until[rid] = until
+        for timer in self._call_timeouts.get(rid, ()):
+            self._apply_extend(rid, timer)
+        waiter = self._waiters.get(rid)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(None)
+
+    def _caller_until(self, rid: str, until: float) -> float:
+        """A waiting call's deadline (this loop's time), an admin extend included."""
+        return max(until, self._extended_until.get(rid, until))
 
     async def stream(
         self, model: str, params: Mapping[str, Any], *, meta_event: bool = False, **call: Any
@@ -1589,7 +1637,7 @@ class Engine:
             reply = await self._wait_result(
                 rid,
                 waiter,
-                until - loop.time(),
+                self._caller_until(rid, until) - loop.time(),
                 recheck=outcome == "attached",
                 watch=run,
                 # A stored result is read at once: `done` waited for a wake-up nobody sent, up
@@ -1849,6 +1897,12 @@ class Engine:
                 continue
             data = message["data"]
             rid = data.decode() if isinstance(data, bytes) else str(data)
+            extended = extend_notice(rid)
+            if extended is not None:  # an admin extend (0.2.0 T2), not a cancel
+                held = self._held.get(extended[0])
+                if held is not None:
+                    held.extended_ms = max(held.extended_ms, extended[1])
+                continue
             held = self._held.get(rid)
             if held is None:
                 continue
@@ -2245,6 +2299,7 @@ class Engine:
                 waiter = self._rearm(rid, waiter)
         tries = 0
         while True:
+            until = self._caller_until(rid, until)  # an admin extend moves it (0.2.0 T2)
             try:
                 reply = await self.requests.take_result(rid)
                 gone = reply is None and (recheck or rid in self._gone) and await self._lost(rid)
@@ -2276,7 +2331,7 @@ class Engine:
                     partial_text=reply.partial_text,
                     request_id=rid,
                 )
-            left = until - loop.time()
+            left = self._caller_until(rid, until) - loop.time()
             if left <= 0:
                 raise CallFailed("deadline_exceeded", "no reply in time", request_id=rid)
             # The wake-up comes by pub/sub (published with the result), or from this process's
@@ -2477,6 +2532,10 @@ class Engine:
                 if isinstance(message["data"], bytes)
                 else str(message["data"])
             )
+            extended = extend_notice(rid)
+            if extended is not None:  # an admin extend (0.2.0 T2): the call waits longer
+                self._extend_caller(*extended)
+                continue
             waiter = self._waiters.get(rid)
             if waiter is not None and not waiter.done():
                 waiter.set_result(None)
@@ -2746,7 +2805,24 @@ class Engine:
     # ================================================================ worker: admission
 
     def _deadline(self, held: _Held) -> float:
-        return held.position_ms / 1000.0 + held.envelope.timeout_secs
+        """The call's deadline, store secs: its send time + its timeout, or an admin extend."""
+        return max(held.position_ms / 1000.0 + held.envelope.timeout_secs, held.extended_ms / 1000)
+
+    async def _past_deadline(self, held: _Held, now: float) -> bool:
+        """True when the call is past its deadline, an admin extend read from the store first.
+
+        A worker that took the call after the extend's notice never saw it: the job's `dl` is
+        read here, once, only when the deadline it knows is reached (no read per call).
+        """
+        if now < self._deadline(held):
+            return False
+        try:
+            raw = await self.state.hget(self.keys.request(held.envelope.request_id, "job"), "dl")
+        except (*STORE_ERRORS, ResponseError):
+            return True
+        if raw is not None:
+            held.extended_ms = max(held.extended_ms, int(float(text(raw))))
+        return now >= self._deadline(held)
 
     def _candidates(
         self,
@@ -3058,12 +3134,14 @@ class Engine:
 
         One copy of the two checks `_try`, `_hold` and `_direct_wait` each wrote (RT-21).
         """
-        if now >= self._deadline(held):
+        if await self._past_deadline(held, now):
             await self._finish_call(
                 held, "rate_limited", "no budget before the deadline", final="expired"
             )
             return True
         max_wait = held.envelope.max_wait_secs
+        if held.extended_ms:  # an extended call waits up to its new deadline (0.2.0 T2)
+            max_wait = None
         if max_wait is not None and now - held.position_ms / 1000.0 >= max_wait:
             await self._finish_call(
                 held,
@@ -3551,7 +3629,7 @@ class Engine:
                 left = self._deadline(held) - self.clock.now()
                 await asyncio.sleep(max(0.0, min(retry_secs, left)))
             while True:
-                if self.clock.now() >= self._deadline(held):
+                if await self._past_deadline(held, self.clock.now()):
                     await self._finish_call(held, "deadline_exceeded", f"last error: {kind}")
                     return
                 # The view now: one read before the failed attempt still offered a deployment

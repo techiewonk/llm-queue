@@ -124,6 +124,7 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `release_claims_failed` | warning | engine/runtime.py |
 | `release_return_failed` | warning | engine/runtime.py |
 | `replicas_short` | warning | engine/store_guard.py |
+| `request_extended` | info | engine/requests_admin.py |
 | `request_moved` | info | engine/requests_admin.py |
 | `request_unusable` | error | engine/runtime.py |
 | `result_drop_skipped` | warning | engine/requests.py |

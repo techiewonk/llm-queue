@@ -413,6 +413,64 @@ end
 return {n, started}
 """
 
+# Extend a call's deadline (0.2.0 T2, owner D6). KEYS: job, callers, status. ARGV: the new
+# deadline (store ms), how long the records outlive it (ms: caller margin + status TTL), the
+# caller margin (ms, the index scores a deadline plus it), the done-channel prefix
+# (`<prefix>:done:`), the cancel channel, the request id. The deadline lives in three places
+# and all three move here: the records (job `dl`, grown TTLs of job / callers / status and the
+# request index score), each worker holding the call (the notice on the cancel channel, every
+# worker reads it; a worker that receives it later reads `dl` before it expires the call) and
+# each waiting caller (the notice on its done channel: its timer is rescheduled). Only grows.
+# Reply: {'ok'} or {'final' | 'gone' | 'already' | 'past'}.
+EXTEND = """
+local state = redis.call('HGET', KEYS[1], 'state')
+if not state then return {'gone'} end
+if state == 'done' or state == 'failed' or state == 'expired' or state == 'cancelled' then
+  return {'final'}
+end
+local dl = tonumber(ARGV[1])
+if dl <= tonumber(redis.call('HGET', KEYS[1], 'dl') or '0') then return {'already'} end
+local now = X.now()
+if dl <= now then return {'past'} end
+redis.call('HSET', KEYS[1], 'dl', ARGV[1])
+local keep = dl - now + tonumber(ARGV[2])
+for i = 1, 3 do
+  if redis.call('EXISTS', KEYS[i]) == 1 and X.pttl(KEYS[i]) < keep then X.expire(KEYS[i], keep) end
+end
+local ix = redis.call('HGET', KEYS[1], 'ix')
+local h = redis.call('HGET', KEYS[1], 'ixh')
+if ix and h then
+  local score = dl + tonumber(ARGV[3])
+  redis.call('ZADD', ix, 'XX', 'GT', score, ARGV[6])
+  local ixs = string.sub(ix, 1, #ix - #h - 1)
+  redis.call('ZADD', ixs, 'GT', score, h)
+  local ms = score - now + 60000
+  if X.pttl(ix) < ms then X.expire(ix, ms) end
+  if X.pttl(ixs) < ms then X.expire(ixs, ms) end
+end
+local notice = '\\0x\\0' .. ARGV[1] .. '\\0' .. ARGV[6]
+for _, caller in ipairs(redis.call('SMEMBERS', KEYS[2])) do
+  redis.call('PUBLISH', ARGV[4] .. caller, notice)
+end
+redis.call('PUBLISH', ARGV[5], notice)
+return {'ok'}
+"""
+# The prefix of an extend notice on a done or cancel channel (a request id never starts with a
+# NUL): `\0x\0<deadline ms>\0<request id>`.
+EXTEND_NOTICE = "\0x\0"
+
+
+def extend_notice(data: str) -> tuple[str, int] | None:
+    """(request id, new deadline ms) of an extend notice; None for a plain request id."""
+    if not data.startswith(EXTEND_NOTICE):
+        return None
+    deadline, _, rid = data[len(EXTEND_NOTICE) :].partition("\0")
+    try:
+        return rid, int(deadline)
+    except ValueError:
+        return None
+
+
 # KEYS: status. ARGV: state, ttl, then field / value pairs (see `_STATUS_FN`).
 STATUS_SET = _STATUS_FN + "return set_status(KEYS[1], ARGV[1], tonumber(ARGV[2]), 3)\n"
 
@@ -503,6 +561,7 @@ class RequestStore:
         self._status = client.register_script(pre + STATUS_SET)
         self._cancel = client.register_script(pre + CANCEL)
         self._settle_done = client.register_script(pre + SETTLE_DONE)
+        self._extend = client.register_script(pre + EXTEND)
 
     def _req(self, request_id: str) -> tuple[str, str, str, str]:
         k = self.keys
@@ -909,6 +968,26 @@ class RequestStore:
         ]
         reply = await self._cancel(keys, [ttl_secs, channel, only_state or "", *request_ids])
         return int(reply[0]), int(reply[1])
+
+    async def extend(self, request_id: str, *, deadline_ms: int, margin_secs: float) -> str:
+        """Move a call's deadline to `deadline_ms` (store ms) everywhere it lives (`EXTEND`).
+
+        `margin_secs` is the callers' margin (the index scores a deadline plus it). Returns
+        `ok`, `final`, `gone`, `already` (not later than its current one) or `past`.
+        """
+        job, callers, status, _ = self._req(request_id)
+        reply = await self._extend(
+            [job, callers, status],
+            [
+                deadline_ms,
+                int((margin_secs + self.status_ttl_secs) * 1000),
+                int(margin_secs * 1000),
+                f"{self.keys.prefix}:done:",
+                self.keys.cancel_channel,
+                request_id,
+            ],
+        )
+        return _text(reply[0])
 
     async def set_status(self, request_id: str, state: str, **fields: Any) -> bool:
         """Write a status (False when a final state was already there)."""
