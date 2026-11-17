@@ -168,10 +168,19 @@ fakellm and the Docker stack, and keeps `reports/` as an artifact for 7 days.
   `check.py` sets per step). They log at `WARNING`; set `DRILL_LOG_LEVEL=INFO` to log every call.
 - Follow a long drill with `tail -f reports/check-<time>/gates.*.log`.
 
+## Manual tools
+
+`scripts/check_docs.py` (links and nav; also in the lint step), `scripts/smoke_install.py`
+(a clean install from PyPI, TestPyPI or a wheel), `scripts/watch_release.py` (a release's
+publish run and PyPI), `scripts/store_keys_page.py` (one page of every store key) and
+`scripts/evict_drill.py`. What each does and when to run it: CONTRIBUTING, "Manual tools".
+
 ## Before a release
 
 Run `python scripts/check.py all --release` (every scenario x every load), `python scripts/check.py soak20`
-and, for a change to key expiry or the store, `python scripts/check.py evict`. Gate B91's
+and, for a change to key expiry or the store, `python scripts/check.py evict`. After the
+release tag: `python scripts/watch_release.py v<version>` and
+`python scripts/smoke_install.py <version>`. Gate B91's
 2 ms mark depends on the machine: on a Windows / Docker Desktop host both 0.1.0b2 and 0.1.0b3
 measure 3-4 ms (see [Tested scenarios](../explanation/tested-scenarios.md)).
 

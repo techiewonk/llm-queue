@@ -348,6 +348,20 @@ CHANGELOG entries are plain sentences: what changed and, for a fix, what used to
   by its allow-list; keep it that way).
 - Never skip hooks (`--no-verify`) or bypass signing.
 
+## Manual tools
+
+Run by hand; each has `--help`, and `tests/unit/scripts/test_release_tools.py` tests their logic
+(no network or store needed).
+
+| Command | What it does | When |
+|---|---|---|
+| `python scripts/check_docs.py` | Every relative link and anchor in the README, CHANGELOG, CONTRIBUTING, STABILITY and `docs/` resolves, and every page in the `zensical.toml` nav exists. Also part of `check.py`'s lint step | After editing docs |
+| `python scripts/smoke_install.py 0.1.1` | A fresh venv (uv, Python 3.12), installs that version from PyPI with `langchain-aws`, checks the version, the public API, the LangChain adapters and the `llm-queue` command, then deletes the venv. `--testpypi`, a wheel path, `--python 3.14`, `--extras ''`, `--keep` | After a release, or on a built wheel before one |
+| `python scripts/watch_release.py v0.1.1` | Follows the tag's `publish` run on GitHub (no `gh` or token needed; `GITHUB_TOKEN` raises the rate limit), prints every job, then checks PyPI lists the version. Exit 0 only when both hold. `--once` for one look | After pushing a release tag |
+| `python scripts/store_keys_page.py` | `reports/store-keys.html`: one searchable page of every store key from `docs/reference/store-keys.json`, with the expiry modes and policy matrix | After changing store keys or their docs |
+| `python scripts/evict_drill.py` | A full evicting store under queue traffic (`volatile-lru` with swept key expiry, and `noeviction`); also `check.py evict` | After changing key expiry or store code |
+| `python scripts/samples.py --live` | The samples on real Bedrock (keys from `.env`, never printed); `--store env` uses the env file's TLS store | Before a release, with AWS access |
+
 ## Releases
 
 Releases go out **only** by pushing a tag `v<version>`: `.github/workflows/publish.yml` checks

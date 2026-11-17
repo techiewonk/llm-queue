@@ -371,11 +371,12 @@ def _run(step: str, label: str, cmd: list[str], *, timeout_secs: float = LINT_SE
 
 
 def _lint(name: str, paths: list[str]) -> list[bool]:
-    """Ruff, ruff format and mypy over `paths` (mypy incremental: its cache is per checkout)."""
+    """Ruff, ruff format, mypy over `paths` (mypy's cache is per checkout), then the docs' links."""
     return [
         _run(name, "ruff check", [PY, "-m", "ruff", "check", *paths]),
         _run(name, "ruff format --check", [PY, "-m", "ruff", "format", "--check", *paths]),
         _run(name, "mypy", [PY, "-m", "mypy", *paths]),
+        _run(name, "docs links", [PY, str(ROOT / "scripts" / "check_docs.py")]),
     ]
 
 

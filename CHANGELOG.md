@@ -27,6 +27,14 @@ apply when coming from 0.1.0b2 or earlier.
   embeds, ran no result reader: each call waited for the `poll_secs` safety net (5 s) before
   it saw its result. The result reader now runs in every role.
 
+### Tooling
+
+- Manual tools in `scripts/`, tested by `tests/unit/scripts/test_release_tools.py`:
+  `check_docs.py` (relative links, anchors and the nav; now part of `check.py`'s lint step),
+  `smoke_install.py` (a clean install from PyPI, TestPyPI or a wheel), `watch_release.py` (a
+  release's publish run and PyPI, without `gh`) and `store_keys_page.py` (one searchable page of
+  every store key). CONTRIBUTING lists them under "Manual tools".
+
 ### Documentation
 
 - In-depth architecture, call flows for every path and failure mode, and the list of tested
