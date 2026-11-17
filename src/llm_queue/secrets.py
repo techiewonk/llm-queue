@@ -8,7 +8,7 @@ turn and the first that has it wins:
   credentials from the default chain, a pod role on EKS);
 * `file:<path>`: a directory (one file per key, as a Kubernetes secret volume mounts it; one
   trailing newline stripped), a `.json` file (an object) or any other file read as `.env`
-  lines (`KEY=VALUE`);
+  lines (`KEY=VALUE`; see `FileSource` for comments and quotes);
 * `env`: the environment;
 * `none` (the default): no external source.
 
@@ -24,6 +24,7 @@ source kinds and ids (which are not secrets) and the names of mapped settings on
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -61,6 +62,7 @@ MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS = 1.0, 300.0
 _HIDDEN = "."
 _PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 _ENV_LINE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=(.*)$")
+_ENV_COMMENT = re.compile(r"\s#")  # an inline comment: `#` after whitespace, unquoted values
 
 
 @runtime_checkable
@@ -181,7 +183,14 @@ def _botocore_client(region: str | None, timeout_secs: float) -> Any:
 
 
 class FileSource:
-    """A directory of files (one per key), a `.json` object file or a `.env` file."""
+    """A directory of files (one per key), a `.json` object file or a `.env` file.
+
+    `.env` rules: blank lines and lines starting with `#` are skipped; `export ` is allowed.
+    An unquoted value ends at an inline comment, a `#` after whitespace (`KEY=abc # note`);
+    a `#` with no whitespace before it is part of the value (`KEY=a#b`). A value in single or
+    double quotes is the text between them, as written (`KEY="a # b"`), and only a comment
+    may follow the closing quote. Anything else is refused, naming the line, never its text.
+    """
 
     kind = "file"
 
@@ -228,13 +237,21 @@ class FileSource:
             if not stripped or stripped.startswith("#"):
                 continue
             found = _ENV_LINE.match(stripped)
-            if found is None:  # the line is not shown: it may hold a value
+            value = _env_value(found.group(2)) if found is not None else None
+            if found is None or value is None:  # the line is not shown: it may hold a value
                 raise ConfigError(f"secrets source {self.label}: line {number} is not KEY=VALUE")
-            value = found.group(2).strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-                value = value[1:-1]
             out[found.group(1)] = value
         return out
+
+
+def _env_value(raw: str) -> str | None:
+    """A `.env` value (the text after `=`) by `FileSource`'s rules; None for a bad quote."""
+    text = raw.strip()
+    if text[:1] in ("'", '"'):
+        end = text.find(text[0], 1)
+        rest = text[end + 1 :].strip() if end > 0 else "x"
+        return text[1:end] if not rest or rest.startswith("#") else None
+    return _ENV_COMMENT.split(raw, maxsplit=1)[0].strip()
 
 
 class EnvSource:
@@ -361,9 +378,16 @@ class SecretReader:
                 return cached.values  # another thread refreshed it meanwhile
             try:
                 values = cached.source.load()
-            except ConfigError as exc:
+            except Exception as exc:
+                # An app's own source may raise anything; its message may echo a value, so only
+                # a `ConfigError` (ours: no values) is shown, else the exception's class.
+                if not isinstance(exc, ConfigError):
+                    exc = ConfigError(
+                        f"secrets source {cached.source.label}: cannot be read "
+                        f"({type(exc).__name__})"
+                    )
                 if strict:
-                    raise
+                    raise exc from None
                 logger.warning("secrets_refresh_failed", source=cached.source.label, error=str(exc))
                 # Fresh again for min(cache_secs, RETRY_SECS): retried soon, not a period later.
                 cached.read_at = self._clock() - self.cache_secs + min(self.cache_secs, RETRY_SECS)
@@ -487,20 +511,30 @@ def parse_secret_names(value: Any) -> tuple[dict[str, str], list[str]]:
     """`LLMQ_SECRET_NAMES` (JSON text or a mapping) and its problems, listed at once."""
     if value is None or value == "":
         return {}, []
+    repeated: list[str] = []
     if isinstance(value, str):
+
+        def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+            seen: dict[str, Any] = {}
+            for key, item in items:
+                if key in seen:
+                    repeated.append(key)
+                seen[key] = item
+            return seen
+
         try:
-            value = orjson.loads(value)
-        except orjson.JSONDecodeError:
+            value = json.loads(value, object_pairs_hook=pairs)
+        except ValueError:
             return {}, ["LLMQ_SECRET_NAMES must be a JSON object of setting names to secret keys"]
     if not isinstance(value, Mapping):
         return {}, ["LLMQ_SECRET_NAMES must be a JSON object of setting names to secret keys"]
     names: dict[str, str] = {}
-    problems = []
+    problems = [f"LLMQ_SECRET_NAMES: {name} is set twice" for name in dict.fromkeys(repeated)]
     for name, secret in value.items():
         if not isinstance(secret, str) or not secret.strip():
             problems.append(f"LLMQ_SECRET_NAMES: {name} must name a secret key")
             continue
-        names[str(name)] = secret.strip()
+        names[str(name).strip()] = secret.strip()
     return names, problems
 
 

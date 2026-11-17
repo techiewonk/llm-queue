@@ -39,8 +39,14 @@ another secret store changes two variables. In a Kubernetes manifest:
   credentials; region `LLMQ_SECRETS_REGION`, else `AWS_REGION`), `file:<path>` (a mounted
   secret volume with one file per key, a `.json` file or a `.env` file), `env` and `none` (the
   default). `${NAME}` and `${NAME:-default}` are expanded from the environment (`ENV` above).
-- `LLMQ_SECRET_NAMES` gives each setting's key in the secret. `secret_names=` in code is merged
-  over it (the argument wins per setting).
+- In a `.env` file, `#` starts a comment at the start of a line or after whitespace
+  (`KEY=abc # note` reads `abc`); a `#` with no whitespace before it is part of the value
+  (`KEY=a#b`). Quote a value that holds ` #`: `KEY="a # b"` is the text between the quotes,
+  and only a comment may follow the closing quote. A line that breaks these rules is refused,
+  naming the line, never its text.
+- `LLMQ_SECRET_NAMES` gives each setting's key in the secret; a setting named twice is
+  refused. `secret_names=` in code is merged over it (the argument wins per setting). Names
+  and keys are stripped of spaces in both.
 - Values are cached for `LLMQ_SECRETS_CACHE_SECS` (300) and read again after, so a rotated
   store password reaches the next new connection within that time. A source that cannot be read
   at start (missing, denied) stops `from_env` with a `ConfigError` naming it; a key it does not
@@ -63,6 +69,9 @@ llmq = LLMQueue.from_env(secrets=lookup, secret_names={"LLMQ_STORE_PASSWORD": "v
 
 An app's own store is a class with `kind`, `label` and `load() -> Mapping[str, str]` (the
 `llm_queue.secrets.SecretSource` protocol), wrapped in `SecretReader([source], cache_secs=...)`.
+Whatever its `load()` raises, the reader treats it like a failed read: at start a `ConfigError`
+naming the source and the exception's class (never its message, which may echo a value); on
+a later refresh the last values are kept and `secrets_refresh_failed` is logged.
 
 ### Layers: secrets, environment, defaults
 

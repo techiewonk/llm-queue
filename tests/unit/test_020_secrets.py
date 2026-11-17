@@ -736,3 +736,85 @@ def test_the_admin_token_guard_reads_a_secret_off_the_event_loop() -> None:
         assert client.get("/x", headers={"X-LLMQ-Token": "nope"}).status_code == 403
     assert len(lookups) == 2
     assert handlers[0] not in lookups  # the lookup ran on a worker thread
+
+
+# Review S-3 -----------------------------------------------------------------------------------
+
+
+def test_a_setting_named_twice_in_secret_names_is_refused() -> None:
+    names = '{"LLMQ_STORE_PASSWORD": "a", "LLMQ_STORE_PASSWORD": "b"}'
+    with pytest.raises(ConfigError, match="LLMQ_SECRET_NAMES: LLMQ_STORE_PASSWORD is set twice"):
+        Layers({**DEV, "LLMQ_SECRET_NAMES": names})
+
+
+def test_secret_names_argument_values_are_stripped(tmp_path: Path) -> None:
+    volume = tmp_path / "vol"
+    volume.mkdir()
+    (volume / "valkey_key").write_text(PASSWORD, encoding="utf-8")
+    layers = Layers(
+        {**DEV, "LLMQ_SECRETS_SOURCE": f"file:{volume}"},
+        secret_names={" LLMQ_STORE_PASSWORD ": " valkey_key\n"},
+    )
+    assert layers.get("LLMQ_STORE_PASSWORD") == PASSWORD
+    assert layers.secret_names == {"LLMQ_STORE_PASSWORD": "valkey_key"}
+
+
+def test_dotenv_inline_comments_and_quotes_follow_the_documented_rule(tmp_path: Path) -> None:
+    dotenv = tmp_path / "app.env"
+    dotenv.write_text(
+        "A=abc # the password\n"
+        "B=a#b\n"
+        'C="x # y"  # quoted: kept\n'
+        "D='q' \n"
+        "E=   # only a comment\n"
+        "F=tab\t# comment\n",
+        encoding="utf-8",
+    )
+    values = dict(FileSource(dotenv).load())
+    assert values == {"A": "abc", "B": "a#b", "C": "x # y", "D": "q", "E": "", "F": "tab"}
+    for bad in ('G="open\n', "H='a' trailing\n"):
+        dotenv.write_text(bad, encoding="utf-8")
+        with pytest.raises(ConfigError, match="line 1 is not KEY=VALUE") as info:
+            FileSource(dotenv).load()
+        assert "open" not in str(info.value)
+        assert "trailing" not in str(info.value)
+
+
+class _Flaky:
+    """An app's own source: works once, then raises a non-`ConfigError` echoing a value."""
+
+    kind = "vault"
+    label = "vault:app"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def load(self) -> dict[str, str]:
+        self.calls += 1
+        if self.calls > 1:
+            raise RuntimeError(f"vault said no for {PASSWORD}")
+        return {"LLMQ_ADMIN_TOKEN": PASSWORD}
+
+
+def test_a_custom_source_raising_on_a_hot_lookup_keeps_the_last_values(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = Clock()
+    source = _Flaky()
+    reader = SecretReader([source], cache_secs=10, clock=clock)
+    assert reader("LLMQ_ADMIN_TOKEN") == PASSWORD
+    clock.now += 11
+    with caplog.at_level(logging.WARNING, logger="llm_queue"):
+        assert reader("LLMQ_ADMIN_TOKEN") == PASSWORD  # kept, not raised
+    assert source.calls == 2
+    assert "secrets_refresh_failed" in caplog.text
+    assert "RuntimeError" in caplog.text
+    _no_secret_in(caplog.text)
+
+
+def test_a_custom_source_raising_at_start_is_a_config_error_naming_it() -> None:
+    source = _Flaky()
+    source.calls = 1  # the next load raises
+    with pytest.raises(ConfigError, match=r"vault:app: cannot be read \(RuntimeError\)") as info:
+        SecretReader([source]).check()
+    _no_secret_in(str(info.value))

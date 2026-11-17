@@ -147,8 +147,8 @@ class Layers(Mapping[str, str]):
         for name, secret in (secret_names or {}).items():
             if not str(secret or "").strip():
                 problems.append(f"secret_names: {name} must name a secret")
-            else:
-                names[str(name)] = str(secret)
+            else:  # stripped as LLMQ_SECRET_NAMES is: `" valkey_host"` names `valkey_host`
+                names[str(name).strip()] = str(secret).strip()
         for name in names:
             if not name.startswith(PREFIX):
                 problems.append(f"secret names: {name!r} is not an LLMQ_* setting")

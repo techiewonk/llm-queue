@@ -93,7 +93,10 @@ index (below).
   source serves every reader: settings, store passwords on each new connection, the admin
   token, `LLMQ_JOB_*`, account secrets, registry placeholders, the CLI,
   `AdminServices.from_env` and `PurgeService.from_env`. In code: `secrets_from_config(spec)`, `SecretReader` and the
-  `SecretSource` protocol. Precedence: `secrets=` in code, else `LLMQ_SECRETS_SOURCE`; then the
+  `SecretSource` protocol (whatever an app's own source raises is a failed read: a
+  `ConfigError` naming it at start, the last values kept later). A setting named twice in
+  `LLMQ_SECRET_NAMES` is refused; names and keys are stripped in it and in `secret_names=`.
+  A `.env` file's inline comment is a `#` after whitespace; quoted values are kept as written. Precedence: `secrets=` in code, else `LLMQ_SECRETS_SOURCE`; then the
   environment; then `defaults=`. `describe()` gains `secrets` (source kinds and ids, mapped
   names, cache time; never a value), and `InfraSettings` the matching fields
   (`secrets_source`, `secret_sources`, `secret_names`, ...). `InfraSettings.from_layers(layers)`
