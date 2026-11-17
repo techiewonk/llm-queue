@@ -119,7 +119,7 @@ async def test_stream_tool_use(start_fake: StartFake, stack: AsyncExitStack) -> 
 
 
 async def test_speed_paces_output(start_fake: StartFake, stack: AsyncExitStack) -> None:
-    fake = await start_fake({"defaults": {"output_tokens": 40, "tokens_per_s": 100}})
+    fake = await start_fake({"defaults": {"output_tokens": 80, "tokens_per_s": 100}})
     client = await _client(stack, fake)
     started = time.monotonic()
     first_chunk = None
@@ -129,9 +129,10 @@ async def test_speed_paces_output(start_fake: StartFake, stack: AsyncExitStack) 
             first_chunk = time.monotonic() - started
     total = time.monotonic() - started
     assert first_chunk is not None
-    # Below the whole answer (0.4 s): the first chunk does not wait for it (0.3 was flaky, FT-21).
-    assert first_chunk < 0.38
-    assert total >= 0.35  # 40 tokens at 100 tokens / s
+    # Well below the whole answer (0.8 s): the first chunk does not wait for it. The answer was
+    # 0.4 s with a 0.38 s bound, too tight for a loaded runner (FT-21, review B-26).
+    assert first_chunk < 0.6
+    assert total >= 0.75  # 80 tokens at 100 tokens / s
 
 
 async def test_usage_missing(start_fake: StartFake, stack: AsyncExitStack) -> None:

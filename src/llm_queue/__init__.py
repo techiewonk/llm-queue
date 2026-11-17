@@ -75,22 +75,18 @@ if TYPE_CHECKING:
         StatusReport,
         queue_ready,
     )
+    from llm_queue.drain import DrainWatcher
     from llm_queue.engine.admin import AdminServices
     from llm_queue.engine.envelope import Meta, Reply
     from llm_queue.engine.jobs import JobContext, JobFn, JobSettings, current_job
     from llm_queue.engine.metrics import EmfSink, Metrics, NullSink, PrometheusSink
     from llm_queue.engine.offload import ResultOffload, S3Offload
-    from llm_queue.engine.purge import PurgeReport, PurgeService
+    from llm_queue.engine.purge import PurgeReport
     from llm_queue.engine.store_client import Secrets
     from llm_queue.engine.tokens import register_token_estimator
     from llm_queue.providers.embeddings import EmbeddingCodec, register_embedding_family
     from llm_queue.registry import RegistryError, register_account_kind
-    from llm_queue.registry.store import (
-        LiveEditRefused,
-        PublishResult,
-        RegistryConflict,
-        RegistryStore,
-    )
+    from llm_queue.registry.store import LiveEditRefused, PublishResult, RegistryConflict
 
 # Loaded on first access: these pull in redis, pydantic models or the SDK layer.
 _LAZY = {
@@ -114,7 +110,6 @@ _LAZY = {
     "ResultOffload": "llm_queue.engine.offload",
     "S3Offload": "llm_queue.engine.offload",
     "RegistryError": "llm_queue.registry",
-    "RegistryStore": "llm_queue.registry.store",
     "RegistryConflict": "llm_queue.registry.store",
     "LiveEditRefused": "llm_queue.registry.store",
     "register_account_kind": "llm_queue.registry",
@@ -136,9 +131,10 @@ _LAZY = {
     "PublishResult": "llm_queue.registry.store",
     # Every admin operation (0.2.0 R): `llmq.admin`, or `AdminServices.from_env()` standalone.
     "AdminServices": "llm_queue.engine.admin",
-    # Purges of removed models / deployments and tenants (0.1.0b3): `llmq.admin.purge`.
-    "PurgeService": "llm_queue.engine.purge",
+    # What a purge did (`llmq.admin.purge.*` returns it; the service itself is internal).
     "PurgeReport": "llm_queue.engine.purge",
+    # A pod-wide drain signal for an app's own readiness (0.2.0 A4, FU5).
+    "DrainWatcher": "llm_queue.drain",
     # Readiness and the per-request middleware (0.2.0 B3, B4).
     "queue_ready": "llm_queue.core",
     "RequestContextMiddleware": "llm_queue.asgi",
@@ -158,6 +154,7 @@ __all__ = [
     "ConfigError",
     "DeploymentStatus",
     "DeploymentView",
+    "DrainWatcher",
     "EmbedResult",
     "EmbeddingCodec",
     "EmfSink",
@@ -182,13 +179,11 @@ __all__ = [
     "Provider",
     "PublishResult",
     "PurgeReport",
-    "PurgeService",
     "QueueDisabled",
     "RateStatus",
     "RegistryConflict",
     "RegistryError",
     "RegistryOptions",
-    "RegistryStore",
     "Reject",
     "Reply",
     "RequestContext",

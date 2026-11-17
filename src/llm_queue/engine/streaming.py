@@ -456,12 +456,10 @@ class ChunkReader:
     async def _xread(self) -> Any:
         """One blocking XREAD over every open stream (and the wake stream).
 
-        Packed here from each stream's cached key argument and sent on a pooled connection:
-        redis-py's `xread` built a dict and packed every key and id in Python again on each
-        turn, 3.6 ms per read at 1,000 open streams (R3PF-2). The reply is raw (a map under
-        RESP3, a list of pairs under RESP2; fields as a flat list). A client without a pool (a
-        test fake) gets the plain command.
+        Packed here from cached key arguments: redis-py's `xread` re-packed every key, 3.6 ms
+        per read at 1,000 streams (R3PF-2). A client without a pool gets the plain command.
         """
+        # The reply is raw: a map under RESP3, a list of pairs under RESP2; fields as a flat list.
         pool = getattr(self._client, "connection_pool", None)
         if pool is None:
             streams: dict[Any, Any] = {key: last[0] for key, (_, last, _) in self._open.items()}

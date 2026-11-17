@@ -1,7 +1,20 @@
 # Stability policy
 
-- **Public API** = the names in `llm_queue.__all__`, the registry document's setting
-  names and the `llm-queue` commands. Anything else may change without notice.
+- **Public API** is exactly this; anything else may change without notice:
+  - the names in `llm_queue.__all__` (`DrainWatcher` among them);
+  - the public submodules: `llm_queue.fastapi` (`install`, `serve`, `mount`),
+    `llm_queue.langchain` (its `__all__`: `chat_model`, `embeddings`, `aliases`, the `Queued*`
+    adapters, `set_default_queue` / `get_default_queue`), `llm_queue.secrets`
+    (`secrets_from_config`, `SecretReader`, `SecretSource`) and `llm_queue.drain`
+    (`DrainWatcher`);
+  - the `llmq.admin` methods: one per row of the operations table in
+    `docs/reference/admin-api.md`, with the parameters and answers listed there. `llmq.admin`
+    is the one Python write path: the services behind it (`PurgeService`, `RegistryStore`) are
+    internal, and only their return types (`PurgeReport`, `PublishResult`) are public;
+  - the HTTP routes and the `llm-queue` commands in `docs/reference/cli-http.md` (paths,
+    methods, status codes and the JSON answers the operations table documents);
+  - the `LLMQ_*` settings (`docs/reference/environment.md`) and the registry document's
+    setting names.
 - **`llm_queue.run`** is part of that API under this generic name: it runs a coroutine like
   `asyncio.run`, on uvloop when the `uvloop` extra is installed (`use_uvloop=` forces it on or
   off). It is kept as `run`, not renamed (FO-23); import it as `llm_queue.run` or
@@ -11,7 +24,8 @@
   than it understands to the queue instead of dropping it. Workers of two releases share a queue
   only where CHANGELOG.md says so: 0.1.0b1 and 0.1.0b2 do not (drain 0.1.0b1 first);
   0.1.0b2 and 0.1.0b3 do on a `noeviction` store (on a `volatile-*` store, upgrade every pod);
-  0.1.1 and 0.2.0 do not (format 3 carries hashed tenant and user ids: drain 0.1.1 first).
+  0.1.1 and 0.2.0 do not (0.2.0 messages carry hashed tenant and user ids, format 3): drain
+  every 0.1.1 worker first, then upgrade the whole fleet.
   See `docs/how-to/upgrade.md`.
 - **Store schema:** the key layout has a schema number; a change to it ships with a migration note.
 - **Supported versions:** Python 3.12-3.14 (unit and integration tests run on each in CI; 3.11 was dropped in 0.1.0b2); Valkey 8

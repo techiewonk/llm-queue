@@ -80,13 +80,13 @@ _STOP_WAIT_SECS = 5.0  # after the drain: how long `stop()` waits for the calls 
 class _Bucket:
     """One budget of one deployment (or account) in this process: GCRA or a minute counter.
 
-    The admission script's rules (`engine/_admission_lua.py`), on wall seconds: `smooth`
-    lets a burst of `max(1, floor(limit x rate_burst))` units through, then one unit every
-    `60 / limit` s; `fixed` counts per calendar minute. `limit` is already divided by the
-    process count, so it may be below 1: one unit above `limit` still passes in a minute with
-    nothing taken, and `fixed` then carries what went over into the next minutes as a debt
-    (`limit` paid off each minute), so no process goes over its share on average (L-2).
+    The admission script's rules on wall seconds (`smooth` GCRA burst, `fixed` per minute);
+    `limit` is per process, so it may be below 1 (L-2).
     """
+
+    # `smooth` lets `max(1, floor(limit x rate_burst))` units through, then one every
+    # `60 / limit` s. Below 1, one unit still passes in an empty minute, and `fixed` carries
+    # what went over into the next minutes as a debt: no process exceeds its share on average.
 
     __slots__ = ("burst", "limit", "mode", "n", "tat", "used", "used_min", "win")
 
@@ -466,10 +466,10 @@ class LocalLimits:
                 secs = min((last.secs if last else 2.5) * 2, 60.0)
                 self.bad[(account, region)] = _Backoff(time.monotonic() + secs, secs)
 
-    def sticky_get(self, alias: str, key: str, ttl: float) -> str | None:
-        """The deployment a session used last, while it was used within `ttl`."""
+    def sticky_get(self, alias: str, key: str, ttl_secs: float) -> str | None:
+        """The deployment a session used last, while it was used within `ttl_secs`."""
         found = self.sticky.get((alias, key))
-        if found is None or found[1] < time.monotonic() - ttl:
+        if found is None or found[1] < time.monotonic() - ttl_secs:
             return None
         return found[0]
 
@@ -653,11 +653,8 @@ class LocalExecutor:
     ) -> None:
         """`view` reads the current registry; `params` builds a provider request.
 
-        `tenant_label` maps a call's tenant hash to its metric label (`TenantLabels`). The
-        concurrency cap and the budgets are `limits`'s, shared by every engine of the process.
-
-        `params` defaults to `request_params`; the queue engine passes its own `_params` (read
-        at each call, so a test may replace it).
+        `tenant_label` maps a tenant hash to its metric label; `limits` (cap and budgets) is
+        shared by every engine of the process; `params` defaults to `request_params`.
         """
         self.providers = providers
         self.limits = limits

@@ -69,15 +69,125 @@ _TRUE, _FALSE = ("true", "1", "yes", "on"), ("false", "0", "no", "off")
 # Settings that no longer exist (review B-15, owner RV4). One still set in the environment or
 # `defaults=` is reported at start: a `ConfigError` when strict, else a `setting_renamed` /
 # `setting_removed` warning, so an old manifest never silently gets the default. Old name ->
-# new name, and old name -> what to do instead; the env-rename wave adds its names here.
-RENAMED: dict[str, str] = {
-    "LLMQ_LOCAL_LIMIT_CAP": "LLMQ_LOCAL_CONCURRENCY",  # one name for local mode and static_cap
-    "LLMQ_PURGE_BATCH": "LLMQ_ADMIN_BATCH",
-}
+# what to do instead.
 REMOVED: dict[str, str] = {
     "LLMQ_TENANT_INDEX": "tenant purges read each model's request index "
     "(LLMQ_REQUEST_INDEX_ENABLED)",
 }
+# Old name -> new name: `RENAMED` is reported as above. `PENDING_RENAMES` is the names standard
+# (`LLMQ_<AREA>_<THING>[_<UNIT>]`, environment.md "Names") not applied yet: the code still reads
+# its old names. `scripts/rename_settings.py` rewrites every read, doc, test, sample and manifest
+# from it and moves it into `RENAMED`; it rewrites this block, so keep it plain.
+# rename-table: begin
+RENAMED: dict[str, str] = {
+    "LLMQ_LOCAL_LIMIT_CAP": "LLMQ_LOCAL_CONCURRENCY",
+    "LLMQ_PURGE_BATCH": "LLMQ_ADMIN_BATCH",
+}
+PENDING_RENAMES: dict[str, str] = {
+    "LLMQ_AUTO_PURGE": "LLMQ_PURGE_AUTO_ENABLED",
+    "LLMQ_PURGE_WAIT": "LLMQ_PURGE_WAIT_ENABLED",
+    "LLMQ_HTTP_PURGE_WAIT_SECS": "LLMQ_ADMIN_HTTP_WAIT_SECS",
+    "LLMQ_TENANT_PURGE_DEFAULT": "LLMQ_PURGE_TENANT_REMOVE",
+    "LLMQ_QUEUE_WAIT_REPLICAS": "LLMQ_REPLICA_WAIT_COUNT",
+    "LLMQ_QUEUE_WAIT_MS": "LLMQ_REPLICA_WAIT_MS",
+    "LLMQ_QUEUE_WAIT_SCOPES": "LLMQ_REPLICA_WAIT_SCOPES",
+    "LLMQ_QUEUE_FAILOVER_SECS": "LLMQ_QUEUE_STORE_FAILOVER_SECS",
+    "LLMQ_CFG_RELOAD_SECS": "LLMQ_REGISTRY_RELOAD_SECS",
+    "LLMQ_KEY_EXPIRY": "LLMQ_KEY_EXPIRY_MODE",
+    "LLMQ_TTL_SWEEP_BATCH": "LLMQ_KEY_EXPIRY_SWEEP_BATCH",
+    "LLMQ_TTL_SWEEP_ROUNDS": "LLMQ_KEY_EXPIRY_SWEEP_ROUNDS",
+    "LLMQ_REGISTRY_LIVE_EDIT": "LLMQ_REGISTRY_LIVE_EDIT_MODE",
+    "LLMQ_DEBUG_CAPTURE_FROM_CONFIG": "LLMQ_DEBUG_CAPTURE_ENABLED",
+    "LLMQ_BASE_URL_ALLOWED_HOSTS": "LLMQ_HTTP_ALLOWED_HOSTS",
+    "LLMQ_MODE": "LLMQ_ROLE",
+    "LLMQ_WORKER_ID": "LLMQ_INSTANCE_ID",
+    "LLMQ_DEFAULT_TENANT": "LLMQ_TENANT_DEFAULT",
+    "LLMQ_ADMIN_DLQ_BODIES_ENABLED": "LLMQ_ADMIN_DEAD_LETTER_BODIES_ENABLED",
+    "LLMQ_SECRET_NAMES": "LLMQ_SECRETS_NAMES",
+}
+# rename-table: end
+# Every process setting (`LLMQ_JOB_*` and the `LLMQ_ACCOUNT_*` secrets aside): environment.md
+# documents exactly these, a test checks each is read, and a registry `*_ref` may not name one.
+SETTING_NAMES = frozenset(
+    {
+        "LLMQ_ADMIN_ACTOR_HEADER",
+        "LLMQ_ADMIN_BATCH",
+        "LLMQ_ADMIN_BODY_MAX_BYTES",
+        "LLMQ_ADMIN_CSRF_HEADER",
+        "LLMQ_ADMIN_DLQ_BODIES_ENABLED",
+        "LLMQ_ADMIN_HEADER",
+        "LLMQ_ADMIN_INDEX_CACHE_SECS",
+        "LLMQ_ADMIN_READ_TOKEN",
+        "LLMQ_ADMIN_SCAN_MAX",
+        "LLMQ_ADMIN_TOKEN",
+        "LLMQ_ADMIN_WRITES_ENABLED",
+        "LLMQ_AUDIT_RETENTION_DAYS",
+        "LLMQ_AUTO_PURGE",
+        "LLMQ_BASE_URL_ALLOWED_HOSTS",
+        "LLMQ_BEDROCK_ENDPOINT_URL",
+        "LLMQ_CALLER_TTL_SECS",
+        "LLMQ_CFG_RELOAD_SECS",
+        "LLMQ_DEBUG_CAPTURE_FROM_CONFIG",
+        "LLMQ_DEFAULT_TENANT",
+        "LLMQ_DRAIN_FILE",
+        "LLMQ_DRAIN_HANDBACK_ENABLED",
+        "LLMQ_DRAIN_POLL_SECS",
+        "LLMQ_DRAIN_SECS",
+        "LLMQ_ENABLED",
+        "LLMQ_ENVIRONMENT",
+        "LLMQ_EXECUTION_MODE",
+        "LLMQ_HTTP_PURGE_WAIT_SECS",
+        "LLMQ_ID_HASH_SALT",
+        "LLMQ_KEY_EXPIRY",
+        "LLMQ_KEY_PREFIX",
+        "LLMQ_LEASE_SECS",
+        "LLMQ_LOCAL_CONCURRENCY",
+        "LLMQ_LOCAL_PROCESS_COUNT",
+        "LLMQ_METRICS_SINK",
+        "LLMQ_METRICS_TENANTS",
+        "LLMQ_MODE",
+        "LLMQ_PURGE_GRACE_SECS",
+        "LLMQ_PURGE_WAIT",
+        "LLMQ_PURGE_WAIT_SECS",
+        "LLMQ_QUEUE_FAILOVER_SECS",
+        "LLMQ_QUEUE_PREFIX",
+        "LLMQ_QUEUE_STORE_PASSWORD",
+        "LLMQ_QUEUE_STORE_URL",
+        "LLMQ_QUEUE_WAIT_MS",
+        "LLMQ_QUEUE_WAIT_REPLICAS",
+        "LLMQ_QUEUE_WAIT_SCOPES",
+        "LLMQ_REGISTRY",
+        "LLMQ_REGISTRY_FILE",
+        "LLMQ_REGISTRY_LIVE_EDIT",
+        "LLMQ_REQUESTS_LIST_MAX",
+        "LLMQ_REQUESTS_MOVE_BATCH",
+        "LLMQ_REQUESTS_MOVE_BYTES",
+        "LLMQ_REQUEST_INDEX_ENABLED",
+        "LLMQ_RESULT_DEDUPE_SECS",
+        "LLMQ_RESULT_TTL_SECS",
+        "LLMQ_SECRETS_CACHE_SECS",
+        "LLMQ_SECRETS_REGION",
+        "LLMQ_SECRETS_SOURCE",
+        "LLMQ_SECRETS_TIMEOUT_SECS",
+        "LLMQ_SECRET_NAMES",
+        "LLMQ_STATIC_CAP_WAIT_SECS",
+        "LLMQ_STATUS_TTL_SECS",
+        "LLMQ_STORE_DB",
+        "LLMQ_STORE_HOST",
+        "LLMQ_STORE_MAX_CONNECTIONS",
+        "LLMQ_STORE_PASSWORD",
+        "LLMQ_STORE_PORT",
+        "LLMQ_STORE_TLS_ENABLED",
+        "LLMQ_STORE_URL",
+        "LLMQ_STS_ENDPOINT_URL",
+        "LLMQ_SYNC_STORE_MAX_CONNECTIONS",
+        "LLMQ_TENANT_NAMES_ENABLED",
+        "LLMQ_TENANT_PURGE_DEFAULT",
+        "LLMQ_TTL_SWEEP_BATCH",
+        "LLMQ_TTL_SWEEP_ROUNDS",
+        "LLMQ_WORKER_ID",
+    }
+)
 # Where secrets come from is never itself read from a secret (llm_queue.secrets.SETTINGS).
 _SECRETS_SETTINGS = frozenset(
     PREFIX + n
@@ -104,17 +214,14 @@ def _set(value: Any) -> str | None:
 class Layers(Mapping[str, str]):
     """`LLMQ_*` values from three layers: secrets, then `environ`, then `defaults` (0.2.0 D1).
 
-    The secret layer is the `secrets` callable when given, else the sources
-    `LLMQ_SECRETS_SOURCE` names (`llm_queue.secrets`), else nothing. `defaults` (the app's own
-    values, for example from its config module) sit below the environment. `secret_names` and
-    `LLMQ_SECRET_NAMES` (merged, the argument wins per setting) map a setting to the key that
-    holds it in the secrets (`{'LLMQ_STORE_HOST': 'valkey_host'}`, 0.2.0 H7). The secrets
-    settings themselves (`llm_queue.secrets.SETTINGS`) are read from the environment and the
-    defaults only. Secrets are read on every lookup (a source caches for
-    `LLMQ_SECRETS_CACHE_SECS`), so a rotated one (the store password, the admin token) is seen
-    without a restart. Settings that name one thing two ways follow `CONFLICT_GROUPS`. A
-    mapping, so `JobSettings.from_env` reads it.
+    Secrets are `secrets`, else `LLMQ_SECRETS_SOURCE`'s sources, read on every lookup (a
+    rotation needs no restart); docs/reference/environment.md "Where values come from".
     """
+
+    # `secret_names` and `LLMQ_SECRET_NAMES` (merged, the argument wins) map a setting to its
+    # key in the secrets (0.2.0 H7). The secrets settings themselves are read from the
+    # environment and the defaults only. Settings that name one thing two ways follow
+    # `CONFLICT_GROUPS`. A mapping, so `JobSettings.from_env` reads it.
 
     def __init__(
         self,
@@ -207,6 +314,12 @@ class Layers(Mapping[str, str]):
     def secret_names(self) -> dict[str, str]:
         """Settings read from the secrets under another key (merged names)."""
         return dict(self._names)
+
+    def invalidate_secrets(self) -> None:
+        """Have the secret layer read its sources again (`SecretReader.invalidate`), if it can."""
+        invalidate = getattr(self._secrets, "invalidate", None)
+        if callable(invalidate):
+            invalidate()
 
     def describe_secrets(self) -> dict[str, Any]:
         """Where secrets come from (kinds and ids) and which settings are mapped: no values."""
@@ -477,12 +590,11 @@ def read_document(
 ) -> str:
     """The registry JSON from the variable or the file, refused when it repeats a key.
 
-    `${NAME}` placeholders are expanded with `lookup` (default: `os.environ`) after parsing,
-    so the repeated-key check sees the document as written and the expanded text is checked
-    again (`registry.interpolate`; credentials are refused). A file ending `.yaml` / `.yml` is
-    read as YAML (extra `yaml`). Text without placeholders is returned as it is. `used`
-    collects the names the placeholders read.
+    `${NAME}` placeholders are expanded with `lookup` after parsing (credentials refused);
+    a `.yaml` / `.yml` file is read as YAML. `used` collects the names read.
     """
+    # Parsing first lets the repeated-key check see the document as written; the expanded
+    # text is checked again. Text without placeholders is returned as it is.
     yaml_file = False
     if registry:
         text = registry
@@ -514,6 +626,9 @@ class InfraSettings:
     # LLMQ_STORE_MAX_CONNECTIONS=auto (0.2.0 D7): the size above is the boot registry's worker
     # slots + STORE_POOL_MARGIN.
     store_max_connections_auto: bool = False
+    # LLMQ_SYNC_STORE_MAX_CONNECTIONS: the private engine of sync calls when no queue is started
+    # (Celery workers, scripts) is caller-only and needs few (D1); capped by the pool above.
+    sync_store_max_connections: int = 20
     # The store as parts (0.2.0 D3), when `LLMQ_STORE_URL` is not set; `store_url` is built from
     # them (the password from LLMQ_STORE_PASSWORD, escaped).
     store_host: str | None = None
@@ -566,6 +681,7 @@ class InfraSettings:
     # token guard (audited `token:<value>`), the `GET /` summary cache, dead-letter bodies.
     admin_writes_enabled: bool = False  # LLMQ_ADMIN_WRITES_ENABLED
     admin_actor_header: str = "X-LLMQ-Actor"  # LLMQ_ADMIN_ACTOR_HEADER
+    admin_csrf_header: str = "X-LLMQ-Admin"  # LLMQ_ADMIN_CSRF_HEADER: a write route needs it
     admin_index_cache_secs: float = 2.0  # LLMQ_ADMIN_INDEX_CACHE_SECS
     admin_dlq_bodies_enabled: bool = False  # LLMQ_ADMIN_DLQ_BODIES_ENABLED
     admin_body_max_bytes: int = 1_048_576  # LLMQ_ADMIN_BODY_MAX_BYTES: a larger POST is a 413
@@ -725,7 +841,12 @@ class InfraSettings:
         default_tenant = str(get("DEFAULT_TENANT", "") or "").strip() or None
         admin_header = str(get("ADMIN_HEADER", "X-LLMQ-Token") or "").strip()
         actor_header = str(get("ADMIN_ACTOR_HEADER", "X-LLMQ-Actor") or "").strip()
-        for name, header in (("ADMIN_HEADER", admin_header), ("ADMIN_ACTOR_HEADER", actor_header)):
+        csrf_header = str(get("ADMIN_CSRF_HEADER", "X-LLMQ-Admin") or "").strip()
+        for name, header in (
+            ("ADMIN_HEADER", admin_header),
+            ("ADMIN_ACTOR_HEADER", actor_header),
+            ("ADMIN_CSRF_HEADER", csrf_header),
+        ):
             if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", header):
                 problems.append(f"LLMQ_{name} must be a header name (letters, digits, `-`)")
         switches = {
@@ -847,6 +968,9 @@ class InfraSettings:
             queue_store_url=urls["QUEUE_STORE_URL"],
             store_max_connections=pool,
             store_max_connections_auto=pool_auto,
+            sync_store_max_connections=number(
+                "SYNC_STORE_MAX_CONNECTIONS", 20, int, lo=1, hi=100_000
+            ),
             store_host=host,
             store_port=port,
             store_db=db,
@@ -891,6 +1015,7 @@ class InfraSettings:
             admin_header=admin_header,
             admin_writes_enabled=switches["ADMIN_WRITES_ENABLED"],
             admin_actor_header=actor_header,
+            admin_csrf_header=csrf_header,
             admin_index_cache_secs=number("ADMIN_INDEX_CACHE_SECS", 2.0, zero=True, hi=60),
             admin_dlq_bodies_enabled=switches["ADMIN_DLQ_BODIES_ENABLED"],
             admin_body_max_bytes=number(
@@ -945,11 +1070,8 @@ class InfraSettings:
     def registry_document(self) -> str:
         """The registry JSON from `LLMQ_REGISTRY` or the file `LLMQ_REGISTRY_FILE`.
 
-        Placeholders expanded (see `read_document`). Tenant names in `fairness.weights` /
-        `quotas` are replaced by their keyed hashes (`LLMQ_ID_HASH_SALT`, owner D2): only
-        hashes reach the store, matching the hashes a call's message carries. `ConfigError`
-        when neither is set, the file cannot be read, the text is not JSON (or YAML), an object
-        repeats a key or a placeholder names an unset variable without a default.
+        Placeholders expanded; tenant names in `fairness` replaced by their keyed hashes (D2),
+        so only hashes reach the store. `ConfigError` when it cannot be read or parsed.
         """
         from llm_queue.engine.fairness import hash_tenant_names
 

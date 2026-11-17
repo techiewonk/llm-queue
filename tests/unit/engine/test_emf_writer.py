@@ -27,11 +27,13 @@ def test_a_slow_stdout_does_not_block_a_metric_point(monkeypatch: pytest.MonkeyP
     writer = _StdoutWriter()
     sink = EmfSink(writer, flush_secs=0)  # one line per point, as before aggregation
     started = time.perf_counter()
-    for _ in range(10):
+    for _ in range(25):
         sink.count("llmq_calls_total", model="m")
-    assert time.perf_counter() - started < 0.15  # inline: 10 x 20 ms = 200 ms
-    assert writer.flush(timeout_secs=5)
-    assert len(slow.getvalue().splitlines()) == 10  # every point written, in order
+    # Inline it would take 25 x 20 ms = 500 ms; queued it takes microseconds. The bound leaves a
+    # loaded CI runner room (it was 150 ms against 200 ms: review B-26).
+    assert time.perf_counter() - started < 0.35
+    assert writer.flush(timeout_secs=10)
+    assert len(slow.getvalue().splitlines()) == 25  # every point written, in order
 
 
 def test_a_full_queue_drops_and_counts(monkeypatch: pytest.MonkeyPatch) -> None:

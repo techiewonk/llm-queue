@@ -61,9 +61,6 @@ if TYPE_CHECKING:
     from llm_queue.engine.admin import AdminServices
 
 logger = get_logger(__name__)
-# Store connections of the private engine that serves sync calls when no queue is started
-# (Celery workers, scripts): a caller-only engine needs few (D1).
-SYNC_STORE_CONNECTIONS = 20
 # A sync call on a started queue's loop checks this often that the loop still runs (CO-26).
 _LOOP_CHECK_SECS = 1.0
 # How long closing the private engine of the sync calls may take before it is logged and left.
@@ -320,15 +317,10 @@ class LLMQueue:
     ) -> LLMQueue:
         """Build from `LLMQ_*`: the secrets first, then `environ`, then `defaults`.
 
-        The secrets are `secrets` when given, else the sources `LLMQ_SECRETS_SOURCE` names
-        (`llm_queue.secrets`), else none. `defaults` (`{"LLMQ_KEY_PREFIX": "myapp", ...}`) is
-        the lowest layer, for the app's own values; `secret_names` (merged over
-        `LLMQ_SECRET_NAMES`) reads a setting from a secret under another key
-        (`{"LLMQ_STORE_HOST": "valkey_host"}`). See `engine.settings.Layers`. `tuning` sets
-        timeouts, pool sizes and loop pacing in code (`Tuning()` is the defaults); a bad value
-        or combination raises `ConfigError` listing every problem. `LLMQ_ENABLED=false`
-        returns a disabled queue (`llm_queue.disabled.DisabledQueue`): probes and the drain
-        file only, every call refused.
+        The secrets are `secrets`, else the sources `LLMQ_SECRETS_SOURCE` names; `secret_names`
+        reads a setting under another key, `tuning` sets timeouts and pools in code (see
+        docs/reference/environment.md). `LLMQ_ENABLED=false` returns a `DisabledQueue` (probes
+        and the drain file only, every call refused); `ConfigError` lists every problem.
         """
         layers = Layers(environ, secrets, defaults, secret_names)  # reads a source once
         settings = InfraSettings.from_layers(layers)
@@ -445,7 +437,7 @@ class LLMQueue:
                 local_limits=local_limits,
             )
 
-        sync_cap = min(SYNC_STORE_CONNECTIONS, settings.store_max_connections)
+        sync_cap = min(settings.sync_store_max_connections, settings.store_max_connections)
         queue = cls(
             build(),
             settings=settings,
@@ -573,12 +565,11 @@ class LLMQueue:
     async def start(self) -> None:
         """Publish / load the registry; run the worker side unless `mode=caller`.
 
-        A second `start()` does nothing; a stopped queue cannot start again (build a new one).
-        The first started queue of the process is the LangChain default and stays so. Starts
-        run one at a time, on one event loop. A start that fails part-way stops what it
-        started and re-raises; the queue is then stopped (a stopped engine cannot start
-        again), and a later `start()` raises `LLMQueueError` naming that first error.
+        A second `start()` does nothing; a start that fails part-way stops what it started, and
+        a later `start()` raises `LLMQueueError` naming that first error (build a new queue).
         """
+        # The first started queue of the process is the LangChain default and stays so. Starts
+        # run one at a time, on one event loop.
         self._check()
         self._refuse_if_stopped()
         loop = asyncio.get_running_loop()
@@ -845,13 +836,12 @@ class LLMQueue:
     async def stop(self, drain_secs: float | None = None) -> None:
         """Shut down in order (plan §3.18) and close every client; a second call does nothing.
 
-        Receiving stops first (calls and jobs, as `pause_receiving()`); `drain_secs` (default
-        `LLMQ_DRAIN_SECS`) bounds the whole wait: jobs first (they make calls), then running
-        calls get what is left of it. Calls made during the drain are
-        served; new calls are refused once it is over. Every step runs even when an earlier
-        one fails (each failure is logged) and the first failure is raised at the end; if the
-        stop is cancelled, the steps left still close their clients, without draining.
+        Receiving stops first (as `pause_receiving()`); `drain_secs` (default `LLMQ_DRAIN_SECS`)
+        bounds the whole wait: jobs, then running calls. Every step runs even when one fails;
+        the first failure is raised last.
         """
+        # Calls made during the drain are served; new calls are refused once it is over. If the
+        # stop is cancelled, the steps left still close their clients, without draining.
         from llm_queue.langchain import get_default_queue, set_default_queue
 
         await self._wait_for_start()
@@ -927,16 +917,9 @@ class LLMQueue:
     ) -> Reply:
         """Any operation of a model (`converse`, `chat`, `invoke_model`, `embeddings`).
 
-        `converse`, `chat` and `call` run the same code: the model's provider, not the method
-        name, decides the request shape (Converse for Bedrock, chat completions for
-        OpenAI-compatible). Use `call` for code that handles every model alike.
-
-        Per-call options (keyword only; R3AP-10): `timeout_secs` (default the model's
-        `timeout_secs`, capped by `timeout_max_secs`), `max_wait_secs` (longest wait for
-        budget), `request_id` (your id; a repeat attaches to the same call), `session_id`,
-        `user_id`, `tenant_id` (default from `request_context`), `allow_fallback` (`"all"`:
-        fallback regions and models, `"regions"`: regions only, `"none"`), `allowed_regions`
-        and `allowed_accounts` (limit the deployments). An unknown option raises `TypeError`.
+        The model's provider, not the method name, decides the request shape. The keyword-only
+        options (`timeout_secs`, `max_wait_secs`, `request_id`, ids, `allow_fallback`, ...) are
+        in docs/how-to/call.md; an unknown one raises `TypeError` (R3AP-10).
         """
         self._check(work=True)
         return await self._engine.call(model, params, **self._call_kwargs(priority, **kw))
@@ -1120,11 +1103,8 @@ class LLMQueue:
     ) -> None:
         """Allow this process to run job `name` (call before `start`).
 
-        `concurrency` caps its runs in this process (default `LLMQ_JOB_CONCURRENCY`, 4).
-
-        A run longer than `timeout_secs` is cancelled and counts as a failure (retried, then
-        dead-lettered); None (the default) lets it run as long as it takes. `ConfigError` in
-        `caller` mode, which runs no jobs: the job waited unseen (R3JE-6).
+        `concurrency` caps its runs here (default `LLMQ_JOB_CONCURRENCY`); a run past
+        `timeout_secs` is cancelled and fails. `ConfigError` in `caller` mode (R3JE-6).
         """
         self._refuse_local("jobs")
         if self.settings is not None and self.settings.mode == "caller":
@@ -1205,17 +1185,9 @@ class LLMQueue:
     ) -> Any:
         """A FastAPI router of every admin operation (extra `http`); see `engine/http.py`.
 
-        Reads need `admin_read_token` (default `LLMQ_ADMIN_READ_TOKEN`), `admin_token`
-        (default `LLMQ_ADMIN_TOKEN`; it may read too) or `dependencies`; with none of them the
-        router refuses to mount unless `insecure_reads=True`. Tokens travel in `admin_header`
-        (default `LLMQ_ADMIN_HEADER`, `X-LLMQ-Token`), are compared in constant time, and a
-        callable is read on every request (rotation without a restart). Writes (`allow_writes`,
-        default `LLMQ_ADMIN_WRITES_ENABLED`) need the admin token or `dependencies`, and an
-        actor: `actor(request)`, else the claimed `LLMQ_ADMIN_ACTOR_HEADER` (`X-LLMQ-Actor`)
-        audited as `token:<value>`. `drain_routes=True` adds `GET /drain`, `POST /drain` and
-        `POST /resume` for this process (a pod with several processes drains through
-        `LLMQ_DRAIN_FILE`); `metrics_route=True` adds an open `GET /metrics`. Outside dev each
-        token must be at least 32 characters (`ConfigError` here, read once to check).
+        Tokens default to `LLMQ_ADMIN_TOKEN` / `LLMQ_ADMIN_READ_TOKEN` (callables read per
+        request); with no token and no `dependencies` only the probes and `/metrics` are mounted.
+        Guards, actors and the drain routes: docs/reference/cli-http.md "HTTP routes".
         """
         from llm_queue.engine.http import BODY_MAX_BYTES, status_router
 
@@ -1235,6 +1207,7 @@ class LLMQueue:
             read_token=admin_read_token if admin_read_token is not None else env_read,
             token_header=admin_header or (s.admin_header if s else "X-LLMQ-Token"),
             actor_header=s.admin_actor_header if s else "X-LLMQ-Actor",
+            csrf_header=s.admin_csrf_header if s else "X-LLMQ-Admin",
             insecure_reads=insecure_reads,
             wait_cap_secs=float(s.http_purge_wait_secs) if s else 60.0,
             dlq_bodies=bool(s.admin_dlq_bodies_enabled) if s else False,
@@ -1337,12 +1310,12 @@ def queue_ready(llmq: LLMQueue | None = None) -> bool:
 def _wait_on_loop[T](future: Future[T], loop: asyncio.AbstractEventLoop) -> T:
     """Wait for a call sent to a started queue's loop, or fail when that loop stops running.
 
-    A loop that was stopped (not closed) never runs the call, and `.result()` with no
-    timeout blocked the sync caller forever (CO-26). A loop that is only between two
-    `run_until_complete` calls is not running for a moment: it must be seen stopped on two
-    polls in a row (or closed) before the call is given up (FC-13). A `KeyboardInterrupt` in
-    the waiting thread cancels the call instead of leaving it running unwatched (FC-13).
+    A stopped loop never runs the call, and `.result()` blocked forever (CO-26).
     """
+    # A loop between two `run_until_complete` calls is not running for a moment: it must be
+    # seen stopped on two polls in a row (or closed) before the call is given up (FC-13). A
+    # `KeyboardInterrupt` in the waiting thread cancels the call instead of leaving it
+    # running unwatched (FC-13).
     stopped_polls = 0
     try:
         while True:

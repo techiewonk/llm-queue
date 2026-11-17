@@ -91,14 +91,11 @@ def test_alert_thresholds_are_bounded_and_dead_names_gone(small: dict[str, Any])
 @pytest.mark.parametrize(
     "name", ["quota_used_mins", "spill_pct", "spill_window_secs", "waiting_age_secs"]
 )
-def test_removed_alert_names_warn_until_0_2(small: dict[str, Any], name: str) -> None:
-    """Q34 / R3AP-5: a 0.1.0b1 document naming a removed alert stopped the pod from starting."""
+def test_removed_alert_names_are_unknown_fields(small: dict[str, Any], name: str) -> None:
+    """Review B-10: the 0.1.0b1 alert names were accepted with a warning until 0.2; now refused."""
     doc = copy.deepcopy(small)
     doc["models"]["gpt20b"]["alerts"] = {name: 5, "dlq_messages": 2}
-    warnings = _warnings(doc)
-    assert _has(warnings, f"alerts.{name}", "removed in 0.1.0b2")
-    view = load_registry(doc)
-    assert name not in view.value("gpt20b", "alerts")
+    assert _has(_errors(doc), "gpt20b.alerts", f"unknown field `{name}`")
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])

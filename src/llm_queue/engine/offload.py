@@ -71,15 +71,13 @@ class ResultOffload(Protocol):
 class S3Offload:
     """`ResultOffload` on an S3 bucket (server-side encryption; expiry by the bucket's rule).
 
-    Object names are `{prefix}/{key_prefix}/{random id}`: no caller text and no request id in
-    a key (a hash of a guessable id told who made large results: R3JE-33), and no two writes on
-    one name. A reference outside that prefix is refused before any read. `sse=None` leaves the
-    header out (the bucket's default encryption applies); `sse="aws:kms"` with `kms_key_id`
-    uses a customer key and `bucket_key=True` turns on S3 Bucket Keys (fewer KMS requests).
-    `expected_bucket_owner` makes every request fail when the bucket changed owner. The client
-    gets short timeouts (`CLIENT_CONFIG`) unless `client_kwargs` has a `config`. One client per
-    event loop (never shared).
+    Object names are `{prefix}/{key_prefix}/{random id}` (no caller text or request id,
+    R3JE-33); `sse`, `kms_key_id`, `bucket_key` and `expected_bucket_owner` as in S3.
     """
+
+    # A reference outside that prefix is refused before any read. `sse=None` leaves the
+    # header out (the bucket's default encryption applies). The client gets short timeouts
+    # (`CLIENT_CONFIG`) unless `client_kwargs` has a `config`; one client per event loop.
 
     def __init__(
         self,

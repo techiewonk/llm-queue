@@ -1,17 +1,19 @@
-"""Mount the queue's admin, status and health routes on a FastAPI app (admin pages, probes).
+"""Wire the queue into a FastAPI app with `install()`: admin, status, health and drain routes.
 
-`llmq.http_router()` returns an `APIRouter` (extra `http`) with every admin operation
-(docs/reference/admin-api.md); `GET /` lists them with a live summary. `/health/live` and
-`/health/ready` take no auth (Kubernetes probes); every other route runs the app's admin
-dependencies (or an admin token). Writes (live registry edits, region / account blocks, purges)
-stay off unless `allow_writes=True`; they take a JSON body, need the `X-LLMQ-Admin` header (a
-browser cannot send it cross-site) and are a dry run unless the body says `"dry_run": false`.
-A preStop hook calls `llmq.pause_receiving()`: readiness fails and no new queued work starts.
-`metrics_route=True` adds `GET /metrics`, the Prometheus exposition of a Prometheus sink (extra
-`metrics`), open like the probes so a scraper can read it.
+`llm_queue.fastapi.install(app, llmq, ...)` starts and stops the queue with the app and mounts
+`llmq.http_router()` (extra `http`): every admin operation (docs/reference/admin-api.md), with
+`GET /` listing them and a live summary. `/health/live` and `/health/ready` take no auth
+(Kubernetes probes); every other route runs the app's admin dependency (or an admin token).
+Writes (registry edits, blocks, purges, drain) stay off unless `allow_writes=True`; they need
+the `X-LLMQ-Admin` header (a browser cannot send it cross-site) and are a dry run unless the
+body says `"dry_run": false`. With `dependencies` and `actor`, `install()` also mounts the drain
+routes: `POST /drain` fails readiness and hands held calls back, `POST /resume` undoes it,
+`GET /drain` shows the state. A pod with several processes drains through `LLMQ_DRAIN_FILE`
+instead: its preStop hook runs `touch $LLMQ_DRAIN_FILE` and every process sees it (a route
+reaches one process only). `metrics_route=True` adds an open `GET /metrics` (extra `metrics`).
 
 Here the app is called in process (httpx's ASGI transport), so no port is opened; in the app
-the same router is served by uvicorn.
+the same routes are served by uvicorn.
 
     python scripts/samples.py 09_http_router [--live]
 """
@@ -19,54 +21,39 @@ the same router is served by uvicorn.
 from __future__ import annotations
 
 import asyncio
-import contextlib
-from collections.abc import AsyncIterator
+import hmac
+import os
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
 
 from llm_queue import LLMQueue, PrometheusSink
+from llm_queue.fastapi import install
 
-# Prometheus metrics for /metrics; in an app `LLMQ_METRICS_SINK=prometheus` does the same.
-llmq = LLMQueue.from_env(metrics=PrometheusSink())
+# The app's own admin secret (here from the environment; use the app's auth in a real app).
+ADMIN_SECRET = os.environ.get("SAMPLE_ADMIN_SECRET", "sample-admin")
 
 
 def admin_only(x_admin_token: str = Header(default="")) -> None:
-    """The app's own admin check (here a fixed header; use the app's auth)."""
-    if x_admin_token != "sample-admin":
+    """The app's own admin check: compared in constant time, so timing cannot leak it."""
+    if not hmac.compare_digest(x_admin_token.encode(), ADMIN_SECRET.encode()):
         raise HTTPException(status_code=401, detail="admin only")
 
 
-@contextlib.asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    await llmq.start()
-    yield
-    await llmq.stop()
-
-
-app = FastAPI(lifespan=lifespan)
-app.include_router(
-    llmq.http_router(
-        dependencies=[admin_only],
-        allow_writes=True,
-        actor=lambda request: "sample-admin",  # the authenticated user's name in an app
-        metrics_route=True,
-    ),
-    prefix="/llm-queue",
+app = FastAPI()
+# Prometheus metrics for /metrics; in an app `LLMQ_METRICS_SINK=prometheus` does the same.
+llmq = install(
+    app,
+    LLMQueue.from_env(metrics=PrometheusSink()),
+    dependencies=[admin_only],
+    allow_writes=True,
+    actor=lambda request: "sample-admin",  # the authenticated user's name in an app
+    metrics_route=True,
 )
 
 
-# GET for Kubernetes' `preStop: httpGet` (a POST-only route answered it 405 and nothing
-# drained); POST for scripts. The route is the app's own: the router has no `/drain`.
-@app.api_route("/drain", methods=["GET", "POST"])
-async def drain() -> dict[str, bool]:
-    """PreStop hook: fail readiness and take no new queued calls; running ones finish."""
-    llmq.pause_receiving()
-    return {"draining": True}
-
-
 async def main() -> None:
-    admin = {"x-admin-token": "sample-admin"}
+    admin = {"x-admin-token": ADMIN_SECRET}
     writer = {**admin, "X-LLMQ-Admin": "1"}  # write routes need this header too
     transport = httpx.ASGITransport(app=app)
     async with (
@@ -138,10 +125,18 @@ async def main() -> None:
             print(f"POST {path} {region} -> {block.json()['blocked_regions']}")
             assert block.status_code == 200
 
-        await client.get("/drain")  # what the preStop httpGet sends
+        drained = await client.post("/llm-queue/drain", json={}, headers=writer)
+        print(f"POST /drain -> {drained.status_code}")
+        assert drained.status_code == 200
         after = await client.get("/llm-queue/health/ready")
-        print(f"after /drain: GET /health/ready -> {after.status_code}")
+        print(f"after POST /drain: GET /health/ready -> {after.status_code}")
         assert after.status_code == 503
+        state = await client.get("/llm-queue/drain", headers=admin)
+        print(f"GET /drain -> {state.status_code}")
+        assert state.status_code == 200
+        resumed = await client.post("/llm-queue/resume", json={}, headers=writer)
+        print(f"POST /resume -> {resumed.status_code}")
+        assert resumed.status_code == 200
 
 
 if __name__ == "__main__":

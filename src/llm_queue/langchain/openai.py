@@ -85,11 +85,8 @@ class _ClosesClients:
 class QueuedChatOpenAI(_ClosesClients, ChatOpenAI):
     """`ChatOpenAI` whose HTTP calls are answered by the LLM queue's `chat` op.
 
-    `model_alias` is the queue alias; when unset, the request's `model` (this class's `model`)
-    is used as the alias. `queue_streaming=True` makes `astream()` (and LangGraph's message
-    streaming) yield tokens as they arrive, through `LLMQueue.chat_stream`; off by default
-    (one full message). Sync `stream()` always yields one full message. The Responses API is
-    off: only `/chat/completions` and `/embeddings` are queued (R3AP-13).
+    `model_alias` defaults to the request's `model`; `queue_streaming=True` streams tokens
+    in `astream()`. Only `/chat/completions` and `/embeddings` are queued (R3AP-13).
     """
 
     llmq: Any = Field(default=None, exclude=True)

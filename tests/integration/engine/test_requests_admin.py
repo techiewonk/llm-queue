@@ -409,7 +409,7 @@ async def test_moved_call_keeps_deadline_and_is_served_in_its_new_class(
             await engine.state.zscore(engine.keys.queue(_queue(engine), "vis"), old.message_id)
             is None
         )
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.35)  # the 0.1 s hold lapses (review B-26: a 50 ms margin flaked)
         worker, _ = await make(caller=False)
         reply = await asyncio.wait_for(calls.tasks[0], 15)
         assert reply.ok

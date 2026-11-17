@@ -28,12 +28,11 @@ _TYPES = ("http", "websocket")
 class RequestContextMiddleware:
     """Run each HTTP / WebSocket request inside `request_context(...)` with these values.
 
-    `tenant_id`, `user_id`, `session_id` (str) and `priority` (bool): a constant, or a callable
-    `fn(scope)` (sync or async) read per request. None (the default, or a callable returning
-    None) inherits the field: the request starts from the context the server runs in, so
-    `LLMQ_DEFAULT_TENANT` still applies to calls with no tenant. Lifespan and other scope
-    types pass through untouched.
+    Each value (`tenant_id`, `user_id`, `session_id`, `priority`) is a constant or
+    `fn(scope)` (sync or async); None inherits it (`LLMQ_DEFAULT_TENANT` still applies).
     """
+
+    # Lifespan and other scope types pass through untouched.
 
     def __init__(
         self,

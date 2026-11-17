@@ -36,11 +36,11 @@ Three layers, highest first: **the secrets**, then **`environ`**, then **`defaul
   name. It is merged over `LLMQ_SECRET_NAMES` (the argument wins per setting). The order of the
   layers stays the same.
 
-The CLI (`llm-queue`), `AdminServices.from_env`, `RequestsAdmin.from_env` and
-`PurgeService.from_env` read the same layers, so `LLMQ_SECRETS_SOURCE` applies to them too. The
-three `from_env` take `LLMQueue.from_env`'s `secrets=`, `defaults=` and `secret_names=`, and
-build on one wiring (`AdminContext.from_layers`), so an admin worker reproduces an app that
-configures through `defaults=`.
+The CLI (`llm-queue`) and `AdminServices.from_env` read the same layers, so
+`LLMQ_SECRETS_SOURCE` applies to them too. `AdminServices.from_env` takes `LLMQueue.from_env`'s
+`secrets=`, `defaults=` and `secret_names=` and builds on the same wiring
+(`AdminContext.from_layers`), so an admin worker reproduces an app that configures through
+`defaults=`.
 
 Two groups name one thing two ways: `LLMQ_STORE_URL` or the store parts (`LLMQ_STORE_HOST`,
 `LLMQ_STORE_PORT`, `LLMQ_STORE_DB`, `LLMQ_STORE_TLS_ENABLED`), and `LLMQ_REGISTRY` or
@@ -114,7 +114,8 @@ flowchart LR
 | `LLMQ_STORE_PASSWORD` | none | text | Optional; read on every new connection (rotation), from a secret, the environment or `defaults=`; wins over a password in the URL |
 | `LLMQ_QUEUE_STORE_URL` | the state store | a store URL | Optional separate store for queues and doorbells (same TLS rule) |
 | `LLMQ_QUEUE_STORE_PASSWORD` | none | text | As `LLMQ_STORE_PASSWORD`, for the queue store |
-| `LLMQ_STORE_MAX_CONNECTIONS` | 200 | 4 to 100000 (whole) | Store connection pool per engine (worker slots + callers + 3). `auto`: the sum of `worker_slots` over the boot registry's models plus 10 (`STORE_POOL_MARGIN`), within 4 to 100000, computed once by `from_env` (a live edit does not resize it; `start()` warns when the pool is below the slots). Sync calls without a started queue use at most 20 |
+| `LLMQ_STORE_MAX_CONNECTIONS` | 200 | 4 to 100000 (whole) | Store connection pool per engine (worker slots + callers + 3). `auto`: the sum of `worker_slots` over the boot registry's models plus 10 (`STORE_POOL_MARGIN`), within 4 to 100000, computed once by `from_env` (a live edit does not resize it; `start()` warns when the pool is below the slots). Sync calls without a started queue use at most `LLMQ_SYNC_STORE_MAX_CONNECTIONS` |
+| `LLMQ_SYNC_STORE_MAX_CONNECTIONS` | 20 | 1 to 100000 (whole) | The pool of the private caller-only engine that serves sync calls when no queue is started (Celery workers, scripts); never more than `LLMQ_STORE_MAX_CONNECTIONS` |
 | `LLMQ_QUEUE_FAILOVER_SECS` | 5 | 0 to 3600 | With a separate queue store: send errors this long before calls run direct |
 | `LLMQ_QUEUE_WAIT_REPLICAS` | 0 | 0 to 16 (whole) | A write waits for this many replicas to acknowledge it (0: off). With fewer replicas a write is sent anyway, warned about at most once a minute and counted (`llmq_send_not_replicated_total`); a store with no replica connected skips the wait ... |
 | `LLMQ_QUEUE_WAIT_MS` | 100 | above 0 to 60000 (whole) | ... for at most this long (it must stay below the store read timeout, see [Tune](../how-to/tune.md)) |
@@ -143,6 +144,15 @@ How calls run (see [Modes](../how-to/modes.md) for when to switch and how to und
 | `LLMQ_LOCAL_CONCURRENCY` | 10 | above 0 to 100000 (whole) | Calls in flight per model and process on the local executor (`local` mode and `store_down: static_cap`; async and sync calls together); priority calls get a free slot first. The one setting for both: the old `LLMQ_LOCAL_LIMIT_CAP` is reported as renamed |
 | `LLMQ_STATIC_CAP_WAIT_SECS` | 5 | 0 to 3600 | The longest a `store_down: static_cap` call waits for a budget or a breaker during a store outage, below its own `max_wait_secs`; then `rate_limited`. Retries and their backoff are not capped |
 
+## Names
+
+Every setting is `LLMQ_<AREA>_<THING>[_<UNIT>]`: units in the name (`_SECS`, `_MS`, `_BYTES`,
+`_DAYS`), switches end in `_ENABLED`, and `_MODE` marks a setting that picks one of several
+behaviours of the same thing (`LLMQ_EXECUTION_MODE`). A setting that names a sink, a source
+list or a role is not a mode: `LLMQ_METRICS_SINK` and `LLMQ_SECRETS_SOURCE` keep their names.
+`TTL` (time to live) is a defined term, not an abbreviation (`LLMQ_RESULT_TTL_SECS`).
+`LLMQ_ENABLED` is the one setting without an area: the switch of the whole library.
+
 ## Renamed and removed settings
 
 A setting that no longer exists is never ignored in silence: when one is still set in the
@@ -150,9 +160,10 @@ environment or `defaults=`, a strict environment refuses to start (`ConfigError`
 new setting) and a dev one logs `setting_renamed` / `setting_removed` (the name, never the
 value). The list is `RENAMED` / `REMOVED` in `llm_queue.engine.settings`:
 
-- `LLMQ_LOCAL_LIMIT_CAP`: renamed `LLMQ_LOCAL_CONCURRENCY` (one setting for local mode and
-  `store_down: static_cap`).
+<!-- rename-table: begin list (generated by scripts/rename_settings.py) -->
+- `LLMQ_LOCAL_LIMIT_CAP`: renamed `LLMQ_LOCAL_CONCURRENCY`.
 - `LLMQ_PURGE_BATCH`: renamed `LLMQ_ADMIN_BATCH`.
+<!-- rename-table: end -->
 - `LLMQ_TENANT_INDEX`: removed; tenant purges read each model's request index
   (`LLMQ_REQUEST_INDEX_ENABLED`).
 
@@ -172,6 +183,7 @@ value). The list is `RENAMED` / `REMOVED` in `llm_queue.engine.settings`:
 | `LLMQ_ADMIN_HEADER` | `X-LLMQ-Token` | a header name | The header that carries the admin tokens (read and write) |
 | `LLMQ_ADMIN_WRITES_ENABLED` | false | true or false (`on` / `off`) | Default of `http_router(allow_writes=)`: mount the admin write routes (registry edits, blocks, purges, dead letters, cancels). Each write is still a dry run unless its body says `"dry_run": false` |
 | `LLMQ_ADMIN_ACTOR_HEADER` | `X-LLMQ-Actor` | a header name | With the token guard and no `actor=`: the header whose value a write is audited under, as `token:<value>` (`token:unknown` without it). A claimed name, not an identity |
+| `LLMQ_ADMIN_CSRF_HEADER` | `X-LLMQ-Admin` | a header name | When the write routes are guarded by `dependencies` only (no `LLMQ_ADMIN_TOKEN`), a write needs this header (any value): no simple cross-site request can carry it |
 | `LLMQ_ADMIN_INDEX_CACHE_SECS` | 2 | 0 to 60 | How long `GET /` (the admin index) reuses its live summary, so a dashboard poll cannot load the store |
 | `LLMQ_ADMIN_DLQ_BODIES_ENABLED` | false | true or false (`on` / `off`) | `GET /dlq/{entry_id}?unsafe=true` may return message bodies (prompts, job payloads); off, it answers 403. The CLI and Python `unsafe=True` do not need it |
 | `LLMQ_ADMIN_BODY_MAX_BYTES` | 1048576 | 1024 to 67108864 (whole) | Largest admin POST body; a larger one answers 413 before it is parsed. Each value of a JSON body (a registry edit's `values`) is also capped at 64 KiB serialised (400) |

@@ -23,7 +23,7 @@ from pathlib import Path
 CHECK = """
 import sys
 import llm_queue
-from llm_queue import LLMQueue, CallFailed, PurgeService, PurgeReport, AdminRefused, AdminServices
+from llm_queue import LLMQueue, CallFailed, DrainWatcher, PurgeReport, AdminRefused, AdminServices
 want = sys.argv[1]
 assert want in ("", llm_queue.__version__), (llm_queue.__version__, want)
 if "langchain" in sys.argv[2]:

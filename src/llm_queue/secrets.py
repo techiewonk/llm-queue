@@ -25,7 +25,9 @@ source kinds and ids (which are not secrets) and the names of mapped settings on
 from __future__ import annotations
 
 import json
+import math
 import os
+import random
 import re
 import threading
 import time
@@ -54,7 +56,13 @@ TIMEOUT_VAR = "LLMQ_SECRETS_TIMEOUT_SECS"
 SETTINGS = (SOURCE_VAR, NAMES_VAR, REGION_VAR, CACHE_VAR, TIMEOUT_VAR)
 SOURCE_KINDS = ("aws-secretsmanager", "file", "env", "none")
 CACHE_SECS = 300.0  # LLMQ_SECRETS_CACHE_SECS default
-RETRY_SECS = 30.0  # a failed refresh is tried again after min(cache_secs, this)
+RETRY_SECS = 30.0  # a failed refresh is tried again after min(cache_secs, this), jittered
+# The retry is spread over +-20 %, so the pods of a fleet that lost Secrets Manager together do
+# not all ask again in the same second (review S-2).
+RETRY_JITTER = 0.2
+# A store login refused with these values re-reads the sources (`invalidate`), at most this often:
+# a rotated password is picked up at once, a wrong one does not hammer the source.
+INVALIDATE_MIN_SECS = 5.0
 MAX_CACHE_SECS = 86_400.0
 TIMEOUT_SECS = 10.0  # LLMQ_SECRETS_TIMEOUT_SECS default: connect and read, each
 MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS = 1.0, 300.0
@@ -185,11 +193,8 @@ def _botocore_client(region: str | None, timeout_secs: float) -> Any:
 class FileSource:
     """A directory of files (one per key), a `.json` object file or a `.env` file.
 
-    `.env` rules: blank lines and lines starting with `#` are skipped; `export ` is allowed.
-    An unquoted value ends at an inline comment, a `#` after whitespace (`KEY=abc # note`);
-    a `#` with no whitespace before it is part of the value (`KEY=a#b`). A value in single or
-    double quotes is the text between them, as written (`KEY="a # b"`), and only a comment
-    may follow the closing quote. Anything else is refused, naming the line, never its text.
+    `.env`: `#` lines and blanks skipped, `export ` allowed, an inline comment is `#` after
+    whitespace, quoted values kept as written; anything else is refused by line number.
     """
 
     kind = "file"
@@ -289,12 +294,8 @@ class _Cached:
 class SecretReader:
     """A `secrets=` lookup over ordered sources, each cached for `cache_secs`.
 
-    Callable as `reader(name) -> str | None`. Thread-safe: one refresh per source at a time
-    (the store password is read from worker threads on new connections). On a thread running
-    an event loop an expired source is never read inline: the last values are served while a
-    background thread reads it again (stale while revalidate), so a slow Secrets Manager call
-    cannot stall the loop. A failed refresh keeps the last values and is tried again after
-    min(`cache_secs`, 30 s).
+    Thread-safe; on an event loop an expired source serves its last values while a thread
+    reads it again. A failed refresh keeps the last values and is retried later (jittered).
     """
 
     def __init__(
@@ -345,6 +346,17 @@ class SecretReader:
             "cache_secs": self.cache_secs,
         }
 
+    def invalidate(self) -> None:
+        """Read every source again on the next lookup (a store login was refused, review S-2).
+
+        A source read in the last `INVALIDATE_MIN_SECS` is kept, so a wrong value cannot turn
+        every failed connection into a Secrets Manager call.
+        """
+        now = self._clock()
+        for cached in self._sources:
+            if now - cached.read_at >= INVALIDATE_MIN_SECS:
+                cached.read_at = -math.inf
+
     def _values(self, cached: _Cached) -> Mapping[str, str] | None:
         if cached.values is not None and self._fresh(cached):
             return cached.values
@@ -390,7 +402,9 @@ class SecretReader:
                     raise exc from None
                 logger.warning("secrets_refresh_failed", source=cached.source.label, error=str(exc))
                 # Fresh again for min(cache_secs, RETRY_SECS): retried soon, not a period later.
-                cached.read_at = self._clock() - self.cache_secs + min(self.cache_secs, RETRY_SECS)
+                retry = min(self.cache_secs, RETRY_SECS)
+                retry *= random.uniform(1 - RETRY_JITTER, 1 + RETRY_JITTER)
+                cached.read_at = self._clock() - self.cache_secs + retry
                 return cached.values
             cached.values = values
             cached.read_at = self._clock()

@@ -140,16 +140,13 @@ def _service_tier(tier: Any) -> dict[str, Any]:
 class QueuedChatBedrockConverse(ChatBedrockConverse):
     """`ChatBedrockConverse` whose Converse calls go through the LLM queue.
 
-    `model_alias` is the registry alias (`gpt120b`); `model_id` is the Bedrock id (looked up
-    from the registry when omitted) and drives the parent's provider-specific request building.
-    `priority=None` takes the class from `request_context`. `queue_streaming=True` makes
-    `astream()` (and LangGraph's message streaming) yield tokens as they arrive, through
-    `LLMQueue.converse_stream`; off by default (one full message). Sync `stream()` always
-    yields one full message: the queue has no sync stream.
-
-    Replies carry how the queue served them in `response_metadata["llmq"]` (the `Meta`) and
-    boto's `response_metadata["ResponseMetadata"]` (`RequestId` is Bedrock's request id).
+    `model_alias` is the registry alias, `model_id` the Bedrock id (looked up when omitted);
+    `queue_streaming=True` streams tokens in `astream()`. See docs/how-to/langchain.md.
     """
+
+    # Sync `stream()` always yields one full message: the queue has no sync stream. Replies
+    # carry the `Meta` in `response_metadata["llmq"]` and boto's
+    # `response_metadata["ResponseMetadata"]` (`RequestId` is Bedrock's request id).
 
     llmq: Any = Field(default=None, exclude=True)
     model_alias: str | None = None
@@ -349,12 +346,12 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
 class QueuedBedrockEmbeddings(BedrockEmbeddings):
     """`BedrockEmbeddings` whose calls go through the queue's `embed` op (batched per provider).
 
-    `model_alias` is the queue alias (defaults to `model_id`; the queue builds the provider
-    body). Queries use `query_input_type` (`"search_query"`), documents `document_input_type`
-    (`"search_document"`); the provider ignores it where the model has no such field. An index
-    built with `embed_query` for its documents keeps matching with
-    `document_input_type="search_query"`. `normalize` is applied locally.
+    Queries use `query_input_type`, documents `document_input_type`; `normalize` is local.
+    See docs/how-to/langchain.md.
     """
+
+    # An index built with `embed_query` for its documents keeps matching with
+    # `document_input_type="search_query"`.
 
     llmq: Any = Field(default=None, exclude=True)
     model_alias: str | None = None

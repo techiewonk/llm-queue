@@ -2,7 +2,7 @@
 
 When a model or deployment leaves the registry, or a tenant leaves your app, its state stays
 in the store: budgets, limiter, breaker, health, sticky sessions, queues, tenant clocks. A
-purge deletes it. One service does every purge, `PurgeService`, reached as `llmq.admin.purge`;
+purge deletes it. One service does every purge, reached as `llmq.admin.purge`;
 the CLI, the built-in HTTP routes and your own API routes all call it (see
 [Admin API](../reference/admin-api.md)).
 
@@ -10,7 +10,7 @@ Every purge is a **dry run** unless you pass `dry_run=False` (`--yes` on the CLI
 `"dry_run": false` over HTTP): it reports what it would delete and changes nothing. A real purge
 writes an entry to the audit (`llm-queue audit list`), logs `llmq_purge` and counts
 `llmq_purged_keys_total{kind}`. `llmq.admin.purge.*` returns the report as a JSON-ready dict
-(`PurgeService` methods return a `PurgeReport`; `report.as_dict()` is the same dict):
+(the internal service returns a `PurgeReport`; `report.as_dict()` is the same dict):
 
 | Field | Holds |
 |---|---|
@@ -44,8 +44,7 @@ async with AdminServices.from_env() as admin:
     print(await admin.purge.removed(actor="nightly"))  # a dry run
 ```
 
-`PurgeService.from_env()` still builds the bare service; its methods are dry runs by default
-too. Errors are `LLMQueueError`s: `AdminRefused` when a purge would delete state still in use
+`AdminServices.from_env()` builds the same services without a queue (`.purge`). Errors are `LLMQueueError`s: `AdminRefused` when a purge would delete state still in use
 (nothing is deleted), `StoreUnavailable` when the store cannot serve it, `ConfigError` for a
 bad argument.
 

@@ -67,11 +67,8 @@ class OpenAIOptions:
 class WarmOptions:
     """Warm connections per Bedrock client (E4); pass `connections=0` to turn it off.
 
-    After a client is built, `connections` unsigned HEAD requests go to its endpoint at once
-    through the client's own aiohttp session, so DNS, TCP and TLS are done before the first
-    call. They are not billable (no model is invoked; AWS answers an unsigned request with an
-    error status and keeps the connection). Every `refresh_secs` the same requests run again,
-    so the connections outlive AWS's ~20 s idle close and aiohttp's `keepalive_secs`.
+    `connections` unsigned HEAD requests (not billable) open DNS, TCP and TLS before the
+    first call, again every `refresh_secs` so they outlive AWS's ~20 s idle close.
     """
 
     connections: int = 2

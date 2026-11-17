@@ -294,12 +294,12 @@ class NullSink:
 class _StdoutWriter:
     """Writes lines to stdout from one daemon thread, so a backed-up log pipe never holds the loop.
 
-    `EmfSink`'s default `write` (EN-20). Lines wait in a bounded queue (`MAX_LINES`); when it is
-    full a line is dropped and counted (`dropped`), with a warning at most once a minute
-    (R3OB-11: once per process hid every later loss). No thread until the first line, so
-    importing or building a sink starts nothing. `on_idle` runs on the thread when no line
-    came for `IDLE_SECS` (the EMF sink's flush of points added up since its last line).
+    A bounded queue (`MAX_LINES`): a full one drops and counts lines, warned once a minute.
+    No thread until the first line; `on_idle` runs after `IDLE_SECS` with no line.
     """
+
+    # `EmfSink`'s default `write` (EN-20). Warning once per process hid every later loss
+    # (R3OB-11).
 
     MAX_LINES = 10_000
     IDLE_SECS = 1.0
@@ -384,14 +384,13 @@ _EMF_MAX_VALUES = 100  # per metric value array (EMF limit)
 class EmfSink:
     """CloudWatch embedded metric format, added up per label set and written once a second.
 
-    One line per point cost 17.7 us and 1,322 bytes of stdout per call (4 points; R3PF-14), and
-    the alert tick wrote one line per gauge (R3OB-11). Now counters are summed, gauges keep
-    their last value and samples go into a value array, per label set; each label set is one
-    line with all its metrics, written when `flush_secs` has passed (checked on each point, and
-    by the default writer's thread when idle), at exit, or by `flush()`. `flush_secs=0` writes
-    one line per point. `properties` (pod, version) ride on every line outside `Dimensions`:
-    searchable in Logs Insights at no metric cost (R3OB-12).
+    Counters summed, gauges last value, samples in an array: one line per label set every
+    `flush_secs` (0: a line per point); `properties` ride outside `Dimensions`.
     """
+
+    # One line per point cost 17.7 us and 1,322 bytes of stdout per call (R3PF-14). Lines are
+    # also written by the default writer's thread when idle, at exit and by `flush()`.
+    # `properties` (pod, version) are searchable in Logs Insights at no metric cost (R3OB-12).
 
     def __init__(
         self,

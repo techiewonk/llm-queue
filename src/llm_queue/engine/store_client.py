@@ -22,8 +22,8 @@ import redis.asyncio
 from redis.asyncio.retry import Retry
 from redis.backoff import EqualJitterBackoff  # in every redis-py the bounds allow (>=5)
 from redis.credentials import CredentialProvider
+from redis.exceptions import AuthenticationError, ReadOnlyError
 from redis.exceptions import ConnectionError as StoreConnectionError
-from redis.exceptions import ReadOnlyError
 
 from llm_queue._logging import get_logger
 from llm_queue.tuning import StoreOptions
@@ -106,12 +106,19 @@ class BusyPool(redis.asyncio.BlockingConnectionPool):
     """
 
     busy_secs: float = 0.0
+    # Called when a login is refused: `FreshPassword.invalidate`, so a rotated password is read
+    # again at once instead of after the secrets cache time (review S-2).
+    auth_failed: Callable[[], None] | None = None
 
     async def get_connection(self, *args: Any, **kwargs: Any) -> Any:  # noqa: D102  # as redis-py
         deadline = time.monotonic() + self.busy_secs
         while True:
             try:
                 return await super().get_connection(*args, **kwargs)  # type: ignore[no-untyped-call]  # redis-py has no annotation here
+            except AuthenticationError:
+                if self.auth_failed is not None:
+                    self.auth_failed()
+                raise
             except StoreConnectionError as exc:
                 if not isinstance(exc.__cause__, TimeoutError):
                     raise  # a real connection failure
@@ -150,6 +157,17 @@ class FreshPassword(CredentialProvider):
         password = self._secrets(self._name) or ""
         return (self._username, password) if self._username else (password,)
 
+    def invalidate(self) -> None:
+        """Make the next read fetch the secret again: the store refused the password.
+
+        `secrets` is a `SecretReader`, or a bound `Layers.get` / `Layers.lookup` whose layers
+        hold one; anything else has no cache to drop.
+        """
+        owner = getattr(self._secrets, "__self__", self._secrets)
+        hook = getattr(owner, "invalidate_secrets", None) or getattr(owner, "invalidate", None)
+        if callable(hook):
+            hook()
+
     async def get_credentials_async(self) -> tuple[str] | tuple[str, str]:
         """`get_credentials` in a worker thread: the asyncio client asks this one.
 
@@ -172,7 +190,10 @@ def secret_store_client(
         return store_client(url, None, max_connections=max_connections, options=options)
     bare, username = split_user(url)
     provider = FreshPassword(secrets, name, username)
-    return store_client(bare, provider, max_connections=max_connections, options=options)
+    client = store_client(bare, provider, max_connections=max_connections, options=options)
+    if isinstance(client.connection_pool, BusyPool):  # always: `store_client` builds one
+        client.connection_pool.auth_failed = provider.invalidate
+    return client
 
 
 def split_user(url: str) -> tuple[str, str | None]:

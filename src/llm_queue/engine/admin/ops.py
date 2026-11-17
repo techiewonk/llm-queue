@@ -39,13 +39,14 @@ REQUIRED: Any = _Required()
 class Param:
     """One parameter of an operation: its JSON type, default and command-line form.
 
-    `kind` is the accepted JSON type (`str`, `int`, `float` (ints too), `bool`, `list` of
-    `item`, `dict`); `cli` how the command line spells it (`flag` is a store-true switch,
-    `noflag` a `--no-<name>` switch (absent: None), `opts` a repeated option named `flag`,
-    `pairs` `path=value` words, `onoff` a positional `on` / `off`). Over HTTP a `{name}` in the
-    route's path takes it from the path (`deployment` from `{account}/{name}`), else from the
-    query (GET) or the JSON body (POST).
+    `kind` is the JSON type (`str`, `int`, `float`, `bool`, `list` of `item`, `dict`); `cli`
+    how the command line spells it. Over HTTP a `{name}` in the path takes it from there.
     """
+
+    # `cli`: `flag` is a store-true switch, `noflag` a `--no-<name>` switch (absent: None),
+    # `opts` a repeated option named `flag`, `pairs` `path=value` words, `onoff` a positional
+    # `on` / `off`. Over HTTP `deployment` comes from `{account}/{name}`; anything not in the
+    # path from the query (GET) or the JSON body (POST).
 
     name: str
     kind: type
