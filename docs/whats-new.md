@@ -25,6 +25,18 @@ curl -H "X-LLMQ-Token: $READ_TOKEN" https://app/llmq/   # every route and a live
 mapping is in [Upgrade](how-to/upgrade.md#from-011-to-020-the-admin-api). The examples in the
 0.1.0b3 section below use the names of that release. Read [Admin API](reference/admin-api.md).
 
+Calls in flight are indexed by model and tenant (`LLMQ_REQUEST_INDEX_ENABLED`, on), so one
+tenant's calls can be listed, counted, cancelled, moved to the other class or given more time
+without touching another tenant's:
+
+```bash
+llm-queue requests list gpt120b --tenant acme --state waiting
+llm-queue --actor ops requests cancel --model gpt120b --tenant acme --yes   # waiting calls
+llm-queue status --model gpt120b --tenant acme
+```
+
+Messages carry only keyed hashes of tenant and user ids.
+
 ## 0.1.0b3
 
 0.1.0b3 lets llm-queue share a cache store that evicts, and deletes the store state of what you

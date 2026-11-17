@@ -43,6 +43,7 @@ from llm_queue.engine.audit import Audit
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.purge import PurgeService, PurgeSettings, keyed_hash
 from llm_queue.engine.queue import StreamQueues
+from llm_queue.engine.requests_admin import AdminSettings, RequestsAdmin
 from llm_queue.engine.settings import InfraSettings
 from llm_queue.engine.status import StatusReader
 
@@ -84,7 +85,7 @@ class AdminServices:
         self.dlq = DlqAdmin(ctx)
         self.jobs = JobsAdmin(ctx)
         self.purge = PurgeAdmin(ctx, self.requests)
-        self.status = StatusAdmin(ctx)
+        self.status = StatusAdmin(ctx, self.requests)
         self.drain = DrainAdmin(ctx)
         self.ops = OpsAdmin(ctx)
         self._owned: list[Any] = []
@@ -118,6 +119,7 @@ class AdminServices:
             settings=settings,
             engine=engine,
             process=process,
+            requests=engine.requests_admin,
         )
         return cls(ctx)
 
@@ -168,19 +170,40 @@ class AdminServices:
             salt=salt,
             status_ttl_secs=settings.status_ttl_secs,
         )
+        admin_settings = AdminSettings.from_infra(settings)
+        requests = RequestsAdmin(
+            state,
+            queue_client=queue_client,
+            keys=keys,
+            registry=registry,
+            queue_prefix=settings.queue_prefix,
+            hash_id=lambda value: keyed_hash(salt, value),
+            settings=admin_settings,
+            status_ttl_secs=settings.status_ttl_secs,
+        )
+        status = StatusReader(
+            state,
+            keys,
+            queues,
+            settings.queue_prefix,
+            requests=requests,
+            request_index=admin_settings.request_index,
+            scan_max=admin_settings.scan_max,
+        )
         ctx = AdminContext(
             state=state,
             queue_client=queue_client,
             keys=keys,
             registry=registry,
             queues=queues,
-            status=StatusReader(state, keys, queues, settings.queue_prefix),
+            status=status,
             purge=purge,
             audit=Audit(state, registry.audit_key),
             hash_id=lambda value: keyed_hash(salt, value),
             queue_prefix=settings.queue_prefix,
             status_ttl_secs=settings.status_ttl_secs,
             settings=settings,
+            requests=requests,
         )
         admin = cls(ctx)
         admin._owned = [c for c in (queue_client, state) if c is not None]

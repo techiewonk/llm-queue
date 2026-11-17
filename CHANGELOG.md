@@ -50,10 +50,9 @@ New settings: `LLMQ_ADMIN_READ_TOKEN` (read routes only), `LLMQ_ADMIN_WRITES_ENA
 `LLMQ_ADMIN_DLQ_BODIES_ENABLED` (false). New: `GET /` admin index with a live summary;
 `AdminServices.from_env()` for admin workers and the CLI; routes for registry versions, diff,
 schema, publish and rollback, audit, models, deployments, blocks, queues, jobs, dead letters and
-`describe`; log event `llmq_admin` per audited write. Requests listed, counted, reprioritized or
-extended by model and tenant, a cancel by model or tenant, `tenants list` and `purge queue` are
-in the table and answer `AdminRefused("requests service not available")` until the per-model
-request index ships.
+`describe`; log event `llmq_admin` per audited write. `llmq.admin.requests`, `tenants.list`,
+`purge.queue` and `status.get(model, tenant=...)` are served by `RequestsAdmin` over the request
+index (below).
 
 ### Added
 

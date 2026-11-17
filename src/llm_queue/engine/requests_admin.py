@@ -50,6 +50,7 @@ STATES: tuple[State, ...] = ("waiting", "running", "all")
 STAGES: tuple[Stage, ...] = ("queued", "delayed", "held", "direct", "running")
 NO_TENANT = "-"  # the index's tenant of a call with no tenant id
 MAX_CANCEL_IDS = 1_000  # request ids one cancel may name
+MAX_ID_CHARS = 256  # characters of one request id a cancel may name
 SAMPLE_IDS = 20  # ids a change report lists
 _HASH_RE = re.compile(r"^[0-9a-f]{16}\Z")
 
@@ -372,7 +373,7 @@ class RequestsAdmin:
         """
         view = await self._view()
         alias = view.registry.alias_of(model)
-        h = self._tenant(tenant, tenant_hash)
+        h = self.pick_tenant(tenant, tenant_hash)
         self._check_state(state)
         if not 1 <= limit <= self.settings.list_max:
             raise ConfigError(f"limit must be 1 to {self.settings.list_max}")
@@ -406,7 +407,7 @@ class RequestsAdmin:
         """
         view = await self._view()
         alias = view.registry.alias_of(model)
-        h = self._tenant(tenant, tenant_hash)
+        h = self.pick_tenant(tenant, tenant_hash)
         indexed = await self._indexed(alias, h)
         by_state = dict.fromkeys(("waiting", "running"), 0)
         by_stage: dict[str, int] = dict.fromkeys(STAGES, 0)
@@ -438,6 +439,44 @@ class RequestsAdmin:
             oldest_wait_secs=None if oldest is None else round(oldest, 3),
             truncated=truncated,
         )
+
+    @store_op
+    async def tenants(self, model: str) -> dict[str, Any]:
+        """Tenants with calls in flight on `model`: hash, calls, seconds to the next deadline.
+
+        Hashes only (`tenant_name` too with `LLMQ_TENANT_NAMES_ENABLED`), most calls first.
+        Reads at most `LLMQ_ADMIN_SCAN_MAX` tenants (`truncated` when it reached that).
+        """
+        view = await self._view()
+        alias = view.registry.alias_of(model)
+        self._need_index("all")
+        now_ms = (await self._now()) * 1000
+        hashes = await self._tenants(alias, None, now_ms)
+        names = await self._names(alias)
+        rows: builtins.list[dict[str, Any]] = []
+        if hashes:
+            async with self._state.pipeline(transaction=False) as pipe:
+                for h in hashes:
+                    key = self.keys.request_index(alias, h)
+                    pipe.zcount(key, now_ms, "+inf")
+                    pipe.zrangebyscore(key, now_ms, "+inf", start=0, num=1, withscores=True)
+                replies = await pipe.execute()
+            for i, h in enumerate(hashes):
+                calls, first = int(replies[2 * i]), replies[2 * i + 1]
+                if not calls:
+                    continue
+                next_in = round((float(first[0][1]) - now_ms) / 1000, 3) if first else None
+                row: dict[str, Any] = {"tenant": h, "calls": calls}
+                row["next_deadline_in_secs"] = next_in
+                if self.settings.tenant_names:
+                    row["tenant_name"] = names.get(h)
+                rows.append(row)
+        rows.sort(key=lambda r: (-r["calls"], r["tenant"]))
+        return {
+            "model": alias,
+            "tenants": rows,
+            "truncated": len(hashes) >= self.settings.scan_max,
+        }
 
     @store_op
     async def get(self, request_id: str) -> RequestDetail | None:
@@ -493,13 +532,15 @@ class RequestsAdmin:
         state: State = "waiting",
         actor: str,
         dry_run: bool = True,
+        op: str = "requests_cancel",
     ) -> ChangeReport:
         """Cancel calls by id, or by model, tenant and state (default `waiting`, owner D9).
 
         Cancel wins for every caller of an id. With `state="waiting"` a call granted between
         the read and the write is left running (`skipped.started`); a call already being
         cancelled is skipped (`already_cancelling`), so a second run changes nothing. A dry run
-        (the default) writes nothing; a real one writes one audit entry with counts.
+        (the default) writes nothing; a real one writes one audit entry with counts, named
+        `op` (`purge_queue` when `llmq.admin.purge.queue` asks).
         """
         self._check_state(state)
         if request_ids is not None and (tenant is not None or tenant_hash is not None):
@@ -515,13 +556,18 @@ class RequestsAdmin:
         skipped: dict[str, int] = {}
         if request_ids is not None:
             ids = list(dict.fromkeys(request_ids))
-            if not 1 <= len(ids) <= MAX_CANCEL_IDS:
-                raise ConfigError(f"request_ids must name 1 to {MAX_CANCEL_IDS} ids")
+            if not 1 <= len(ids) <= MAX_CANCEL_IDS or any(
+                not rid or len(rid) > MAX_ID_CHARS for rid in ids
+            ):
+                raise ConfigError(
+                    f"request_ids must name 1 to {MAX_CANCEL_IDS} ids of 1 to {MAX_ID_CHARS} "
+                    "characters"
+                )
             rows = await self._rows_by_id(ids)
         else:
             assert view is not None
             assert alias is not None
-            h = self._tenant(tenant, tenant_hash)
+            h = self.pick_tenant(tenant, tenant_hash)
             self._need_index(state)
             await self._refuse_above_cap(alias, h)
             async for chunk in self._rows(view, alias, h, float("-inf"), "", self.settings.batch):
@@ -541,7 +587,7 @@ class RequestsAdmin:
                 continue
             chosen.append(row)
         report = ChangeReport(
-            op="requests_cancel",
+            op=op,
             model=alias,
             tenant=h,
             dry_run=dry_run,
@@ -599,7 +645,7 @@ class RequestsAdmin:
         """
         view = await self._view()
         alias = view.registry.alias_of(model)
-        h = self._tenant(tenant, tenant_hash)
+        h = self.pick_tenant(tenant, tenant_hash)
         if limit is not None and limit < 1:
             raise ConfigError("limit must be 1 or more")
         self._need_index("waiting")
@@ -730,7 +776,7 @@ class RequestsAdmin:
             raise ConfigError("no registry is published yet (llm-queue registry publish)")
         return view
 
-    def _tenant(self, tenant: str | None, tenant_hash: str | None) -> str | None:
+    def pick_tenant(self, tenant: str | None, tenant_hash: str | None) -> str | None:
         """The tenant hash asked for (None: every tenant); a raw name is hashed here."""
         if tenant is not None and tenant_hash is not None:
             raise ConfigError("give tenant or tenant_hash, not both")

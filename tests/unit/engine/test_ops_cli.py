@@ -131,8 +131,10 @@ def test_fo8_main_returns_the_exit_code(
 
 def _admin_over(client: Any) -> AdminServices:
     keys = Keys("llmq")
+    registry = MagicMock()
+    registry.audit_key = "llmq:cfg:audit"
     ctx = AdminContext(
-        state=client, queue_client=None, keys=keys, registry=MagicMock(), queues=MagicMock(),
+        state=client, queue_client=None, keys=keys, registry=registry, queues=MagicMock(),
         status=MagicMock(), purge=MagicMock(), audit=Audit(client, "llmq:cfg:audit"),
         hash_id=lambda v: v, queue_prefix="", status_ttl_secs=60,
     )  # fmt: skip
@@ -140,9 +142,9 @@ def _admin_over(client: Any) -> AdminServices:
 
 
 class _Pipe:
-    """A pipeline whose replies are given: one (job state, cancel mark) pair per id."""
+    """A pipeline that answers each `execute()` with the next of the given reply lists."""
 
-    def __init__(self, replies: list[Any]) -> None:
+    def __init__(self, replies: list[list[Any]]) -> None:
         self.replies = replies
 
     async def __aenter__(self) -> _Pipe:
@@ -151,14 +153,19 @@ class _Pipe:
     async def __aexit__(self, *_: object) -> None:
         return None
 
-    def hget(self, *_: Any) -> None:
-        return None
-
-    def exists(self, *_: Any) -> None:
-        return None
+    def __getattr__(self, _: str) -> Any:
+        return lambda *a, **kw: None  # hgetall, hmget, hget, exists: queued only
 
     async def execute(self) -> list[Any]:
-        return self.replies
+        return self.replies.pop(0)
+
+
+def _records(*rows: tuple[str | None, int]) -> list[Any]:
+    """`_records` replies: (job state, cancel mark) per id; no status record, no model."""
+    out: list[Any] = []
+    for state, mark in rows:
+        out += [{b"state": state.encode()} if state else {}, [None] * 5, mark]
+    return out
 
 
 async def test_cancel_by_ids_is_dry_by_default_filters_and_is_audited() -> None:
@@ -167,33 +174,38 @@ async def test_cancel_by_ids_is_dry_by_default_filters_and_is_audited() -> None:
     script = AsyncMock(return_value=[2, 0])  # CANCEL: [marked, started]
     client.register_script.return_value = script
     client.xadd = AsyncMock()
-    replies = [b"queued", 0, b"running", 0, b"done", 0, b"queued", 1, None, 0]
-    client.pipeline.return_value = _Pipe(replies)
+    rows = [("queued", 0), ("running", 0), ("done", 0), ("queued", 1), (None, 0)]
+    settle = [b"running", 1, b"running", 1]  # both started meanwhile: nothing to settle
+    client.pipeline.side_effect = lambda **_: _Pipe(pipes)
+    pipes = [_records(*rows), _records(*rows), settle]
     admin = _admin_over(client)
     ids = ["q", "r", "d", "c", "gone"]
 
     dry = await admin.requests.cancel(request_ids=ids, actor="ann")
     assert (dry["dry_run"], dry["matched"], dry["changed"]) == (True, 1, 0)
-    assert dry["skipped"] == {"started": 1, "final": 1, "already_cancelling": 1, "unknown": 1}
+    assert dry["skipped"] == {"other_state": 1, "final": 2, "already_cancelling": 1}
     script.assert_not_awaited()
     client.xadd.assert_not_awaited()
 
     done = await admin.requests.cancel(request_ids=ids, state="all", actor="ann", dry_run=False)
-    assert (done["matched"], done["by_state"]) == (2, {"waiting": 1, "running": 1})
+    assert (done["matched"], done["changed"]) == (2, 2)
+    assert done["by_state"] == {"waiting": 1, "running": 1}
     script.assert_awaited_once()
     (key, fields), _ = client.xadd.await_args
     assert (key, fields["actor"], fields["op"]) == ("llmq:cfg:audit", "ann", "requests_cancel")
     assert orjson.loads(fields["diff"])[0]["after"]["matched"] == 2
 
 
-async def test_cancel_bounds_its_ids_and_needs_the_service_for_the_rest() -> None:
-    from llm_queue.errors import AdminRefused
-
+async def test_cancel_bounds_its_ids_and_needs_a_model_or_ids() -> None:
     admin = _admin_over(MagicMock())
-    with pytest.raises(ConfigError, match="request ids"):
+    with pytest.raises(ConfigError, match="request_ids"):
+        await admin.requests.cancel(request_ids=[], actor="ann")
+    with pytest.raises(ConfigError, match="request_ids"):
         await admin.requests.cancel(request_ids=["x" * 300], actor="ann")
-    with pytest.raises(AdminRefused, match="requests service not available"):
-        await admin.requests.cancel("m", actor="ann")
+    with pytest.raises(ConfigError, match="give a model"):
+        await admin.requests.cancel(actor="ann")
+    with pytest.raises(ConfigError, match="not both"):
+        await admin.requests.cancel(request_ids=["a"], tenant="t", actor="ann")
 
 
 def test_fo25_caller_data_shaped_like_the_bytes_marker_survives() -> None:

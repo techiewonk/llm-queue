@@ -189,12 +189,15 @@ async def test_admin_services_on_a_live_engine(make: Make) -> None:
     assert summary["process"]["live"] is True
     with pytest.raises(AdminRefused, match="process-local"):
         admin.drain.get()  # no LLMQueue around this engine
-    with pytest.raises(AdminRefused, match="requests service not available"):
-        await admin.requests.list("big")
+    assert (await admin.requests.list("big"))["items"] == []
+    assert (await admin.tenants.list("big"))["tenants"] == []
+    assert (await admin.status.get("big", tenant="acme"))["tenant"]["tenant"] == (
+        engine.hash_id("acme")
+    )
 
 
 async def test_admin_cancel_and_request_by_id(make: Make) -> None:
-    """`requests.get` / `requests.cancel` by id work without the request index."""
+    """`requests.get` / `requests.cancel` by id: a final call is found and skipped."""
     engine, _ = await make()
     admin = AdminServices.for_engine(engine)
     reply = await engine.call("big", CHAT)

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     import redis.asyncio
 
     from llm_queue.engine.purge import PurgeService
+    from llm_queue.engine.requests_admin import RequestsAdmin
     from llm_queue.engine.runtime import Engine
     from llm_queue.engine.settings import InfraSettings
     from llm_queue.registry.resolve import ResolvedRegistry
@@ -37,7 +38,8 @@ class AdminContext:
     """The parts of one environment the admin services share.
 
     `engine` and `process` (the `LLMQueue`) are None outside a running queue: process-local
-    operations (drain, health) then refuse with `AdminRefused`.
+    operations (drain, health) then refuse with `AdminRefused`. `requests` is the request index
+    service (`Engine.requests_admin`, or one over these stores); None: built on first use.
     """
 
     state: redis.asyncio.Redis
@@ -54,6 +56,7 @@ class AdminContext:
     settings: InfraSettings | None = None
     engine: Engine | None = None
     process: Any = None  # the LLMQueue: pause_receiving, resume_receiving, drain_status
+    requests: RequestsAdmin | None = None
 
     async def view(self) -> ResolvedRegistry:
         """The registry to read: the engine's loaded one, else the stored one, read now."""

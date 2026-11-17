@@ -21,15 +21,30 @@ MAX_DLQ_IDS = 1000
 class StatusAdmin:
     """Live status of every model and job, or of one model."""
 
-    def __init__(self, ctx: AdminContext) -> None:
-        """Over one environment's stores."""
+    def __init__(self, ctx: AdminContext, requests: RequestsAdapter) -> None:
+        """Over one environment's stores and request index service."""
         self._ctx = ctx
+        self._requests = requests
 
-    async def get(self, model: str | None = None) -> dict[str, Any]:
-        """`StatusReport` of everything, or `ModelStatus` of `model`."""
+    async def get(
+        self,
+        model: str | None = None,
+        *,
+        tenant: str | None = None,
+        tenant_hash: str | None = None,
+    ) -> dict[str, Any]:
+        """`StatusReport` of everything, or `ModelStatus` of `model`.
+
+        With `tenant` (a name, hashed here) or `tenant_hash` (`-`: calls with no tenant), the
+        model's report adds a `tenant` block: its calls by stage and its fairness numbers.
+        """
+        h = self._requests.tenant_hash(tenant, tenant_hash)
+        if h is not None and model is None:
+            raise ConfigError("a tenant's status needs a model")
         view = await self._ctx.view()
         if model is not None:
-            return await self._ctx.status.model(view, view.registry.alias_of(model))
+            alias = view.registry.alias_of(model)
+            return await self._ctx.status.model(view, alias, tenant_hash=h)
         return await self._ctx.status.report(view)
 
 

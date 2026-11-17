@@ -149,8 +149,9 @@ OPERATIONS: tuple[Op, ...] = (
        http=("POST", "/resume"), writes=True, audit_op="resume", mount="drain",
        missing={"cli": _PROCESS}),
     # -- status ---------------------------------------------------------------------------
-    _r("status.get", "status", "Live status of every model and job, or of one model",
-       params=(_OPT_MODEL,), http=("GET", "/status"), cli=("status",)),
+    _r("status.get", "status",
+       "Live status of every model and job, or of one model (and one tenant on it)",
+       params=(_OPT_MODEL, *_TENANT_PICK), http=("GET", "/status"), cli=("status",)),
     # -- registry -------------------------------------------------------------------------
     _r("registry.get", "registry", "The live registry (secrets hidden) and its live edits",
        params=(_OPT_MODEL,), http=("GET", "/registry"), cli=("registry", "get")),
@@ -242,7 +243,8 @@ OPERATIONS: tuple[Op, ...] = (
        params=(Param("request_id", str, cli="arg"), Param("timeout_secs", float)),
        http=("POST", "/requests/{request_id}/extend"), cli=("requests", "extend")),
     # -- tenants --------------------------------------------------------------------------
-    _r("tenants.list", "tenants", "Tenants with calls in flight on a model (hashes only)",
+    _r("tenants.list", "tenants",
+       "Tenants with calls in flight on a model: hash, calls, next deadline",
        params=(_MODEL,), http=("GET", "/tenants"), cli=("tenants", "list")),
     _r("tenants.hash", "tenants", "The keyed hash of a tenant name (needs only the salt)",
        params=(Param("tenant", str, cli="arg"),), http=("POST", "/tenants/hash"),

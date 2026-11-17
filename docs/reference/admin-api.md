@@ -61,7 +61,7 @@ mistyped fields are a 400.
 | `drain.get` | read | `llmq.admin.drain.get()` | process-local | `GET /drain` | read |  |  |
 | `drain.start` | update | `await llmq.admin.drain.start(actor="ann")` | process-local (pods use `LLMQ_DRAIN_FILE`) | `POST /drain` | write | `drain` | no |
 | `drain.resume` | update | `await llmq.admin.drain.resume(actor="ann")` | process-local | `POST /resume` | write | `resume` | no |
-| `status.get` | read | `await llmq.admin.status.get("sonnet")` | `llm-queue status [--model M]` | `GET /status?model=M` | read |  |  |
+| `status.get` | read | `await llmq.admin.status.get("sonnet", tenant="acme")` | `llm-queue status [--model M] [--tenant T]` | `GET /status?model=M&tenant=T` | read |  |  |
 | `registry.get` | read | `await llmq.admin.registry.get()` | `llm-queue registry get [--model M]` | `GET /registry` | read |  |  |
 | `registry.versions` | read | `await llmq.admin.registry.versions()` | `llm-queue registry versions` | `GET /registry/versions` | read |  |  |
 | `registry.diff` | read | `await llmq.admin.registry.diff()` | `llm-queue registry diff` | `GET /registry/diff` | read |  |  |
@@ -114,7 +114,7 @@ settings (`registry.set`); jobs are sent by the app (`llmq.send_job`), their dea
 
 | Op | Parameters (default) | Answer |
 |---|---|---|
-| `status.get` | `model` (all) | `StatusReport`, or `ModelStatus` of one model |
+| `status.get` | `model` (all), `tenant` / `tenant_hash` (with a model) | `StatusReport`, or `ModelStatus` of one model (with `tenants` and `request_index`); with a tenant also `tenant: {tenant, waiting, running, by_stage, oldest_wait_secs, fairness}` |
 | `registry.get` | `model` (whole document) | `{registry, changes, live_edits}`, secrets shown as `[redacted]` |
 | `registry.versions` | | `{versions: [int], current: int}` |
 | `registry.set` | `values` (`{path: value}`, at most 100; `null` deletes), `model` | `{diff, version, dry_run}` |
@@ -129,8 +129,13 @@ settings (`registry.set`); jobs are sent by the app (`llmq.send_job`), their dea
 | `deployments.get` | `model`, `deployment` (`account/name`) | the row and its `settings`; 404 when the model has no such deployment |
 | `blocks.list` | | `{regions: [{name, since, by}], accounts: [...], kill_switch: {on, since, by}}` (`since` / `by` from the audit, best effort) |
 | `blocks.add` / `remove` | `region` or `account` | `{blocked_regions, blocked_accounts, diff, version, dry_run}` |
-| `requests.get` | `request_id` | `{status, final}`; 404 when unknown or expired |
-| `requests.cancel` | `request_ids` (1-1,000), or `model` with `tenant` / `tenant_hash`; `state` (`waiting`) | `{op, matched, changed, skipped: {reason: n}, by_state, sample_ids, dry_run, actor, at}`; `skipped` reasons: `started` (already running, `state=waiting`), `waiting`, `final`, `unknown`, `already_cancelling` |
+| `requests.list` | `model`, `tenant` / `tenant_hash` (`-`: no tenant), `state` (`all`), `limit` (100, at most `LLMQ_REQUESTS_LIST_MAX`), `after` (the previous page's `next`) | `{items: [{request_id, model, tenant, state, stage, priority, age_secs, deadline_in_secs, deployment, user, cancelling, message_id, tenant_name}], next, scanned}`, oldest deadline first; `tenant` / `user` are hashes |
+| `requests.count` | `model`, `tenant` / `tenant_hash` | `{model, tenant, total, by_state, by_stage, cancelling, oldest_wait_secs, truncated}` |
+| `requests.get` | `request_id` | `{summary, status, final, callers, result_ready}` (`summary` null once final); 404 when unknown or expired |
+| `requests.cancel` | `request_ids` (1-1,000), or `model` with `tenant` / `tenant_hash`; `state` (`waiting`) | `{op, model, tenant, matched, changed, skipped: {reason: n}, by_state, sample_ids, dry_run, actor, at}`; `skipped` reasons: `other_state` (not in `state`), `final` (ended or unknown), `already_cancelling`, `started` (granted between the read and the cancel, `state=waiting`), `not_running` |
+| `requests.reprioritize` | `model`, `priority`, `tenant` / `tenant_hash`, `limit` (all) | the same report; waiting calls only, each keeps its deadline and place |
+| `requests.extend` | `request_id`, `timeout_secs` | the same report for one call; `skipped` says `final`, `gone`, `already` (not later) or `past` |
+| `tenants.list` | `model` | `{model, tenants: [{tenant, calls, next_deadline_in_secs, tenant_name?}], truncated}`, most calls first; `tenant_name` only with `LLMQ_TENANT_NAMES_ENABLED` |
 | `tenants.hash` | `tenant` | `{tenant_hash}`: the keyed hash (`LLMQ_ID_HASH_SALT`) admin views show |
 | `queues.list` | | `{queues: [{queue, model, job, class, messages, waiting, held, dead_letters, oldest_wait_secs, consumer}]}` |
 | `dlq.list` | `model` or `job`, `priority` (false), `count` (10) | `{queue, letters: [{id, src, fails, request_id, tenant}]}`; `tenant` is a hash, bodies never listed |
@@ -144,10 +149,15 @@ settings (`registry.set`); jobs are sent by the app (`llmq.send_job`), their dea
 
 ### Requests by model and tenant
 
-`requests.list`, `requests.count`, `requests.reprioritize`, `requests.extend`, `tenants.list`,
-`purge.queue` and `requests.cancel` by model and tenant need the per-model request index
-(0.2.0 T1). Until it ships, they answer `AdminRefused("requests service not available ...")`
-(HTTP 409, CLI exit 1). `requests.get` and `requests.cancel` by request ids work now.
+`requests.*`, `tenants.list`, `purge.queue` and `status.get` with a tenant are served by
+`RequestsAdmin` (`engine/requests_admin.py`) over the per-model request index
+(`P:{m:ALIAS}:tq:H`, 0.2.0 T1): the engine's own in a running queue, one over the same stores
+under `AdminServices.from_env()` and the CLI. A tenant is given by name (`tenant`, hashed with
+`LLMQ_ID_HASH_SALT`, never stored) or by hash (`tenant_hash`, 16 hex, or `-` for calls with no
+tenant). With `LLMQ_REQUEST_INDEX_ENABLED=false`, looking calls up by model and tenant answers
+`AdminRefused` (HTTP 409, CLI exit 1); `requests.get` and `requests.cancel` by request ids still
+work. An operation that would read more than `LLMQ_ADMIN_SCAN_MAX` index entries is refused the
+same way.
 
 ## `GET /` and `llm-queue ops`
 

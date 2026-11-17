@@ -193,8 +193,9 @@ llm-queue purge tenant T --yes                      # a tenant's fairness state 
 Every command that changes something is a **dry run** until `--yes`: it prints what it would
 do and changes nothing. `llm-queue dlq list --job J` lists dead jobs. Purges are described in
 [Purge](purge.md). `requests cancel --state running|all` also cancels calls that already run;
-cancelling by model or tenant, `requests list|count|reprioritize|extend` and `tenants list`
-answer `requests service not available` until the per-model request index service ships.
+`requests list|count|cancel|reprioritize MODEL [--tenant T]`, `requests extend ID` and
+`tenants list MODEL` find calls by model and tenant in the request index
+([Admin API](../reference/admin-api.md#requests-by-model-and-tenant)).
 
 `--actor NAME` (default the OS user) records who made a change in the audit (`llm-queue audit
 list`). Live edits and their limits are in [Configure](configure.md#live-edits). Every
