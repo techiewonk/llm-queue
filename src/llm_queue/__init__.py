@@ -73,12 +73,12 @@ if TYPE_CHECKING:
         StatusReport,
         queue_ready,
     )
+    from llm_queue.drain import DrainWatcher
     from llm_queue.engine.admin import AdminServices
     from llm_queue.engine.envelope import Meta, Reply
     from llm_queue.engine.jobs import JobContext, JobFn, JobSettings, current_job
     from llm_queue.engine.metrics import EmfSink, Metrics, NullSink, PrometheusSink
     from llm_queue.engine.offload import ResultOffload, S3Offload
-    from llm_queue.drain import DrainWatcher
     from llm_queue.engine.purge import PurgeReport
     from llm_queue.engine.store_client import Secrets
     from llm_queue.engine.tokens import register_token_estimator
