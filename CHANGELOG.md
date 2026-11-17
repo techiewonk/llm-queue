@@ -207,6 +207,13 @@ index (below).
 - `store_down: static_cap` runs on the local executor: the per-process budgets (rpm / tpm
   divided by `LLMQ_LOCAL_PROCESS_COUNT`), `LLMQ_LOCAL_CONCURRENCY` calls per model, retries,
   breakers and fallbacks, where it was one attempt per confirmed deployment with no budget.
+  A `static_cap` call can now wait for a budget or a breaker and retry: the wait is capped by
+  the new `LLMQ_STATIC_CAP_WAIT_SECS` (default 5 s, then `rate_limited`). Each process takes
+  the model's rpm / tpm divided by `LLMQ_LOCAL_PROCESS_COUNT`, which queue mode never needed
+  before and which defaults to 1 (the whole budget per process): set it to the processes that
+  share the quota; start logs `static_cap_process_count_unset` when a model uses `static_cap`
+  and it is left at 1. `Engine.stop()` drains `static_cap` calls with the others and ends
+  those still running with `worker_shutdown` (it never waited for them).
   `LLMQ_LOCAL_LIMIT_CAP` is removed: set `LLMQ_LOCAL_CONCURRENCY` instead (same default, 10).
   The `static_cap_attempt_failed` log event is now `local_attempt_failed` (field `path`).
 - `llmq_calls_total` has a `path` label (`queue`, `direct`, `static_cap`, `local`,

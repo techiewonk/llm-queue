@@ -394,6 +394,7 @@ class LLMQueue:
                 drain_handback_enabled=settings.drain_handback_enabled,
                 local_process_count=settings.local_process_count,
                 local_concurrency=settings.local_concurrency,
+                static_cap_wait_secs=settings.static_cap_wait_secs,
                 id_hash_salt=settings.id_hash_salt or "",
                 cfg_reload_secs=settings.cfg_reload_secs,
                 queue_failover_secs=settings.queue_failover_secs,
@@ -613,19 +614,24 @@ class LLMQueue:
             worker=mode in ("both", "worker"), caller=mode in ("both", "caller")
         )
         self._cross_check()
-        if self._local:
+        if isinstance(self._engine, LocalEngine):
             # One line saying how this process runs: calls go straight to the provider, and
-            # the worker / caller role (LLMQ_MODE) does not apply.
+            # the worker / caller role (LLMQ_MODE) does not apply. `LLMQ_LOCAL_PROCESS_COUNT`
+            # is a fixed ceiling (review Q-10): the share each process takes, logged per
+            # model, does not follow autoscaling.
             logger.info(
                 "local_mode_started",
                 worker=self._engine.worker_id,
                 process_count=self._engine.settings.local_process_count,
                 concurrency=self._engine.settings.local_concurrency,
+                budgets=_local_shares(self._engine.registry.current, self._engine.limits),
                 ignored_mode=mode if mode != "both" else None,
             )
-        elif mode in ("both", "worker"):
-            self._check_store_pool()
-            await self._jobs.start()
+        else:
+            self._warn_static_cap_share()
+            if mode in ("both", "worker"):
+                self._check_store_pool()
+                await self._jobs.start()
         from llm_queue.langchain import get_default_queue, set_default_queue
 
         try:
@@ -702,6 +708,29 @@ class LLMQueue:
                 store_max_connections=cap,
                 worker_slots=slots,
                 hint=f"set LLMQ_STORE_MAX_CONNECTIONS to at least {wanted}",
+            )
+
+    def _warn_static_cap_share(self) -> None:
+        """Warn at start when `static_cap` models run with `LLMQ_LOCAL_PROCESS_COUNT` left at 1.
+
+        During a store outage each process then takes the model's whole rpm / tpm, and the
+        pods together go over the provider quota (review L-5, owner Q-12).
+        """
+        view = getattr(self._engine.registry, "current", None)
+        count = getattr(self._engine.settings, "local_process_count", 1)
+        if view is None or count != 1:
+            return
+        models = sorted(
+            alias
+            for alias in view.registry.models
+            if view.value(alias, "store_down") == "static_cap"
+        )
+        if models:
+            logger.warning(
+                "static_cap_process_count_unset",
+                models=models,
+                hint="set LLMQ_LOCAL_PROCESS_COUNT to the processes sharing the quota "
+                "(pods x workers): each process takes rpm / tpm divided by it",
             )
 
     def pause_receiving(self) -> None:
@@ -1168,6 +1197,20 @@ class LLMQueue:
     def describe(self) -> dict[str, Any]:
         """This queue's settings for a log line: no password, salt, token or registry body."""
         return self.admin.describe()
+
+
+def _local_shares(view: Any, limits: LocalLimits) -> dict[str, dict[str, float | None]]:
+    """Per model, the rpm / tpm this process may use: its confirmed deployments' shares added."""
+    out: dict[str, dict[str, float | None]] = {}
+    for alias in view.registry.models:
+        shares: dict[str, float | None] = {"rpm": None, "tpm": None}
+        for dep in view.deployments(alias, "confirmed"):
+            for budget in limits.budgets(view, alias, dep):
+                name = budget.key[-1]
+                if budget.key[0] == "d" and name in shares:
+                    shares[name] = round((shares[name] or 0.0) + budget.limit, 3)
+        out[alias] = shares
+    return out
 
 
 async def _embed(

@@ -35,7 +35,7 @@ When to use which:
 
 ```bash
 LLMQ_EXECUTION_MODE=local
-LLMQ_LOCAL_PROCESS_COUNT=8     # pods x worker processes sharing the provider quota
+LLMQ_LOCAL_PROCESS_COUNT=8     # pods x worker processes sharing the provider quota (a ceiling)
 LLMQ_LOCAL_CONCURRENCY=10      # calls in flight per model in each process
 LLMQ_REGISTRY_FILE=/etc/app/registry.yaml
 ```
@@ -48,6 +48,9 @@ does not apply (`local_mode_started` logs it once when set). What a call gets, p
   `rate_window` (`smooth`: GCRA with `rate_burst`; `fixed`: per minute) and settled with the
   same refund rule (the real usage after an answer, everything back after a throttle). Set the
   count to the number of processes that share the quota, or the pods together may exceed it.
+  The count is a fixed ceiling read at start, not discovered: with autoscaling, set it to the
+  most processes that may run at once (fewer running leave part of the quota unused, more go
+  over it). `local_mode_started` logs `budgets`, the rpm / tpm per model this process takes.
   A share below one unit a minute (`rpm: 4` over 10 processes) still lets one call through,
   and one call estimated above the share (`tpm` over the process count) is never refused for
   that alone: with `fixed` minutes what went over is carried into the next minutes as a debt

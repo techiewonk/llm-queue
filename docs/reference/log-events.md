@@ -85,7 +85,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `llmq_registry_audit` | info | registry/store.py |
 | `llmq_start_failed` | error | fastapi.py (`on_start_error="log"`: the app stays up, not ready) |
 | `local_attempt_failed` | warning | engine/local.py (one provider attempt on the local executor: `local` mode or `store_down: static_cap`, field `path`) |
-| `local_mode_started` | info | core.py (`LLMQ_EXECUTION_MODE=local`: process count, concurrency, an `LLMQ_MODE` that does not apply) |
+| `local_mode_started` | info | core.py (`LLMQ_EXECUTION_MODE=local`: process count, concurrency, `budgets` (per model the rpm / tpm this process may use), an `LLMQ_MODE` that does not apply) |
 | `message_needs_newer_library` | warning | engine/runtime.py |
 | `metric_dropped` | warning | engine/metrics.py |
 | `model_loop_died` | error | engine/runtime.py |
@@ -144,6 +144,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `secrets_refresh_failed` | warning | secrets.py (the last values are kept) |
 | `shutdown_give_back_failed` | warning | engine/runtime.py |
 | `start_rollback_failed` | warning | core.py |
+| `static_cap_process_count_unset` | warning | core.py (queue mode: `models` with `store_down: static_cap` while `LLMQ_LOCAL_PROCESS_COUNT` is 1) |
 | `state_store_promoted` | error | engine/runtime.py |
 | `state_store_reset_detected` | error | engine/runtime.py |
 | `queue_store_unreachable_at_start` | error | engine/runtime.py |

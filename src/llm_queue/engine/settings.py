@@ -510,6 +510,7 @@ class InfraSettings:
     # processes), and calls in flight per model and process (`local` mode and `static_cap`).
     local_process_count: int = 1  # LLMQ_LOCAL_PROCESS_COUNT
     local_concurrency: int = 10  # LLMQ_LOCAL_CONCURRENCY
+    static_cap_wait_secs: float = 5.0  # LLMQ_STATIC_CAP_WAIT_SECS: a `static_cap` budget wait
     metrics_sink: str = "emf"
     mode: str = "both"
     bedrock_endpoint_url: str | None = None
@@ -829,6 +830,7 @@ class InfraSettings:
             execution_mode=execution_mode,
             local_process_count=number("LOCAL_PROCESS_COUNT", 1, int, hi=100_000),
             local_concurrency=number("LOCAL_CONCURRENCY", 10, int, hi=100_000),
+            static_cap_wait_secs=number("STATIC_CAP_WAIT_SECS", 5.0, zero=True, hi=3600),
             metrics_sink=sink,
             mode=mode,
             bedrock_endpoint_url=endpoints["BEDROCK_ENDPOINT_URL"],

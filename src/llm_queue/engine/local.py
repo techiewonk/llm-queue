@@ -592,6 +592,7 @@ class _Call:
     start: float  # loop time
     deadline: float  # loop time
     sink: Sink | None = None
+    wait_cap: float | None = None  # the longest wait for a budget or breaker (`static_cap`)
     granted: float = 0.0  # loop time of the first grant
     texts: list[str] = field(default_factory=list)  # streamed text (partial_text)
     sent: bool = False  # events reached the caller: no other attempt any more
@@ -710,15 +711,17 @@ class LocalExecutor:
         *,
         path: str = "local",
         sink: Sink | None = None,
+        wait_cap_secs: float | None = None,
     ) -> Reply:
         """Run one call to its reply; `CallFailed` with the queue path's kinds otherwise.
 
         `env.timeout_secs` bounds it all (slot, budget waits, attempts, backoff); `sink`
         gets each streamed event (the call then streams, and never retries once one was sent).
+        `wait_cap_secs` caps the wait for a budget or breaker below `max_wait_secs`.
         """
         loop = asyncio.get_running_loop()
         now = loop.time()
-        call = _Call(env, path, now, now + env.timeout_secs, sink)
+        call = _Call(env, path, now, now + env.timeout_secs, sink, wait_cap=wait_cap_secs)
         task = asyncio.current_task()
         end: asyncio.Future[None] = loop.create_future()
         self.running[end] = task
@@ -758,14 +761,17 @@ class LocalExecutor:
                         "llmq_admission_refusals_total", model=alias, reason=pick.reason
                     )
                 waited = loop.time() - call.start
-                max_wait = env.max_wait_secs
+                max_wait, why = env.max_wait_secs, "max_wait_secs passed"
+                if call.wait_cap is not None and (max_wait is None or call.wait_cap < max_wait):
+                    max_wait, why = (
+                        call.wait_cap,
+                        f"no budget within {call.wait_cap:g} s ({call.path})",
+                    )
                 if max_wait is not None and waited + min(pick.secs, 1.0) > max_wait:
                     if waited < max_wait:
                         await asyncio.sleep(max_wait - waited)
                         continue
-                    self._fail(
-                        call, alias, "rate_limited", "max_wait_secs passed", retry_after=pick.secs
-                    )
+                    self._fail(call, alias, "rate_limited", why, retry_after=pick.secs)
                 await asyncio.sleep(max(0.01, min(pick.secs, 1.0)))
                 continue
             if pick is None:

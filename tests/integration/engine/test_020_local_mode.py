@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from collections.abc import AsyncIterator
@@ -369,6 +370,17 @@ async def test_describe_and_health_say_local(rig: Rig) -> None:
     assert health["ready"] is True
     assert health["stores"] == {}
     assert llmq.ready
+
+
+async def test_local_mode_started_logs_each_models_share(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review Q-10: the process count is a fixed ceiling; the start line shows its effect."""
+    with caplog.at_level(logging.INFO, logger="llm_queue"):
+        await rig.started({"small": {"rpm": 60, "tpm": 40000}}, LLMQ_LOCAL_PROCESS_COUNT="4")
+    line = next(r.getMessage() for r in caplog.records if "local_mode_started" in r.getMessage())
+    assert "process_count=4" in line
+    assert "'small': {'rpm': 15.0, 'tpm': 10000.0}" in line
 
 
 async def test_store_only_operations_are_refused(rig: Rig) -> None:
