@@ -11,11 +11,11 @@ import asyncio
 import dataclasses
 
 import pytest
-from engine_testkit import CHAT, Make
+from engine_testkit import CHAT, SMALL, Make, stats
 
 from llm_queue.engine.requests import extend_notice
 from llm_queue.engine.runtime import Engine
-from llm_queue.errors import ConfigError
+from llm_queue.errors import AdminRefused, ConfigError
 
 pytestmark = pytest.mark.integration
 
@@ -26,6 +26,15 @@ MODEL = {"small": {"timeout_secs": 30, "attempt_timeout_secs": 20}}
 def _short_margin(engine: Engine) -> None:
     """The caller waits 0.5 s past the worker's deadline (5 s by default): a quick test."""
     engine.settings = dataclasses.replace(engine.settings, caller_margin_secs=0.5)
+    engine.requests_admin.caller_margin_secs = 0.5
+
+
+async def _running(engine: Engine, rid: str) -> None:
+    for _ in range(300):
+        if (await engine.requests.job(rid)).get("state") == "running":
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("call never ran")
 
 
 async def _rid(engine: Engine, tenant: str = "acme") -> str:
@@ -104,3 +113,94 @@ async def test_extend_refuses_past_the_models_cap(make: Make) -> None:
     task.cancel()
     with pytest.raises(BaseException):  # noqa: B017 PT011  # cancelled or failed: either ends it
         await task
+
+
+# G7 (RQ-1 to RQ-4, RQ-12): the five extend cases.
+
+
+async def test_g7a_a_waiting_call_outlives_its_max_wait(make: Make) -> None:
+    """Extended before any worker took it: the worker that takes it later lifts max_wait."""
+    caller, _ = await make(worker=False)
+    _short_margin(caller)
+    task = asyncio.create_task(
+        caller.call("small", CHAT, tenant_id="acme", timeout_secs=4, max_wait_secs=1)
+    )
+    rid = await _rid(caller)
+    done = await caller.requests_admin.extend(rid, timeout_secs=12, actor="ops", dry_run=False)
+    assert done.changed == 1
+    await asyncio.sleep(1.5)  # past max_wait_secs, before the first deadline
+    await make(caller=False)
+    reply = await asyncio.wait_for(task, 15)
+    assert reply.ok
+
+
+async def test_g7b_a_running_attempt_is_not_cut_at_the_old_deadline(make: Make) -> None:
+    """A 3 s call with timeout 2 extended to 8 while it runs: one provider call, no retry."""
+    engine, fake = await make(MODEL, SLOW)
+    _short_margin(engine)
+    task = asyncio.create_task(engine.call("small", CHAT, tenant_id="acme", timeout_secs=2))
+    rid = await _rid(engine)
+    await _running(engine, rid)
+    done = await engine.requests_admin.extend(rid, timeout_secs=8, actor="ops", dry_run=False)
+    assert done.changed == 1
+    reply = await asyncio.wait_for(task, 15)
+    assert reply.ok
+    assert reply.meta.attempts == 1
+    assert stats(fake, f"{SMALL}@r1")["calls"] == 1
+
+
+async def test_g7c_a_stream_reads_the_extended_deadline(make: Make) -> None:
+    """A stream's own deadline moves too, and its chunks live past the new one."""
+    engine, fake = await make(MODEL, SLOW)
+    _short_margin(engine)
+    events: list[dict[str, object]] = []
+
+    async def read() -> None:
+        async for event in engine.stream(
+            "small", CHAT, tenant_id="acme", timeout_secs=2, request_id="g7c"
+        ):
+            events.append(event)
+
+    task = asyncio.create_task(read())
+    await _running(engine, "g7c")
+    done = await engine.requests_admin.extend("g7c", timeout_secs=8, actor="ops", dry_run=False)
+    assert done.changed == 1
+    await asyncio.wait_for(task, 15)
+    assert events
+    assert stats(fake, f"{SMALL}@r1")["calls"] == 1
+
+
+async def test_g7d_an_extend_never_shortens(make: Make) -> None:
+    """`extend(60)` on a 120 s call is `already`: nothing written, max_wait stays on."""
+    engine, _ = await make(worker=False)
+    task = asyncio.create_task(engine.call("small", CHAT, tenant_id="acme", timeout_secs=120))
+    rid = await _rid(engine)
+    report = await engine.requests_admin.extend(rid, timeout_secs=60, actor="ops", dry_run=False)
+    assert (report.changed, report.skipped) == (0, {"already": 1})
+    assert "dl" not in await engine.requests.job(rid)
+    assert await engine.requests.extend(rid, deadline_ms=1, margin_secs=5.0) == "already"
+    task.cancel()
+    with pytest.raises(BaseException):  # noqa: B017 PT011  # cancelled or failed: either ends it
+        await task
+
+
+async def test_g7e_an_extend_past_the_queue_retention_is_refused(make: Make) -> None:
+    """Past `queue.retention_secs` the waiting message would be trimmed: refused."""
+    engine, _ = await make({"small": {"queue": {"retention_secs": 60}}}, worker=False)
+    task = asyncio.create_task(engine.call("small", CHAT, tenant_id="acme", timeout_secs=30))
+    rid = await _rid(engine)
+    with pytest.raises(ConfigError, match="retention_secs"):
+        await engine.requests_admin.extend(rid, timeout_secs=90, actor="ops")
+    ok = await engine.requests_admin.extend(rid, timeout_secs=60, actor="ops")
+    assert ok.matched == 1
+    task.cancel()
+    with pytest.raises(BaseException):  # noqa: B017 PT011  # cancelled or failed: either ends it
+        await task
+
+
+async def test_extend_needs_the_request_index(make: Make) -> None:
+    engine, _ = await make(worker=False)
+    admin = engine.requests_admin
+    admin.settings = dataclasses.replace(admin.settings, request_index=False)
+    with pytest.raises(AdminRefused, match="request index"):
+        await admin.extend("any", timeout_secs=9, actor="ops")

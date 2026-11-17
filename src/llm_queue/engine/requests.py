@@ -420,7 +420,9 @@ return {n, started}
 # and all three move here: the records (job `dl`, grown TTLs of job / callers / status and the
 # request index score), each worker holding the call (the notice on the cancel channel, every
 # worker reads it; a worker that receives it later reads `dl` before it expires the call) and
-# each waiting caller (the notice on its done channel: its timer is rescheduled). Only grows.
+# each waiting caller (the notice on its done channel: its timer is rescheduled). Only grows:
+# the current deadline is the later of `dl` and the first one (the index score less the caller
+# margin), so an extend shorter than the call's own timeout is `already` (RQ-4).
 # Reply: {'ok'} or {'final' | 'gone' | 'already' | 'past'}.
 EXTEND = """
 local state = redis.call('HGET', KEYS[1], 'state')
@@ -429,7 +431,14 @@ if state == 'done' or state == 'failed' or state == 'expired' or state == 'cance
   return {'final'}
 end
 local dl = tonumber(ARGV[1])
-if dl <= tonumber(redis.call('HGET', KEYS[1], 'dl') or '0') then return {'already'} end
+local current = tonumber(redis.call('HGET', KEYS[1], 'dl') or '0')
+local ix = redis.call('HGET', KEYS[1], 'ix')
+local h = redis.call('HGET', KEYS[1], 'ixh')
+if ix then
+  local first = tonumber(redis.call('ZSCORE', ix, ARGV[6]) or '')
+  if first then current = math.max(current, first - tonumber(ARGV[3])) end
+end
+if dl <= current then return {'already'} end
 local now = X.now()
 if dl <= now then return {'past'} end
 redis.call('HSET', KEYS[1], 'dl', ARGV[1])
@@ -437,8 +446,6 @@ local keep = dl - now + tonumber(ARGV[2])
 for i = 1, 3 do
   if redis.call('EXISTS', KEYS[i]) == 1 and X.pttl(KEYS[i]) < keep then X.expire(KEYS[i], keep) end
 end
-local ix = redis.call('HGET', KEYS[1], 'ix')
-local h = redis.call('HGET', KEYS[1], 'ixh')
 if ix and h then
   local score = dl + tonumber(ARGV[3])
   redis.call('ZADD', ix, 'XX', 'GT', score, ARGV[6])

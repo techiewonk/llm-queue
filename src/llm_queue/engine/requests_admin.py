@@ -499,8 +499,10 @@ class RequestsAdmin:
         final = state in FINAL_STATES or status.get("state") in FINAL_STATES
         summary = None
         alias = status.get("model")
-        if not final and job and alias:
-            view = await self._view()
+        view = await self._view() if not final and job and alias else None
+        # A model removed since the call was sent has no queues to read: no summary, only
+        # the records (its lookup raised a bare KeyError before).
+        if view is not None and alias is not None and alias in view.registry.models:
             score = None
             if job.get("ix"):
                 score = await self._state.zscore(job["ix"], request_id)
@@ -720,19 +722,22 @@ class RequestsAdmin:
     ) -> ChangeReport:
         """Give a call in flight a longer timeout: `timeout_secs` from when it was sent.
 
-        The new deadline (send time + `timeout_secs`, at most the model's `timeout_max_secs`)
-        reaches all three places a deadline lives (owner D6): the records and the index, every
-        worker holding the call, and every caller waiting on it (their timers move). It only
-        grows: a deadline not later than the current one is `skipped.already`. Dry run by
-        default.
+        The new deadline (send time + `timeout_secs`) reaches all three places a deadline lives
+        (owner D6): the records and the index, every worker holding the call, and every caller
+        waiting on it. `timeout_secs` above the model's `timeout_max_secs` or its queue's
+        `retention_secs` (the message would be trimmed) is a `ConfigError`. It only grows: a
+        deadline not later than the current one (the call's own timeout included) is
+        `skipped.already`. Needs the request index (`AdminRefused` when off). Dry run by default.
         """
         if not timeout_secs > 0:
             raise ConfigError("timeout_secs must be above 0")
+        self._need_index("extended")
         k = self.keys
         async with self._state.pipeline(transaction=False) as pipe:
             pipe.hmget(k.status(request_id), ["model", "enqueued_at", "state"])
-            pipe.hmget(k.request(request_id, "job"), ["state", "ixh", "dl"])
-            (model, enqueued, status_state), (state, h, dl) = await pipe.execute()
+            pipe.hmget(k.request(request_id, "job"), ["state", "ixh", "dl", "ix"])
+            (model, enqueued, status_state), (state, h, dl, ix) = await pipe.execute()
+        first = await self._state.zscore(_text(ix), request_id) if ix is not None else None
         alias = _text(model) if model is not None else None
         report = ChangeReport(
             op="requests_extend",
@@ -747,13 +752,23 @@ class RequestsAdmin:
         if job_state in FINAL_STATES or _text(status_state or b"") in FINAL_STATES:
             return _replace(report, skipped={"final": 1})
         view = await self._view()
-        cap = float(view.value(view.registry.alias_of(alias), "timeout_max_secs"))
-        if timeout_secs > cap:
+        try:
+            canonical = view.registry.alias_of(alias)
+        except ConfigError:  # the model was removed since the call was sent
+            return _replace(report, skipped={"unknown_model": 1})
+        cap = float(view.value(canonical, "timeout_max_secs"))
+        queue = view.value(canonical, "queue") or {}
+        retention = float(queue.get("retention_secs", RETENTION_SECS))
+        if timeout_secs > min(cap, retention):
             raise ConfigError(
-                f"timeout_secs must be at most the model's timeout_max_secs ({cap:g})"
+                f"timeout_secs must be at most the model's timeout_max_secs ({cap:g}) and its "
+                f"queue's retention_secs ({retention:g}, past it the message is trimmed)"
             )
         deadline_ms = int((float(_text(enqueued)) + timeout_secs) * 1000)
-        if dl is not None and deadline_ms <= int(float(_text(dl))):
+        current = float(_text(dl)) if dl is not None else 0.0
+        if first is not None:  # the index scores the first deadline plus the caller margin
+            current = max(current, float(first) - self.caller_margin_secs * 1000)
+        if deadline_ms <= current:
             return _replace(report, skipped={"already": 1})
         state_name = "running" if job_state == "running" else "waiting"
         report = _replace(report, matched=1, by_state={state_name: 1}, sample_ids=[request_id])

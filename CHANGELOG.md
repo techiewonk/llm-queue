@@ -237,6 +237,14 @@ index (below).
   model fallback (C3): the served alias never equals the model id, so each reply paid a
   registry lookup to fill `model_name`. A fallback is now read from the engine's
   `Meta.fallback == "model"`.
+- `requests.extend` reaches every place a deadline lives: a worker that takes the call after
+  the extend gets its deadline from `PICK_TAKE` and no longer ends it at `max_wait_secs`; a
+  running attempt's timer moves (it was cut at the old deadline and run again); `stream()`
+  reads the new deadline and the chunks live past it. It never shortens a call (an extend
+  below the call's own timeout is `already`), refuses a `timeout_secs` above the queue's
+  `retention_secs` as well as `timeout_max_secs`, and needs the request index. An attempt's
+  first-response budget is now `attempt_timeout_secs` alone; the call's deadline is the
+  outer timer's.
 - Drain API (plan A1-A5). `pause_receiving()` stays sync and callable from any thread;
   `resume_receiving()` undoes it (ready again when started; `LLMQueueError` after `stop()`);
   `await drain(drain_secs=None)` pauses and waits for running calls and jobs (it does not
