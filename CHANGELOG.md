@@ -17,6 +17,21 @@ public API (see STABILITY.md).
   `llm_queue.error_retryable(exc)` answer for any exception (`internal` / False for one that is
   not llm-queue's). Computed, so pickling is unchanged. See
   [Errors](docs/reference/errors.md#category-and-retryable).
+- The provider's request id reaches the caller (C2): `Meta.provider_request_id` is Bedrock's
+  `x-amzn-RequestId` or the OpenAI-compatible server's `x-request-id` of the attempt that
+  answered, on plain and streamed calls (also in a stream's `meta_event=True` last event). The
+  LangChain chat adapters add boto's `response_metadata["ResponseMetadata"]` (`RequestId`,
+  `HTTPStatusCode` 200, `RetryAttempts` = attempts - 1; no `HTTPHeaders`), so code that reads
+  the AWS request id from a direct `ChatBedrockConverse` reply reads it here too. fakellm
+  sends both headers.
+
+### Changed
+
+- The LangChain chat adapters put how the queue served a reply under
+  `response_metadata["llmq"]` (the `Meta` dict) instead of flat keys
+  (`response_metadata["deployment"]` is now `response_metadata["llmq"]["deployment"]`), on whole
+  replies and on a `queue_streaming` stream's last chunk. `model_name`, `finish_reason` and
+  `stopReason` stay where LangChain puts them.
 
 ## [0.1.1] - 2026-11-17
 

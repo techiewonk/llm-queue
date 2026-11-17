@@ -30,6 +30,7 @@ from llm_queue.langchain._client import (
 )
 from llm_queue.langchain._stream import (
     finish_reason,
+    queue_metadata,
     queued_chunks,
     should_stream,
     usage_metadata,
@@ -145,6 +146,9 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
     `astream()` (and LangGraph's message streaming) yield tokens as they arrive, through
     `LLMQueue.converse_stream`; off by default (one full message). Sync `stream()` always
     yields one full message: the queue has no sync stream.
+
+    Replies carry how the queue served them in `response_metadata["llmq"]` (the `Meta`) and
+    boto's `response_metadata["ResponseMetadata"]` (`RequestId` is Bedrock's request id).
     """
 
     llmq: Any = Field(default=None, exclude=True)
@@ -226,9 +230,9 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
         """Parse like the parent (same call, canned reply), then add how the queue served it."""
         response = result.response or {}
         chat = self._run_parent(messages, stop, call_kwargs, lambda _request: response)
-        meta = result.meta.model_dump()
+        added = queue_metadata(result.meta.model_dump())
         for generation in chat.generations:
-            generation.message.response_metadata.update(meta)
+            generation.message.response_metadata.update(added)
         served = result.meta.served_model
         if served and served != self._alias:
             # Model fallback: report the model that answered (tracers price by `llm_output`).
@@ -308,7 +312,7 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
         def closing(info: Mapping[str, Any], had_usage: bool) -> ChatGenerationChunk:
             meta = dict(info.get("meta") or {})
             metadata: dict[str, Any] = {
-                **meta,
+                **queue_metadata(meta),
                 "model_name": self._model_id_of(str(meta.get("served_model") or "")),
             }
             if stop_reason and (reason := finish_reason(stop_reason[-1] or None)):

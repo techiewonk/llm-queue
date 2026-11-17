@@ -40,6 +40,25 @@ Convert = Callable[[dict[str, Any]], ChatGenerationChunk | None]
 Closing = Callable[[Mapping[str, Any], bool], ChatGenerationChunk]
 
 
+def queue_metadata(meta: Mapping[str, Any]) -> dict[str, Any]:
+    """The `response_metadata` keys the queued adapters add: `llmq` and `ResponseMetadata`.
+
+    `llmq` is the queue's `Meta` (served model, deployment, fallback, attempts, timings,
+    provider request id). `ResponseMetadata` has boto's shape, so code that reads the AWS
+    request id and retries from a direct `ChatBedrockConverse` reply reads them here too:
+    `RetryAttempts` counts the queue's attempts after the first. No `HTTPHeaders`.
+    """
+    attempts = int(meta.get("attempts") or 0)
+    return {
+        LLMQ_EVENT: dict(meta),
+        "ResponseMetadata": {
+            "RequestId": str(meta.get("provider_request_id") or ""),
+            "HTTPStatusCode": 200,
+            "RetryAttempts": max(0, attempts - 1),
+        },
+    }
+
+
 def finish_reason(stop_reason: str | None) -> str | None:
     """A Bedrock `stopReason` as an OpenAI `finish_reason` (unknown reasons pass through)."""
     if stop_reason is None:

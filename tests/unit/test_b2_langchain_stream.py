@@ -32,14 +32,21 @@ Q1_MESSAGE = (
     "`await chat.ainvoke(...)`"
 )
 BEDROCK_ID = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # streams on langchain-aws 0.2 too
-META = {"served_model": "big", "deployment": "aws-a/r1", "fallback": None, "attempts": 1}
+META = {
+    "served_model": "big",
+    "deployment": "aws-a/r1",
+    "fallback": None,
+    "attempts": 1,
+    "provider_request_id": "req-1",
+}
+BOTO_META = {"RequestId": "req-1", "HTTPStatusCode": 200, "RetryAttempts": 0}
 USAGE = {"inputTokens": 7, "outputTokens": 5, "cacheReadInputTokens": 0}
 
 
 class FakeQueue:
     """The adapters' queue methods; streams replay `events`, then raise `fail` if set."""
 
-    registry = None
+    registry: Any = None
 
     def __init__(self, events: list[dict[str, Any]], fail: Exception | None = None) -> None:
         self.events = events
@@ -48,6 +55,7 @@ class FakeQueue:
         self.closed = False
         self.sync_error: Exception | None = None
         self.gate: asyncio.Event | None = None  # set: the stream waits on it after one event
+        self.meta: dict[str, Any] = dict(META)  # how non-streamed replies were served
 
     async def _stream(
         self, op: str, model: str, request: Mapping[str, Any], kw: dict[str, Any]
@@ -74,7 +82,7 @@ class FakeQueue:
         return self._stream("chat_stream", model, request, kw)
 
     def _reply(self, response: dict[str, Any]) -> Any:
-        meta = SimpleNamespace(served_model="big", model_dump=lambda **_: dict(META))
+        meta = SimpleNamespace(**self.meta, model_dump=lambda **_: dict(self.meta))
         return SimpleNamespace(response=response, meta=meta)
 
     async def converse(self, model: str, request: Mapping[str, Any], **kw: Any) -> Any:
@@ -244,8 +252,9 @@ async def test_bedrock_streams_text_tools_usage_and_stop_reason() -> None:
     assert whole.usage_metadata["output_tokens"] == 5
     assert whole.response_metadata["stopReason"] == "tool_use"
     assert whole.response_metadata["finish_reason"] == "tool_calls"
-    assert whole.response_metadata["deployment"] == "aws-a/r1"
+    assert whole.response_metadata["llmq"]["deployment"] == "aws-a/r1"
     assert whole.response_metadata["model_name"] == BEDROCK_ID
+    assert whole.response_metadata["ResponseMetadata"] == BOTO_META
 
 
 async def test_bedrock_usage_from_the_closing_event_when_the_provider_sent_none() -> None:
@@ -302,7 +311,8 @@ async def test_openai_streams_text_tools_usage_and_finish_reason() -> None:
     assert whole.usage_metadata is not None
     assert whole.usage_metadata["total_tokens"] == 12
     assert whole.response_metadata["finish_reason"] == "tool_calls"
-    assert whole.response_metadata["served_model"] == "big"
+    assert whole.response_metadata["llmq"]["served_model"] == "big"
+    assert whole.response_metadata["ResponseMetadata"] == BOTO_META
 
 
 async def test_openai_alias_defaults_to_the_model() -> None:
@@ -410,3 +420,29 @@ def test_result_chunk_keeps_tool_calls() -> None:
     assert isinstance(chunk, ChatGenerationChunk)
     assert isinstance(chunk.message, AIMessageChunk)
     assert chunk.message.tool_calls[0]["args"] == {"a": 1}
+
+
+# ------------------------------------------------------------------------------ C2 / C3 (0.2.0)
+
+
+def test_c2_queue_metadata_is_llmq_plus_boto_response_metadata() -> None:
+    from llm_queue.langchain._stream import queue_metadata
+
+    added = queue_metadata({**META, "attempts": 3})
+    assert added == {
+        "llmq": {**META, "attempts": 3},
+        "ResponseMetadata": {"RequestId": "req-1", "HTTPStatusCode": 200, "RetryAttempts": 2},
+    }
+    empty = queue_metadata({})["ResponseMetadata"]
+    assert empty == {"RequestId": "", "HTTPStatusCode": 200, "RetryAttempts": 0}
+
+
+@pytest.mark.parametrize("which", ["bedrock", "openai"])
+async def test_c2_whole_replies_carry_llmq_and_response_metadata(which: str) -> None:
+    """The queue's `Meta` under `llmq` only (no flat keys), plus boto's `ResponseMetadata`."""
+    queue = FakeQueue([])
+    make = _bedrock if which == "bedrock" else _openai
+    message = await make(queue).ainvoke("hi")
+    assert message.response_metadata["llmq"] == META
+    assert message.response_metadata["ResponseMetadata"] == BOTO_META
+    assert not set(META) & set(message.response_metadata)

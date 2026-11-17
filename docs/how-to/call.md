@@ -22,7 +22,12 @@ reply = await llmq.converse("gpt120b", {"messages": [...]})
 reply.response          # the Bedrock Converse body
 reply.meta.deployment   # "aws-main/ap-south-1"
 reply.meta.served_model # the alias that served it (another one after a model fallback)
+reply.meta.provider_request_id  # the provider's own id of the answering attempt
 ```
+
+`provider_request_id` is Bedrock's `x-amzn-RequestId` or the OpenAI-compatible server's
+`x-request-id` (empty when the server sent none): the id to quote to the provider's support. A
+stream's `meta_event=True` last event carries it too.
 
 `converse`, `chat` and `call` are one call under three names, all supported:
 

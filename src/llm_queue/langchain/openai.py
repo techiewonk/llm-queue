@@ -4,7 +4,8 @@ Both SDK clients get an httpx client whose transport answers from the LLM queue 
 LangChain/SDK code path is queued and parsed unchanged. SDK streaming and retries are forced off:
 the queue's workers own retry and fallback (`queue_streaming=True` streams through
 `LLMQueue.chat_stream` instead of the SDK). Chat replies get how the queue served
-them (served model, deployment, attempts, queue wait) in `response_metadata`.
+them in `response_metadata["llmq"]` (the `Meta`) plus a boto-shaped `ResponseMetadata` whose
+`RequestId` is the server's `x-request-id`.
 """
 
 from __future__ import annotations
@@ -23,7 +24,13 @@ from pydantic import Field, model_validator
 from llm_queue.errors import LLMQueueError
 from llm_queue.http_transport import META_KEY, QUEUED_BASE_URL, QueuedHTTPTransport
 from llm_queue.langchain._client import checked_values, resolve_queue, streaming_queue
-from llm_queue.langchain._stream import queued_chunks, result_chunk, should_stream, usage_metadata
+from llm_queue.langchain._stream import (
+    queue_metadata,
+    queued_chunks,
+    result_chunk,
+    should_stream,
+    usage_metadata,
+)
 
 if TYPE_CHECKING:
     from langchain_core.callbacks import (
@@ -116,15 +123,16 @@ class QueuedChatOpenAI(_ClosesClients, ChatOpenAI):
     def _create_chat_result(
         self, response: Any, generation_info: dict[str, Any] | None = None
     ) -> ChatResult:
-        """Parse like the parent, then add the queue's `llmq_meta` to `response_metadata`."""
+        """Parse like the parent, then add the queue's `llmq_meta` (`queue_metadata`)."""
         result = super()._create_chat_result(response, generation_info)
         if isinstance(response, dict):
             meta = response.get(META_KEY)
         else:
             meta = (getattr(response, "model_extra", None) or {}).get(META_KEY)
         if isinstance(meta, dict):
+            added = queue_metadata(meta)
             for generation in result.generations:
-                generation.message.response_metadata.update(meta)
+                generation.message.response_metadata.update(added)
         return result
 
     def _should_stream(self, *, async_api: bool, run_manager: Any = None, **kwargs: Any) -> bool:
@@ -180,7 +188,9 @@ class QueuedChatOpenAI(_ClosesClients, ChatOpenAI):
         def closing(info: Mapping[str, Any], had_usage: bool) -> ChatGenerationChunk:
             usage = None if had_usage else usage_metadata(info.get("usage"))
             message = AIMessageChunk(
-                content="", response_metadata=dict(info.get("meta") or {}), usage_metadata=usage
+                content="",
+                response_metadata=queue_metadata(info.get("meta") or {}),
+                usage_metadata=usage,
             )
             return ChatGenerationChunk(message=message)
 

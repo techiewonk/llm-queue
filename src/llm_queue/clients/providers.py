@@ -49,10 +49,15 @@ class Usage:
 
 @dataclass(frozen=True, slots=True)
 class Result:
-    """One successful attempt: the provider-native reply and its usage."""
+    """One successful attempt: the provider-native reply, its usage and the provider's id.
+
+    `request_id` is the provider's own request id (Bedrock `x-amzn-RequestId`, OpenAI
+    `x-request-id`), empty when the provider sent none.
+    """
 
     response: dict[str, Any]
     usage: Usage
+    request_id: str = ""
 
 
 Sink = Callable[[Any], Awaitable[None]]
@@ -231,6 +236,11 @@ def _converse_body(events: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     return assembler.result()
 
 
+def _bedrock_request_id(reply: Mapping[str, Any]) -> str:
+    """The `RequestId` in a botocore-shaped reply's `ResponseMetadata` (both transports)."""
+    return str((reply.get("ResponseMetadata") or {}).get("RequestId") or "")
+
+
 def _bedrock_usage(usage: Mapping[str, Any] | None) -> Usage:
     if not usage:
         return Usage()
@@ -252,15 +262,24 @@ class BedrockProvider:
         self._pool = pool
 
     async def stream(
-        self, params: Mapping[str, Any], route: Route, timing: Timing
+        self,
+        params: Mapping[str, Any],
+        route: Route,
+        timing: Timing,
+        on_request_id: Callable[[str], None] | None = None,
     ) -> AsyncGenerator[Mapping[str, Any], None]:
-        """ConverseStream events of one attempt, each within the attempt timers."""
+        """ConverseStream events of one attempt, each within the attempt timers.
+
+        `on_request_id` gets the provider's request id once the stream opened.
+        """
         async with self._pool.borrow_bedrock(route) as client:
             request = {**params, "modelId": route.model_id}
             started = time.monotonic()
             reply = await first(
                 client.converse_stream(**request), timing.first_response_secs, "first response"
             )
+            if on_request_id is not None:
+                on_request_id(_bedrock_request_id(reply))
             stream = reply["stream"]
             try:
                 async for event in paced(stream, opened(timing, started), started=False):
@@ -306,21 +325,22 @@ class BedrockProvider:
             limit = timing.attempt_secs or timing.first_response_secs
             reply = await first(pending, limit, "response")
         body: dict[str, Any] = {k: v for k, v in reply.items() if k != "ResponseMetadata"}
-        return Result(body, _bedrock_usage(body.get("usage")))
+        return Result(body, _bedrock_usage(body.get("usage")), _bedrock_request_id(reply))
 
     async def _converse_stream(
         self, params: Mapping[str, Any], route: Route, timing: Timing, sink: Sink | None
     ) -> Result:
         assembler = _ConverseAssembler()  # folded as they come, no list of events (R3PF-4)
+        ids: list[str] = []
         # aclosing: a sink that raised (or a cancel during it) left the generator suspended and
         # its connection held until the asyncgen finalizer ran (CL-10).
-        async with contextlib.aclosing(self.stream(params, route, timing)) as stream:
+        async with contextlib.aclosing(self.stream(params, route, timing, ids.append)) as stream:
             async for event in stream:
                 assembler.add(event)
                 if sink is not None:
                     await sink(event)
         body = assembler.result()
-        return Result(body, _bedrock_usage(body.get("usage")))
+        return Result(body, _bedrock_usage(body.get("usage")), ids[-1] if ids else "")
 
     async def _invoke(self, params: Mapping[str, Any], route: Route, timing: Timing) -> Result:
         request = {**params, "modelId": route.model_id}
@@ -340,7 +360,11 @@ class BedrockProvider:
             "body_b64": base64.b64encode(data).decode("ascii"),
             "contentType": raw.get("contentType", ""),
         }
-        return Result(response, Usage(input_tokens=int(counted) if counted else None))
+        return Result(
+            response,
+            Usage(input_tokens=int(counted) if counted else None),
+            _bedrock_request_id(raw),
+        )
 
     def classify(self, exc: BaseException) -> ErrorInfo:
         """By Bedrock error family (`classify_bedrock`)."""
@@ -588,6 +612,12 @@ def _chat_body(chunks: Iterable[Any]) -> dict[str, Any]:
     return assembler.result()
 
 
+def _openai_request_id(response: Any) -> str:
+    """`x-request-id` of a stream's HTTP response (`AsyncStream.response`); empty if none."""
+    headers = getattr(response, "headers", None)
+    return str(headers.get("x-request-id") or "") if headers is not None else ""
+
+
 def _openai_usage(usage: Mapping[str, Any] | None) -> Usage:
     if not usage:
         return Usage()
@@ -612,9 +642,16 @@ class OpenAIProvider:
         self._pool = pool
 
     async def stream(
-        self, params: Mapping[str, Any], route: Route, timing: Timing
+        self,
+        params: Mapping[str, Any],
+        route: Route,
+        timing: Timing,
+        on_request_id: Callable[[str], None] | None = None,
     ) -> AsyncGenerator[Any, None]:
-        """Chat completion chunks of one attempt, each within the attempt timers."""
+        """Chat completion chunks of one attempt, each within the attempt timers.
+
+        `on_request_id` gets the server's `x-request-id` once the stream opened.
+        """
         check_params(params)  # before any client or connection (R3SE-1)
         async with self._pool.borrow_openai(route) as client:
             create = client.chat.completions.create
@@ -629,6 +666,8 @@ class OpenAIProvider:
             )
             started = time.monotonic()
             reply = await first(create(**request), timing.first_response_secs, "first response")
+            if on_request_id is not None:
+                on_request_id(_openai_request_id(getattr(reply, "response", None)))
             try:
                 async for chunk in paced(reply, opened(timing, started), started=False):
                     yield chunk
@@ -657,13 +696,16 @@ class OpenAIProvider:
         self, params: Mapping[str, Any], route: Route, timing: Timing, sink: Sink | None
     ) -> Result:
         assembler = _ChatAssembler()  # folded as they come, no list of chunks (R3PF-4)
-        async with contextlib.aclosing(self.stream(params, route, timing)) as stream:  # CL-10
+        ids: list[str] = []
+        async with contextlib.aclosing(  # CL-10
+            self.stream(params, route, timing, ids.append)
+        ) as stream:
             async for chunk in stream:
                 assembler.add(chunk)
                 if sink is not None:
                     await sink(chunk)
         body = assembler.result()
-        return Result(body, _openai_usage(body.get("usage")))
+        return Result(body, _openai_usage(body.get("usage")), ids[-1] if ids else "")
 
     async def _embeddings(self, params: Mapping[str, Any], route: Route, timing: Timing) -> Result:
         check_params(params)  # R3SE-1
@@ -677,7 +719,9 @@ class OpenAIProvider:
         # The reply carries base64 vectors (R3PF-10) where the SDK's model says list[float], so
         # pydantic's serializer warns; the codec decodes them, the warning is noise here.
         body = reply.model_dump(mode="json", exclude_unset=True, warnings=False)
-        return Result(body, _openai_usage(body.get("usage")))
+        # The SDK sets `_request_id` from `x-request-id` on every non-streamed reply.
+        request_id = str(getattr(reply, "_request_id", None) or "")
+        return Result(body, _openai_usage(body.get("usage")), request_id)
 
     def classify(self, exc: BaseException) -> ErrorInfo:
         """By HTTP status (`classify_openai`)."""
