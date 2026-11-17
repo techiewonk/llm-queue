@@ -17,7 +17,7 @@ from typing import Any, NamedTuple
 import pytest
 
 from llm_queue.engine.jobs import JobSettings
-from llm_queue.engine.settings import InfraSettings
+from llm_queue.engine.settings import REMOVED, RENAMED, InfraSettings
 from llm_queue.errors import ConfigError
 from llm_queue.registry import load_registry
 from llm_queue.registry import settings as st
@@ -227,13 +227,17 @@ JOB_ROWS = _rows(_section(CONFIG, "## Job settings (`LLMQ_JOB_*`)"))
 
 
 def _variables_read() -> set[str]:
-    """Every `LLMQ_*` variable the library reads (settings.py names, literals, job fields)."""
+    """Every `LLMQ_*` variable the library reads (settings.py names, literals, job fields).
+
+    The old names of `RENAMED` / `REMOVED` are only reported, never read.
+    """
     settings = (SRC / "engine" / "settings.py").read_text(encoding="utf-8")
-    names = {f"LLMQ_{n}" for n in re.findall(r'"([A-Z][A-Z0-9_]*[A-Z0-9])"', settings)}
+    found = re.findall(r'"([A-Z][A-Z0-9_]*[A-Z0-9])"', settings)
+    names = {f"LLMQ_{n}" for n in found if not n.startswith("LLMQ_")}
     for path in SRC.rglob("*.py"):
         names |= set(re.findall(r'"(LLMQ_[A-Z0-9_]*[A-Z0-9])"', path.read_text(encoding="utf-8")))
     names |= {f"LLMQ_JOB_{f.name.upper()}" for f in dataclasses.fields(JobSettings)}
-    return names
+    return names - set(RENAMED) - set(REMOVED)
 
 
 def _problems(read: Callable[[], object]) -> list[str]:

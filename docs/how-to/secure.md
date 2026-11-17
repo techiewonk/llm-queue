@@ -10,11 +10,28 @@ Leave `LLMQ_ENVIRONMENT` unset or set it to your environment's name (`prod`, `st
 `dev`, `local`, `test` and `ci` relax the checks. Strict mode requires TLS stores with
 certificate and host-name checks, an `LLMQ_ID_HASH_SALT` of 16 characters or more, an explicit
 `LLMQ_KEY_PREFIX` (so two environments on one store never share queues), allowed `base_url`
-hosts and `https` for `LLMQ_BEDROCK_ENDPOINT_URL` / `LLMQ_STS_ENDPOINT_URL` (any host), and it
-refuses debug capture. See [Environment variables](../reference/environment.md#llmq_environment-strict-or-dev).
+hosts, `https` for `LLMQ_BEDROCK_ENDPOINT_URL` / `LLMQ_STS_ENDPOINT_URL` (any host) and admin
+tokens of 32 characters or more, and it refuses debug capture. See [Environment variables](../reference/environment.md#llmq_environment-strict-or-dev).
 
 `verify=False` (or `use_ssl=False`) in an account's `credentials=` is allowed in every mode, with a
 `bedrock_tls_verify_off` warning: use it only against a local fake.
+
+### Redirects and the Bedrock transport
+
+The default Bedrock transport (`BedrockOptions.transport="aiohttp"`) never follows an HTTP
+redirect. The `botocore` transport does: aiobotocore sends with `allow_redirects=True` and has
+no setting to turn it off, so a 301, 307 or 308 from the endpoint re-sends the SigV4-signed
+request, its body and the session token to the host the redirect names. Against AWS's own
+endpoints that does not happen; with `LLMQ_BEDROCK_ENDPOINT_URL` (a proxy, a VPC endpoint, a
+gateway) it is the proxy's choice. So:
+
+- When strict, `LLMQ_BEDROCK_ENDPOINT_URL` set with `Tuning(bedrock=BedrockOptions(
+  transport="botocore"))` stops `from_env` with a `ConfigError`. Keep the default transport.
+- An account whose `credentials=` returns keys only botocore understands (`verify`,
+  `api_version`, ...) still switches that account to botocore at its first call, in every mode,
+  with the `bedrock_transport_fallback` warning (a call is never failed for it). With an
+  endpoint override, return only the AWS keys (`aws_access_key_id`, `aws_secret_access_key`,
+  `aws_session_token`) and treat that warning as an alarm.
 
 ## 2. Keep account secrets out of the registry
 
@@ -31,6 +48,11 @@ The registry names secrets; it never holds them:
 - The value is looked up in the secrets (`from_env(secrets=)`, else `LLMQ_SECRETS_SOURCE`)
   first, then the environment.
 - Audit entries and the HTTP router redact `role_arn`, `external_id_ref` and `api_key_ref`.
+- Registry `${NAME}` placeholders may not name a credential: `LLMQ_*_PASSWORD`,
+  `LLMQ_*_TOKEN`, `LLMQ_ID_HASH_SALT`, `LLMQ_SECRET*` / `LLMQ_SECRETS_*`,
+  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` are refused at start
+  (the expanded document is stored and served by `GET /registry`). The names a document read
+  are logged (`registry_placeholders`), never the values.
 
 ### Read secrets from a secret store, not the manifest
 
@@ -80,6 +102,11 @@ app.include_router(
 - Two tokens, both optional and read on every request (rotation needs no restart), carried in
   `LLMQ_ADMIN_HEADER` (`X-LLMQ-Token`): `LLMQ_ADMIN_READ_TOKEN` opens the read routes only;
   `LLMQ_ADMIN_TOKEN` opens reads and writes. The app's `dependencies` apply on top of them.
+  When strict, each token must be at least 32 characters (a shared token can be guessed
+  online, and nothing rate-limits the 403s): `http_router()` / `install()` read each token once
+  at mount (a callable too) and refuse a short one with a `ConfigError`; a token rotated to a
+  short value later is refused per request. Generate one with
+  `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
 - **Reads are guarded too.** `/registry` lists account names, regions, model ids, `base_url`s
   and routing blocks (only role ARNs and secret references are redacted). With no token and no
   `dependencies` the router mounts only the open routes and logs

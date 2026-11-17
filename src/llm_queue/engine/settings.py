@@ -20,11 +20,14 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 import orjson
 from redis.connection import parse_url, to_bool
 
+from llm_queue._logging import get_logger
 from llm_queue.engine.expiry import KEY_EXPIRY_MODES
 from llm_queue.engine.store_guard import WAIT_SCOPES, parse_scopes
 from llm_queue.errors import ConfigError
 from llm_queue.registry.interpolate import YAML_SUFFIXES, expand, load_yaml, to_json
 from llm_queue.registry.validate import parse_document
+
+logger = get_logger(__name__)
 
 PREFIX = "LLMQ_"
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
@@ -64,6 +67,18 @@ CONFLICT_GROUPS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("REGISTRY",), ("REGISTRY_FILE",)),
 )
 _TRUE, _FALSE = ("true", "1", "yes", "on"), ("false", "0", "no", "off")
+# Settings that no longer exist (review B-15, owner RV4). One still set in the environment or
+# `defaults=` is reported at start: a `ConfigError` when strict, else a `setting_renamed` /
+# `setting_removed` warning, so an old manifest never silently gets the default. Old name ->
+# new name, and old name -> what to do instead; the env-rename wave adds its names here.
+RENAMED: dict[str, str] = {
+    "LLMQ_LOCAL_LIMIT_CAP": "LLMQ_LOCAL_CONCURRENCY",  # one name for local mode and static_cap
+    "LLMQ_PURGE_BATCH": "LLMQ_ADMIN_BATCH",
+}
+REMOVED: dict[str, str] = {
+    "LLMQ_TENANT_INDEX": "tenant purges read each model's request index "
+    "(LLMQ_REQUEST_INDEX_ENABLED)",
+}
 # Where secrets come from is never itself read from a secret (llm_queue.secrets.SETTINGS).
 _SECRETS_SETTINGS = frozenset(
     PREFIX + n
@@ -132,8 +147,8 @@ class Layers(Mapping[str, str]):
         for name, secret in (secret_names or {}).items():
             if not str(secret or "").strip():
                 problems.append(f"secret_names: {name} must name a secret")
-            else:
-                names[str(name)] = str(secret)
+            else:  # stripped as LLMQ_SECRET_NAMES is: `" valkey_host"` names `valkey_host`
+                names[str(name).strip()] = str(secret).strip()
         for name in names:
             if not name.startswith(PREFIX):
                 problems.append(f"secret names: {name!r} is not an LLMQ_* setting")
@@ -273,6 +288,29 @@ class Layers(Mapping[str, str]):
     def __len__(self) -> int:
         """How many names `__iter__` yields."""
         return len(dict.fromkeys([*self._env, *self._defaults]))
+
+
+def old_names(layers: Layers, *, strict: bool) -> list[str]:
+    """Renamed or removed settings still set (`RENAMED`, `REMOVED`): problems when strict.
+
+    Outside strict mode each is logged (`setting_renamed` / `setting_removed`) and `[]` is
+    returned. Only the environment and `defaults=` are looked at (secrets cannot be listed).
+    """
+    problems: list[str] = []
+    for name in sorted(set(layers)):
+        if name in RENAMED:
+            event, text = "setting_renamed", f"{name} was renamed {RENAMED[name]}: set that instead"
+        elif name in REMOVED:
+            event, text = "setting_removed", f"{name} was removed: {REMOVED[name]}"
+        else:
+            continue
+        if layers.get(name) is None:
+            continue
+        if strict:
+            problems.append(text)
+        else:
+            logger.warning(event, setting=name, use=RENAMED.get(name), hint=text)
+    return problems
 
 
 def read_bool(layers: Mapping[str, Any], name: str, default: bool, problems: list[str]) -> bool:
@@ -442,13 +480,15 @@ def _read_document(
     registry: str | None,
     registry_file: str | None,
     lookup: Callable[[str], str | None] | None = None,
+    used: set[str] | None = None,
 ) -> str:
     """The registry JSON from the variable or the file, refused when it repeats a key.
 
     `${NAME}` placeholders are expanded with `lookup` (default: `os.environ`) after parsing,
     so the repeated-key check sees the document as written and the expanded text is checked
-    again (`registry.interpolate`). A file ending `.yaml` / `.yml` is read as YAML (extra
-    `yaml`). Text without placeholders is returned as it is.
+    again (`registry.interpolate`; credentials are refused). A file ending `.yaml` / `.yml` is
+    read as YAML (extra `yaml`). Text without placeholders is returned as it is. `used`
+    collects the names the placeholders read.
     """
     yaml_file = False
     if registry:
@@ -465,7 +505,7 @@ def _read_document(
     document = load_yaml(text) if yaml_file else parse_document(text)
     if "${" not in text and not yaml_file:
         return text
-    return to_json(expand(document, lookup or os.environ.get))
+    return to_json(expand(document, lookup or os.environ.get, used=used))
 
 
 @dataclass(frozen=True, slots=True)
@@ -510,6 +550,7 @@ class InfraSettings:
     # processes), and calls in flight per model and process (`local` mode and `static_cap`).
     local_process_count: int = 1  # LLMQ_LOCAL_PROCESS_COUNT
     local_concurrency: int = 10  # LLMQ_LOCAL_CONCURRENCY
+    static_cap_wait_secs: float = 5.0  # LLMQ_STATIC_CAP_WAIT_SECS: a `static_cap` budget wait
     metrics_sink: str = "emf"
     mode: str = "both"
     bedrock_endpoint_url: str | None = None
@@ -612,6 +653,7 @@ class InfraSettings:
         if environment == "production":
             environment = "prod"
         strict = environment not in DEV_ENVIRONMENTS
+        problems += old_names(layers, strict=strict)
         host = str(get("STORE_HOST", "") or "").strip() or None
         if store and "STORE_URL" in layers.conflicts():
             problems.append(
@@ -637,13 +679,17 @@ class InfraSettings:
         if registry and registry_file:
             problems.append("set one of LLMQ_REGISTRY and LLMQ_REGISTRY_FILE, not both")
         elif registry or registry_file:
+            used: set[str] = set()
             try:
-                document = boot = orjson.loads(_read_document(registry, registry_file, placeholder))
+                text = _read_document(registry, registry_file, placeholder, used)
+                document = boot = orjson.loads(text)
             except ConfigError as exc:
                 problems.append(str(exc))
             except ValueError as exc:  # orjson refuses what `json` took (NaN): R3CF-1
                 problems.append(f"registry is not valid JSON: {exc}")
             else:
+                if used:  # the names only: a value never reaches a log line
+                    logger.info("registry_placeholders", names=sorted(used))
                 accounts = document.get("accounts") if isinstance(document, dict) else None
                 kinds = [a.get("kind") for a in (accounts or {}).values() if isinstance(a, dict)]
                 if strict and "openai" in kinds and not hosts:
@@ -829,6 +875,7 @@ class InfraSettings:
             execution_mode=execution_mode,
             local_process_count=number("LOCAL_PROCESS_COUNT", 1, int, hi=100_000),
             local_concurrency=number("LOCAL_CONCURRENCY", 10, int, hi=100_000),
+            static_cap_wait_secs=number("STATIC_CAP_WAIT_SECS", 5.0, zero=True, hi=3600),
             metrics_sink=sink,
             mode=mode,
             bedrock_endpoint_url=endpoints["BEDROCK_ENDPOINT_URL"],

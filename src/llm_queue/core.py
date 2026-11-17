@@ -322,9 +322,10 @@ class LLMQueue:
         # engine adds a random tail, so two processes never share one.
         worker_id = worker_id or settings.worker_id or _default_worker_id()
         tuning = tuning or Tuning()
-        if problems := tuning.problems(
+        problems = tuning.problems(
             queue_wait_ms=settings.queue_wait_ms, result_ttl_secs=settings.result_ttl_secs
-        ):
+        )
+        if problems := problems + _transport_problems(settings, tuning):
             raise ConfigError("invalid tuning:\n  " + "\n  ".join(problems))
         # One sink for both engines (O5). EMF: the environment is a dimension, so two
         # environments in one account are not summed; pod and version are plain fields (R3OB-12).
@@ -332,6 +333,14 @@ class LLMQueue:
             settings.metrics_sink,
             static={"environment": settings.environment},
             properties={"pod": worker_id or socket.gethostname(), "version": __version__},
+        )
+
+        # One `static_cap` budget, concurrency cap and probe per process: the started engine
+        # and the sync calls' private engine share them (review L-4).
+        local_limits = LocalLimits(
+            process_count=settings.local_process_count,
+            concurrency=settings.local_concurrency,
+            timings=tuning.engine,
         )
 
         def build(cap: int = settings.store_max_connections) -> Engine:
@@ -386,6 +395,7 @@ class LLMQueue:
                 drain_handback_enabled=settings.drain_handback_enabled,
                 local_process_count=settings.local_process_count,
                 local_concurrency=settings.local_concurrency,
+                static_cap_wait_secs=settings.static_cap_wait_secs,
                 id_hash_salt=settings.id_hash_salt or "",
                 cfg_reload_secs=settings.cfg_reload_secs,
                 queue_failover_secs=settings.queue_failover_secs,
@@ -411,6 +421,7 @@ class LLMQueue:
                 metrics=sink,
                 offload=offload,
                 offload_bytes=offload_bytes,
+                local_limits=local_limits,
             )
 
         sync_cap = min(SYNC_STORE_CONNECTIONS, settings.store_max_connections)
@@ -444,9 +455,10 @@ class LLMQueue:
         """
         worker_id = worker_id or settings.worker_id or _default_worker_id()
         tuning = tuning or Tuning()
-        if problems := tuning.problems(
+        problems = tuning.problems(
             queue_wait_ms=settings.queue_wait_ms, result_ttl_secs=settings.result_ttl_secs
-        ):
+        )
+        if problems := problems + _transport_problems(settings, tuning):
             raise ConfigError("invalid tuning:\n  " + "\n  ".join(problems))
         sink = metrics or sink_for(
             settings.metrics_sink,
@@ -462,7 +474,11 @@ class LLMQueue:
             timings=tuning.engine,
             admin=AdminSettings.from_infra(settings),  # the tenant metric labels
         )
-        limits = LocalLimits(process_count=settings.local_process_count, timings=tuning.engine)
+        limits = LocalLimits(
+            process_count=settings.local_process_count,
+            concurrency=settings.local_concurrency,
+            timings=tuning.engine,
+        )
         pool_kwargs: dict[str, Any] = {
             "bedrock_endpoint_url": settings.bedrock_endpoint_url,
             "sts_endpoint_url": settings.sts_endpoint_url,
@@ -600,19 +616,24 @@ class LLMQueue:
             worker=mode in ("both", "worker"), caller=mode in ("both", "caller")
         )
         self._cross_check()
-        if self._local:
+        if isinstance(self._engine, LocalEngine):
             # One line saying how this process runs: calls go straight to the provider, and
-            # the worker / caller role (LLMQ_MODE) does not apply.
+            # the worker / caller role (LLMQ_MODE) does not apply. `LLMQ_LOCAL_PROCESS_COUNT`
+            # is a fixed ceiling (review Q-10): the share each process takes, logged per
+            # model, does not follow autoscaling.
             logger.info(
                 "local_mode_started",
                 worker=self._engine.worker_id,
                 process_count=self._engine.settings.local_process_count,
                 concurrency=self._engine.settings.local_concurrency,
+                budgets=_local_shares(self._engine.registry.current, self._engine.limits),
                 ignored_mode=mode if mode != "both" else None,
             )
-        elif mode in ("both", "worker"):
-            self._check_store_pool()
-            await self._jobs.start()
+        else:
+            self._warn_static_cap_share()
+            if mode in ("both", "worker"):
+                self._check_store_pool()
+                await self._jobs.start()
         from llm_queue.langchain import get_default_queue, set_default_queue
 
         try:
@@ -689,6 +710,28 @@ class LLMQueue:
                 store_max_connections=cap,
                 worker_slots=slots,
                 hint=f"set LLMQ_STORE_MAX_CONNECTIONS to at least {wanted}",
+            )
+
+    def _warn_static_cap_share(self) -> None:
+        """Warn at start when `static_cap` models run with `LLMQ_LOCAL_PROCESS_COUNT` left at 1.
+
+        During a store outage each process then takes the model's whole rpm / tpm, and the
+        pods together go over the provider quota (review L-5, owner Q-12).
+        """
+        if not isinstance(self._engine, Engine) or self._engine.settings.local_process_count != 1:
+            return
+        view = self._engine.registry.current
+        models = sorted(
+            alias
+            for alias in view.registry.models
+            if view.value(alias, "store_down") == "static_cap"
+        )
+        if models:
+            logger.warning(
+                "static_cap_process_count_unset",
+                models=models,
+                hint="set LLMQ_LOCAL_PROCESS_COUNT to the processes sharing the quota "
+                "(pods x workers): each process takes rpm / tpm divided by it",
             )
 
     def pause_receiving(self) -> None:
@@ -1126,7 +1169,8 @@ class LLMQueue:
         actor: `actor(request)`, else the claimed `LLMQ_ADMIN_ACTOR_HEADER` (`X-LLMQ-Actor`)
         audited as `token:<value>`. `drain_routes=True` adds `GET /drain`, `POST /drain` and
         `POST /resume` for this process (a pod with several processes drains through
-        `LLMQ_DRAIN_FILE`); `metrics_route=True` adds an open `GET /metrics`.
+        `LLMQ_DRAIN_FILE`); `metrics_route=True` adds an open `GET /metrics`. Outside dev each
+        token must be at least 32 characters (`ConfigError` here, read once to check).
         """
         from llm_queue.engine.http import status_router
 
@@ -1150,11 +1194,41 @@ class LLMQueue:
             wait_cap_secs=float(s.http_purge_wait_secs) if s else 60.0,
             dlq_bodies=bool(s.admin_dlq_bodies_enabled) if s else False,
             index_cache_secs=float(s.admin_index_cache_secs) if s else 2.0,
+            strict=bool(s.strict) if s else False,
         )
 
     def describe(self) -> dict[str, Any]:
         """This queue's settings for a log line: no password, salt, token or registry body."""
         return self.admin.describe()
+
+
+def _transport_problems(settings: InfraSettings, tuning: Tuning) -> list[str]:
+    """Strict mode with `LLMQ_BEDROCK_ENDPOINT_URL`: the botocore transport is refused.
+
+    botocore follows 301 / 307 / 308 redirects (aiobotocore has no switch for it), so a signed
+    request and its session token could be re-sent to another host (review B-29).
+    """
+    if settings.strict and settings.bedrock_endpoint_url and tuning.bedrock.transport != "aiohttp":
+        return [
+            f"BedrockOptions.transport={tuning.bedrock.transport} is refused outside dev with "
+            "LLMQ_BEDROCK_ENDPOINT_URL set: it follows HTTP redirects with the signed request; "
+            "use the default aiohttp transport"
+        ]
+    return []
+
+
+def _local_shares(view: Any, limits: LocalLimits) -> dict[str, dict[str, float | None]]:
+    """Per model, the rpm / tpm this process may use: its confirmed deployments' shares added."""
+    out: dict[str, dict[str, float | None]] = {}
+    for alias in view.registry.models:
+        shares: dict[str, float | None] = {"rpm": None, "tpm": None}
+        for dep in view.deployments(alias, "confirmed"):
+            for budget in limits.budgets(view, alias, dep):
+                name = budget.key[-1]
+                if budget.key[0] == "d" and name in shares:
+                    shares[name] = round((shares[name] or 0.0) + budget.limit, 3)
+        out[alias] = shares
+    return out
 
 
 async def _embed(

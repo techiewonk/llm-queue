@@ -44,6 +44,15 @@ by default on every surface. No old name is kept:
 | `GET /drain` open | `GET /drain` needs a read guard |
 | Read routes mounted open with no guard (a warning) | Not mounted: with no token and no `dependencies` only the probes and `/metrics` are (warning `admin_routes_unauthenticated`), unless `insecure_reads=True` |
 
+In a strict environment with `LLMQ_BEDROCK_ENDPOINT_URL` set, the `botocore` Bedrock transport
+(`Tuning(bedrock=BedrockOptions(transport="botocore"))`) is refused at `from_env`: it follows
+redirects with the signed request (see [Secure](docs/how-to/secure.md)).
+
+In a strict environment `LLMQ_ADMIN_TOKEN` and `LLMQ_ADMIN_READ_TOKEN` (or the tokens passed
+to `http_router()`, a callable's value included) must be at least 32 characters: a shorter one
+stops the mount with a `ConfigError`, and a token rotated to a shorter value is refused per
+request.
+
 New settings: `LLMQ_ADMIN_READ_TOKEN` (read routes only), `LLMQ_ADMIN_WRITES_ENABLED` (false),
 `LLMQ_ADMIN_ACTOR_HEADER` (`X-LLMQ-Actor`: a write under the token guard is audited as
 `token:<value>`, `token:unknown` without it), `LLMQ_ADMIN_INDEX_CACHE_SECS` (2),
@@ -73,6 +82,13 @@ index (below).
   `"reason": "local_mode"`. `llmq.admin.status`, `ops.index` (`GET /`), `describe`, `drain.*`,
   `registry.get` and `tenants.hash` answer from the process. Local mode reads its settings and secrets like queue mode. See
   [Queue and local modes](docs/how-to/modes.md), with the switch ladder from the queue to local mode.
+  The concurrency cap, budgets and breaker probe are one per process, shared by the started
+  engine and the sync calls' private engine. `stop()` and `drain()` wait for each call, not
+  for the request handler that made it; only calls the shutdown cancels fail
+  `worker_shutdown` (a caller's own cancel stays a cancel). A `fixed` window whose
+  per-process share is below one unit a minute, or one estimate above it, carries what went
+  over into the next minutes as a debt. A breaker probe that fails before the provider (the
+  request cannot be built) ends the probe and gives its budget back.
 - Configurable secrets (`llm_queue.secrets`): `LLMQ_SECRETS_SOURCE` is an ordered list of
   sources (`aws-secretsmanager:<secret-id>` with one JSON secret, `file:<path>` for a
   Kubernetes secret volume, a `.json` or a `.env` file, `env`, `none` by default) with
@@ -86,7 +102,10 @@ index (below).
   source serves every reader: settings, store passwords on each new connection, the admin
   token, `LLMQ_JOB_*`, account secrets, registry placeholders, the CLI,
   `AdminServices.from_env` and `PurgeService.from_env`. In code: `secrets_from_config(spec)`, `SecretReader` and the
-  `SecretSource` protocol. Precedence: `secrets=` in code, else `LLMQ_SECRETS_SOURCE`; then the
+  `SecretSource` protocol (whatever an app's own source raises is a failed read: a
+  `ConfigError` naming it at start, the last values kept later). A setting named twice in
+  `LLMQ_SECRET_NAMES` is refused; names and keys are stripped in it and in `secret_names=`.
+  A `.env` file's inline comment is a `#` after whitespace; quoted values are kept as written. Precedence: `secrets=` in code, else `LLMQ_SECRETS_SOURCE`; then the
   environment; then `defaults=`. `describe()` gains `secrets` (source kinds and ids, mapped
   names, cache time; never a value), and `InfraSettings` the matching fields
   (`secrets_source`, `secret_sources`, `secret_names`, ...). `InfraSettings.from_layers(layers)`
@@ -97,7 +116,10 @@ index (below).
   a JSON list, object, number or boolean becomes that value. An unset name without a default
   stops the start, naming the variable and its JSON path. Expansion runs on the parsed
   document, so a value cannot break the JSON, and repeated keys are still refused. Stored
-  documents and live edits are never expanded.
+  documents and live edits are never expanded. A placeholder may not read a credential
+  (`LLMQ_*_PASSWORD`, `LLMQ_*_TOKEN`, `LLMQ_ID_HASH_SALT`, `LLMQ_SECRET*`, the AWS key
+  variables): the expanded document is stored and served by `GET /registry`. The names read
+  are logged at start (`registry_placeholders`), never the values.
 - YAML registry files: a `LLMQ_REGISTRY_FILE` ending `.yaml` / `.yml` is read as YAML (new
   extra `llm-queue[yaml]`), with repeated keys refused like in JSON.
 - `residency.allowed_regions: "auto"`: every region the document's deployments use (and their
@@ -174,6 +196,10 @@ index (below).
 - `LLMQ_TENANT_INDEX` and its cross-model index `P:tenant:H:reqs` (with
   `PurgeService.index_call`): a tenant purge of `queued` / `running` calls reads the request
   index of each model. `LLMQ_PURGE_BATCH` (now `LLMQ_ADMIN_BATCH`).
+- A renamed or removed setting still set (`LLMQ_LOCAL_LIMIT_CAP`, `LLMQ_PURGE_BATCH`,
+  `LLMQ_TENANT_INDEX`) is reported at start: a `ConfigError` naming the new setting when
+  strict, the `setting_renamed` / `setting_removed` warning in dev (`RENAMED` / `REMOVED` in
+  `llm_queue.engine.settings`). Before, the old name was ignored and the default used.
 
 ### Changed
 
@@ -200,7 +226,15 @@ index (below).
 - `store_down: static_cap` runs on the local executor: the per-process budgets (rpm / tpm
   divided by `LLMQ_LOCAL_PROCESS_COUNT`), `LLMQ_LOCAL_CONCURRENCY` calls per model, retries,
   breakers and fallbacks, where it was one attempt per confirmed deployment with no budget.
-  `LLMQ_LOCAL_LIMIT_CAP` is removed: set `LLMQ_LOCAL_CONCURRENCY` instead (same default, 10).
+  A `static_cap` call can now wait for a budget or a breaker and retry: the wait is capped by
+  the new `LLMQ_STATIC_CAP_WAIT_SECS` (default 5 s, then `rate_limited`). Each process takes
+  the model's rpm / tpm divided by `LLMQ_LOCAL_PROCESS_COUNT`, which queue mode never needed
+  before and which defaults to 1 (the whole budget per process): set it to the processes that
+  share the quota; start logs `static_cap_process_count_unset` when a model uses `static_cap`
+  and it is left at 1. `Engine.stop()` drains `static_cap` calls with the others and ends
+  those still running with `worker_shutdown` (it never waited for them).
+  `LLMQ_LOCAL_LIMIT_CAP` is renamed `LLMQ_LOCAL_CONCURRENCY` (same default, 10), the one
+  setting for local mode and `static_cap`.
   The `static_cap_attempt_failed` log event is now `local_attempt_failed` (field `path`).
 - `llmq_calls_total` has a `path` label (`queue`, `direct`, `static_cap`, `local`,
   `dead_letter`); `health()` has `mode`.

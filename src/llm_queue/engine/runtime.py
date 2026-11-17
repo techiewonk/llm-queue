@@ -103,6 +103,7 @@ from llm_queue.tuning import EngineTimings
 if TYPE_CHECKING:
     import redis.asyncio
 
+    from llm_queue.engine.local import LocalLimits
     from llm_queue.registry import Deployment, ResolvedRegistry
     from llm_queue.registry.store import RegistryStore
 
@@ -500,6 +501,9 @@ class EngineSettings:
     # `local_concurrency` calls per model and process run at once.
     local_process_count: int = 1
     local_concurrency: int = 10
+    # LLMQ_STATIC_CAP_WAIT_SECS (review L-5, owner Q-12): a `static_cap` call waits at most this
+    # long for a budget or a breaker, below its own `max_wait_secs`; then `rate_limited`.
+    static_cap_wait_secs: float = 5.0
     drain_secs: float = 25.0  # k8s grace 30 s: calls still running then are given back (C3)
     # LLMQ_DRAIN_HANDBACK_ENABLED (0.2.0 A1, owner Q2): a pause returns held calls at once.
     drain_handback_enabled: bool = True
@@ -853,8 +857,12 @@ class Engine:
         metrics: Metrics | None = None,
         offload: ResultOffload | None = None,
         offload_bytes: int | None = None,
+        local_limits: LocalLimits | None = None,
     ) -> None:
-        """Wire the stores; nothing runs until `start`."""
+        """Wire the stores; nothing runs until `start`.
+
+        `local_limits` (the `static_cap` budgets and cap) is shared by the engines of a process.
+        """
         self.settings = settings or EngineSettings()
         # Two heartbeats at least (owner Q4): one late or lost renewal no longer makes a live
         # caller look gone (R3FM-1, R3RC-3). Send and attach refresh it too (REGISTER).
@@ -1014,11 +1022,13 @@ class Engine:
         # `store_down: static_cap` runs here, on the executor of local mode (0.2.0).
         self.local = LocalExecutor(
             providers,
-            LocalLimits(
-                process_count=self.settings.local_process_count, timings=self.settings.timings
+            local_limits
+            or LocalLimits(
+                process_count=self.settings.local_process_count,
+                concurrency=self.settings.local_concurrency,
+                timings=self.settings.timings,
             ),
             view=lambda: self.registry.current,
-            concurrency=self.settings.local_concurrency,
             worker_id=self.worker_id,
             metrics=self.metrics,
             hash_id=self.hash_id,
@@ -1282,6 +1292,10 @@ class Engine:
             self._idle.clear()
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._idle.wait(), max(0.0, until - loop.time()))
+        # `static_cap` calls run in this process: drained with the rest, then cancelled
+        # (`worker_shutdown`) like the calls of local mode (review L-5).
+        await self.local.wait_running(max(0.0, until - loop.time()))
+        await self.local.shutdown()
         tasks: list[asyncio.Task[Any]] = [
             *self._tasks,
             *self._model_tasks.values(),
@@ -2387,9 +2401,16 @@ class Engine:
 
         The same per-process budgets, concurrency cap, retries and fallbacks as
         `LLMQ_EXECUTION_MODE=local`: each rpm / tpm divided by `LLMQ_LOCAL_PROCESS_COUNT`, at
-        most `LLMQ_LOCAL_CONCURRENCY` calls per model in this process.
+        most `LLMQ_LOCAL_CONCURRENCY` calls per model in this process; a budget is waited for
+        at most `LLMQ_STATIC_CAP_WAIT_SECS`.
         """
-        return await self.local.run(view, alias, envelope, path="static_cap")
+        return await self.local.run(
+            view,
+            alias,
+            envelope,
+            path="static_cap",
+            wait_cap_secs=self.settings.static_cap_wait_secs,
+        )
 
     def _start_direct(self, env: Envelope) -> asyncio.Task[None]:
         """Start a direct run; its caller watches the task (`_wait_result`, `watch`)."""

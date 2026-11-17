@@ -35,7 +35,7 @@ When to use which:
 
 ```bash
 LLMQ_EXECUTION_MODE=local
-LLMQ_LOCAL_PROCESS_COUNT=8     # pods x worker processes sharing the provider quota
+LLMQ_LOCAL_PROCESS_COUNT=8     # pods x worker processes sharing the provider quota (a ceiling)
 LLMQ_LOCAL_CONCURRENCY=10      # calls in flight per model in each process
 LLMQ_REGISTRY_FILE=/etc/app/registry.yaml
 ```
@@ -48,15 +48,27 @@ does not apply (`local_mode_started` logs it once when set). What a call gets, p
   `rate_window` (`smooth`: GCRA with `rate_burst`; `fixed`: per minute) and settled with the
   same refund rule (the real usage after an answer, everything back after a throttle). Set the
   count to the number of processes that share the quota, or the pods together may exceed it.
-- **Concurrency.** At most `LLMQ_LOCAL_CONCURRENCY` calls per model in flight; a waiting
-  priority call (`priority=True`, `request_context(priority=True)`) takes the next free slot.
+  The count is a fixed ceiling read at start, not discovered: with autoscaling, set it to the
+  most processes that may run at once (fewer running leave part of the quota unused, more go
+  over it). `local_mode_started` logs `budgets`, the rpm / tpm per model this process takes.
+  A share below one unit a minute (`rpm: 4` over 10 processes) still lets one call through,
+  and one call estimated above the share (`tpm` over the process count) is never refused for
+  that alone: with `fixed` minutes what went over is carried into the next minutes as a debt
+  (the share is paid off each minute), as `smooth` does, so each process stays within its
+  share on average (rpm 4 over 10 processes: one call every 3 minutes per process).
+- **Concurrency.** At most `LLMQ_LOCAL_CONCURRENCY` calls per model in flight in the process,
+  async and sync calls together (the sync calls' private engine shares the cap, the budgets and
+  the breakers); a waiting priority call (`priority=True`, `request_context(priority=True)`)
+  takes the next free slot.
 - **Attempts.** The engine's rules: `attempt_timeout_secs`, `timeout_secs`, `max_wait_secs`
   (`rate_limited` when no budget comes in time), retries with `retry_base_secs` backoff,
   `max_attempts`, the retry budget, `throttle_retry_attempts` with the throttle backoff,
   region fallback (`fallback`), model fallback (`model_fallback`, `allow_fallback`, Converse to
   OpenAI shape conversion), sticky sessions and the `balance` strategies.
 - **Health.** Breakers, throttle backoff, target-error auto-disable and failed credentials per
-  deployment, in this process's memory.
+  deployment, in this process's memory. A half-open breaker lets one probe through per
+  process; a probe that fails before it reaches the provider (the request cannot be built)
+  ends the probe and gives its budget back.
 - **Streams and embeddings.** `converse_stream` / `chat_stream` yield the provider's events
   as they arrive (`meta_event=True` ends with the usual `{"llmq": ...}` event); `embed` batches
   by the model's codec and `embed_batch_size`.
@@ -86,8 +98,16 @@ this process. To change a model in local mode, change the registry document and 
 | `/drain`, `POST /drain`, `POST /resume` | As in queue mode (not audited: the audit is in the store) |
 | `/requests*`, `/tenants`, `/purge/*`, `/registry/versions`, `POST /registry*`, `/audit`, `/models*`, `/blocks*`, `/queues`, `/jobs`, `/dlq*` | 503 `{"reason": "local_mode"}` |
 
+A route's guards answer before the local-mode refusal, as in queue mode: a request without a
+valid token is 403; a write route is mounted only with `allow_writes=True` (404 otherwise),
+and with `dependencies` alone a write without the `X-LLMQ-Admin` header is 403. A request that
+passes them gets the 503 above.
+
 ## Drain
 
 Unchanged: `LLMQ_DRAIN_FILE` (or `POST /drain`) fails readiness, so the load balancer stops
-sending; calls in flight finish, and new calls from them are still served. `stop()` waits up
-to `LLMQ_DRAIN_SECS` for calls in flight, then cancels the rest with `worker_shutdown`.
+sending; calls in flight finish, and new calls from them are still served. `stop()` and
+`drain()` wait up to `LLMQ_DRAIN_SECS` for the calls in flight (each call, not the request
+handler that made it: a handler that goes on streaming its answer does not hold the drain),
+then `stop()` cancels the calls still running with `worker_shutdown`. A call its own caller
+cancels (a client that went away) stays a plain cancel, during a shutdown too.
