@@ -112,6 +112,15 @@ async def slow_rig() -> AsyncIterator[Rig]:
 # ---------------------------------------------------------------- the public calls
 
 
+async def _until(check: Any, secs: float = 5.0) -> None:
+    """Poll `check()` (a coroutine function) until it is true: no fixed sleep (review B-26)."""
+    loop = asyncio.get_running_loop()
+    until = loop.time() + secs
+    while not await check():
+        assert loop.time() < until, "condition not met in time"
+        await asyncio.sleep(0.02)
+
+
 async def test_converse_and_chat_run_in_process_without_a_store(rig: Rig) -> None:
     llmq = await rig.started()
     assert llmq.execution_mode == "local"
@@ -222,13 +231,21 @@ async def test_the_concurrency_cap_holds_calls_and_priority_goes_first(slow_rig:
         await llmq.converse("small", CHAT, priority=priority)
         order.append(name)
 
+    async def seen(running: int, priority: int, normal: int) -> bool:
+        status = await llmq.status("small")
+        waiting = status["waiting"] or {}
+        return status["in_progress"] == running and (
+            waiting.get("priority", 0),
+            waiting.get("normal", 0),
+        ) == (priority, normal)
+
     first = asyncio.create_task(one("first", False))
-    await asyncio.sleep(0.1)
+    await _until(lambda: seen(1, 0, 0))
     normal = asyncio.create_task(one("normal", False))
-    await asyncio.sleep(0.05)
+    await _until(lambda: seen(1, 0, 1))
     with request_context(priority=True):  # the task copies the context
         urgent = asyncio.create_task(one("urgent", None))
-    await asyncio.sleep(0.05)
+    await _until(lambda: seen(1, 1, 1))
     status = await llmq.status("small")
     assert status["in_progress"] == 1
     assert status["waiting"] == {"priority": 1, "normal": 1}
@@ -239,7 +256,11 @@ async def test_the_concurrency_cap_holds_calls_and_priority_goes_first(slow_rig:
 async def test_concurrency_status_counts_calls_in_flight(slow_rig: Rig) -> None:
     llmq = await slow_rig.started(LLMQ_LOCAL_CONCURRENCY="2")
     calls = [asyncio.create_task(llmq.converse("small", CHAT)) for _ in range(3)]
-    await asyncio.sleep(0.15)
+
+    async def two_running() -> bool:
+        return bool((await llmq.status("small"))["concurrency"]["in_use"] == 2)
+
+    await _until(two_running)
     status = await llmq.status("small")
     assert status["concurrency"] == {"limit": 2, "in_use": 2}
     assert status["deployments"][0]["concurrency"]["in_use"] == 2
@@ -481,13 +502,18 @@ async def test_install_mounts_every_route_with_local_answers(rig: Rig, tmp_path:
         slow = rig.fake.scenario
         slow.patch_model(f"{SMALL}@r1", {"latency_ms": {"p50": 500, "p95": 500}})
         running = asyncio.create_task(llmq.converse("small", CHAT))
-        await asyncio.sleep(0.1)
+
+        async def in_flight() -> bool:
+            return bool((await llmq.status("small"))["in_progress"] == 1)
+
+        await _until(in_flight)
         drain.touch()
         os.utime(drain, (time.time() + 2, time.time() + 2))
-        for _ in range(30):
-            if not llmq.ready:
-                break
-            await asyncio.sleep(0.05)
+
+        async def paused() -> bool:
+            return not llmq.ready
+
+        await _until(paused)
         not_ready = await client.get(f"{base}/health/ready")
         assert not_ready.status_code == 503
         assert not_ready.json()["not_ready_reason"] == "draining"

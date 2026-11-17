@@ -358,7 +358,8 @@ async def test_worker_death_and_redelivery_settle_once(make: Make) -> None:
     # The dead worker: took the message and never answered; its hold lapses (visibility 0.2 s).
     taken, _ = await engine.queues.receive(queue, 1, QueueSettings(visibility_secs=0.2))
     assert taken
-    await asyncio.sleep(0.3)
+    # Let the 0.2 s hold lapse; longer only makes the lapse surer (review B-26: 0.1 s margin).
+    await asyncio.sleep(0.5)
     assert await engine.state.zcard(key) == 1  # not final: still indexed
     worker, _ = await make(SLOW_MODEL, SLOW, caller=False)
     assert (await task).ok
