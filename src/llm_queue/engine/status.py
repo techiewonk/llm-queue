@@ -189,11 +189,14 @@ class StatusReader:
                 "limit": rpm,
                 "used": used_calls,
                 "left": None if rpm is None else max(0, rpm - used_calls),
+                # The provider quota behind the budget (`quota_rpm` x `budget_pct`), or None.
+                "quota": view.quota(alias, "rpm", dep),
             },
             "tpm": {
                 "limit": tpm,
                 "used": used_tokens,
                 "left": None if tpm is None else max(0, tpm - used_tokens),
+                "quota": view.quota(alias, "tpm", dep),
             },
             "concurrency": {"limit": round(limit, 2), "in_use": int(in_use)},
             "breaker": _text(breaker),

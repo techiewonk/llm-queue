@@ -75,6 +75,7 @@ class RateStatus(TypedDict):
     limit: int | None
     used: int
     left: int | None
+    quota: int | None  # the provider quota behind `limit` (`quota_rpm` / `quota_tpm`)
 
 
 class ConcurrencyStatus(TypedDict):

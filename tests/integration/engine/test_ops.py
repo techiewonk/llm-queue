@@ -46,7 +46,7 @@ async def test_status_of_model_and_request(make: Make) -> None:
     assert done["state"] == "done"
     status = await engine.status("big")
     dep = next(d for d in status["deployments"] if d["name"] == "aws-a/r1")
-    assert dep["rpm"] == {"limit": 50, "used": 1, "left": 49}
+    assert dep["rpm"] == {"limit": 50, "used": 1, "left": 49, "quota": None}
     assert dep["healthy"]
     assert dep["breaker"] == "closed"
     assert dep["concurrency"]["in_use"] == 0
