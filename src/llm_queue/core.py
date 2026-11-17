@@ -208,6 +208,8 @@ class EmbedResult:
     errors: dict[int, CallFailed] = field(default_factory=dict)
     batches: int = 0
     request_ids: list[str] = field(default_factory=list)
+    # The provider's own id of each answered batch (Bedrock x-amzn-requestid), for support.
+    provider_request_ids: list[str] = field(default_factory=list)
 
 
 # Every queue of the process, so a fork can mark them (weak: a dropped queue is not kept).
@@ -1085,8 +1087,14 @@ async def _embed(
         engine, model, texts, input_type=input_type, partial=partial, **kwargs
     )
     alias = engine.registry.current.registry.alias_of(model)
-    meta = Meta(served_model=alias, tokens_in=out.tokens_in, attempts=out.batches)
-    return EmbedResult(out.vectors, meta, out.errors, out.batches, out.request_ids)
+    ids = out.provider_request_ids
+    meta = Meta(
+        served_model=alias,
+        tokens_in=out.tokens_in,
+        attempts=out.batches,
+        provider_request_id=ids[0] if len(ids) == 1 else "",  # one batch: its id
+    )
+    return EmbedResult(out.vectors, meta, out.errors, out.batches, out.request_ids, list(ids))
 
 
 async def _close_offload(offload: ResultOffload | None) -> None:

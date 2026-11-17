@@ -71,7 +71,7 @@ def test_an_unknown_kind_is_internal() -> None:
         (UnknownModel("m"), "config_error", False),
         (MissingExtra("feature", "extra"), "config_error", False),
         (RegistryError(["bad"]), "config_error", False),
-        (RegistryConflict("x"), "config_error", False),
+        (RegistryConflict("x"), "config_error", True),
         (LiveEditRefused("x"), "config_error", False),
         (StoreUnavailable("x"), "unavailable", True),
         (PurgeRefused("x"), "internal", False),

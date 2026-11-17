@@ -145,6 +145,7 @@ class EmbedOutcome:
     tokens_in: int | None = None
     batches: int = 0
     request_ids: list[str] = field(default_factory=list)
+    provider_request_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -155,12 +156,14 @@ class _Part:
     tokens_in: int | None = None
     batches: int = 0
     request_ids: list[str] = field(default_factory=list)
+    provider_request_ids: list[str] = field(default_factory=list)
 
     def add(self, other: _Part) -> None:
         """Append another part's results and usage."""
         self.items += other.items
         self.batches += other.batches
         self.request_ids += other.request_ids
+        self.provider_request_ids += other.provider_request_ids
         if other.tokens_in is not None:
             self.tokens_in = (self.tokens_in or 0) + other.tokens_in
 
@@ -311,13 +314,18 @@ async def embed_detailed(
                 raise failed from exc
             return _Part([failed] * len(group), batches=1)
         tokens = getattr(reply.meta, "tokens_in", None)
-        return _Part(list(vectors), tokens, 1, [reply.request_id])
+        provider_id = getattr(reply.meta, "provider_request_id", "") or ""
+        return _Part(
+            list(vectors), tokens, 1, [reply.request_id], [provider_id] if provider_id else []
+        )
 
     jobs = [(str(n), n * size, group) for n, group in enumerate(groups)]
     total = _Part([])
     for part in await _windowed(jobs, one, concurrency):
         total.add(part)
-    outcome = EmbedOutcome([], {}, total.tokens_in, total.batches, total.request_ids)
+    outcome = EmbedOutcome(
+        [], {}, total.tokens_in, total.batches, total.request_ids, total.provider_request_ids
+    )
     for index, item in enumerate(total.items):
         if isinstance(item, CallFailed):
             outcome.errors[index] = item

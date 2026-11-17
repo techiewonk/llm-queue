@@ -35,7 +35,8 @@ becomes `if not llm_queue.error_retryable(exc): stop`.
 | Error | `category` | `retryable` |
 |---|---|---|
 | `CallFailed` | by `kind`, see below (an unknown kind is `internal`, False) | by `kind` |
-| `ConfigError` and its subclasses (`RegistryError`, `RegistryConflict`, `LiveEditRefused`, `UnknownModel`, `MissingExtra`) | `config_error` | False |
+| `ConfigError` and its subclasses (`RegistryError`, `LiveEditRefused`, `UnknownModel`, `MissingExtra`) | `config_error` | False |
+| `RegistryConflict` | `config_error` | True: the same publish or edit can succeed once the other writes are done |
 | `StoreUnavailable` | `unavailable` | True |
 | `PurgeRefused`, a plain `LLMQueueError`, anything else | `internal` | False |
 

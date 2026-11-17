@@ -108,3 +108,12 @@ async def test_a_context_reset_in_another_context_is_tolerated() -> None:
     # The generator's `finally` now runs in another task's context: before 0.2.0 the
     # ContextVar reset raised "created in a different Context" out of aclose().
     await asyncio.create_task(gen.aclose())
+
+
+def test_registry_conflict_is_retryable() -> None:
+    """FU6: running the same publish or edit again can succeed once other writes are done."""
+    from llm_queue.registry.store import RegistryConflict
+
+    error = RegistryConflict("lost the race")
+    assert error.category == "config_error"
+    assert error.retryable

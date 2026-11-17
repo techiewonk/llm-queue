@@ -92,8 +92,11 @@ MODEL_ADMISSION_SETTINGS = (
 class RegistryConflict(ConfigError):
     """A publish or live edit lost the race with other writes on every try it had.
 
-    The number of tries is `Tuning.registry.edit_retries`.
+    The number of tries is `Tuning.registry.edit_retries`. Retryable: running the same
+    publish or edit again can succeed once the other writes are done.
     """
+
+    _retryable = True
 
 
 class LiveEditRefused(ConfigError):
