@@ -29,6 +29,7 @@ LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 STORE_SCHEMES = ("redis", "rediss", "valkey", "valkeys")
 TLS_SCHEMES = ("rediss", "valkeys")
 METRICS_SINKS = ("emf", "prometheus", "none")
+EXECUTION_MODES = ("queue", "local")  # LLMQ_EXECUTION_MODE
 # The only environments where the store may skip verified TLS, ids may go unkeyed and debug
 # capture may run. Anything else, `LLMQ_ENVIRONMENT` unset included, is treated as holding real
 # data (fail closed): a forgotten variable must not switch the checks off.
@@ -176,7 +177,13 @@ class InfraSettings:
     drain_handback_enabled: bool = True  # LLMQ_DRAIN_HANDBACK_ENABLED
     drain_file: str = ""  # LLMQ_DRAIN_FILE
     drain_poll_secs: float = 1.0  # LLMQ_DRAIN_POLL_SECS
-    local_limit_cap: int = 10
+    # LLMQ_EXECUTION_MODE (0.2.0): `queue` sends calls through the store; `local` runs every
+    # call in this process against the provider and never contacts the store (engine/local.py).
+    execution_mode: str = "queue"
+    # The local executor's budgets: each deployment's rpm / tpm divided by this (pods x
+    # processes), and calls in flight per model and process (`local` mode and `static_cap`).
+    local_process_count: int = 1  # LLMQ_LOCAL_PROCESS_COUNT
+    local_concurrency: int = 10  # LLMQ_LOCAL_CONCURRENCY
     metrics_sink: str = "emf"
     mode: str = "both"
     bedrock_endpoint_url: str | None = None
@@ -249,17 +256,21 @@ class InfraSettings:
 
         problems: list[str] = []
         store = get("STORE_URL")
+        execution_mode = str(get("EXECUTION_MODE", "queue")).strip().lower()
+        if execution_mode not in EXECUTION_MODES:
+            problems.append("LLMQ_EXECUTION_MODE must be queue or local")
+        local = execution_mode == "local"
         environment = str(get("ENVIRONMENT", "") or "").strip().lower() or "unset"
         if environment == "production":
             environment = "prod"
         strict = environment not in DEV_ENVIRONMENTS
-        if not store:
+        if not store and not local:  # local mode never contacts a store
             problems.append(f"LLMQ_STORE_URL is required ({_SCHEMES_TEXT})")
         urls: dict[str, str | None] = {}
         for name in ("STORE_URL", "QUEUE_STORE_URL"):
             raw = get(name)
             urls[name] = None
-            if raw:
+            if raw and not local:  # never connected to in local mode: not checked
                 urls[name], found = _store_url(PREFIX + name, str(raw), strict)
                 problems += found
         registry, registry_file = get("REGISTRY"), get("REGISTRY_FILE")
@@ -333,7 +344,7 @@ class InfraSettings:
         if key_expiry not in KEY_EXPIRY_MODES:
             problems.append("LLMQ_KEY_EXPIRY must be auto, native or swept")
         key_prefix = get("KEY_PREFIX")
-        if strict and not key_prefix:
+        if strict and not key_prefix and not local:
             # Owner decision Q26 (R3SE-9): two environments on one store that both left the
             # default `llmq` shared queues and registry (staging workers ran prod prompts).
             problems.append(
@@ -430,7 +441,9 @@ class InfraSettings:
             drain_handback_enabled=hand_back in _TRUE,
             drain_file=drain_file,
             drain_poll_secs=number("DRAIN_POLL_SECS", 1.0, lo=0.1, hi=60),
-            local_limit_cap=number("LOCAL_LIMIT_CAP", 10, int, hi=100_000),
+            execution_mode=execution_mode,
+            local_process_count=number("LOCAL_PROCESS_COUNT", 1, int, hi=100_000),
+            local_concurrency=number("LOCAL_CONCURRENCY", 10, int, hi=100_000),
             metrics_sink=sink,
             mode=mode,
             bedrock_endpoint_url=endpoints["BEDROCK_ENDPOINT_URL"],

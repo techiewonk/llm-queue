@@ -87,6 +87,20 @@ class StoreUnavailable(LLMQueueError, ConnectionError):  # named for what it is
     _retryable = True
 
 
+class LocalModeRefused(ConfigError):
+    """An operation that needs the store, asked of a queue in local mode (`LLMQ_EXECUTION_MODE`).
+
+    Request records and status by id, cancel by id, purges, registry live edits and publishes,
+    jobs and dead letters live in the store, which local mode never contacts. Category
+    `config_error`: the process is set up without a store; HTTP routes answer 503.
+    """
+
+    def __init__(self, operation: str) -> None:
+        """`operation` names what was asked (`cancel`, `request status`, `registry edit`...)."""
+        super().__init__(f"{operation} is not available in local mode (LLMQ_EXECUTION_MODE=local)")
+        self.operation = operation
+
+
 class PurgeRefused(LLMQueueError):
     """A purge that would delete state still in use, or that needs a setting that is off.
 

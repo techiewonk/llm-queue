@@ -8,12 +8,20 @@ unless the app passes `allow_writes=True`.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+import functools
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from llm_queue._logging import get_logger
 from llm_queue.engine.store_guard import STORE_DOWN
-from llm_queue.errors import ConfigError, LLMQueueError, MissingExtra, PurgeRefused, UnknownModel
+from llm_queue.errors import (
+    ConfigError,
+    LLMQueueError,
+    LocalModeRefused,
+    MissingExtra,
+    PurgeRefused,
+    UnknownModel,
+)
 from llm_queue.registry.store import (
     _SECRET_FIELDS,  # one set for the audit and this view, so a new secret is hidden in both
     LiveEditRefused,
@@ -23,6 +31,7 @@ from llm_queue.registry.store import (
 from llm_queue.registry.validate import RegistryError
 
 if TYPE_CHECKING:
+    from llm_queue.engine.local import LocalEngine
     from llm_queue.engine.runtime import Engine
 
 logger = get_logger(__name__)
@@ -37,6 +46,21 @@ RETRY_AFTER_SECS = 1
 # Bounds on what a client sends before anything reads the store or diffs the registry (FO-15).
 MAX_ID_CHARS = 256
 MAX_EDIT_PATHS = 100
+
+
+def local_refusal[**P](
+    fn: Callable[P, Awaitable[Response]],
+) -> Callable[P, Awaitable[Response]]:
+    """A store-only route asked of a local-mode queue: 503 with the reason, not a 500."""
+
+    @functools.wraps(fn)
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> Response:
+        try:
+            return await fn(*args, **kwargs)
+        except LocalModeRefused as exc:
+            return 503, {"error": str(exc), "reason": "local_mode", "mode": "local"}
+
+    return wrapper
 
 
 def redacted(doc: Any) -> Any:
@@ -97,7 +121,7 @@ def _purge_body(kind: str, body: Any) -> str | None:
 class Handlers:
     """The HTTP handlers of one engine."""
 
-    def __init__(self, engine: Engine, *, allow_writes: bool = False) -> None:
+    def __init__(self, engine: Engine | LocalEngine, *, allow_writes: bool = False) -> None:
         """Writes stay refused unless `allow_writes`."""
         self.engine = engine
         self.allow_writes = allow_writes
@@ -145,6 +169,7 @@ class Handlers:
         except STORE_DOWN:
             return _UNAVAILABLE
 
+    @local_refusal
     async def request(self, request_id: str) -> Response:
         """Status of one call (503 while the store is unreachable)."""
         if _too_long(request_id):
@@ -171,6 +196,7 @@ class Handlers:
             "live_edits": redacted(live_edits),
         }
 
+    @local_refusal
     async def set(
         self, values: Mapping[str, Any], *, actor: str, model: str | None = None
     ) -> Response:
@@ -186,12 +212,15 @@ class Handlers:
             view = await self.engine.registry.set(values, actor=f"http:{actor}", model=model)
         except RegistryConflict as exc:
             return 409, {"error": str(exc), "retry_after_secs": RETRY_AFTER_SECS}
+        except LocalModeRefused:
+            raise  # `local_refusal`: 503, not a bad edit
         except (LiveEditRefused, RegistryError, ConfigError) as exc:
             return 400, {"error": str(exc)}
         except STORE_DOWN:
             return _UNAVAILABLE
         return 200, {"diff": redacted(audit_diff(before, dict(view.registry.raw)))}
 
+    @local_refusal
     async def block(
         self, *, actor: str, region: str | None = None, account: str | None = None, on: bool = True
     ) -> Response:
@@ -208,6 +237,8 @@ class Handlers:
             )
         except RegistryConflict as exc:
             return 409, {"error": str(exc), "retry_after_secs": RETRY_AFTER_SECS}
+        except LocalModeRefused:
+            raise  # `local_refusal`: 503
         except ConfigError as exc:
             return 400, {"error": str(exc)}
         except STORE_DOWN:
@@ -222,11 +253,12 @@ class Handlers:
 class PurgeHandlers:
     """The purge routes (only with `allow_writes`): thin calls into `engine.purge`."""
 
-    def __init__(self, engine: Engine, *, allow_writes: bool = False) -> None:
+    def __init__(self, engine: Engine | LocalEngine, *, allow_writes: bool = False) -> None:
         """Purges stay refused unless `allow_writes`."""
         self.engine = engine
         self.allow_writes = allow_writes
 
+    @local_refusal
     async def purge(self, kind: str, body: Any, *, actor: str) -> Response:
         """`kind` is model, deployment, tenant or gc; `body` a JSON object; returns the report."""
         if not self.allow_writes:
@@ -270,12 +302,15 @@ class PurgeHandlers:
                 )
         except PurgeRefused as exc:
             return 409, {"error": str(exc)}
+        except LocalModeRefused:
+            raise  # `local_refusal`: 503
         except ConfigError as exc:
             return 400, {"error": str(exc)}
         except STORE_DOWN:
             return _UNAVAILABLE
         return 200, report.as_dict()
 
+    @local_refusal
     async def scheduled(self) -> Response:
         """Auto purges waiting for their grace."""
         if not self.allow_writes:
@@ -285,6 +320,7 @@ class PurgeHandlers:
         except STORE_DOWN:
             return _UNAVAILABLE
 
+    @local_refusal
     async def cancel_scheduled(self, body: Any, *, actor: str) -> Response:
         """Drop one scheduled auto purge: body `{"target": ...}`."""
         if not self.allow_writes:
@@ -301,7 +337,7 @@ class PurgeHandlers:
 
 
 def status_router(
-    engine: Engine,
+    engine: Engine | LocalEngine,
     *,
     dependencies: Sequence[Any] = (),
     allow_writes: bool = False,

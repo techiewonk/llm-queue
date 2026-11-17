@@ -25,6 +25,7 @@ from llm_queue.errors import ConfigError
 from llm_queue.providers.embeddings import EmbeddingCodec, batches, codec_for, request_body
 
 if TYPE_CHECKING:
+    from llm_queue.engine.local import LocalEngine
     from llm_queue.engine.runtime import Engine
 
 
@@ -166,7 +167,7 @@ class _Part:
 
 
 async def embed(
-    engine: Engine,
+    engine: Engine | LocalEngine,
     model: str,
     texts: Sequence[str],
     *,
@@ -196,7 +197,7 @@ async def embed(
 
 
 async def embed_partial(
-    engine: Engine,
+    engine: Engine | LocalEngine,
     model: str,
     texts: Sequence[str],
     *,
@@ -217,7 +218,7 @@ def _max_chars(view: Any, alias: str, codec: EmbeddingCodec) -> int:
 
 
 async def embed_detailed(
-    engine: Engine,
+    engine: Engine | LocalEngine,
     model: str,
     texts: Sequence[str],
     *,
