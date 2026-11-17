@@ -122,6 +122,7 @@ PY_RULES: tuple[tuple[tuple[str, ...], str, str], ...] = (
         '"instance_id": worker_id',
     ),
     (("src/llm_queue/engine/admin/process.py",), r"\bmode=s\.role\b", "role=s.role"),
+    (("tests/", "docs/"), r'"worker_id":', '"instance_id":'),  # describe()'s key in tests
     (ADMIN, r'"worker": engine\.worker_id', '"instance": engine.worker_id'),
     (ADMIN, r'"mode": settings\.role', '"role": settings.role'),
     # describe()'s tenant key (W5a, review B-04) follows `tenant_default`.
