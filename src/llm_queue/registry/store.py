@@ -749,26 +749,8 @@ class RegistryStore:
             if attempt:
                 await self._backoff(attempt)
             doc, meta = await self._read()
-            if doc is None:
-                raise ConfigError("no registry is stored; publish one first")
-            min_lib = doc.get("min_lib_version")
-            if isinstance(min_lib, str) and needs_newer_lib(min_lib):
-                raise ConfigError(
-                    f"the registry needs llm-queue {min_lib} or later (this is {__version__}); "
-                    "edit it from a newer version"
-                )
-            after = orjson.loads(orjson.dumps(doc))
-            change(after)
-            reasons = refused_edits(doc, after, self.live_edit_mode(doc))
-            if reasons:
-                logger.warning("registry_edit_refused", actor=actor, reasons=reasons)
-                raise LiveEditRefused("; ".join(reasons))
-            registry, errors, warnings = check(after, strict=False, allowed_hosts=self._hosts)
-            if registry is None:
-                raise RegistryError(errors, warnings)
-            if new_errors := _new_path_errors(doc, after, self._hosts):
-                raise RegistryError(new_errors, warnings)
-            changes = orjson.dumps(audit_diff(doc, after)).decode()
+            after, registry = self._changed(doc, change, actor)
+            changes = orjson.dumps(audit_diff(doc or {}, after)).decode()
             keys, values = self._numbers(ResolvedRegistry(registry))
             reply = await self._edit(
                 [self.doc_key, self.meta_key, self.audit_key, self.history_key, *keys],
@@ -793,6 +775,81 @@ class RegistryStore:
             f"the registry kept changing ({self._edit_retries} tries); try again"
         )
 
+    def _changed(
+        self, doc: dict[str, Any] | None, change: Callable[[dict[str, Any]], None], actor: str
+    ) -> tuple[dict[str, Any], Registry]:
+        """`doc` with `change` applied, after every check of a live edit (no write)."""
+        if doc is None:
+            raise ConfigError("no registry is stored; publish one first")
+        min_lib = doc.get("min_lib_version")
+        if isinstance(min_lib, str) and needs_newer_lib(min_lib):
+            raise ConfigError(
+                f"the registry needs llm-queue {min_lib} or later (this is {__version__}); "
+                "edit it from a newer version"
+            )
+        after = orjson.loads(orjson.dumps(doc))
+        change(after)
+        reasons = refused_edits(doc, after, self.live_edit_mode(doc))
+        if reasons:
+            logger.warning("registry_edit_refused", actor=actor, reasons=reasons)
+            raise LiveEditRefused("; ".join(reasons))
+        registry, errors, warnings = check(after, strict=False, allowed_hosts=self._hosts)
+        if registry is None:
+            raise RegistryError(errors, warnings)
+        if new_errors := _new_path_errors(doc, after, self._hosts):
+            raise RegistryError(new_errors, warnings)
+        return after, registry
+
+    @store_op
+    async def plan_edit(
+        self, change: Callable[[dict[str, Any]], None], *, actor: str
+    ) -> list[dict[str, Any]]:
+        """What `edit(change)` would change, as audit diff rows; nothing is written.
+
+        Runs every check `edit` runs (refused fields, validation), so a dry run that passes
+        is an edit that would pass on the same stored document.
+        """
+        check_actor(actor)
+        doc, _ = await self._read()
+        after, _ = self._changed(doc, change, actor)
+        return audit_diff(doc or {}, after)
+
+    @store_op
+    async def plan_publish(self, doc: Mapping[str, Any]) -> dict[str, Any]:
+        """What `publish(doc)` would do: `{action, version, carried, diff}`; nothing written.
+
+        `action` is `published`, `kept` (same content), `ignored` (older than stored) or
+        `not_bumped` (same version, other content), by the version rule; `RegistryError` when
+        `doc` is invalid.
+        """
+        registry, errors, warnings = check(doc, strict=True, allowed_hosts=self._hosts)
+        if registry is None:
+            raise RegistryError(errors, warnings)
+        stored, meta = await self._read()
+        replace = stored is not None and self._readable(stored) is None
+        merged = carry_routing(None if replace else stored, doc)
+        stored_version = int(meta.get("version", "0"))
+        # The PUBLISH script's rule: higher replaces, lower is ignored, equal keeps (`kept` for
+        # the same content, `not_bumped` for another); an unreadable equal one is replaced.
+        if (
+            stored is None
+            or registry.version > stored_version
+            or (replace and registry.version == stored_version)
+        ):
+            action = "published"
+        elif registry.version < stored_version:
+            action = "ignored"
+        elif meta.get("config_hash") == content_hash(doc):
+            action = "kept"
+        else:
+            action = "not_bumped"
+        return {
+            "action": action,
+            "version": registry.version if action == "published" else stored_version,
+            "carried": list(carried_routing(doc, merged)),
+            "diff": audit_diff(stored or {}, merged) if action == "published" else [],
+        }
+
     async def _backoff(self, attempt: int) -> None:
         """Wait a jittered, doubling time before try `attempt` (1 = the first retry).
 
@@ -802,11 +859,10 @@ class RegistryStore:
         cap = min(_CONFLICT_BACKOFF_MAX_SECS, _CONFLICT_BACKOFF_SECS * 2**attempt)
         await self._sleep(random.uniform(0, cap))
 
-    @store_op
-    async def set(
-        self, values: Mapping[str, Any], *, actor: str, model: str | None = None
-    ) -> ResolvedRegistry:
-        """Set dotted paths (`{"rpm": 400}` with `model=`, or from the root); None deletes."""
+    def set_change(
+        self, values: Mapping[str, Any], *, model: str | None = None
+    ) -> Callable[[dict[str, Any]], None]:
+        """The change `set(values, model=)` applies (for `edit` or `plan_edit`)."""
 
         def change(doc: dict[str, Any]) -> None:
             base = doc
@@ -818,13 +874,19 @@ class RegistryStore:
             for dotted, value in values.items():
                 _set_path(doc, [*prefix, *split_path(base, dotted)], value)
 
-        return await self.edit(change, actor=actor)
+        return change
 
     @store_op
-    async def set_enabled(
-        self, model: str, deployment: str, enabled: bool, *, actor: str
+    async def set(
+        self, values: Mapping[str, Any], *, actor: str, model: str | None = None
     ) -> ResolvedRegistry:
-        """Enable or disable one deployment (`account/name`) of a model."""
+        """Set dotted paths (`{"rpm": 400}` with `model=`, or from the root); None deletes."""
+        return await self.edit(self.set_change(values, model=model), actor=actor)
+
+    def enabled_change(
+        self, model: str, deployment: str, enabled: bool
+    ) -> Callable[[dict[str, Any]], None]:
+        """The change `set_enabled` applies: one deployment (`account/name`) on or off."""
         account, _, name = deployment.partition("/")
         alias = self.current.registry.alias_of(model)
         path = ["models", alias, "deployments", account, "overrides", name, "enabled"]
@@ -832,13 +894,19 @@ class RegistryStore:
         def change(doc: dict[str, Any]) -> None:
             _set_path(doc, path, None if enabled else False)
 
-        return await self.edit(change, actor=actor)
+        return change
 
     @store_op
-    async def block(
-        self, *, region: str | None = None, account: str | None = None, on: bool, actor: str
+    async def set_enabled(
+        self, model: str, deployment: str, enabled: bool, *, actor: str
     ) -> ResolvedRegistry:
-        """Block (or unblock) a region or an account for every model.
+        """Enable or disable one deployment (`account/name`) of a model."""
+        return await self.edit(self.enabled_change(model, deployment, enabled), actor=actor)
+
+    def block_change(
+        self, *, region: str | None = None, account: str | None = None, on: bool
+    ) -> Callable[[dict[str, Any]], None]:
+        """The change `block` applies, after its checks.
 
         `ConfigError` when neither is given, or when blocking a name the registry does not use
         (a typo would otherwise block nothing and look done).
@@ -862,7 +930,16 @@ class RegistryStore:
                 listed = [v for v in routing.get(field, []) if v != value]
                 routing[field] = [*listed, value] if on else listed
 
-        return await self.edit(change, actor=actor)
+        return change
+
+    @store_op
+    async def block(
+        self, *, region: str | None = None, account: str | None = None, on: bool, actor: str
+    ) -> ResolvedRegistry:
+        """Block (or unblock) a region or an account for every model (see `block_change`)."""
+        return await self.edit(
+            self.block_change(region=region, account=account, on=on), actor=actor
+        )
 
     # ---------------------------------------------------------------- history, rollback, diff
 
@@ -898,6 +975,25 @@ class RegistryStore:
         return sorted(int(_text(v)) for v in await self._client.hkeys(self.history_key))
 
     @store_op
+    async def kept(self, version: int) -> dict[str, Any]:
+        """The document published as `version`, from the history; `ConfigError` when gone."""
+        raw = await self._client.hget(self.history_key, str(version))
+        if raw is None:
+            raise ConfigError(f"version {version} is not kept any more")
+        try:
+            kept = orjson.loads(raw)
+        except orjson.JSONDecodeError as exc:
+            raise ConfigError(f"version {version} is stored unreadable: {exc}") from exc
+        if not isinstance(kept, dict):
+            raise ConfigError(f"version {version} is stored unreadable: not a JSON object")
+        return kept
+
+    async def stored_version(self) -> int:
+        """The stored registry's version (0 when none is stored)."""
+        _, meta = await self._read()
+        return int(meta.get("version", "0"))
+
+    @store_op
     async def rollback(self, version: int, *, actor: str) -> PublishResult:
         """Publish the content of an earlier version as a new, higher version.
 
@@ -912,15 +1008,7 @@ class RegistryStore:
         `carried` lists them (Q41): a rollback never lifts an emergency block.
         """
         check_actor(actor)
-        raw = await self._client.hget(self.history_key, str(version))
-        if raw is None:
-            raise ConfigError(f"version {version} is not kept any more")
-        try:
-            kept = orjson.loads(raw)
-        except orjson.JSONDecodeError as exc:
-            raise ConfigError(f"version {version} is stored unreadable: {exc}") from exc
-        if not isinstance(kept, dict):
-            raise ConfigError(f"version {version} is stored unreadable: not a JSON object")
+        kept = await self.kept(version)
         note = f" (rollback to {version})"
         composed = actor[: _ACTOR_MAX - len(note)] + note  # a long actor went past the limit
         for attempt in range(self._edit_retries):

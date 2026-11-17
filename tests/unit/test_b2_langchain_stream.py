@@ -46,7 +46,7 @@ USAGE = {"inputTokens": 7, "outputTokens": 5, "cacheReadInputTokens": 0}
 class FakeQueue:
     """The adapters' queue methods; streams replay `events`, then raise `fail` if set."""
 
-    registry: Any = None
+    admin: Any = None
 
     def __init__(self, events: list[dict[str, Any]], fail: Exception | None = None) -> None:
         self.events = events
@@ -472,7 +472,7 @@ async def test_c3_no_fallback_without_model_alias(streaming: bool) -> None:
 
     looked_up: list[str] = []
     queue = FakeQueue(_bedrock_events())
-    queue.registry = _registry_spy(looked_up)
+    queue.admin = SimpleNamespace(registry=_registry_spy(looked_up))
     model = QueuedChatBedrockConverse(
         model_id=BEDROCK_ID, region_name="us-east-1", llmq=queue, queue_streaming=streaming
     )
@@ -495,7 +495,7 @@ async def test_c3_a_model_fallback_reports_the_model_that_answered(streaming: bo
     events = [e for e in _bedrock_events() if "llmq" not in e]
     queue = FakeQueue([*events, {"llmq": {"usage": USAGE, "meta": fallback}}])
     queue.meta = fallback
-    queue.registry = _registry_spy(looked_up)
+    queue.admin = SimpleNamespace(registry=_registry_spy(looked_up))
     model = QueuedChatBedrockConverse(
         model_id=BEDROCK_ID, region_name="us-east-1", llmq=queue, queue_streaming=streaming
     )

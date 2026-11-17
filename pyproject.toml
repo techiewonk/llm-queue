@@ -169,7 +169,7 @@ disallow_untyped_decorators = false
 # Test helpers are imported by bare name (pytest puts their folder on sys.path); the helper
 # files themselves are still type-checked as part of `files`.
 [[tool.mypy.overrides]]
-module = ["fakellm_testkit", "providers_fake", "clients_testkit", "engine_testkit", "gates_fleet", "failover", "gates", "test_store_unit", "test_audit_runtime"]
+module = ["fakellm_testkit", "providers_fake", "clients_testkit", "engine_testkit", "admin_testkit", "gates_fleet", "failover", "gates", "test_store_unit", "test_audit_runtime"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

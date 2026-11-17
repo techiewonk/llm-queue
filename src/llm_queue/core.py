@@ -3,9 +3,10 @@
 Built from the environment (`from_env`: stores, registry, clients) or from parts. `start()`
 publishes / loads the registry and runs the worker side in this process; `converse`, `chat` and
 `embed` send calls through the model's queue; `*_sync` run on the direct path: on the started
-queue's own loop, else on one private loop per process (E2); jobs, cancel, status, health and the
-registry are here too. One started queue per process is the norm (C2): a second one is warned
-about, a forked child or another event loop gets a clear error instead of hanging.
+queue's own loop, else on one private loop per process (E2); jobs, status, health and drain are
+here too, every admin operation under `llmq.admin`. One started queue per process is the norm
+(C2): a second one is warned about, a forked child or another event loop gets a clear error
+instead of hanging.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from collections.abc import (
 )
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import Any, NotRequired, TypedDict, cast, overload
+from typing import TYPE_CHECKING, Any, NotRequired, TypedDict, cast, overload
 
 import orjson
 
@@ -44,7 +45,7 @@ from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.jobs import JobFn, JobRunner, JobSettings
 from llm_queue.engine.metrics import Metrics, sink_for
 from llm_queue.engine.offload import ResultOffload
-from llm_queue.engine.purge import PurgeService, PurgeSettings
+from llm_queue.engine.purge import PurgeSettings
 from llm_queue.engine.queue import QueueFull
 from llm_queue.engine.runtime import Engine, EngineSettings
 from llm_queue.engine.settings import STORE_POOL_MARGIN, InfraSettings, Layers
@@ -53,6 +54,9 @@ from llm_queue.engine.store_guard import store_op
 from llm_queue.errors import ConfigError, LLMQueueError
 from llm_queue.registry.store import RegistryStore
 from llm_queue.tuning import Tuning
+
+if TYPE_CHECKING:
+    from llm_queue.engine.admin import AdminServices
 
 logger = get_logger(__name__)
 # Store connections of the private engine that serves sync calls when no queue is started
@@ -238,7 +242,10 @@ class LLMQueue:
         """
         self._engine = engine
         self.settings = settings
-        self._admin_token: Callable[[], str | None] = lambda: None  # `from_env` sets it
+        # LLMQ_ADMIN_TOKEN / LLMQ_ADMIN_READ_TOKEN, read per request; `from_env` sets them.
+        self._admin_token: Callable[[], str | None] = lambda: None
+        self._admin_read_token: Callable[[], str | None] = lambda: None
+        self._admin: AdminServices | None = None
         self._tuning = tuning or Tuning()
         self._jobs = JobRunner(
             engine.queues,
@@ -397,6 +404,7 @@ class LLMQueue:
             tuning=tuning,
         )
         queue._admin_token = lambda: layers.get("LLMQ_ADMIN_TOKEN")
+        queue._admin_read_token = lambda: layers.get("LLMQ_ADMIN_READ_TOKEN")
         return queue
 
     # ---------------------------------------------------------------- guards (C2)
@@ -941,24 +949,6 @@ class LLMQueue:
         except QueueFull as exc:
             raise CallFailed("queue_full", str(exc), retry_after_secs=5) from exc
 
-    @store_op
-    async def job_dead_letters(self, name: str, count: int = 10) -> list[dict[str, Any]]:
-        """Dead jobs of one name, oldest first: entry id, job id, failures, payload (Q15)."""
-        self._check()
-        return await self._jobs.dead_letters(name, count)
-
-    @store_op
-    async def redrive_jobs(self, name: str, count: int = 1000) -> int:
-        """Send up to `count` dead jobs of one name back to run again; returns how many."""
-        self._check()
-        return await self._jobs.redrive(name, count)
-
-    @store_op
-    async def cancel(self, request_id: str) -> None:
-        """Cancel a call (waiting or running)."""
-        self._check()
-        await self._engine.cancel(request_id)
-
     @overload
     async def status(self, model: None = None) -> StatusReport: ...
 
@@ -983,90 +973,73 @@ class LLMQueue:
         return cast("Health", await self._engine.health_check())
 
     @property
-    def registry(self) -> RegistryStore:
-        """The registry store (live edits, audit, rollback)."""
-        return self._engine.registry
+    def admin(self) -> AdminServices:
+        """Every admin operation (`llmq.admin.registry`, `.purge`, `.requests`, `.dlq` ...).
 
-    @property
-    def purge(self) -> PurgeService:
-        """Purges of removed models, deployments and tenants (dry runs, audited, auto purge).
-
-        `await llmq.purge.tenant("acme", actor=user)`; see docs/how-to/purge.md.
+        One method per operation, the same the CLI and the HTTP routes call; every write
+        takes `actor` and is a dry run unless `dry_run=False`. See docs/reference/admin-api.md.
         """
-        return self._engine.purge
+        if self._admin is None:
+            from llm_queue.engine.admin import AdminServices
+
+            self._admin = AdminServices.for_engine(
+                self._engine, settings=self.settings, process=self
+            )
+        return self._admin
 
     def http_router(
         self,
         *,
         dependencies: Sequence[Any] = (),
-        allow_writes: bool = False,
+        allow_writes: bool | None = None,
         actor: Callable[[Any], str] | None = None,
         metrics_route: bool = False,
         admin_token: str | Callable[[], str | None] | None = None,
+        admin_read_token: str | Callable[[], str | None] | None = None,
         admin_header: str | None = None,
         drain_routes: bool = False,
+        insecure_reads: bool = False,
     ) -> Any:
-        """A FastAPI router with status, requests, registry and health (extra `http`).
+        """A FastAPI router of every admin operation (extra `http`); see `engine/http.py`.
 
-        `drain_routes=True` adds `POST /drain` (`pause_receiving`), `POST /resume` and an open
-        `GET /drain` (status only). The POST routes are guarded like the write routes (a token
-        or `dependencies`, and the `X-LLMQ-Admin` header); they reach this process only: a
-        pod with several processes drains through `LLMQ_DRAIN_FILE`.
-
-        Writes need `actor(request) -> str`, the authenticated name recorded in the audit.
-        `metrics_route=True` adds `GET /metrics` (Prometheus exposition, open like the health
-        routes). `admin_token` (a value, or a callable read on every request so a rotated
-        secret needs no restart; default `LLMQ_ADMIN_TOKEN`) guards every route but the
-        probes and `/metrics` with header `admin_header` (default `LLMQ_ADMIN_HEADER`,
-        `X-LLMQ-Token`), compared in constant time. With no token configured anywhere, only
-        `dependencies` guard the routes, as before; a token that reads empty refuses all.
+        Reads need `admin_read_token` (default `LLMQ_ADMIN_READ_TOKEN`), `admin_token`
+        (default `LLMQ_ADMIN_TOKEN`; it may read too) or `dependencies`; with none of them the
+        router refuses to mount unless `insecure_reads=True`. Tokens travel in `admin_header`
+        (default `LLMQ_ADMIN_HEADER`, `X-LLMQ-Token`), are compared in constant time, and a
+        callable is read on every request (rotation without a restart). Writes (`allow_writes`,
+        default `LLMQ_ADMIN_WRITES_ENABLED`) need the admin token or `dependencies`, and an
+        actor: `actor(request)`, else the claimed `LLMQ_ADMIN_ACTOR_HEADER` (`X-LLMQ-Actor`)
+        audited as `token:<value>`. `drain_routes=True` adds `GET /drain`, `POST /drain` and
+        `POST /resume` for this process (a pod with several processes drains through
+        `LLMQ_DRAIN_FILE`); `metrics_route=True` adds an open `GET /metrics`.
         """
-        from llm_queue.engine.http import admin_token_dependency, status_router
+        from llm_queue.engine.http import status_router
 
-        settings = getattr(self, "settings", None)
-        header = admin_header or getattr(settings, "admin_header", None) or "X-LLMQ-Token"
-        guards = list(dependencies)
-        if admin_token is not None:
-            guards.append(admin_token_dependency(admin_token, header))
-        else:
-            reader = getattr(self, "_admin_token", None)  # LLMQ_ADMIN_TOKEN, read per request
-            if reader is not None and reader() is not None:
-                guards.append(admin_token_dependency(reader, header))
+        s = self.settings
+        env_token = getattr(self, "_admin_token", None)
+        env_read = getattr(self, "_admin_read_token", None)
         return status_router(
-            self._engine,
-            dependencies=guards,
-            allow_writes=allow_writes,
+            self.admin,
+            dependencies=dependencies,
+            allow_writes=bool(s.admin_writes_enabled if s else False)
+            if allow_writes is None
+            else allow_writes,
             actor=actor,
             metrics_route=metrics_route,
             drain_routes=drain_routes,
-            drain=self,
+            admin_token=admin_token if admin_token is not None else env_token,
+            read_token=admin_read_token if admin_read_token is not None else env_read,
+            token_header=admin_header or (s.admin_header if s else "X-LLMQ-Token"),
+            actor_header=s.admin_actor_header if s else "X-LLMQ-Actor",
+            insecure_reads=insecure_reads,
+            wait_cap_secs=float(s.http_purge_wait_secs) if s else 60.0,
+            dlq_bodies=bool(s.admin_dlq_bodies_enabled) if s else False,
+            index_cache_secs=float(s.admin_index_cache_secs) if s else 2.0,
         )
 
     def describe(self) -> dict[str, Any]:
         """This queue's settings for a log line: no password, salt, token or registry body."""
-        from urllib.parse import urlsplit
-
-        s = self.settings
-        out: dict[str, Any] = {"version": __version__, "worker_id": self._engine.worker_id}
-        if s is None:
-            return out
-        store = urlsplit(s.store_url)
-        doc = orjson.loads(s.registry_document()) if (s.registry or s.registry_file) else {}
-        out.update(
-            mode=s.mode,
-            environment=s.environment,
-            store=f"{store.scheme}://{store.hostname}:{store.port or 6379}",
-            separate_queue_store=s.queue_store_url is not None,
-            key_prefix=s.key_prefix,
-            queue_prefix=s.queue_prefix,
-            key_expiry=s.key_expiry,
-            store_max_connections=s.store_max_connections,
-            metrics_sink=s.metrics_sink,
-            default_tenant=s.default_tenant,
-            registry_version=doc.get("registry_version"),
-            models=sorted(doc.get("models") or {}),
-        )
-        return out
+        return self.admin.describe()
 
 
 async def _embed(

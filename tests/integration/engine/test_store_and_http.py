@@ -21,6 +21,7 @@ from redis.asyncio.connection import Connection
 from redis.exceptions import ConnectionError as StoreConnectionError
 from redis.exceptions import ReadOnlyError
 
+from llm_queue.engine.admin import AdminServices
 from llm_queue.engine.http import status_router
 from llm_queue.engine.runtime import Engine
 from llm_queue.engine.store_client import store_client
@@ -83,7 +84,7 @@ def test_writes_need_an_actor(make: Make) -> None:
     from llm_queue.errors import ConfigError
 
     with pytest.raises(ConfigError, match="actor"):
-        status_router(object(), allow_writes=True)  # type: ignore[arg-type]
+        status_router(object(), dependencies=[lambda: None], allow_writes=True)  # type: ignore[arg-type]
 
 
 async def test_pause_receiving_fails_readiness_and_takes_no_calls(make: Make) -> None:
@@ -110,7 +111,7 @@ async def http(make: Make) -> AsyncIterator[tuple[Engine, httpx.AsyncClient]]:
 
     app = FastAPI()
     router = status_router(
-        engine,
+        AdminServices.for_engine(engine),
         dependencies=[admin],
         allow_writes=True,
         actor=lambda request: request.headers.get("x-user", "nobody"),
@@ -136,7 +137,7 @@ async def test_http_router_routes_and_auth(http: tuple[Engine, httpx.AsyncClient
     ).status_code == 404
     reply = await engine.call("small", CHAT, request_id="r-http")
     found = await client.get(f"/q/requests/{reply.request_id}", headers=admin)
-    assert found.json()["state"] == "done"
+    assert found.json()["status"]["state"] == "done"
     assert (await client.get("/q/requests/nope", headers=admin)).status_code == 404
     reg = await client.get("/q/registry", headers=admin)
     assert reg.json()["registry"]["models"]["big"]["model_id"]
@@ -145,29 +146,32 @@ async def test_http_router_routes_and_auth(http: tuple[Engine, httpx.AsyncClient
 async def test_http_router_writes(http: tuple[Engine, httpx.AsyncClient]) -> None:
     engine, client = http
     admin = {"x-admin": "yes", "x-user": "ann", "x-llmq-admin": "1"}
-    params = {"actor": "mallory", "model": "big"}  # a client-supplied actor is ignored
-    assert (await client.post("/q/registry", json={"rpm": 5}, params=params)).status_code == 401
-    done = await client.post("/q/registry", json={"rpm": 5}, params=params, headers=admin)
+    # A client-supplied actor is refused: it is not a field of the operation.
+    edit = {"values": {"rpm": 5}, "model": "big", "dry_run": False}
+    assert (await client.post("/q/registry", json=edit)).status_code == 401
+    spoof = await client.post("/q/registry", json={**edit, "actor": "mallory"}, headers=admin)
+    assert spoof.status_code == 400
+    done = await client.post("/q/registry", json=edit, headers=admin)
     assert done.status_code == 200, done.text
     assert done.json()["diff"] == [{"path": "models.big.rpm", "before": None, "after": 5}]
-    refused = await client.post(
-        "/q/registry", json={"deployments.aws-a.confirmed": ["r1"]}, params=params, headers=admin
-    )
+    protected = {"values": {"deployments.aws-a.confirmed": ["r1"]}, "model": "big"}
+    refused = await client.post("/q/registry", json=protected, headers=admin)
     assert refused.status_code == 400  # protected field
-    blocked = await client.post("/q/registry/block", json={"region": "r2"}, headers=admin)
+    block = {"region": "r2", "dry_run": False}
+    blocked = await client.post("/q/blocks", json=block, headers=admin)
     assert blocked.json()["blocked_regions"] == ["r2"]
-    typo = await client.post("/q/registry/block", json={"region": "r9"}, headers=admin)
+    typo = await client.post("/q/blocks", json={"region": "r9"}, headers=admin)
     assert typo.status_code == 400  # a region no deployment uses would block nothing
-    assert (await client.post("/q/registry/block", json={}, headers=admin)).status_code == 400
+    assert (await client.post("/q/blocks", json={}, headers=admin)).status_code == 400
     log = await engine.registry.log(count=5)
     actors = {row.get("actor") for row in log}
     assert "http:ann" in actors
     assert "http:mallory" not in actors
     read_only = FastAPI()
-    read_only.include_router(status_router(engine))
+    read_only.include_router(status_router(AdminServices.for_engine(engine), insecure_reads=True))
     transport = httpx.ASGITransport(app=read_only)
     async with httpx.AsyncClient(transport=transport, base_url="http://app") as other:
-        assert (await other.post("/registry", json={"rpm": 6})).status_code == 403
+        assert (await other.post("/registry", json=edit)).status_code == 405
 
 
 async def test_finish_skips_on_store_error(make: Make, monkeypatch: pytest.MonkeyPatch) -> None:

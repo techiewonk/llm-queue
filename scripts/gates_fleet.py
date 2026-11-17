@@ -941,7 +941,7 @@ async def _client_main(spec: dict[str, Any]) -> None:
     logging.getLogger("llm_queue").setLevel(logging.INFO)  # the registry events are INFO
     llmq = LLMQueue.from_env(credentials=account_keys, tuning=drill_tuning())
     await llmq.start()
-    view = llmq.registry.current
+    view = llmq.admin.registry.current
     model = str(spec["model"])
     print(json.dumps({"ready": True, "worker_id": llmq._engine.worker_id,
                       "version": int(view.registry.version)}), flush=True)  # fmt: skip
@@ -984,7 +984,7 @@ async def _client_main(spec: dict[str, Any]) -> None:
         tasks.append(asyncio.create_task(one(i)))
         await asyncio.sleep(max(0.0, t0 + (i + 1) / rate - time.monotonic()))
     results = await asyncio.gather(*tasks)
-    view = llmq.registry.current
+    view = llmq.admin.registry.current
     report = {
         "results": results,
         "events": sorted(events.seen),

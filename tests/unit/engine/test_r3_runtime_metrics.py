@@ -294,7 +294,11 @@ def test_every_emitted_metric_is_in_the_table() -> None:
 
 async def test_http_live_names_the_reason_and_metrics_are_served() -> None:
     """R3OB-20 / R3OB-14: /health/live said only false; no /metrics route existed."""
-    from llm_queue.engine.http import Handlers
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from llm_queue.engine.admin import AdminServices
+    from llm_queue.engine.http import status_router
 
     registry = CollectorRegistry()
     sink = PrometheusSink(registry)
@@ -305,7 +309,10 @@ async def test_http_live_names_the_reason_and_metrics_are_served() -> None:
 
     engine._loop(boom(), "alerts")
     await asyncio.sleep(0.01)
-    handlers = Handlers(engine)
-    assert await handlers.live() == (503, {"live": False, "reason": "loop died: alerts"})
-    body, _ = handlers.metrics()
-    assert b'llmq_loop_died_total{loop="alerts"} 1.0' in body
+    app = FastAPI()
+    admin = AdminServices.for_engine(engine)
+    app.include_router(status_router(admin, insecure_reads=True, metrics_route=True))
+    client = TestClient(app)
+    live = client.get("/health/live")
+    assert (live.status_code, live.json()) == (503, {"live": False, "reason": "loop died: alerts"})
+    assert b'llmq_loop_died_total{loop="alerts"} 1.0' in client.get("/metrics").content

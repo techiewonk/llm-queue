@@ -1,53 +1,34 @@
-"""The `llm-queue` command line: registry, status, purge and operations.
+"""The `llm-queue` command line, generated from the operations table (0.2.0 R).
 
-Every command but `registry schema` reads `LLMQ_*` from the environment
-(`InfraSettings.from_env`) and talks to the stores directly; writes go through the registry
-store (validated, protected fields, audited with `--actor`, default the OS user). Output is
-JSON, one document per command. Commands that delete or move data (`dlq purge`,
-`dlq redrive`, `registry gc`, `purge`, `drain`, `cancel`) need `--yes`; `--dry-run` shows what they
-would do.
+One sub-command per operation of `engine/admin/ops.py` with a `cli` entry (`llm-queue models
+list`, `llm-queue requests cancel --id ID`, ...); each calls the same `llmq.admin` method as
+Python and HTTP, over the stores `LLMQ_*` names (`AdminServices.from_env`). Output is JSON, one
+document per command. Commands that change something report what they would do unless given
+`--yes` (a dry run by default, D3); they are audited with `--actor` (default the OS user).
+`registry schema` needs no settings and no store.
 
-Exit codes: 0 done, 1 an error (bad input, unknown or expired request, store outage), 3 a
-`drain --wait` that timed out with calls still waiting (FO-8).
+Exit codes: 0 done, 1 an error (bad input, unknown or expired item, store outage), 3 a
+`models drain --wait-secs` that ran out with calls still waiting (FO-8).
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import getpass
+import inspect
 import json
 import os
 import sys
-import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-import orjson
-import redis.asyncio
 from redis.exceptions import RedisError
 
-from llm_queue._logging import get_logger
-from llm_queue.engine._codec import text as _text
-from llm_queue.engine.http import redacted
-from llm_queue.engine.keys import Keys
-from llm_queue.engine.purge import PurgeService, PurgeSettings
-from llm_queue.engine.purge import _glob_escape as _glob_escape  # kept importable here (EN-30)
-from llm_queue.engine.queue import RETENTION_SECS, StreamQueues
-from llm_queue.engine.requests import RequestStore
-from llm_queue.engine.settings import InfraSettings
-from llm_queue.engine.status import StatusReader
-from llm_queue.engine.store_client import secret_store_client
+from llm_queue.engine.admin.ops import OPERATIONS, Op, Param
 from llm_queue.errors import ConfigError, LLMQueueError
-from llm_queue.registry._lua import AUDIT_MAX_ENTRIES
-from llm_queue.registry.json_schema import registry_schema
-from llm_queue.registry.store import RegistryStore
-from llm_queue.tuning import Tuning
 
-logger = get_logger(__name__)
-EXIT_DRAIN_TIMEOUT = 3  # `drain --wait` ran out of time with calls still waiting (FO-8)
-MAX_CANCEL_IDS = 1000  # one `cancel` command at most
+EXIT_DRAIN_TIMEOUT = 3  # `models drain --wait-secs` ran out with calls still waiting (FO-8)
 
 
 def default_actor() -> str:
@@ -74,398 +55,117 @@ def _value(text: str) -> Any:
         return text
 
 
-def _confirm(parser: argparse.ArgumentParser) -> None:
-    """`--yes` / `--dry-run` on a command that deletes or moves data."""
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument("--yes", action="store_true", help="do it (the command changes data)")
-    group.add_argument("--dry-run", action="store_true", dest="dry_run", help="only report")
+def _pairs(words: Sequence[str]) -> dict[str, Any]:
+    """`path=value` words as a mapping (values parsed as JSON when they parse)."""
+    values: dict[str, Any] = {}
+    for pair in words:
+        path, sep, text = pair.partition("=")
+        if not sep or not path:
+            raise ConfigError(f"expected path=value, got {pair!r}")
+        values[path] = _value(text)
+    return values
 
 
-def _confirmed(args: argparse.Namespace, what: str) -> bool:
-    """True to go ahead, False for a dry run; `ConfigError` when neither flag was given."""
-    if args.dry_run:
-        return False
-    if not args.yes:
-        raise ConfigError(f"{what}: pass --yes to do it, or --dry-run to see what it would do")
-    return True
+def _onoff(text: str) -> bool:
+    if text not in ("on", "off"):
+        raise argparse.ArgumentTypeError("on or off")
+    return text == "on"
+
+
+def _scalar(kind: type) -> Any:
+    return {int: int, float: float}.get(kind, str)
+
+
+def _add_param(parser: argparse.ArgumentParser, param: Param) -> None:
+    """One parameter as an argument (dest = the parameter's name)."""
+    flag = param.flag or "--" + param.name.replace("_", "-")
+    extra: dict[str, Any] = {"help": param.help or None}
+    if param.choices:
+        extra["choices"] = param.choices
+    if param.cli == "arg":
+        parser.add_argument(param.name, type=_scalar(param.kind), **extra)
+    elif param.cli == "pairs":
+        parser.add_argument(param.name, nargs="+", metavar="path=value", **extra)
+    elif param.cli == "onoff":
+        parser.add_argument(param.name, type=_onoff, metavar="on|off", **extra)
+    elif param.cli == "flag":
+        parser.add_argument(flag, dest=param.name, action="store_true", **extra)
+    elif param.cli == "noflag":
+        parser.add_argument(
+            "--no-" + param.name.replace("_", "-"), dest=param.name, action="store_false",
+            default=None, **extra,
+        )  # fmt: skip
+    elif param.cli == "opts":
+        parser.add_argument(flag, dest=param.name, action="append", default=None, **extra)
+    elif param.kind is list:  # a comma list
+        parser.add_argument(flag, dest=param.name, default=None, **extra)
+    else:
+        default = None if param.required else param.default
+        parser.add_argument(
+            flag, dest=param.name, type=_scalar(param.kind), default=default,
+            required=param.required, **extra,
+        )  # fmt: skip
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="llm-queue", description=__doc__.splitlines()[0])
     parser.add_argument("--actor", default=None, help="who makes a change (audit)")
     sub = parser.add_subparsers(dest="command", required=True)
-
-    reg = sub.add_parser("registry", help="read and change the registry").add_subparsers(
-        dest="action", required=True
-    )
-    get = reg.add_parser("get")
-    get.add_argument("--model")
-    setp = reg.add_parser("set", help="live edit: path=value ... (JSON values)")
-    setp.add_argument("--model")
-    setp.add_argument("pairs", nargs="+")
-    for name in ("enable", "disable"):
-        p = reg.add_parser(name)
-        p.add_argument("model")
-        p.add_argument("deployment")
-    reg.add_parser("diff", help="what is live but not in this config")
-    reg.add_parser("schema", help="print the registry document's JSON Schema (no store needed)")
-    log = reg.add_parser("log")
-    log.add_argument("--count", type=int, default=20)
-    log.add_argument("--path", default="")
-    pub = reg.add_parser("publish", help="publish LLMQ_REGISTRY, or roll back")
-    pub.add_argument("--from-version", type=int, dest="from_version")
-    gc = reg.add_parser("gc", help="purge models and deployments that no longer exist")
-    gc.add_argument("--force", action="store_true", help="also queues that still hold messages")
-    gc.add_argument(
-        "--no-wait", action="store_false", dest="wait", default=None,
-        help="do not wait for calls still running on removed deployments",
-    )  # fmt: skip
-    gc.add_argument("--wait-secs", type=float, dest="wait_secs")
-    _confirm(gc)
-
-    purge = sub.add_parser("purge", help="delete store state (audited)").add_subparsers(
-        dest="action", required=True
-    )
-    pm = purge.add_parser("model", help="a removed model: keys, queues, doorbells")
-    pm.add_argument("model")
-    pm.add_argument("--force", action="store_true", help="even if in the registry / queued")
-    pd = purge.add_parser("deployment", help="a removed deployment (account/name) of a model")
-    pd.add_argument("model")
-    pd.add_argument("deployment")
-    pd.add_argument("--force", action="store_true", help="even if still in the registry")
-    pd.add_argument("--no-wait", action="store_false", dest="wait", default=None)
-    pd.add_argument("--wait-secs", type=float, dest="wait_secs")
-    pt = purge.add_parser("tenant", help="a tenant's fairness state (and calls)")
-    pt.add_argument("tenant")
-    pt.add_argument("--remove", help="comma list of keys, queued, running")
-    pt.add_argument("--models", help="comma list of model aliases (default: all)")
-    for p in (pm, pd, pt):
-        _confirm(p)
-
-    settings = sub.add_parser("settings").add_subparsers(dest="action", required=True)
-    sget = settings.add_parser("get")
-    sget.add_argument("--model", required=True)
-    sget.add_argument("--deployment")
-
-    status = sub.add_parser("status")
-    status.add_argument("--model")
-    request = sub.add_parser("request")
-    request.add_argument("request_id")
-
-    for name in ("block", "unblock"):
-        p = sub.add_parser(name)
-        p.add_argument("--region")
-        p.add_argument("--account")
-
-    cancel = sub.add_parser("cancel", help="cancel calls by request id (audited)")
-    cancel.add_argument("request_ids", nargs="+")
-    _confirm(cancel)
-
-    drain = sub.add_parser(
-        "drain",
-        help="disable a model for new calls; serve waiting ones "
-        "(undo: registry set --model M enabled=true)",
-    )
-    drain.add_argument("model")
-    drain.add_argument("--wait", action="store_true")
-    drain.add_argument("--timeout", type=float, default=600.0)
-    _confirm(drain)
-
-    dlq = sub.add_parser("dlq").add_subparsers(dest="action", required=True)
-    for name in ("list", "show", "redrive", "purge"):
-        p = dlq.add_parser(name)
-        which = p.add_mutually_exclusive_group(required=True)
-        which.add_argument("--model")
-        which.add_argument("--job", help="a job name: its dead jobs (Q15)")
-        p.add_argument("--priority", action="store_true")
-        p.add_argument("--count", type=int, default=10)
-        if name == "show":
-            p.add_argument("--unsafe", action="store_true", help="print message bodies")
-        if name in ("redrive", "purge"):
-            _confirm(p)
-
-    queues = sub.add_parser("queues").add_subparsers(dest="action", required=True)
-    queues.add_parser("list")
+    groups: dict[str, Any] = {}
+    for op in OPERATIONS:
+        if op.cli is None:
+            continue
+        if len(op.cli) == 1:
+            leaf = sub.add_parser(op.cli[0], help=op.summary)
+        else:
+            group = groups.get(op.cli[0])
+            if group is None:
+                group = sub.add_parser(op.cli[0]).add_subparsers(dest="action", required=True)
+                groups[op.cli[0]] = group
+            leaf = group.add_parser(op.cli[1], help=op.summary)
+        leaf.set_defaults(admin_op=op)  # not `op`: `audit list --op` is a parameter
+        for param in op.params:
+            _add_param(leaf, param)
+        if op.dry_run_default is not None:
+            leaf.add_argument("--yes", action="store_true", help="do it (default: a dry run)")
     return parser
 
 
-class Cli:
-    """The command implementations over one environment's stores."""
+def arguments(op: Op, args: argparse.Namespace) -> dict[str, Any]:
+    """The method's keyword arguments from parsed arguments (actor and dry run excluded)."""
+    out: dict[str, Any] = {}
+    for param in op.params:
+        value = getattr(args, param.name, None)
+        if param.cli == "pairs":
+            value = _pairs(value or ())
+        elif param.kind is list and isinstance(value, str):
+            value = [v.strip() for v in value.split(",") if v.strip()]
+        if value is None and not param.required:
+            continue
+        out[param.name] = value
+    return out
 
-    def __init__(
-        self,
-        settings: InfraSettings,
-        client: redis.asyncio.Redis,
-        actor: str | None,
-        queue_client: redis.asyncio.Redis | None = None,
-    ) -> None:
-        """Wire the stores: queues live on `queue_client` when `LLMQ_QUEUE_STORE_URL` is set.
 
-        `actor` None means the OS user, looked up only when a command writes (FO-5).
-        """
-        self.settings = settings
-        self.client = client
-        self.queue_client = queue_client
-        self._actor = actor
-        self.keys = Keys(settings.key_prefix)
-        config = None
-        if settings.registry or settings.registry_file:
-            config = orjson.loads(settings.registry_document())
-        self.registry = RegistryStore(
-            client,
-            settings.key_prefix,
-            config=config,
-            live_edit=settings.registry_live_edit,
-            allowed_hosts=settings.base_url_allowed_hosts,
-            audit_retention_days=settings.audit_retention_days,
-        )
-        self.queues = StreamQueues(queue_client or client, self.keys)
-        self.purger = PurgeService(
-            client,
-            self.registry,
-            queue_client=queue_client,
-            queue_prefix=settings.queue_prefix,
-            settings=PurgeSettings.from_infra(settings),
-            salt=settings.id_hash_salt or "",
-            status_ttl_secs=settings.status_ttl_secs,
-        )
-
-    @property
-    def actor(self) -> str:
-        """Who makes a change, for the audit: `--actor`, else the OS user."""
-        if self._actor is None:
-            self._actor = default_actor()
-        return self._actor
-
-    async def loaded(self) -> Any:
-        """The stored registry; `ConfigError` when none is published."""
-        view = await self.registry.load()
-        if view is None:
-            raise ConfigError("no registry is published yet (llm-queue registry publish)")
-        return view
-
-    def _queue(self, view: Any, model: str, priority: bool) -> str:
-        alias = view.registry.alias_of(model)
-        name = self.settings.queue_prefix + view.queue_name(alias)
-        return f"{name}-priority" if priority else name
-
-    async def run(self, args: argparse.Namespace) -> Any:
-        """Run one parsed command; returns what to print."""
-        handler = getattr(self, f"_{args.command}")
-        return await handler(args)
-
-    async def _registry(self, args: argparse.Namespace) -> Any:
-        action = args.action
-        if action == "publish":
-            if args.from_version is not None:
-                result = await self.registry.rollback(args.from_version, actor=self.actor)
-            else:
-                if self.registry.config is None:
-                    raise ConfigError("LLMQ_REGISTRY (or LLMQ_REGISTRY_FILE) is not set")
-                result = await self.registry.publish(self.registry.config, actor=self.actor)
-            return {"action": result.action, "version": result.version}
-        if action == "log":
-            return await self.registry.log(args.count, args.path)
-        if action == "diff":
-            return redacted(await self.registry.diff_with_config())
-        view = await self.loaded()
-        if action == "get":
-            doc = dict(view.registry.raw)
-            if args.model:
-                doc = doc["models"][view.registry.alias_of(args.model)]
-            return redacted(doc)
-        if action == "set":
-            values = {}
-            for pair in args.pairs:
-                path, sep, text = pair.partition("=")
-                if not sep:
-                    raise ConfigError(f"expected path=value, got {pair!r}")
-                values[path] = _value(text)
-            changed = await self.registry.set(values, actor=self.actor, model=args.model)
-            return {"changes": self.registry.changes, "version": changed.registry.version}
-        if action in ("enable", "disable"):
-            await self.registry.set_enabled(
-                args.model, args.deployment, action == "enable", actor=self.actor
-            )
-            return {"model": args.model, "deployment": args.deployment, action: True}
-        if action == "gc":
-            go = _confirmed(args, "registry gc deletes keys")
-            report = await self.purger.removed(
-                actor=self.actor,
-                force=args.force,
-                wait=args.wait,
-                wait_secs=args.wait_secs,
-                dry_run=not go,
-            )
-            return report.as_dict()
-        raise ConfigError(f"unknown registry action {action}")
-
-    async def _purge(self, args: argparse.Namespace) -> Any:
-        """`purge model|deployment|tenant`: the service does it; this only maps the flags."""
-        go = _confirmed(args, f"purge {args.action} deletes keys")
-        actor = self.actor if go else "plan"
-        if args.action == "model":
-            report = await self.purger.model(
-                args.model, actor=actor, force=args.force, dry_run=not go
-            )
-        elif args.action == "deployment":
-            report = await self.purger.deployment(
-                args.model,
-                args.deployment,
-                actor=actor,
-                force=args.force,
-                wait=args.wait,
-                wait_secs=args.wait_secs,
-                dry_run=not go,
-            )
-        else:
-            remove = args.remove.split(",") if args.remove else None
-            models = args.models.split(",") if args.models else None
-            report = await self.purger.tenant(
-                args.tenant, actor=actor, remove=remove, models=models, dry_run=not go
-            )
-        return report.as_dict()
-
-    async def _settings(self, args: argparse.Namespace) -> Any:
-        view = await self.loaded()
-        table = view.table(args.model, args.deployment)
-        return {name: {"value": e.value, "level": e.level} for name, e in table.items()}
-
-    async def _status(self, args: argparse.Namespace) -> Any:
-        view = await self.loaded()
-        reader = StatusReader(self.client, self.keys, self.queues, self.settings.queue_prefix)
-        if args.model:
-            return await reader.model(view, view.registry.alias_of(args.model))
-        return await reader.report(view)
-
-    async def _request(self, args: argparse.Namespace) -> Any:
-        reader = StatusReader(self.client, self.keys, self.queues, self.settings.queue_prefix)
-        return await reader.request(args.request_id) or {"error": "unknown or expired request"}
-
-    async def _block(self, args: argparse.Namespace, on: bool = True) -> Any:
-        if not args.region and not args.account:
-            raise ConfigError("give --region or --account")
-        await self.loaded()
-        view = await self.registry.block(
-            region=args.region, account=args.account, on=on, actor=self.actor
-        )
-        routing = view.registry.routing
-        return {
-            "blocked_regions": list(routing.blocked_regions),
-            "blocked_accounts": list(routing.blocked_accounts),
-        }
-
-    async def _unblock(self, args: argparse.Namespace) -> Any:
-        return await self._block(args, on=False)
-
-    async def _cancel(self, args: argparse.Namespace) -> Any:
-        """Cancel calls for every caller of each id, audited like a registry edit (owner Q5).
-
-        Anyone may cancel any id; the audit stream (`registry log`) records who, and each
-        cancel is logged as `call_cancel` with `source=cli`.
-        """
-        ids = list(dict.fromkeys(args.request_ids))
-        if len(ids) > MAX_CANCEL_IDS or any(not rid or len(rid) > 256 for rid in ids):
-            raise ConfigError(f"give 1-{MAX_CANCEL_IDS} request ids of at most 256 characters")
-        if not _confirmed(args, "cancel stops these calls for every caller"):
-            return {"would_cancel": ids}
-        actor = self.actor
-        store = RequestStore(self.client, self.keys, status_ttl_secs=self.settings.status_ttl_secs)
-        cancelled = await store.cancel(
-            ids, ttl_secs=self.settings.status_ttl_secs, channel=self.keys.cancel_channel
-        )
-        for rid in ids:
-            logger.info("call_cancel", request_id=rid, source="cli", by=actor)
-        diff = [{"path": f"requests.{rid}", "before": None, "after": "cancelled"} for rid in ids]
-        await self.client.xadd(
-            self.registry.audit_key,
-            {
-                "actor": actor,
-                "op": "cancel",
-                "version": "",
-                "diff": orjson.dumps(diff),
-                "ts": f"{time.time():.6f}",  # wall time, like the Lua audit entries
-            },
-            maxlen=AUDIT_MAX_ENTRIES,
-            approximate=True,
-        )
-        return {"cancelled": cancelled, "requested": len(ids), "actor": actor}
-
-    async def _drain(self, args: argparse.Namespace) -> Any:
-        view = await self.loaded()
-        alias = view.registry.alias_of(args.model)
-        if not _confirmed(args, f"drain disables {alias} for new calls"):
-            depth = [await self.queues.depth(self._queue(view, alias, p)) for p in (True, False)]
-            return {"model": alias, "would_disable": True, "waiting": sum(d[0] for d in depth)}
-        await self.registry.set({"enabled": False}, model=alias, actor=self.actor)
-        if not args.wait:
-            return {"model": alias, "enabled": False}
-        loop = asyncio.get_running_loop()
-        until = loop.time() + args.timeout
-        while loop.time() < until:
-            depth = [await self.queues.depth(self._queue(view, alias, p)) for p in (True, False)]
-            if all(total == 0 for total, _, _ in depth):
-                return {"model": alias, "enabled": False, "drained": True}
-            await asyncio.sleep(1)
-        return {"model": alias, "enabled": False, "drained": False}
-
-    async def _dlq(self, args: argparse.Namespace) -> Any:
-        if args.job:
-            queue = f"{self.settings.queue_prefix}jobs-{args.job}"
-            view = None
-        else:
-            view = await self.loaded()
-            queue = self._queue(view, args.model, args.priority)
-        if args.action == "list":
-            letters = await self.queues.dead_letters(queue, args.count)
-            return [{k: v for k, v in letter.items() if k != "body"} for letter in letters]
-        if args.action == "show":
-            letters = await self.queues.dead_letters(queue, args.count)
-            if not args.unsafe:
-                return [{k: v for k, v in letter.items() if k != "body"} for letter in letters]
-            return [
-                {**letter, "body": letter["body"].decode(errors="replace")} for letter in letters
-            ]
-        if args.action == "redrive":
-            if not _confirmed(args, "dlq redrive sends dead letters back to the queue"):
-                _, _, dead = await self.queues.depth(queue)
-                return {"would_redrive": min(dead, args.count), "queue": queue}
-            # The model's own stream retention: the redrive trims like a send (EN-12), and the
-            # 4-day default cut a queue that keeps more. Jobs keep the queue default.
-            keep = (
-                RETENTION_SECS
-                if view is None
-                else int(view.value(view.registry.alias_of(args.model), "queue")["retention_secs"])
-            )
-            return {"redriven": await self.queues.redrive(queue, args.count, keep)}
-        if not _confirmed(args, "dlq purge deletes every dead letter"):
-            _, _, dead = await self.queues.depth(queue)
-            return {"would_purge": dead, "queue": queue}
-        await self.queues.purge_dead(queue)
-        return {"purged": queue}
-
-    async def _queues(self, args: argparse.Namespace) -> Any:
-        view = await self.loaded()
-        out = {}
-        for alias in view.registry.models:
-            for priority in (False, True):
-                name = self._queue(view, alias, priority)
-                total, held, dead = await self.queues.depth(name)
-                out[name] = {"messages": total, "held": held, "dead": dead}
-        # Job queues too: dead jobs had no CLI at all (R3JE-4, Q15).
-        key = f"{self.queues.keys.prefix}:jobs:{self.settings.queue_prefix}"
-        for job in sorted(_text(n) for n in await self.queues.client.smembers(key)):
-            name = f"{self.settings.queue_prefix}jobs-{job}"
-            total, held, dead = await self.queues.depth(name)
-            out[name] = {"messages": total, "held": held, "dead": dead}
-        return out
+async def run(admin: Any, op: Op, args: argparse.Namespace, actor: str | None) -> Any:
+    """Run one parsed command on `admin`; returns what to print."""
+    kwargs = arguments(op, args)
+    if op.writes:
+        kwargs["actor"] = actor or default_actor()
+        if op.dry_run_default is not None:
+            kwargs["dry_run"] = not args.yes
+    result = admin.method(op)(**kwargs)
+    if inspect.isawaitable(result):
+        result = await result
+    if result is None:
+        return {"error": "not found (unknown or expired)"}
+    return result
 
 
 def exit_code(result: Any) -> int:
     """The exit code of a printed result: 1 for an error document, 3 for a drain timeout.
 
-    `request ID` printed `{"error": ...}` and `drain --wait` printed `"drained": false`, both
-    with exit 0, so a script waiting on them carried on (FO-8).
+    `requests get ID` printed `{"error": ...}` and a drain that timed out printed `"drained":
+    false`, both with exit 0, so a script waiting on them carried on (FO-8).
     """
     if isinstance(result, Mapping):
         if "error" in result:
@@ -477,29 +177,17 @@ def exit_code(result: Any) -> int:
 
 async def amain(argv: Sequence[str], environ: Mapping[str, str] | None = None) -> Any:
     """Parse and run one command; returns its JSON-able result."""
+    from llm_queue.engine.admin import AdminServices
+
     args = _parser().parse_args(list(argv))
-    if args.command == "registry" and args.action == "schema":
-        return registry_schema()  # needs no settings and no store: editors and CI use it
+    op: Op = args.admin_op
+    if not op.store:  # `registry schema`: editors and CI run it with no settings or store
+        from llm_queue.registry.json_schema import registry_schema
+
+        return registry_schema()
     env = dict(os.environ if environ is None else environ)
-    settings = InfraSettings.from_env(env)
-    # The same clients as the queue's: the password variable wins over one in the URL and is
-    # read again on each new connection (rotation); timeouts and retries from `Tuning()`.
-    cap, options = settings.store_max_connections, Tuning().store
-    client = secret_store_client(settings.store_url, env.get, "LLMQ_STORE_PASSWORD", cap, options)
-    queue_client = (
-        secret_store_client(
-            settings.queue_store_url, env.get, "LLMQ_QUEUE_STORE_PASSWORD", cap, options
-        )
-        if settings.queue_store_url
-        else None
-    )
-    # An exit stack: when the first close raised, the queue client was never closed (EN-30).
-    async with contextlib.AsyncExitStack() as stack:
-        if queue_client is not None:
-            stack.push_async_callback(queue_client.aclose)
-        stack.push_async_callback(client.aclose)
-        cli = Cli(settings, client, args.actor, queue_client)
-        return await cli.run(args)
+    async with AdminServices.from_env(env) as admin:
+        return await run(admin, op, args, args.actor)
 
 
 def main(argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = None) -> int:

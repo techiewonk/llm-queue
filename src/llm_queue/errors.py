@@ -87,12 +87,15 @@ class StoreUnavailable(LLMQueueError, ConnectionError):  # named for what it is
     _retryable = True
 
 
-class PurgeRefused(LLMQueueError):
-    """A purge that would delete state still in use, or that needs a setting that is off.
+class AdminRefused(LLMQueueError):
+    """An admin operation that was refused; nothing was changed.
 
-    E.g. a model still in the registry without `force`, or a tenant purge of queued / running
-    calls while `LLMQ_TENANT_INDEX` is off. Nothing was deleted.
+    E.g. a purge of a model still in the registry without `force`, an operation whose
+    service is not available in this build or process, or one above a scan limit. Category
+    `bad_request` (HTTP 409, CLI exit 1): repeating it unchanged gets the same answer.
     """
+
+    _category = "bad_request"
 
 
 class MissingExtra(ConfigError, ImportError):  # named for what it is

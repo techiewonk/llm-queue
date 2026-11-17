@@ -19,32 +19,20 @@ def events(caplog: pytest.LogCaptureFixture, name: str) -> list[logging.LogRecor
     return [r for r in caplog.records if getattr(r, "llmq", {}).get("event") == name]
 
 
-class DownEngine:
-    """An engine whose store reads all fail as redis-py reports an outage."""
-
-    def __init__(self) -> None:
-        self.registry = self
-
-    async def status(self, _model: str | None) -> Any:
-        raise StoreConnectionError("refused")
-
-    async def request_status(self, _request_id: str) -> Any:
-        raise StoreConnectionError("refused")
-
-    async def diff_with_config(self) -> Any:
-        raise StoreConnectionError("refused")
-
-
 async def test_en10_http_reports_a_store_outage_as_503() -> None:
     """EN-10: redis-py's ConnectionError reached FastAPI as a 500 with a traceback."""
-    from llm_queue.engine.http import Handlers
+    from llm_queue.engine.admin import BY_ID
+    from llm_queue.engine.http import call
 
-    handlers = Handlers(DownEngine())  # type: ignore[arg-type]  # fake
-    for response in (
-        await handlers.status(),
-        await handlers.request("r"),
-        await handlers.registry(),
-    ):
+    class Down:
+        def method(self, _op: Any) -> Any:
+            async def run(**_: Any) -> Any:
+                raise StoreConnectionError("refused")
+
+            return run
+
+    for op in ("status.get", "requests.get", "registry.get"):
+        response = await call(Down(), BY_ID[op], {})  # type: ignore[arg-type]  # fake
         assert response == (503, {"error": "state store unavailable"})
 
 
@@ -67,7 +55,7 @@ async def test_en22_store_check_failures_leave_a_trace(caplog: pytest.LogCapture
 
 def test_en30_gc_scan_pattern_escapes_the_prefix() -> None:
     """EN-30: `[`, `*` or `?` in LLMQ_KEY_PREFIX widened `registry gc`'s SCAN match."""
-    from llm_queue.engine.cli import _glob_escape
+    from llm_queue.engine.purge import _glob_escape
 
     assert _glob_escape("app[1]*?") == "app\\[1\\]\\*\\?"
     assert _glob_escape("plain:prefix") == "plain:prefix"
@@ -85,6 +73,9 @@ async def test_en30_queue_client_closed_when_the_first_close_raises(
         def __init__(self, name: str) -> None:
             self.name = name
 
+        def register_script(self, _script: str) -> Any:
+            return None
+
         async def aclose(self) -> None:
             closed.append(self.name)
             if self.name == "state":
@@ -93,11 +84,11 @@ async def test_en30_queue_client_closed_when_the_first_close_raises(
     def make(url: str, *_: Any) -> Client:
         return Client("queue" if "6380" in url else "state")
 
-    async def run(_self: Any, _args: Any) -> Any:
+    async def run(*_: Any) -> Any:
         return {"ok": True}
 
-    monkeypatch.setattr(cli, "secret_store_client", make)
-    monkeypatch.setattr(cli.Cli, "run", run)
+    monkeypatch.setattr("llm_queue.engine.store_client.secret_store_client", make)
+    monkeypatch.setattr(cli, "run", run)
     env = {
         "LLMQ_STORE_URL": "redis://127.0.0.1:6379/0",
         "LLMQ_QUEUE_STORE_URL": "redis://127.0.0.1:6380/0",

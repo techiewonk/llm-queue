@@ -209,7 +209,9 @@ class Ctx:
         # During a store outage the edit fails with StoreUnavailable; an operator would retry.
         for _ in range(60):
             try:
-                await self.queues[0].registry.set(values, model=model, actor="scenario")
+                await self.queues[0].admin.registry.set(
+                    values, model=model, actor="scenario", dry_run=False
+                )
                 return
             except StoreUnavailable:
                 await asyncio.sleep(0.5)
@@ -653,14 +655,16 @@ async def kill_switch(ctx: Ctx) -> None:
 
 async def bad_edit(ctx: Ctx) -> None:
     """An invalid live edit is refused; the version in use does not change."""
-    version = ctx.queues[0].registry.current.registry.version
+    version = ctx.queues[0].admin.registry.current.registry.version
     try:
         await ctx.edit({"rpm": -5})
         ctx.checks["bad edit refused"] = False
     except RegistryError:  # the refusal; anything else is a bug and fails the run
         ctx.checks["bad edit refused"] = True
     await asyncio.sleep(1)
-    ctx.checks["version unchanged"] = ctx.queues[0].registry.current.registry.version == version
+    ctx.checks["version unchanged"] = (
+        ctx.queues[0].admin.registry.current.registry.version == version
+    )
     await _hold(ctx)
 
 
@@ -994,7 +998,7 @@ async def registry_versions(ctx: Ctx) -> None:
         "registry_older_ignored" in old_pod.report["events"]
     )
     await asyncio.sleep(2)  # LLMQ_CFG_RELOAD_SECS 1: the driver's callers reload
-    seen = int(ctx.queues[0].registry.current.registry.version)
+    seen = int(ctx.queues[0].admin.registry.current.registry.version)
     ctx.checks["the other callers moved to the newer version"] = seen == want
     ctx.notes.append(
         f"versions: new pod {new_pod.report['version']}, old pod {old_pod.ready['version']} at "

@@ -774,8 +774,8 @@ async def b33() -> bool:
                 for n, worker in enumerate(list(gate.fleet)):
                     await asyncio.sleep(6)
                     await gate.workers(1)
-                    edit = queues[0].registry.set(
-                        {"rpm": 1_000_000 - n - 1}, model="chat", actor="b33"
+                    edit = queues[0].admin.registry.set(
+                        {"rpm": 1_000_000 - n - 1}, model="chat", actor="b33", dry_run=False
                     )
                     await asyncio.gather(worker.stop(), edit)  # an edit mid-restart
                     edits += 1
@@ -785,13 +785,13 @@ async def b33() -> bool:
         async def sample() -> None:
             while not done.is_set():
                 for k, queue in enumerate(queues):
-                    seen[k].append(queue.registry.changes)
+                    seen[k].append(queue.admin.registry.changes)
                 await asyncio.sleep(0.2)
 
         load = paced(50, 40, lambda i: run.call(queues[i % 2], "chat", chat(), priority=i % 4 == 0))
         await asyncio.gather(load, restarts(), sample())
         await asyncio.sleep(2)  # LLMQ_CFG_RELOAD_SECS 1: every caller has the last edit
-        final = [q.registry.changes for q in queues]
+        final = [q.admin.registry.changes for q in queues]
     start = seen[0][0] if seen[0] else 0
     return verdict(
         "B33",

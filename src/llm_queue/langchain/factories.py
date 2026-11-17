@@ -68,7 +68,7 @@ def boot_registry(registry: Any = None) -> Registry:
         if settings is not None and (settings.registry or settings.registry_file):
             document = settings.registry_document()
         else:
-            return registry.registry.current.registry  # type: ignore[no-any-return]
+            return registry.admin.registry.current.registry  # type: ignore[no-any-return]
     if isinstance(document, str):
         document = orjson.loads(document)
     return load_registry(document).registry

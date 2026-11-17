@@ -360,7 +360,13 @@ class InfraSettings:
     debug_capture_from_config: bool = False
     worker_id: str = ""  # LLMQ_WORKER_ID: this process's id prefix (default pod:pid)
     default_tenant: str | None = None  # LLMQ_DEFAULT_TENANT: when a call names none
-    admin_header: str = "X-LLMQ-Token"  # LLMQ_ADMIN_HEADER: the admin token's header
+    admin_header: str = "X-LLMQ-Token"  # LLMQ_ADMIN_HEADER: the admin tokens' header
+    # Admin surfaces (0.2.0 R): write routes mounted by default, the claimed-actor header of a
+    # token guard (audited `token:<value>`), the `GET /` summary cache, dead-letter bodies.
+    admin_writes_enabled: bool = False  # LLMQ_ADMIN_WRITES_ENABLED
+    admin_actor_header: str = "X-LLMQ-Actor"  # LLMQ_ADMIN_ACTOR_HEADER
+    admin_index_cache_secs: float = 2.0  # LLMQ_ADMIN_INDEX_CACHE_SECS
+    admin_dlq_bodies_enabled: bool = False  # LLMQ_ADMIN_DLQ_BODIES_ENABLED
     # How keys expire (LLMQ_KEY_EXPIRY): `auto` picks native TTLs on a `noeviction` store and the
     # expiry index on a `volatile-*` one (owner decision K4, 0.1.0b3); engine/expiry.py.
     key_expiry: str = "auto"
@@ -484,8 +490,14 @@ class InfraSettings:
             problems.append("LLMQ_WORKER_ID must be letters, digits, `_`, `.`, `:` or `-`")
         default_tenant = str(get("DEFAULT_TENANT", "") or "").strip() or None
         admin_header = str(get("ADMIN_HEADER", "X-LLMQ-Token") or "").strip()
-        if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", admin_header):
-            problems.append("LLMQ_ADMIN_HEADER must be a header name (letters, digits, `-`)")
+        actor_header = str(get("ADMIN_ACTOR_HEADER", "X-LLMQ-Actor") or "").strip()
+        for name, header in (("ADMIN_HEADER", admin_header), ("ADMIN_ACTOR_HEADER", actor_header)):
+            if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", header):
+                problems.append(f"LLMQ_{name} must be a header name (letters, digits, `-`)")
+        switches = {
+            name: read_bool(layers, name, False, problems)
+            for name in ("ADMIN_WRITES_ENABLED", "ADMIN_DLQ_BODIES_ENABLED")
+        }
         hand_back = read_bool(layers, "DRAIN_HANDBACK_ENABLED", True, problems)
         drain_file = str(get("DRAIN_FILE", "") or "").strip()
         mode = str(get("MODE", "both"))
@@ -639,6 +651,10 @@ class InfraSettings:
             worker_id=worker_id,
             default_tenant=default_tenant,
             admin_header=admin_header,
+            admin_writes_enabled=switches["ADMIN_WRITES_ENABLED"],
+            admin_actor_header=actor_header,
+            admin_index_cache_secs=number("ADMIN_INDEX_CACHE_SECS", 2.0, zero=True, hi=60),
+            admin_dlq_bodies_enabled=switches["ADMIN_DLQ_BODIES_ENABLED"],
             key_expiry=key_expiry,
             ttl_sweep_batch=number("TTL_SWEEP_BATCH", 500, int, lo=1, hi=5_000),
             ttl_sweep_rounds=number("TTL_SWEEP_ROUNDS", 100, int, lo=1, hi=10_000),

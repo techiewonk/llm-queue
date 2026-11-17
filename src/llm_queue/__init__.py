@@ -35,11 +35,11 @@ from llm_queue.engine.hooks import (
 )
 from llm_queue.errors import (
     CATEGORIES,
+    AdminRefused,
     Category,
     ConfigError,
     LLMQueueError,
     MissingExtra,
-    PurgeRefused,
     StoreUnavailable,
     UnknownModel,
     error_category,
@@ -72,6 +72,7 @@ if TYPE_CHECKING:
         StatusReport,
         queue_ready,
     )
+    from llm_queue.engine.admin import AdminServices
     from llm_queue.engine.envelope import Meta, Reply
     from llm_queue.engine.jobs import JobContext, JobFn, JobSettings, current_job
     from llm_queue.engine.metrics import EmfSink, Metrics, NullSink, PrometheusSink
@@ -129,7 +130,9 @@ _LAZY = {
     "current_job": "llm_queue.engine.jobs",
     "Secrets": "llm_queue.engine.store_client",
     "PublishResult": "llm_queue.registry.store",
-    # Purges of removed models / deployments and tenants (0.1.0b3): `LLMQueue.purge`.
+    # Every admin operation (0.2.0 R): `llmq.admin`, or `AdminServices.from_env()` standalone.
+    "AdminServices": "llm_queue.engine.admin",
+    # Purges of removed models / deployments and tenants (0.1.0b3): `llmq.admin.purge`.
     "PurgeService": "llm_queue.engine.purge",
     "PurgeReport": "llm_queue.engine.purge",
     # Readiness and the per-request middleware (0.2.0 B3, B4).
@@ -141,6 +144,8 @@ __all__ = [
     "CATEGORIES",
     "KINDS",
     "KIND_CATEGORIES",
+    "AdminRefused",
+    "AdminServices",
     "BedrockOptions",
     "CallContext",
     "CallFailed",
@@ -170,7 +175,6 @@ __all__ = [
     "PrometheusSink",
     "Provider",
     "PublishResult",
-    "PurgeRefused",
     "PurgeReport",
     "PurgeService",
     "RateStatus",

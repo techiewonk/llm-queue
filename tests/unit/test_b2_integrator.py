@@ -13,12 +13,12 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from admin_testkit import client
 
 from llm_queue import CallFailed, OpenAIOptions, Tuning, WarmOptions
 from llm_queue.clients.timing import Timing, opened
 from llm_queue.core import LLMQueue
 from llm_queue.engine.admission import Admission
-from llm_queue.engine.http import Handlers
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.offload import S3Offload
 from llm_queue.engine.requests import RequestStore
@@ -103,7 +103,9 @@ async def test_liveness_route_reports_dead_loops() -> None:
     """
     for live, code in ((True, 200), (False, 503)):
         engine = SimpleNamespace(_live=lambda live=live: live, _not_live_reason=lambda: "why")
-        status, body = await Handlers(engine).live()  # type: ignore[arg-type]
+        admin = SimpleNamespace(context=SimpleNamespace(engine=engine))
+        reply = client(admin, insecure_reads=True).get("/health/live")
+        status, body = reply.status_code, reply.json()
         expected = {"live": True} if live else {"live": False, "reason": "why"}  # (R3OB-20)
         assert (status, body) == (code, expected)
 

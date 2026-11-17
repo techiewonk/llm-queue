@@ -58,7 +58,7 @@ def test_layers_mapping_reads_secrets_before_env() -> None:
 
 
 def test_from_env_worker_id_tenant_admin_and_describe(monkeypatch: pytest.MonkeyPatch) -> None:
-    secrets = {"LLMQ_ADMIN_TOKEN": "s3cret"}
+    secrets = {"LLMQ_ADMIN_TOKEN": "s3cret", "LLMQ_ADMIN_READ_TOKEN": "r3ad"}
     llmq = LLMQueue.from_env(
         {**DEV, "LLMQ_WORKER_ID": "pod-a:1", "LLMQ_DEFAULT_TENANT": "acme"},
         secrets=secrets.get,
@@ -70,12 +70,15 @@ def test_from_env_worker_id_tenant_admin_and_describe(monkeypatch: pytest.Monkey
     assert llmq._admin_token() == "s3cret"
     secrets["LLMQ_ADMIN_TOKEN"] = "rotated"  # read on every request
     assert llmq._admin_token() == "rotated"
+    assert llmq._admin_read_token() == "r3ad"
     described = llmq.describe()
     text = repr(described)
     assert described["store"] == "redis://localhost:6379"
     assert described["default_tenant"] == "acme"
     assert "rotated" not in text
     assert "s3cret" not in text
+    assert "r3ad" not in text
+    assert described == llmq.admin.describe()
 
 
 def test_admin_token_guards_routes_but_not_probes() -> None:
@@ -93,6 +96,27 @@ def test_admin_token_guards_routes_but_not_probes() -> None:
     assert client.get("/health/live").status_code != 403  # probes stay open
     token["value"] = ""  # an empty token refuses everything (fail closed)
     assert client.get("/status", headers={"X-LLMQ-Token": ""}).status_code == 403
+
+
+def test_env_tokens_and_settings_reach_the_router() -> None:
+    """Q4: the read token reads, the admin token writes; LLMQ_ADMIN_* settings are defaults."""
+    pytest.importorskip("fastapi")
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    secrets = {"LLMQ_ADMIN_TOKEN": "w", "LLMQ_ADMIN_READ_TOKEN": "r"}
+    env = {**DEV, "LLMQ_ADMIN_WRITES_ENABLED": "true", "LLMQ_ADMIN_HEADER": "X-Admin-Token"}
+    llmq = LLMQueue.from_env(env, secrets=secrets.get)
+    app = FastAPI()
+    app.include_router(llmq.http_router())
+    client = TestClient(app)
+    # Not loaded: the read passes the guard and answers 503, not 403.
+    assert client.get("/registry", headers={"X-Admin-Token": "r"}).status_code == 503
+    assert client.get("/registry", headers={"X-LLMQ-Token": "r"}).status_code == 403
+    write = client.post("/blocks", json={"region": "r1"}, headers={"X-Admin-Token": "r"})
+    assert write.status_code == 403  # the read token cannot write
+    write = client.post("/blocks", json={"region": "r1"}, headers={"X-Admin-Token": "w"})
+    assert write.status_code == 503  # writes are mounted (LLMQ_ADMIN_WRITES_ENABLED)
 
 
 async def test_a_context_reset_in_another_context_is_tolerated() -> None:

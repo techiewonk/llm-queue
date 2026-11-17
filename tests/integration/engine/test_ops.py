@@ -18,11 +18,13 @@ import redis.asyncio
 from engine_testkit import CHAT, Make, away_from_minute_end
 
 from llm_queue.engine import cli
+from llm_queue.engine.admin import AdminServices
 from llm_queue.engine.errors import CallFailed
-from llm_queue.engine.http import Handlers
+from llm_queue.engine.http import status_router
 from llm_queue.engine.metrics import EmfSink
 from llm_queue.engine.settings import InfraSettings
-from llm_queue.errors import ConfigError
+from llm_queue.errors import AdminRefused, ConfigError, UnknownModel
+from llm_queue.registry.store import LiveEditRefused
 
 pytestmark = pytest.mark.integration
 
@@ -120,24 +122,123 @@ async def test_model_drain(make: Make) -> None:
     assert json.loads(rows)["deployments"][0]["enabled"] is True  # waiting calls still served
 
 
-async def test_http_handlers(make: Make) -> None:
+async def test_admin_services_on_a_live_engine(make: Make) -> None:
+    """Every non-request operation through `llmq.admin`, against the real stores."""
     engine, _ = await make()
-    reader = Handlers(engine)
-    assert (await reader.ready())[0] == 200
-    assert (await reader.status("nope"))[0] == 404
-    assert (await reader.request("nope"))[0] == 404
-    code, body = await reader.registry()
-    assert code == 200
-    assert body["registry"]["models"]["big"]["model_id"]
-    assert (await reader.set({"rpm": 5}, actor="ann", model="big"))[0] == 403
-    writer = Handlers(engine, allow_writes=True)
-    code, body = await writer.set({"rpm": 5}, actor="ann", model="big")
-    assert code == 200
-    assert body["diff"] == [{"path": "models.big.rpm", "before": None, "after": 5}]
-    code, body = await writer.set({"deployments.aws-a.confirmed": ["r1"]}, actor="ann", model="big")
-    assert code == 400  # protected field
-    code, body = await writer.block(actor="ann", region="r2")
-    assert body["blocked_regions"] == ["r2"]
+    admin = AdminServices.for_engine(engine)
+    assert (await admin.status.get("big"))["model"] == "big"
+    with pytest.raises(UnknownModel):
+        await admin.status.get("nope")
+    got = await admin.registry.get()
+    assert got["registry"]["models"]["big"]["model_id"]
+    assert (await admin.registry.versions())["current"] >= 1
+    assert "properties" in admin.registry.schema()
+    plan = await admin.registry.set({"rpm": 5}, model="big", actor="ann")
+    assert plan["dry_run"] is True
+    assert plan["diff"] == [{"path": "models.big.rpm", "before": None, "after": 5}]
+    assert engine.registry.current.value("big", "rpm") != 5  # a dry run writes nothing
+    done = await admin.registry.set({"rpm": 5}, model="big", actor="ann", dry_run=False)
+    assert done["diff"] == plan["diff"]
+    assert engine.registry.current.value("big", "rpm") == 5
+    with pytest.raises(LiveEditRefused):  # protected: refused by the dry run too
+        await admin.registry.set({"deployments.aws-a.confirmed": ["r1"]}, model="big", actor="a")
+    assert (await admin.registry.publish(actor="ann"))["action"] in ("kept", "not_bumped")
+    models = {m["model"]: m for m in (await admin.models.list())["models"]}
+    assert models["big"]["deployments"] >= 1
+    assert (await admin.models.get("big"))["settings"]["rpm"]["value"] == 5
+    off = await admin.models.disable("small", actor="ann", dry_run=False)
+    assert off["diff"] == [{"path": "models.small.enabled", "before": None, "after": False}]
+    drained = await admin.models.drain("small", wait_secs=2, actor="ann", dry_run=False)
+    assert (drained["enabled"], drained["drained"]) == (False, True)
+    await admin.models.enable("small", actor="ann", dry_run=False)
+    deps = (await admin.deployments.list("big"))["deployments"]
+    assert deps[0]["usable"] is True
+    one = await admin.deployments.get("big", deps[0]["name"])
+    assert one is not None
+    assert "settings" in one
+    assert await admin.deployments.get("big", "nope/none") is None
+    disabled = await admin.deployments.disable("big", deps[0]["name"], actor="ann", dry_run=False)
+    assert disabled["enabled"] is False
+    await admin.deployments.enable("big", deps[0]["name"], actor="ann", dry_run=False)
+    blocked = await admin.blocks.add(region="r2", actor="ann", dry_run=False)
+    assert blocked["blocked_regions"] == ["r2"]
+    listed = await admin.blocks.list()
+    assert listed["regions"][0]["name"] == "r2"
+    assert listed["regions"][0]["by"] == "ann"
+    assert (await admin.blocks.remove(region="r2", actor="ann", dry_run=False))[
+        "blocked_regions"
+    ] == []
+    assert (await admin.blocks.kill_switch(True, actor="ann"))["dry_run"] is True
+    assert engine.registry.current.registry.routing.kill_switch is False
+    entries = (await admin.audit.list(50, op="edit"))["entries"]
+    assert entries
+    assert all(e["op"] == "edit" for e in entries)
+    queues = (await admin.queues.list())["queues"]
+    assert any(q["queue"].endswith("llm-big-priority") for q in queues)
+    assert (await admin.dlq.list(model="big"))["letters"] == []
+    assert await admin.dlq.show("1-0", model="big") is None
+    assert (await admin.dlq.redrive(model="big", actor="ann"))["moved"] == 0
+    assert (await admin.dlq.purge(model="big", actor="ann", dry_run=False))["deleted"] == 0
+    assert (await admin.jobs.list())["jobs"] == []
+    assert (await admin.purge.scheduled())["scheduled"] == []
+    assert (await admin.purge.unschedule("ghost", actor="ann"))["cancelled"] is False
+    assert len(admin.tenants.hash("acme")["tenant_hash"]) == 16
+    summary = await admin.ops.index()
+    assert summary["registry"]["version"] >= 1
+    assert {m["model"] for m in summary["models"]} >= {"big", "small"}
+    assert summary["process"]["live"] is True
+    with pytest.raises(AdminRefused, match="process-local"):
+        admin.drain.get()  # no LLMQueue around this engine
+    with pytest.raises(AdminRefused, match="requests service not available"):
+        await admin.requests.list("big")
+
+
+async def test_admin_cancel_and_request_by_id(make: Make) -> None:
+    """`requests.get` / `requests.cancel` by id work without the request index."""
+    engine, _ = await make()
+    admin = AdminServices.for_engine(engine)
+    reply = await engine.call("big", CHAT)
+    found = await admin.requests.get(reply.request_id)
+    assert found is not None
+    assert found["final"] is True
+    assert await admin.requests.get("nope") is None
+    report = await admin.requests.cancel(request_ids=[reply.request_id], actor="ann")
+    assert (report["matched"], report["skipped"]) == (0, {"final": 1})
+
+
+async def test_admin_http_routes_on_a_live_engine(make: Make) -> None:
+    import httpx
+    from fastapi import FastAPI
+
+    engine, _ = await make()
+    app = FastAPI()
+    admin = AdminServices.for_engine(engine)
+    app.include_router(status_router(admin, admin_token="w", allow_writes=True))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://app") as http:
+        token = {"X-LLMQ-Token": "w", "X-LLMQ-Actor": "bob"}
+        assert (await http.get("/health/ready")).status_code == 200
+        nope = await http.get("/status", params={"model": "nope"}, headers=token)
+        assert nope.status_code == 404
+        assert (await http.get("/requests/nope", headers=token)).status_code == 404
+        body = (await http.get("/registry", headers=token)).json()
+        assert body["registry"]["models"]["big"]["model_id"]
+        edit = {"values": {"rpm": 5}, "model": "big"}
+        assert (await http.post("/registry", json=edit, headers=token)).json()["dry_run"] is True
+        done = await http.post("/registry", json={**edit, "dry_run": False}, headers=token)
+        assert done.json()["diff"] == [{"path": "models.big.rpm", "before": None, "after": 5}]
+        protected = {"values": {"deployments.aws-a.confirmed": ["r1"]}, "model": "big"}
+        assert (await http.post("/registry", json=protected, headers=token)).status_code == 400
+        block = {"region": "r2", "dry_run": False}
+        blocked = await http.post("/blocks", json=block, headers=token)
+        assert blocked.json()["blocked_regions"] == ["r2"]
+        entry = (await admin.audit.list(1))["entries"][0]
+        assert entry["actor"] == "token:bob"
+        index = (await http.get("/", headers=token)).json()
+    assert index["writes"] is True
+    assert {"method": "POST", "path": "/blocks"}.items() <= next(
+        r for r in index["routes"] if r["op"] == "blocks.add"
+    ).items()
 
 
 async def test_command_line(make: Make, store: redis.asyncio.Redis, prefix: str) -> None:
@@ -153,21 +254,26 @@ async def test_command_line(make: Make, store: redis.asyncio.Redis, prefix: str)
     async def run(*argv: str) -> Any:
         return await cli.amain(["--actor", "tester", *argv], env)
 
-    assert (await run("registry", "get", "--model", "big"))["model_id"]
-    table = await run("settings", "get", "--model", "big", "--deployment", "aws-a/r1")
-    assert table["timeout_secs"] == {"value": 10, "level": "defaults"}
-    assert (await run("registry", "set", "--model", "big", "rpm=7"))["changes"] >= 1
-    log = await run("registry", "log", "--count", "1")
-    assert log[0]["actor"] == "tester"
-    assert (await run("block", "--region", "r3"))["blocked_regions"] == ["r3"]
-    assert (await run("unblock", "--region", "r3"))["blocked_regions"] == []
-    assert "models.big.rpm" in [c["path"] for c in await run("registry", "diff")]
+    assert (await run("registry", "get", "--model", "big"))["registry"]["model_id"]
+    dep = await run("deployments", "get", "big", "aws-a/r1")
+    assert dep["settings"]["timeout_secs"] == {"value": 10, "level": "defaults"}
+    plan = await run("registry", "set", "--model", "big", "rpm=7")
+    assert plan["dry_run"] is True
+    assert (await run("registry", "set", "--model", "big", "rpm=7", "--yes"))["dry_run"] is False
+    log = await run("audit", "list", "--count", "1")
+    assert log["entries"][0]["actor"] == "tester"
+    assert (await run("blocks", "add", "--region", "r3", "--yes"))["blocked_regions"] == ["r3"]
+    assert (await run("blocks", "remove", "--region", "r3", "--yes"))["blocked_regions"] == []
+    assert "models.big.rpm" in [c["path"] for c in (await run("registry", "diff"))["live_edits"]]
     assert (await run("status", "--model", "big"))["model"] == "big"
-    assert await run("dlq", "list", "--model", "big") == []
-    queues = await run("queues", "list")
-    assert any(name.endswith("llm-big-priority") for name in queues)
-    drained = await run("drain", "small", "--wait", "--timeout", "2", "--yes")
-    assert drained == {"model": "small", "enabled": False, "drained": True}
+    assert (await run("dlq", "list", "--model", "big"))["letters"] == []
+    queues = (await run("queues", "list"))["queues"]
+    assert any(q["queue"].endswith("llm-big-priority") for q in queues)
+    assert (await run("describe"))["key_prefix"] == prefix
+    assert (await run("ops"))["registry"]["version"] >= 1
+    drained = await run("models", "drain", "small", "--wait-secs", "2", "--yes")
+    assert (drained["enabled"], drained["drained"]) == (False, True)
+    assert cli.exit_code(await run("requests", "get", "nope")) == 1
 
 
 def test_environment_settings() -> None:

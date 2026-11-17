@@ -1,9 +1,10 @@
 """Purge: delete the store state of a removed model or deployment, or of one tenant (0.1.0b3).
 
-One service, `PurgeService`, holds the logic; `LLMQueue.purge`, the CLI and the HTTP routes
-call it (owner K5). Every purge but a dry run is audited in the registry audit stream, logged
-`llmq_purge` and counted in `llmq_purged_keys_total{kind}`. Auto purge (owner K1) schedules a
-model or deployment the registry dropped and purges it after a grace, unless it came back.
+One service, `PurgeService`, holds the logic; `llmq.admin.purge`, the CLI and the HTTP routes
+call it (owner K5). Every method is a dry run unless given `dry_run=False` (0.2.0 D3). Every purge
+but a dry run is audited in the registry audit stream, logged `llmq_purge` and counted in
+`llmq_purged_keys_total{kind}`. Auto purge (owner K1) schedules a model or deployment the
+registry dropped and purges it after a grace, unless it came back.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from llm_queue.engine.queue import StreamQueues
 from llm_queue.engine.requests import RequestStore
 from llm_queue.engine.settings import TENANT_PURGE_PARTS, InfraSettings
 from llm_queue.engine.store_guard import store_op
-from llm_queue.errors import ConfigError, PurgeRefused
+from llm_queue.errors import AdminRefused, ConfigError
 from llm_queue.registry._lua import AUDIT_MAX_ENTRIES
 
 if TYPE_CHECKING:
@@ -262,16 +263,16 @@ class PurgeService:
 
     @store_op
     async def model(
-        self, alias: str, *, actor: str, force: bool = False, dry_run: bool = False
+        self, alias: str, *, actor: str, force: bool = False, dry_run: bool = True
     ) -> PurgeReport:
         """Delete every key of model `alias`, its queues and doorbells.
 
-        Queues go only when empty unless `force`. `PurgeRefused` while the registry still has
+        Queues go only when empty unless `force`. `AdminRefused` while the registry still has
         the model, unless `force`.
         """
         view = await self._view()
         if alias in view.registry.models and not force:
-            raise PurgeRefused(
+            raise AdminRefused(
                 f"model {alias!r} is still in the registry: remove it first, or pass force=True"
             )
         report = await self._model(view, alias, force=force, dry_run=dry_run, actor=actor)
@@ -288,17 +289,17 @@ class PurgeService:
         force: bool = False,
         wait: bool | None = None,
         wait_secs: float | None = None,
-        dry_run: bool = False,
+        dry_run: bool = True,
     ) -> PurgeReport:
         """Delete the state of deployment `deployment` (`account/name`) of model `alias`.
 
         `wait` (default `LLMQ_PURGE_WAIT`) waits up to `wait_secs` (`LLMQ_PURGE_WAIT_SECS`)
         for its running calls to end; still running then, nothing is deleted and the report
-        says why. `PurgeRefused` while the registry still has it, unless `force`.
+        says why. `AdminRefused` while the registry still has it, unless `force`.
         """
         view = await self._view()
         if deployment in self._deployments(view, alias) and not force:
-            raise PurgeRefused(
+            raise AdminRefused(
                 f"deployment {alias}/{deployment} is still in the registry: remove it first, "
                 "or pass force=True"
             )
@@ -321,13 +322,13 @@ class PurgeService:
         actor: str,
         remove: Iterable[str] | None = None,
         models: Sequence[str] | None = None,
-        dry_run: bool = False,
+        dry_run: bool = True,
     ) -> PurgeReport:
         """Delete a tenant's fairness state in every model (or `models`); maybe cancel its calls.
 
         `tenant_id` is the raw id (hashed as admission hashes it). `remove` (default
         `LLMQ_TENANT_PURGE_DEFAULT`): `keys`, `queued` (cancel calls still waiting), `running`
-        (cancel every call); the last two need `LLMQ_TENANT_INDEX`, else `PurgeRefused`.
+        (cancel every call); the last two need `LLMQ_TENANT_INDEX`, else `AdminRefused`.
         """
         parts = self.settings.tenant_default if remove is None else frozenset(remove)
         unknown = parts - set(TENANT_PURGE_PARTS)
@@ -336,7 +337,7 @@ class PurgeService:
                 f"remove must be a non-empty subset of {', '.join(TENANT_PURGE_PARTS)}"
             )
         if parts & {"queued", "running"} and not self.settings.tenant_index:
-            raise PurgeRefused(
+            raise AdminRefused(
                 "removing a tenant's queued or running calls needs the per-tenant request "
                 "index: set LLMQ_TENANT_INDEX=true (it indexes calls made from then on)"
             )
@@ -354,7 +355,7 @@ class PurgeService:
         force: bool = False,
         wait: bool | None = None,
         wait_secs: float | None = None,
-        dry_run: bool = False,
+        dry_run: bool = True,
     ) -> PurgeReport:
         """Purge every model and deployment the store has state of and the registry has not.
 
@@ -395,30 +396,6 @@ class PurgeService:
         )
         await self._done(report, parts=[r.target for r in reports])
         return report
-
-    async def plan_model(self, alias: str, *, force: bool = False) -> PurgeReport:
-        """`model(...)` as a dry run: what it would delete."""
-        return await self.model(alias, actor="plan", force=force, dry_run=True)
-
-    async def plan_deployment(
-        self, alias: str, deployment: str, *, force: bool = False
-    ) -> PurgeReport:
-        """`deployment(...)` as a dry run (never waits)."""
-        return await self.deployment(
-            alias, deployment, actor="plan", force=force, wait=False, dry_run=True
-        )
-
-    async def plan_tenant(
-        self,
-        tenant_id: str,
-        *,
-        remove: Iterable[str] | None = None,
-        models: Sequence[str] | None = None,
-    ) -> PurgeReport:
-        """`tenant(...)` as a dry run."""
-        return await self.tenant(
-            tenant_id, actor="plan", remove=remove, models=models, dry_run=True
-        )
 
     # ---------------------------------------------------------------- public: auto purge
 

@@ -200,7 +200,7 @@ def test_drain_routes_are_off_by_default() -> None:
 def test_drain_routes_need_a_guard() -> None:
     """An open POST /drain would let anyone take a pod out of service."""
     pytest.importorskip("fastapi")
-    with pytest.raises(ConfigError, match="drain_routes"):
+    with pytest.raises(ConfigError, match="dependencies"):
         LLMQueue.from_env(DEV).http_router(drain_routes=True)
 
 
@@ -215,18 +215,17 @@ def test_drain_routes_are_post_guarded_and_get_is_status_only() -> None:
     client = TestClient(app)
     token = {"X-LLMQ-Token": "t"}
     both = {**token, "X-LLMQ-Admin": "1"}
-    status = client.get("/drain")  # open, like the probes, and changes nothing
+    assert client.get("/drain").status_code == 403  # a read: the token
+    status = client.get("/drain", headers=token)  # changes nothing
     assert status.status_code == 200
     assert status.json() == {"draining": False, "since": None, "held": 0, "running": 0}
     assert client.post("/drain").status_code == 403  # no token
-    assert client.post("/drain", headers=token).status_code == 403  # no X-LLMQ-Admin header
     assert llmq.draining is False
     paused = client.post("/drain", headers=both)
     assert paused.status_code == 200
     assert paused.json()["draining"] is True
     assert llmq.draining is True
-    assert client.get("/drain").json()["since"] == llmq.draining_since
-    assert client.post("/resume", headers=token).status_code == 403
+    assert client.get("/drain", headers=token).json()["since"] == llmq.draining_since
     resumed = client.post("/resume", headers=both)
     assert resumed.status_code == 200
     assert resumed.json()["draining"] is False

@@ -117,7 +117,7 @@ def _alias_values(values: Any) -> Any:
         if queue is None:
             with contextlib.suppress(LLMQueueError):
                 queue = get_default_queue()
-        registry = getattr(queue, "registry", None)
+        registry = getattr(getattr(queue, "admin", None), "registry", None)
         if registry is None:
             raise ValueError(
                 f"model_alias={alias!r} needs model_id='<Bedrock model id>', llmq=<LLMQueue>, "
@@ -248,7 +248,7 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
         """
         if fallback != "model" or not served:
             return self.model_id
-        registry = getattr(self._queue(), "registry", None)
+        registry = getattr(getattr(self._queue(), "admin", None), "registry", None)
         return registry.current.model(served).model_id if registry else served
 
     def _generate(
