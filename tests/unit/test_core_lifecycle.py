@@ -31,6 +31,7 @@ class _Engine:
         self.registry = SimpleNamespace(current=None)
         self.queues = None
         self.metrics = None
+        self.hash_id = str  # the job runner hashes a job's ids with it
         self.settings = SimpleNamespace(
             queue_prefix="", drain_secs=0, queue_wait_replicas=0, queue_wait_ms=100
         )

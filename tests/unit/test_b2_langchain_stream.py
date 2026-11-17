@@ -506,3 +506,21 @@ async def test_c3_a_model_fallback_reports_the_model_that_answered(streaming: bo
         result = await model._agenerate([_human("hi")])  # the ChatResult `_parse` built
         assert (result.llm_output or {})["model_name"] == "other.model-v1:0"
     assert looked_up == ["other"]
+
+
+# `_stream.py` reads LangChain's private `_StreamingCallbackHandler` (review B-24): checked on
+# these `langchain-core` lines only. A new line fails here until the import is checked on it.
+TESTED_LANGCHAIN_CORE = ("0.3", "1.8")
+
+
+def test_the_private_streaming_handler_import_is_pinned_to_tested_versions() -> None:
+    from importlib.metadata import version
+
+    from langchain_core.tracers._streaming import _StreamingCallbackHandler
+
+    line = ".".join(version("langchain-core").split(".")[:2])
+    assert line in TESTED_LANGCHAIN_CORE, (
+        f"langchain-core {line} is untested: check `_StreamingCallbackHandler` in "
+        "llm_queue/langchain/_stream.py on it, then add the line here"
+    )
+    assert isinstance(_StreamingCallbackHandler, type)

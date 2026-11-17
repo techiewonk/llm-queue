@@ -267,6 +267,7 @@ A field left out takes the default below (the *merged* objects merge it across l
 | `fairness.tpm` | none | 1 or more (whole) | `quota`: each tenant's TPM cap |
 | `fairness.quotas` | none | tenant id -> `{rpm, tpm}` | `quota`: caps of one tenant |
 | `fairness.active_secs` | 60 | 1 to 86400 | A tenant counts as active this long after its last call |
+| `fairness.tenant_keys` | `names` | `names`, `hashed` | Written `hashed` by every registry write path once the names in `weights` / `quotas` are replaced by their keyed hashes; an exported document keeps it, so it is not hashed twice. A 16-hex key in a block of `names` is refused |
 
 The tenant is the request context's tenant id, else its user id; tenant ids are 1-256
 characters. A `quota` with no cap is refused; a cap above the model's budget, a `tpm` cap below

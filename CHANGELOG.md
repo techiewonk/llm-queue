@@ -7,6 +7,13 @@ public API (see STABILITY.md).
 
 ## [Unreleased]
 
+### Upgrading from 0.1.1: drain 0.1.1 first
+
+The message format is now version 3: `tenant_id` and `user_id` carry keyed hashes, not raw ids,
+and job messages carry the sender's hashes. 0.1.1 and 0.2.0 workers do not share a queue (a
+0.1.1 worker returns a 0.2.0 message; a 0.2.0 worker refuses a 0.1.1 one). Let the 0.1.1
+workers empty the queues, then start 0.2.0 everywhere (see `docs/how-to/upgrade.md`).
+
 ### Removed and renamed (admin API)
 
 Every admin operation is now one service method under `llmq.admin`, and the `llm-queue` CLI and
@@ -271,6 +278,45 @@ index (below).
   model fallback (C3): the served alias never equals the model id, so each reply paid a
   registry lookup to fill `model_name`. A fallback is now read from the engine's
   `Meta.fallback == "model"`.
+- `requests.extend` reaches every place a deadline lives: a worker that takes the call after
+  the extend gets its deadline from `PICK_TAKE` and no longer ends it at `max_wait_secs`; a
+  running attempt's timer moves (it was cut at the old deadline and run again); `stream()`
+  reads the new deadline and the chunks live past it. It never shortens a call (an extend
+  below the call's own timeout is `already`), refuses a `timeout_secs` above the queue's
+  `retention_secs` as well as `timeout_max_secs`, and needs the request index. An attempt's
+  first-response budget is now `attempt_timeout_secs` alone; the call's deadline is the
+  outer timer's.
+- Request admin: a send short of `queue_wait_replicas` keeps its message id (`list` showed
+  none and reprioritize skipped the call as `direct`); a separate queue store's moved calls
+  have their records written again after a store error (`request_records_stale` when that
+  keeps failing); a takeover under another tenant leaves the old tenant's index; lapsed
+  tenants leave the names hash (`tqn`); `requests.count` with the index off is refused, not
+  zeros; the no-tenant status block reads the fairness numbers fairness writes; a cancel logs
+  `call_cancel` only for the calls it cancelled and answers waiting calls in one round trip per
+  batch; a reprioritize stopped by a full target counts every call left in `skipped.full`;
+  `requests.get` of a call whose model was removed returns its records, not a `KeyError`.
+- Tenant names in `fairness.weights` / `quotas` are hashed on every registry write path, not
+  only when the boot file is read: `registry set fairness.weights.acme=3` stored the raw name,
+  which never matched a call. A hashed block is marked `tenant_keys: hashed` (new registry
+  field), so an exported document is not hashed twice; a 16-hex name in a block of names is
+  refused. Job messages carry the hashes of the sender's ids (`ctx.user_hash` /
+  `ctx.tenant_hash`), not the ids; the job's calls use them as they are
+  (`llm_queue.ids.HashedId`).
+- No tenant name on a read route: `describe()` shows `default_tenant_hash` (the name only with
+  `LLMQ_TENANT_NAMES_ENABLED`); `GET /status`, `/requests` and `/requests/count` refuse
+  `?tenant=` (400) and take `tenant_hash` (the CLI and Python still take a name and hash it
+  locally); `POST /tenants/hash` needs the write guard, as with the hashes the reads show it
+  would tell a read token which tenant a hash is.
+- Every admin write checks its actor before it acts (1-128 characters, no control
+  characters): dead letters, purges, unschedule, drains, model drains and request changes took
+  any text before, and only registry writes checked it (at 200 characters, while HTTP cut at
+  128). Every audit entry outside the registry's own script goes through one writer
+  (`Audit.write`), which logs one `llmq_admin` line with a `kind`; purges also keep their
+  `llmq_purge` line.
+- `AdminServices.from_env`, `RequestsAdmin.from_env` and `PurgeService.from_env` take
+  `defaults=` and `secret_names=` like `LLMQueue.from_env`, and share one wiring
+  (`AdminContext.from_layers(layers)`): an admin worker could not reproduce an app configured
+  through `defaults=`.
 - Drain API (plan A1-A5). `pause_receiving()` stays sync and callable from any thread;
   `resume_receiving()` undoes it (ready again when started; `LLMQueueError` after `stop()`);
   `await drain(drain_secs=None)` pauses and waits for running calls and jobs (it does not

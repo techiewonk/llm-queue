@@ -16,9 +16,11 @@ status records); worker-side hooks (balancer, fallback policy, sticky key) see t
 only the caller's `admission` hook sees the raw ids. Metrics carry a `tenant` label only for
 the tenants listed in `LLMQ_METRICS_TENANTS` (by a label you choose), and `status()` shows
 counts and hashes. Raw ids appear only where the operator writes them: `weights` and `quotas`
-in the registry file, and those names are replaced by their hashes when the file is read
-(owner D2), so only hashes reach the store. A live edit (`registry set`) must name the hash
-(`llm-queue tenants hash NAME`).
+in the registry file, and those names are replaced by their hashes on every registry write
+path (owner D2): when the file is read, and on `registry set`, publish and rollback. A hashed
+block is marked `tenant_keys: hashed`, so an exported document is never hashed twice; a 16-hex
+name in a block without the mark is refused, as it reads as a hash. A live edit names the
+tenant (`registry set fairness.weights.acme=3`): the name is hashed before it is stored.
 
 The request index (`P:{m:ALIAS}:tq:H`, 0.2.0) uses the tenant id only: a call with no tenant
 is indexed under `-`, never under its user id, because an admin "tenant" is the app's tenant.

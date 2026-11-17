@@ -16,6 +16,13 @@ from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import QueueSettings, StreamQueues
 from llm_queue.engine.requests import RequestStore
 from llm_queue.engine.streaming import ChunkReader
+from llm_queue.ids import keyed_hash
+
+
+def _hash(value: str) -> str:
+    """The keyed hash a job runner is built with (its ids travel hashed)."""
+    return keyed_hash("test-salt", value)
+
 
 pytestmark = pytest.mark.integration
 
@@ -154,7 +161,7 @@ async def test_dead_letters_are_trimmed_on_a_timer(store: redis.asyncio.Redis, p
 
 def _runner(store: redis.asyncio.Redis, prefix: str, **kw: Any) -> JobRunner:
     settings = QueueSettings(visibility_secs=30, max_receives=5, max_waiting=JOBS_MAX_WAITING)
-    return JobRunner(StreamQueues(store, Keys(prefix)), settings=settings, **kw)
+    return JobRunner(StreamQueues(store, Keys(prefix)), settings=settings, **kw, hash_id=_hash)
 
 
 async def test_job_timeout(store: redis.asyncio.Redis, prefix: str) -> None:
@@ -248,4 +255,4 @@ async def test_job_with_no_consumer_is_reported(store: redis.asyncio.Redis, pref
     runner = _runner(store, prefix, metrics=sink)
     await runner.send("nobody", {})
     assert sink.total("llmq_jobs_no_consumer_total") == 1
-    assert JobRunner(runner.queues).settings.max_waiting == JOBS_MAX_WAITING
+    assert JobRunner(runner.queues, hash_id=_hash).settings.max_waiting == JOBS_MAX_WAITING

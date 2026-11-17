@@ -228,6 +228,12 @@
               "type": "number",
               "minimum": 1,
               "maximum": 86400
+            },
+            "tenant_keys": {
+              "enum": [
+                "names",
+                "hashed"
+              ]
             }
           },
           "additionalProperties": false,
@@ -1950,6 +1956,12 @@
               "type": "number",
               "minimum": 1,
               "maximum": 86400
+            },
+            "tenant_keys": {
+              "enum": [
+                "names",
+                "hashed"
+              ]
             }
           },
           "additionalProperties": false,

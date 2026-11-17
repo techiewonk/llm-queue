@@ -53,7 +53,8 @@ another secret store changes two variables. In a Kubernetes manifest:
   hold is unset, and the environment and `defaults=` are asked next.
 - The same source serves the store passwords, `LLMQ_ADMIN_TOKEN`, `LLMQ_JOB_*`, the account
   secrets (`api_key_ref`, `external_id_ref`), registry placeholders, the `llm-queue` CLI,
-  `AdminServices.from_env` and `PurgeService.from_env`.
+  `AdminServices.from_env`, `RequestsAdmin.from_env` and `PurgeService.from_env` (each takes
+  `secrets=`, `defaults=` and `secret_names=` as `LLMQueue.from_env` does).
 - `describe()` shows the sources (kind and secret id) and the mapped setting names, never a
   value.
 

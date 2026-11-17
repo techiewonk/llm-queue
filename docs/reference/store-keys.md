@@ -806,7 +806,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 |---|---|
 | Type | hash |
 | Store | state |
-| Schema | The claim record: `state` (`queued`, `running`, `done`, `failed`, `expired`, `cancelled`), `user` (keyed hash of the user or session id, `runtime.py:1487`), `params` (params hash, `envelope.py:161`), `caller` (worker id of the sender), `confirmed` (`0`/`1`), `created` (store secs), `app` (`1`: app-supplied id), `direct` (`1`: run in the caller's process), `owner` (`WORKER@TAG` running it), `hb` (ms of its last heartbeat). With the request index on (0.2.0 T1): `ix` (its `tq:H` key name), `ixh` (`H`), `mid` (its stream message id, `''` for a direct run; a reprioritize moves it), `q` (class `p` / `n`). After an admin extend (0.2.0 T2): `dl` (the new deadline, store ms; `EXTEND` writes it, a worker reads it before it expires the call). |
+| Schema | The claim record: `state` (`queued`, `running`, `done`, `failed`, `expired`, `cancelled`), `user` (keyed hash of the user or session id, `runtime.py:1487`), `params` (params hash, `envelope.py:161`), `caller` (worker id of the sender), `confirmed` (`0`/`1`), `created` (store secs), `app` (`1`: app-supplied id), `direct` (`1`: run in the caller's process), `owner` (`WORKER@TAG` running it), `hb` (ms of its last heartbeat). With the request index on (0.2.0 T1): `ix` (its `tq:H` key name), `ixh` (`H`), `mid` (its stream message id, `''` for a direct run; a reprioritize moves it), `q` (class `p` / `n`). After an admin extend (0.2.0 T2): `dl` (the new deadline, store ms; `EXTEND` writes it, `PICK_TAKE` returns it with a grant or a wait, and a worker reads it before it expires the call or ends its `max_wait_secs`). |
 | Written by | `register` `requests.py:69-160`; `REGISTER_SEND` `requests.py:180-188`; `CONFIRM` `requests.py:196-202`; `RESULT_PUT` `requests.py:245-248`; `SETTLE_DONE` `requests.py:274-277`; `PICK_TAKE` `_admission_lua.py:789-793`; `release_claim` `:955-964`; `RENEW` `:1013-1019`; `REREGISTER` `:1096-1101`. |
 | Read by | `register` `requests.py:71`; `PICK_TAKE` `_admission_lua.py:372,396-397,413`; `RESULT_TAKE` / `_DROP_READ` `requests.py:302,329`; `CANCEL` `requests.py:348`; `_RESULTS_EXIST` `runtime.py:263`; `_lost` `runtime.py:2237-2248`. |
 | Lifetime (native) | Created with 30 s (`unconfirmed_secs`, `requests.py:380`). After the send: the call's deadline + `LLMQ_STATUS_TTL_SECS` (1800 s) (`requests.py:509,527`). After the result: `LLMQ_STATUS_TTL_SECS` (`requests.py:247`). A record a worker's claim made: `Tuning.engine.job_ttl_ms` (3600 s, `_admission_lua.py:792,1100`); `RENEW` pushes it back to `job_ttl_ms` when under 2 leases are left (`:1018`). |
@@ -873,7 +873,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | zset |
 | Store | state |
 | Schema | The calls in flight of tenant `H` on model `ALIAS` (0.2.0 T1): member = request id, score = the call's deadline (store ms: now + call time + `caller_margin_secs`; an extend raises it). `H` = the keyed hash of the call's tenant (`LLMQ_DEFAULT_TENANT` included), `-` for no tenant; the user id is never a fallback here. `ALIAS` = the model whose queue holds the call (after the disabled-model fallback). |
-| Written by | `index_add` (`_INDEX_FN`, `requests.py`) in `REGISTER_SEND` (queued, shared store) and `CONFIRM` (separate queue store or replica wait; direct runs; takeovers update the score): `ZADD`, then entries past their deadline are pruned (`ZREMRANGEBYSCORE`). `EXTEND` (`ZADD XX`). |
+| Written by | `index_add` (`_INDEX_FN`, `requests.py`) in `REGISTER_SEND` (queued, shared store) and `CONFIRM` (separate queue store or replica wait; direct runs; takeovers update the score, and a takeover under another tenant `ZREM`s the call from the old tenant's key): `ZADD`, then entries past their deadline are pruned (`ZREMRANGEBYSCORE`). `EXTEND` (`ZADD XX`). |
 | Read by | `RequestsAdmin` (`requests_admin.py`: list, count, cancel, reprioritize); tenant purge `queued` / `running` (`purge.py`); `status(model, tenant=...)` (`status.py`). Readers count only scores in the future and drop ids whose job is final or gone. |
 | Lifetime (native) | 60 s past the latest deadline in it; a write only lengthens it (`X.pttl` check). |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
@@ -890,7 +890,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Store | state |
 | Schema | The tenants with calls in flight on model `ALIAS`: member = tenant hash `H` (or `-`), score = the latest deadline of any of its calls (`ZADD GT`). |
 | Written by | `index_add` (as `tq:H`), entries past their deadline pruned on each add; `EXTEND` (`ZADD GT`). |
-| Read by | `RequestsAdmin.list` / `count` without a tenant; `status()` `tenants.active`. |
+| Read by | `RequestsAdmin.list` / `count` without a tenant; `status()` `tenants.active`. A status of the no-tenant block (`-`) reads fairness under the hash of the shared no-tenant name, as fairness writes it. |
 | Lifetime (native) | 60 s past its latest deadline; a write only lengthens it. |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime. Never evictable. |
 | Count | 1 per model with calls in flight; one member per tenant. |
@@ -905,7 +905,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | hash |
 | Store | state |
 | Schema | Only with `LLMQ_TENANT_NAMES_ENABLED=true` (owner Q5): tenant hash `H` -> the tenant's name, so admin lists and status can show it. Off, no name is stored anywhere (messages carry hashes only). |
-| Written by | `index_add` (`HSET`, with the index). |
+| Written by | `index_add` (`HSET`, with the index); tenants whose entries in `tq` lapsed are removed (`HDEL`) on each add, as `tq` prunes them. |
 | Read by | `RequestsAdmin` (`tenant_name` of summaries), `status(model, tenant=...)`. |
 | Lifetime (native) | As `tq`. |
 | Swept mode | Indexed in `P:ttl`. Never evictable. |

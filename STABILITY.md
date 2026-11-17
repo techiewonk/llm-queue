@@ -10,7 +10,8 @@
 - **Message format:** queue messages carry a format version `v`. A worker returns a message newer
   than it understands to the queue instead of dropping it. Workers of two releases share a queue
   only where CHANGELOG.md says so: 0.1.0b1 and 0.1.0b2 do not (drain 0.1.0b1 first);
-  0.1.0b2 and 0.1.0b3 do on a `noeviction` store (on a `volatile-*` store, upgrade every pod).
+  0.1.0b2 and 0.1.0b3 do on a `noeviction` store (on a `volatile-*` store, upgrade every pod);
+  0.1.1 and 0.2.0 do not (format 3 carries hashed tenant and user ids: drain 0.1.1 first).
   See `docs/how-to/upgrade.md`.
 - **Store schema:** the key layout has a schema number; a change to it ships with a migration note.
 - **Supported versions:** Python 3.12-3.14 (unit and integration tests run on each in CI; 3.11 was dropped in 0.1.0b2); Valkey 8

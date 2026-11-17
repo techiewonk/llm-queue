@@ -6,8 +6,6 @@ source and a few process limits. Every problem is reported at once.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import math
 import os
 import re
@@ -24,6 +22,7 @@ from llm_queue._logging import get_logger
 from llm_queue.engine.expiry import KEY_EXPIRY_MODES
 from llm_queue.engine.store_guard import WAIT_SCOPES, parse_scopes
 from llm_queue.errors import ConfigError
+from llm_queue.ids import keyed_hash
 from llm_queue.registry.interpolate import YAML_SUFFIXES, expand, load_yaml, to_json
 from llm_queue.registry.validate import parse_document
 
@@ -418,15 +417,6 @@ METRICS_TENANTS_MAX = 50
 _LABEL_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}\Z")
 
 
-def _switch(get: Callable[..., Any], name: str, default: bool, problems: list[str]) -> bool:
-    """A true / false variable (`on` / `off`, `1` / `0`, `yes` / `no` too)."""
-    raw = str(get(name, "true" if default else "false")).strip().lower()
-    if raw not in _TRUE + _FALSE:
-        problems.append(f"LLMQ_{name} must be true or false (on / off)")
-        return default
-    return raw in _TRUE
-
-
 def parse_metrics_tenants(text: str) -> tuple[tuple[tuple[str, str], ...], list[str]]:
     """`LLMQ_METRICS_TENANTS` (`acme,globex=t2`) as (tenant name, label) pairs, and problems.
 
@@ -457,14 +447,17 @@ def parse_metrics_tenants(text: str) -> tuple[tuple[tuple[str, str], ...], list[
 
 
 def _admin_settings(
-    get: Callable[..., Any], number: Callable[..., Any], problems: list[str]
+    layers: Mapping[str, Any],
+    get: Callable[..., Any],
+    number: Callable[..., Any],
+    problems: list[str],
 ) -> dict[str, Any]:
     """The request index and admin settings (design 0.2.0 T1, T2, T6) as `InfraSettings` fields."""
     tenants, found = parse_metrics_tenants(str(get("METRICS_TENANTS", "") or ""))
     problems.extend(found)
     return {
-        "request_index_enabled": _switch(get, "REQUEST_INDEX_ENABLED", True, problems),
-        "tenant_names_enabled": _switch(get, "TENANT_NAMES_ENABLED", False, problems),
+        "request_index_enabled": read_bool(layers, "REQUEST_INDEX_ENABLED", True, problems),
+        "tenant_names_enabled": read_bool(layers, "TENANT_NAMES_ENABLED", False, problems),
         "admin_batch": number("ADMIN_BATCH", 500, int, lo=1, hi=10_000),
         "admin_scan_max": number("ADMIN_SCAN_MAX", 100_000, int, lo=1_000, hi=10_000_000),
         "requests_list_max": number("REQUESTS_LIST_MAX", 1_000, int, lo=1, hi=10_000),
@@ -476,7 +469,7 @@ def _admin_settings(
     }
 
 
-def _read_document(
+def read_document(
     registry: str | None,
     registry_file: str | None,
     lookup: Callable[[str], str | None] | None = None,
@@ -682,7 +675,7 @@ class InfraSettings:
         elif registry or registry_file:
             used: set[str] = set()
             try:
-                text = _read_document(registry, registry_file, placeholder, used)
+                text = read_document(registry, registry_file, placeholder, used)
                 document = boot = orjson.loads(text)
             except ConfigError as exc:
                 problems.append(str(exc))
@@ -843,7 +836,7 @@ class InfraSettings:
                 problems += [found_pool] if found_pool else []
         else:
             pool = number("STORE_MAX_CONNECTIONS", 200, int, lo=4, hi=100_000)
-        admin = _admin_settings(get, number, problems)
+        admin = _admin_settings(layers, get, number, problems)
         settings = cls(
             store_url=urls["STORE_URL"] or str(store or ""),
             queue_store_url=urls["QUEUE_STORE_URL"],
@@ -918,7 +911,7 @@ class InfraSettings:
     def registry_document(self) -> str:
         """The registry JSON from `LLMQ_REGISTRY` or the file `LLMQ_REGISTRY_FILE`.
 
-        Placeholders expanded (see `_read_document`). Tenant names in `fairness.weights` /
+        Placeholders expanded (see `read_document`). Tenant names in `fairness.weights` /
         `quotas` are replaced by their keyed hashes (`LLMQ_ID_HASH_SALT`, owner D2): only
         hashes reach the store, matching the hashes a call's message carries. `ConfigError`
         when neither is set, the file cannot be read, the text is not JSON (or YAML), an object
@@ -926,12 +919,8 @@ class InfraSettings:
         """
         from llm_queue.engine.fairness import hash_tenant_names
 
-        text = _read_document(self.registry, self.registry_file, self.placeholder_lookup)
+        text = read_document(self.registry, self.registry_file, self.placeholder_lookup)
         document = parse_document(text)
-        salt = (self.id_hash_salt or "").encode()
-
-        def hash_id(value: str) -> str:
-            return hmac.new(salt, value.encode(), hashlib.sha256).hexdigest()[:16]
-
-        hashed = hash_tenant_names(document, hash_id)
+        salt = self.id_hash_salt or ""
+        hashed = hash_tenant_names(document, lambda value: keyed_hash(salt, value))
         return text if hashed == document else to_json(hashed)

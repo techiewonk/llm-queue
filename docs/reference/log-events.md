@@ -3,8 +3,8 @@
 Every structured log event the library writes, by name. Each line is `event key=value ...`
 (structlog key-value format; the app configures the renderer). Use the name to search and alarm;
 the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alarming on.
-`llmq_admin` is written once per audited admin write (`actor`, `op`, `path`, `after`: counts,
-never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, ...).
+`llmq_admin` is written once per audited admin write (`kind`, `actor`, `op`, `path`, `after`:
+counts, never a tenant name), purges included (which also write `llmq_purge`); `call_cancel` carries `source` (`api`, `admin`, `purge`, ...).
 
 | Event | Level | Where |
 |---|---|---|
@@ -81,7 +81,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `key_expiry_changed` | warning | engine/runtime.py |
 | `key_expiry_conflict` | warning | engine/runtime.py |
 | `key_expiry_publish_failed` | warning | engine/runtime.py |
-| `llmq_admin` | info | engine/audit.py, engine/requests_admin.py |
+| `llmq_admin` | info | engine/audit.py |
 | `llmq_call_finished` | info | engine/runtime.py |
 | `llmq_purge` | info | engine/purge.py |
 | `llmq_registry_audit` | info | registry/store.py |
@@ -138,6 +138,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `replicas_short` | warning | engine/store_guard.py |
 | `request_extended` | info | engine/requests_admin.py |
 | `request_moved` | info | engine/requests_admin.py |
+| `request_records_stale` | error | engine/requests_admin.py |
 | `request_unusable` | error | engine/runtime.py, engine/local.py |
 | `result_drop_skipped` | warning | engine/requests.py |
 | `result_reader_error` | warning | engine/runtime.py |

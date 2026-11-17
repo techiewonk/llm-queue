@@ -33,7 +33,7 @@ from llm_queue.engine.metrics import Metrics, NullSink
 from llm_queue.engine.queue import Message, NotReplicated, QueueSettings, StreamQueues
 from llm_queue.engine.store_guard import ReplicaWait
 from llm_queue.errors import ConfigError
-from llm_queue.ids import new_id
+from llm_queue.ids import HashedId, hash_once, new_id
 
 logger = get_logger(__name__)
 JobFn = Callable[[dict[str, Any]], Awaitable[Any]]
@@ -172,12 +172,15 @@ class JobRunner:
         job_settings: JobSettings | None = None,
         metrics: Metrics | None = None,
         replica_wait: ReplicaWait | None = None,
+        hash_id: Callable[[str], str],
     ) -> None:
         """Nothing runs until `start`.
 
         `replica_wait` is the process's (scope `jobs`): a send waits for the replicas as a
-        call's send does (R3JE-7, R3FM-5, owner Q8).
+        call's send does (R3JE-7, R3FM-5, owner Q8). `hash_id` is the engine's keyed hash:
+        a job carries the hashes of its sender's ids, never the ids.
         """
+        self._hash_id = hash_id
         self.queues = queues
         self.queue_prefix = queue_prefix
         self.limits = job_settings or JobSettings()
@@ -250,8 +253,13 @@ class JobRunner:
         """The message of one job; refuses a payload that is not JSON or is too large."""
         ctx = current_context()
         # The sender's ids travel with the job: its LLM calls are counted and audited for
-        # the user who asked, not for whoever started the worker (R3JE-15, Q18).
-        who = {k: v for k, v in (("user_id", ctx.user_id), ("tenant_id", ctx.tenant_id)) if v}
+        # the user who asked, not for whoever started the worker (R3JE-15, Q18). As their
+        # keyed hashes only (D1, review RQ-6): a dead letter is kept 7 days.
+        who = {
+            k: hash_once(v, self._hash_id)
+            for k, v in (("user_hash", ctx.user_id), ("tenant_hash", ctx.tenant_id))
+            if v
+        }
         try:
             body = orjson.dumps({"id": ident, "name": name, "payload": payload, "ctx": who})
         except TypeError as exc:  # orjson.JSONEncodeError: a bare TypeError before (R3JE-10)
@@ -517,7 +525,12 @@ class JobRunner:
             attempt = await self._attempt(message)
             who = body.get("ctx") or {}
             token = _JOB.set(JobContext(name, str(ident), attempt, self.settings.max_receives))
-            with request_context(user_id=who.get("user_id"), tenant_id=who.get("tenant_id")):
+            # The sender's hashes, marked so the job's calls do not hash them again.
+            user, tenant = who.get("user_hash"), who.get("tenant_hash")
+            with request_context(
+                user_id=HashedId(user) if user else None,
+                tenant_id=HashedId(tenant) if tenant else None,
+            ):
                 # Per-job timeout (RESCAN S6): a hung job held a worker slot for good.
                 async with limit:
                     await self._jobs[name](body["payload"])

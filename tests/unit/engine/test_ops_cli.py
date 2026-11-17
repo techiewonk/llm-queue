@@ -171,7 +171,7 @@ def _records(*rows: tuple[str | None, int]) -> list[Any]:
 async def test_cancel_by_ids_is_dry_by_default_filters_and_is_audited() -> None:
     """Q5 / D9: an operator cancel is audited; `state` waiting leaves running calls alone."""
     client = MagicMock()
-    script = AsyncMock(return_value=[2, 0])  # CANCEL: [marked, started]
+    script = AsyncMock(return_value=[[b"q", b"r"], 0])  # CANCEL: [ids marked, started]
     client.register_script.return_value = script
     client.xadd = AsyncMock()
     rows = [("queued", 0), ("running", 0), ("done", 0), ("queued", 1), (None, 0)]

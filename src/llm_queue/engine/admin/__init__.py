@@ -40,12 +40,8 @@ from llm_queue.engine.admin.registry import (
 )
 from llm_queue.engine.admin.requests import RequestsAdapter
 from llm_queue.engine.audit import Audit
-from llm_queue.engine.keys import Keys
-from llm_queue.engine.purge import PurgeService, PurgeSettings, keyed_hash
-from llm_queue.engine.queue import StreamQueues
-from llm_queue.engine.requests_admin import AdminSettings, RequestsAdmin
 from llm_queue.engine.settings import InfraSettings, Layers
-from llm_queue.engine.status import StatusReader
+from llm_queue.ids import keyed_hash
 
 if TYPE_CHECKING:
     from llm_queue.engine.local import LocalEngine
@@ -171,90 +167,21 @@ class AdminServices:
         environ: Mapping[str, str] | None = None,
         *,
         secrets: Callable[[str], str | None] | None = None,
+        defaults: Mapping[str, Any] | None = None,
+        secret_names: Mapping[str, str] | None = None,
     ) -> AdminServices:
         """Standalone services from `LLMQ_*` (CLI, admin workers); close with `aclose()`.
 
-        Settings and store passwords are read as `LLMQueue.from_env` reads them: `secrets`
-        when given, else the sources `LLMQ_SECRETS_SOURCE` names, then the environment.
+        Read as `LLMQueue.from_env` reads its settings (same arguments): `secrets` when given,
+        else the sources `LLMQ_SECRETS_SOURCE` names, then `environ`, then `defaults`.
         """
-        from llm_queue.engine.store_client import secret_store_client
-        from llm_queue.registry.store import RegistryStore
-        from llm_queue.tuning import Tuning
-
-        layers = Layers(environ, secrets)
+        layers = Layers(environ, secrets, defaults, secret_names)
         settings = InfraSettings.from_layers(layers)
         if settings.execution_mode == "local":  # no store to talk to
             return cls.for_local(None, settings=settings)
-        cap, options = settings.store_max_connections, Tuning().store
-        lookup = layers.get
-        state = secret_store_client(settings.store_url, lookup, "LLMQ_STORE_PASSWORD", cap, options)
-        queue_client = (
-            secret_store_client(
-                settings.queue_store_url, lookup, "LLMQ_QUEUE_STORE_PASSWORD", cap, options
-            )
-            if settings.queue_store_url
-            else None
-        )
-        config = None
-        if settings.registry or settings.registry_file:
-            config = orjson.loads(settings.registry_document())
-        registry = RegistryStore(
-            state,
-            settings.key_prefix,
-            config=config,
-            live_edit=settings.registry_live_edit,
-            allowed_hosts=settings.base_url_allowed_hosts,
-            audit_retention_days=settings.audit_retention_days,
-        )
-        keys = Keys(settings.key_prefix)
-        queues = StreamQueues(queue_client or state, keys)
-        salt = settings.id_hash_salt or ""
-        purge = PurgeService(
-            state,
-            registry,
-            queue_client=queue_client,
-            queue_prefix=settings.queue_prefix,
-            settings=PurgeSettings.from_infra(settings),
-            salt=salt,
-            status_ttl_secs=settings.status_ttl_secs,
-        )
-        admin_settings = AdminSettings.from_infra(settings)
-        requests = RequestsAdmin(
-            state,
-            queue_client=queue_client,
-            keys=keys,
-            registry=registry,
-            queue_prefix=settings.queue_prefix,
-            hash_id=lambda value: keyed_hash(salt, value),
-            settings=admin_settings,
-            status_ttl_secs=settings.status_ttl_secs,
-        )
-        status = StatusReader(
-            state,
-            keys,
-            queues,
-            settings.queue_prefix,
-            requests=requests,
-            request_index=admin_settings.request_index,
-            scan_max=admin_settings.scan_max,
-        )
-        ctx = AdminContext(
-            state=state,
-            queue_client=queue_client,
-            keys=keys,
-            registry=registry,
-            queues=queues,
-            status=status,
-            purge=purge,
-            audit=Audit(state, registry.audit_key),
-            hash_id=lambda value: keyed_hash(salt, value),
-            queue_prefix=settings.queue_prefix,
-            status_ttl_secs=settings.status_ttl_secs,
-            settings=settings,
-            requests=requests,
-        )
+        ctx = AdminContext.from_layers(layers)
         admin = cls(ctx)
-        admin._owned = [c for c in (queue_client, state) if c is not None]
+        admin._owned = ctx.owned
         return admin
 
     async def aclose(self) -> None:

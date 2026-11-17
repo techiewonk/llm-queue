@@ -266,6 +266,7 @@ class LLMQueue:
             metrics=engine.metrics,
             replica_wait=getattr(engine, "replica_wait", None),  # one per process (R3FM-5, Q8)
             job_settings=job_settings,
+            hash_id=engine.hash_id,
         )
         self._builder = builder
         self._offload = offload

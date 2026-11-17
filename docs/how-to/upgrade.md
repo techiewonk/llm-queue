@@ -3,6 +3,24 @@
 What an app has to do when it moves to a new release, newest first. The full list of changes is
 in [CHANGELOG.md](../project/changelog.md).
 
+## From 0.1.1 to 0.2.0: drain 0.1.1 first
+
+0.2.0 messages carry keyed hashes of `tenant_id` and `user_id` where 0.1.1 carried the raw ids,
+so the message format is version 3. Workers of the two releases do not share a queue: a 0.1.1
+worker returns a 0.2.0 message to the queue (it is newer), and a 0.2.0 worker refuses a 0.1.1
+one (it would read the raw tenant as a hash, and write the raw name into fairness keys). Job
+messages carry the sender's hashes too. Upgrade the whole fleet at once:
+
+1. Stop sending: pause or scale down the 0.1.1 callers (or drain their pods, `LLMQ_DRAIN_FILE`).
+2. Let the 0.1.1 workers empty the queues (`llm-queue queues list` shows 0 waiting and held),
+   then stop them.
+3. Start 0.2.0 everywhere.
+
+Tenant names in the registry's `fairness.weights` / `quotas` are hashed on every write path
+(the boot document, `registry set`, publish, rollback); the hashed block is marked
+`tenant_keys: hashed`, so an exported document is never hashed twice. A 16-hex tenant name in
+a block without that mark is refused (it reads as a hash).
+
 ## From 0.1.1 to 0.2.0: the admin API
 
 Every admin operation moved under `llmq.admin`, and the CLI commands and HTTP routes were

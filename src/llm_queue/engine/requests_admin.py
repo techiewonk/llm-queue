@@ -12,6 +12,7 @@ routes and an admin worker share it without an engine (`RequestsAdmin.from_env`)
 
 from __future__ import annotations
 
+import asyncio
 import builtins
 import contextlib
 import heapq
@@ -22,17 +23,19 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, Self
 
-import orjson
+from redis.exceptions import ConnectionError as StoreConnectionError
+from redis.exceptions import TimeoutError as StoreTimeoutError
 
 from llm_queue._logging import get_logger
 from llm_queue.engine._codec import text as _text
+from llm_queue.engine.audit import Audit
 from llm_queue.engine.envelope import Meta, Reply
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import RETENTION_SECS, StreamQueues
 from llm_queue.engine.requests import FINAL_STATES, RequestStore
 from llm_queue.engine.store_guard import store_op
 from llm_queue.errors import AdminRefused, ConfigError
-from llm_queue.registry._lua import AUDIT_MAX_ENTRIES
+from llm_queue.registry.store import check_actor
 
 if TYPE_CHECKING:
     import redis.asyncio
@@ -53,6 +56,9 @@ MAX_CANCEL_IDS = 1_000  # request ids one cancel may name
 MAX_ID_CHARS = 256  # characters of one request id a cancel may name
 SAMPLE_IDS = 20  # ids a change report lists
 _HASH_RE = re.compile(r"^[0-9a-f]{16}\Z")
+# Pauses before the moved calls' records are written again (separate queue store, RQ-8).
+_RECORD_RETRY_SECS = (0.2, 0.5, 1.0)
+_STORE_ERRORS = (StoreConnectionError, StoreTimeoutError, OSError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,7 +283,7 @@ class RequestsAdmin:
         self.keys = keys
         self.registry = registry
         self.queue_prefix = queue_prefix
-        self._hash = hash_id
+        self.hash_id = hash_id  # the keyed hash of a tenant or user id
         self.settings = settings or AdminSettings()
         self.status_ttl_secs = status_ttl_secs
         self.caller_margin_secs = caller_margin_secs
@@ -295,48 +301,21 @@ class RequestsAdmin:
         environ: Mapping[str, str] | None = None,
         *,
         secrets: Callable[[str], str | None] | None = None,
+        defaults: Mapping[str, Any] | None = None,
+        secret_names: Mapping[str, str] | None = None,
     ) -> RequestsAdmin:
         """A standalone service from `LLMQ_*` (CLI, admin worker); close it with `aclose()`.
 
-        Settings and store passwords are read as `LLMQueue.from_env` reads them.
+        Read as `LLMQueue.from_env` reads its settings (same arguments): `secrets` when given,
+        else the sources `LLMQ_SECRETS_SOURCE` names, then `environ`, then `defaults`.
         """
-        from llm_queue.engine.purge import keyed_hash
-        from llm_queue.engine.settings import InfraSettings, Layers
-        from llm_queue.engine.store_client import secret_store_client
-        from llm_queue.registry.store import RegistryStore
-        from llm_queue.tuning import Tuning
+        from llm_queue.engine.admin.context import AdminContext
+        from llm_queue.engine.settings import Layers
 
-        layers = Layers(environ, secrets)  # `secrets`, else LLMQ_SECRETS_SOURCE, then the env
-        settings = InfraSettings.from_layers(layers)
-        cap, options = settings.store_max_connections, Tuning().store
-        lookup = layers.get
-        state = secret_store_client(settings.store_url, lookup, "LLMQ_STORE_PASSWORD", cap, options)
-        queue_client = (
-            secret_store_client(
-                settings.queue_store_url, lookup, "LLMQ_QUEUE_STORE_PASSWORD", cap, options
-            )
-            if settings.queue_store_url
-            else None
-        )
-        registry = RegistryStore(
-            state,
-            settings.key_prefix,
-            live_edit=settings.registry_live_edit,
-            allowed_hosts=settings.base_url_allowed_hosts,
-            audit_retention_days=settings.audit_retention_days,
-        )
-        salt = settings.id_hash_salt or ""
-        service = cls(
-            state,
-            queue_client=queue_client,
-            keys=Keys(settings.key_prefix),
-            registry=registry,
-            queue_prefix=settings.queue_prefix,
-            hash_id=lambda value: keyed_hash(salt, value),
-            settings=AdminSettings.from_infra(settings),
-            status_ttl_secs=settings.status_ttl_secs,
-        )
-        service._owned = [c for c in (queue_client, state) if c is not None]
+        ctx = AdminContext.from_layers(Layers(environ, secrets, defaults, secret_names))
+        assert ctx.requests is not None  # `from_layers` builds it
+        service = ctx.requests
+        service._owned = ctx.owned
         return service
 
     async def aclose(self) -> None:
@@ -406,11 +385,13 @@ class RequestsAdmin:
     ) -> RequestCounts:
         """Calls in flight of `model` (and one tenant) by state and stage.
 
-        Reads every index entry up to `LLMQ_ADMIN_SCAN_MAX` (`truncated` above it).
+        Reads every index entry up to `LLMQ_ADMIN_SCAN_MAX` (`truncated` above it). Needs the
+        request index: with it off nothing is counted, so `AdminRefused` (not zeros).
         """
         view = await self._view()
         alias = view.registry.alias_of(model)
         h = self.pick_tenant(tenant, tenant_hash)
+        self._need_index("in-flight")
         indexed = await self._indexed(alias, h)
         by_state = dict.fromkeys(("waiting", "running"), 0)
         by_stage: dict[str, int] = dict.fromkeys(STAGES, 0)
@@ -499,8 +480,10 @@ class RequestsAdmin:
         final = state in FINAL_STATES or status.get("state") in FINAL_STATES
         summary = None
         alias = status.get("model")
-        if not final and job and alias:
-            view = await self._view()
+        view = await self._view() if not final and job and alias else None
+        # A model removed since the call was sent has no queues to read: no summary, only
+        # the records (its lookup raised a bare KeyError before).
+        if view is not None and alias is not None and alias in view.registry.models:
             score = None
             if job.get("ix"):
                 score = await self._state.zscore(job["ix"], request_id)
@@ -545,6 +528,7 @@ class RequestsAdmin:
         (the default) writes nothing; a real one writes one audit entry with counts, named
         `op` (`purge_queue` when `llmq.admin.purge.queue` asks).
         """
+        check_actor(actor)
         self._check_state(state)
         if request_ids is not None and (tenant is not None or tenant_hash is not None):
             raise ConfigError("give request_ids, or a model and tenant: not both")
@@ -607,18 +591,18 @@ class RequestsAdmin:
         ids = [r.rid for r in chosen]
         for start in range(0, len(ids), self.settings.batch):
             batch = ids[start : start + self.settings.batch]
-            marked, moved_on = await self._requests.cancel_counts(
+            marked, moved_on = await self._requests.cancel_ids(
                 batch,
                 ttl_secs=self.status_ttl_secs,
                 channel=self.keys.cancel_channel,
                 only_state=only,
             )
-            changed += marked
+            changed += len(marked)
             if moved_on:
                 _bump(skipped, "started" if state == "waiting" else "not_running", moved_on)
             if state != "running":
-                await self._settle_waiting(batch)
-            for rid in batch:
+                await self._settle_waiting(marked)
+            for rid in marked:  # only the calls it cancelled (RQ-13)
                 logger.info("call_cancel", request_id=rid, source="admin", by=actor)
         if self._metrics is not None:
             self._metrics.count("llmq_cancels_total", float(changed), source="admin")
@@ -646,6 +630,7 @@ class RequestsAdmin:
         `max_wait_secs` and its place among waiting calls by arrival (`pos`, owner Q9).
         `limit`: at most this many (oldest first). Dry run by default.
         """
+        check_actor(actor)
         view = await self._view()
         alias = view.registry.alias_of(model)
         h = self.pick_tenant(tenant, tenant_hash)
@@ -708,6 +693,9 @@ class RequestsAdmin:
             for _, why in result.skipped:
                 _bump(skipped, why)
             if any(why == "full" for _, why in result.skipped):
+                # The calls of later batches are not moved either (RQ-15: they went uncounted).
+                if rest := len(pairs) - at - len(part):
+                    _bump(skipped, "full", rest)
                 break
             at += max(1, result.looked)
         report = _replace(report, changed=changed, skipped=skipped)
@@ -720,19 +708,23 @@ class RequestsAdmin:
     ) -> ChangeReport:
         """Give a call in flight a longer timeout: `timeout_secs` from when it was sent.
 
-        The new deadline (send time + `timeout_secs`, at most the model's `timeout_max_secs`)
-        reaches all three places a deadline lives (owner D6): the records and the index, every
-        worker holding the call, and every caller waiting on it (their timers move). It only
-        grows: a deadline not later than the current one is `skipped.already`. Dry run by
-        default.
+        The new deadline (send time + `timeout_secs`) reaches all three places a deadline lives
+        (owner D6): the records and the index, every worker holding the call, and every caller
+        waiting on it. `timeout_secs` above the model's `timeout_max_secs` or its queue's
+        `retention_secs` (the message would be trimmed) is a `ConfigError`. It only grows: a
+        deadline not later than the current one (the call's own timeout included) is
+        `skipped.already`. Needs the request index (`AdminRefused` when off). Dry run by default.
         """
+        check_actor(actor)
         if not timeout_secs > 0:
             raise ConfigError("timeout_secs must be above 0")
+        self._need_index("extended")
         k = self.keys
         async with self._state.pipeline(transaction=False) as pipe:
             pipe.hmget(k.status(request_id), ["model", "enqueued_at", "state"])
-            pipe.hmget(k.request(request_id, "job"), ["state", "ixh", "dl"])
-            (model, enqueued, status_state), (state, h, dl) = await pipe.execute()
+            pipe.hmget(k.request(request_id, "job"), ["state", "ixh", "dl", "ix"])
+            (model, enqueued, status_state), (state, h, dl, ix) = await pipe.execute()
+        first = await self._state.zscore(_text(ix), request_id) if ix is not None else None
         alias = _text(model) if model is not None else None
         report = ChangeReport(
             op="requests_extend",
@@ -747,13 +739,23 @@ class RequestsAdmin:
         if job_state in FINAL_STATES or _text(status_state or b"") in FINAL_STATES:
             return _replace(report, skipped={"final": 1})
         view = await self._view()
-        cap = float(view.value(view.registry.alias_of(alias), "timeout_max_secs"))
-        if timeout_secs > cap:
+        try:
+            canonical = view.registry.alias_of(alias)
+        except ConfigError:  # the model was removed since the call was sent
+            return _replace(report, skipped={"unknown_model": 1})
+        cap = float(view.value(canonical, "timeout_max_secs"))
+        queue = view.value(canonical, "queue") or {}
+        retention = float(queue.get("retention_secs", RETENTION_SECS))
+        if timeout_secs > min(cap, retention):
             raise ConfigError(
-                f"timeout_secs must be at most the model's timeout_max_secs ({cap:g})"
+                f"timeout_secs must be at most the model's timeout_max_secs ({cap:g}) and its "
+                f"queue's retention_secs ({retention:g}, past it the message is trimmed)"
             )
         deadline_ms = int((float(_text(enqueued)) + timeout_secs) * 1000)
-        if dl is not None and deadline_ms <= int(float(_text(dl))):
+        current = float(_text(dl)) if dl is not None else 0.0
+        if first is not None:  # the index scores the first deadline plus the caller margin
+            current = max(current, float(first) - self.caller_margin_secs * 1000)
+        if deadline_ms <= current:
             return _replace(report, skipped={"already": 1})
         state_name = "running" if job_state == "running" else "waiting"
         report = _replace(report, matched=1, by_state={state_name: 1}, sample_ids=[request_id])
@@ -786,7 +788,7 @@ class RequestsAdmin:
         if tenant is not None:
             if not tenant:
                 raise ConfigError("tenant must not be empty")
-            return self._hash(tenant)
+            return self.hash_id(tenant)
         if tenant_hash is not None and tenant_hash != NO_TENANT and not _HASH_RE.match(tenant_hash):
             raise ConfigError("tenant_hash must be 16 hex characters, or - for no tenant")
         return tenant_hash
@@ -1033,29 +1035,55 @@ class RequestsAdmin:
         reply a worker writes; written once). Its message is acked by the worker that takes it
         (PICK_TAKE answers `done`). A call that started meanwhile is left to its worker.
         """
+        if not request_ids:
+            return
         k = self.keys
         async with self._state.pipeline(transaction=False) as pipe:
             for rid in request_ids:
                 pipe.hget(k.request(rid, "job"), "state")
                 pipe.exists(k.request(rid, "cancel"))
             replies = await pipe.execute()
-        for i, rid in enumerate(request_ids):
-            state, marked = replies[2 * i], replies[2 * i + 1]
-            if state is None or _text(state) != "queued" or not marked:
-                continue
-            reply = Reply(
+        ended = [
+            Reply(
                 request_id=rid,
                 ok=False,
                 error="cancelled",
                 message="the call was cancelled by an admin",
                 meta=Meta(worker=self._owner),
             )
-            await self._requests.put_result(
-                reply, final_state="cancelled", status={"error": "cancelled"}
-            )
+            for i, rid in enumerate(request_ids)
+            if replies[2 * i] is not None
+            and _text(replies[2 * i]) == "queued"
+            and replies[2 * i + 1]
+        ]
+        # One pipelined round trip per batch: one per id made a 50k cancel 50k round trips.
+        await self._requests.put_results(
+            ended, final_state="cancelled", status={"error": "cancelled"}
+        )
 
     async def _moved_records(self, moved: Sequence[tuple[str, str]], cls: str) -> None:
-        """Separate queue store: the moved calls' job `mid` / `q` and status `priority`."""
+        """Separate queue store: the moved calls' job `mid` / `q` and status `priority`.
+
+        Written from `MOVE`'s reply, tried again on a store error (RQ-8): the messages already
+        moved, and a record left on the old message showed the call in the wrong class and made
+        a later reprioritize skip it as `gone`. Still failing, it is logged with the ids.
+        """
+        for pause in (*_RECORD_RETRY_SECS, None):
+            try:
+                await self._write_moved(moved, cls)
+                return
+            except _STORE_ERRORS as exc:
+                if pause is None:
+                    logger.error(
+                        "request_records_stale",
+                        request_ids=[rid for rid, _ in moved][:SAMPLE_IDS],
+                        count=len(moved),
+                        error_type=type(exc).__name__,
+                    )
+                    return
+                await asyncio.sleep(pause)
+
+    async def _write_moved(self, moved: Sequence[tuple[str, str]], cls: str) -> None:
         async with self._state.pipeline(transaction=False) as pipe:
             for rid, new in moved:
                 pipe.hset(self.keys.request(rid, "job"), mapping={"mid": new, "q": cls})
@@ -1072,27 +1100,8 @@ class RequestsAdmin:
             "sample_ids": report.sample_ids,
         }
         path = f"requests.{report.model or '*'}.{report.tenant or '*'}"
-        diff = [{"path": path, "before": None, "after": after}]
-        await self._state.xadd(
-            self.registry.audit_key,
-            {
-                "actor": report.actor,
-                "op": report.op,
-                "version": "",
-                "diff": orjson.dumps(diff),
-                "ts": f"{time.time():.6f}",
-            },
-            maxlen=AUDIT_MAX_ENTRIES,
-            approximate=True,
-        )
-        logger.info(
-            "llmq_admin",
-            op=report.op,
-            actor=report.actor,
-            model=report.model,
-            tenant=report.tenant,
-            matched=report.matched,
-            changed=report.changed,
+        await Audit(self._state, self.registry.audit_key).write(
+            kind="requests", actor=report.actor, op=report.op, path=path, before=None, after=after
         )
 
 

@@ -17,8 +17,12 @@ Transport rules (authentication, the CSRF header, status codes and exit codes) a
   run runs every check the real change runs and reports what it would do; nothing is written.
 - Every real write is **audited**: one entry in the registry's audit stream (`audit list`,
   `GET /audit`) with `actor`, `op`, the path it touched and its counts (never a tenant name),
-  and one `llmq_admin` log line. Registry edits and publishes are audited by the registry's own
-  script (`op` `edit` / `publish`).
+  and one `llmq_admin` log line (`kind`: `requests`, `purge`, `dlq`, `drain`, `models`), all
+  through one writer (`engine/audit.py`); a purge also logs `llmq_purge` with what it deleted.
+  Registry edits and publishes are audited by the registry's own script (`op` `edit` /
+  `publish`).
+- The actor is 1-128 characters without control characters, on every surface; every write
+  checks it before it acts (`ConfigError`, HTTP 400), dry runs too.
 - The actor is `--actor` (default the OS user) on the CLI, `http:<actor(request)>` with the
   app's `actor=` function, or `token:<X-LLMQ-Actor>` with the admin token and no `actor=`
   (`token:unknown` without the header: a claimed name, marked as such).
@@ -61,7 +65,7 @@ mistyped fields are a 400.
 | `drain.get` | read | `llmq.admin.drain.get()` | process-local | `GET /drain` | read |  |  |
 | `drain.start` | update | `await llmq.admin.drain.start(actor="ann")` | process-local (pods use `LLMQ_DRAIN_FILE`) | `POST /drain` | write | `drain` | no |
 | `drain.resume` | update | `await llmq.admin.drain.resume(actor="ann")` | process-local | `POST /resume` | write | `resume` | no |
-| `status.get` | read | `await llmq.admin.status.get("sonnet", tenant="acme")` | `llm-queue status [--model M] [--tenant T]` | `GET /status?model=M&tenant=T` | read |  |  |
+| `status.get` | read | `await llmq.admin.status.get("sonnet", tenant="acme")` | `llm-queue status [--model M] [--tenant T]` | `GET /status?model=M&tenant_hash=H` | read |  |  |
 | `registry.get` | read | `await llmq.admin.registry.get()` | `llm-queue registry get [--model M]` | `GET /registry` | read |  |  |
 | `registry.versions` | read | `await llmq.admin.registry.versions()` | `llm-queue registry versions` | `GET /registry/versions` | read |  |  |
 | `registry.diff` | read | `await llmq.admin.registry.diff()` | `llm-queue registry diff` | `GET /registry/diff` | read |  |  |
@@ -90,7 +94,7 @@ mistyped fields are a 400.
 | `requests.reprioritize` | update | `await llmq.admin.requests.reprioritize("sonnet", priority=True, actor="ann", dry_run=False)` | `llm-queue requests reprioritize MODEL [--priority] [--yes]` | `POST /requests/reprioritize` | write | `requests_reprioritize` | yes |
 | `requests.extend` | update | `await llmq.admin.requests.extend("r-1", timeout_secs=120, actor="ann", dry_run=False)` | `llm-queue requests extend REQUEST_ID --timeout-secs S [--yes]` | `POST /requests/{request_id}/extend` | write | `requests_extend` | yes |
 | `tenants.list` | read | `await llmq.admin.tenants.list("sonnet")` | `llm-queue tenants list MODEL` | `GET /tenants?model=M` | read |  |  |
-| `tenants.hash` | read | `llmq.admin.tenants.hash("acme")` | `llm-queue tenants hash TENANT` | `POST /tenants/hash` | read |  |  |
+| `tenants.hash` | read | `llmq.admin.tenants.hash("acme")` | `llm-queue tenants hash TENANT` | `POST /tenants/hash` | write |  |  |
 | `queues.list` | read | `await llmq.admin.queues.list()` | `llm-queue queues list` | `GET /queues` | read |  |  |
 | `dlq.list` | read | `await llmq.admin.dlq.list(model="sonnet")` | `llm-queue dlq list --model M` (or `--job J`) | `GET /dlq?model=M` | read |  |  |
 | `dlq.show` | read | `await llmq.admin.dlq.show("1700000000000-0", model="sonnet")` | `llm-queue dlq show ENTRY_ID --model M [--unsafe]` | `GET /dlq/{entry_id}?model=M` | read |  |  |
@@ -134,9 +138,9 @@ settings (`registry.set`); jobs are sent by the app (`llmq.send_job`), their dea
 | `requests.get` | `request_id` | `{summary, status, final, callers, result_ready}` (`summary` null once final); 404 when unknown or expired |
 | `requests.cancel` | `request_ids` (1-1,000), or `model` with `tenant` / `tenant_hash`; `state` (`waiting`) | `{op, model, tenant, matched, changed, skipped: {reason: n}, by_state, sample_ids, dry_run, actor, at}`; `skipped` reasons: `other_state` (not in `state`), `final` (ended or unknown), `already_cancelling`, `started` (granted between the read and the cancel, `state=waiting`), `not_running` |
 | `requests.reprioritize` | `model`, `priority`, `tenant` / `tenant_hash`, `limit` (all) | the same report; waiting calls only, each keeps its deadline and place |
-| `requests.extend` | `request_id`, `timeout_secs` | the same report for one call; `skipped` says `final`, `gone`, `already` (not later) or `past` |
+| `requests.extend` | `request_id`, `timeout_secs` (from the send; at most the model's `timeout_max_secs` and its queue's `retention_secs`, else `ConfigError`) | the same report for one call; `skipped` says `final`, `gone`, `already` (not later than the current deadline, the call's own timeout included), `past` or `unknown_model`. A waiting call's `max_wait_secs` no longer applies; a running attempt and a stream run on to the new deadline. Needs the request index (`AdminRefused` when off) |
 | `tenants.list` | `model` | `{model, tenants: [{tenant, calls, next_deadline_in_secs, tenant_name?}], truncated}`, most calls first; `tenant_name` only with `LLMQ_TENANT_NAMES_ENABLED` |
-| `tenants.hash` | `tenant` | `{tenant_hash}`: the keyed hash (`LLMQ_ID_HASH_SALT`) admin views show |
+| `tenants.hash` | `tenant` | `{tenant_hash}`: the keyed hash (`LLMQ_ID_HASH_SALT`) admin views show. Write-guarded over HTTP: it confirms which tenant a hash is |
 | `queues.list` | | `{queues: [{queue, model, job, class, messages, waiting, held, dead_letters, oldest_wait_secs, consumer}]}` |
 | `dlq.list` | `model` or `job`, `priority` (false), `count` (10) | `{queue, letters: [{id, src, fails, request_id, tenant}]}`; `tenant` is a hash, bodies never listed |
 | `dlq.show` | `entry_id`, `model` or `job`, `priority`, `unsafe` (false) | one letter; `body` only with `unsafe`, and over HTTP only with `LLMQ_ADMIN_DLQ_BODIES_ENABLED=true` |
@@ -154,10 +158,16 @@ settings (`registry.set`); jobs are sent by the app (`llmq.send_job`), their dea
 (`P:{m:ALIAS}:tq:H`, 0.2.0 T1): the engine's own in a running queue, one over the same stores
 under `AdminServices.from_env()` and the CLI. A tenant is given by name (`tenant`, hashed with
 `LLMQ_ID_HASH_SALT`, never stored) or by hash (`tenant_hash`, 16 hex, or `-` for calls with no
-tenant). With `LLMQ_REQUEST_INDEX_ENABLED=false`, looking calls up by model and tenant answers
-`AdminRefused` (HTTP 409, CLI exit 1); `requests.get` and `requests.cancel` by request ids still
-work. An operation that would read more than `LLMQ_ADMIN_SCAN_MAX` index entries is refused the
-same way.
+tenant). `GET` routes take `tenant_hash` only (`?tenant=` is a 400: a name in a URL reaches
+access logs); run `llm-queue tenants hash NAME` first. `describe()` shows
+`default_tenant_hash`, and the name of `LLMQ_DEFAULT_TENANT` only with
+`LLMQ_TENANT_NAMES_ENABLED`. With `LLMQ_REQUEST_INDEX_ENABLED=false`, looking calls up by model and tenant answers
+`AdminRefused` (HTTP 409, CLI exit 1), `requests.count` and `requests.extend` included (a count
+of zeros would read as "nothing waiting"); `requests.get` and `requests.cancel` by request ids
+still work. A cancel logs `call_cancel` only for the calls it cancelled, and answers the waiting
+ones in one pipelined round trip per `LLMQ_ADMIN_BATCH`. A reprioritize stopped by a full target
+counts every call it did not reach in `skipped.full`. An operation that would read more than
+`LLMQ_ADMIN_SCAN_MAX` index entries is refused the same way.
 
 ## `GET /` and `llm-queue ops`
 

@@ -17,6 +17,8 @@ from llm_queue.engine.admin.registry import usable
 from llm_queue.engine.settings import InfraSettings
 from llm_queue.engine.store_guard import STORE_DOWN
 from llm_queue.errors import LLMQueueError
+from llm_queue.ids import keyed_hash
+from llm_queue.registry.store import check_actor
 
 
 class DrainAdmin:
@@ -32,6 +34,7 @@ class DrainAdmin:
 
     async def start(self, *, actor: str) -> dict[str, Any]:
         """Stop taking calls and jobs here (readiness fails); held calls go back at once."""
+        check_actor(actor)
         process = self._ctx.needs_process("drain")
         process.pause_receiving()
         await self._audit(actor, "drain")
@@ -39,6 +42,7 @@ class DrainAdmin:
 
     async def resume(self, *, actor: str) -> dict[str, Any]:
         """Take calls and jobs again; `LLMQueueError` once the queue is stopping."""
+        check_actor(actor)
         process = self._ctx.needs_process("resume")
         process.resume_receiving()
         await self._audit(actor, "resume")
@@ -49,8 +53,9 @@ class DrainAdmin:
         # Best effort: the drain happened; a store outage must not hide that from the caller.
         with contextlib.suppress(LLMQueueError, *STORE_DOWN):
             await self._ctx.audit.write(
-                actor=actor, op=op, path=f"drain.{worker}", before=None, after={"op": op}
-            )
+                kind="drain", actor=actor, op=op, path=f"drain.{worker}", before=None,
+                after={"op": op},
+            )  # fmt: skip
 
 
 def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> dict[str, Any]:
@@ -73,7 +78,7 @@ def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> 
             local_process_count=s.local_process_count,
             local_concurrency=s.local_concurrency,
             metrics_sink=s.metrics_sink,
-            default_tenant=s.default_tenant,
+            **_default_tenant(s),
             admin_writes_enabled=s.admin_writes_enabled,
             registry_version=doc.get("registry_version"),
             models=sorted(doc.get("models") or {}),
@@ -90,11 +95,26 @@ def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> 
         key_expiry=s.key_expiry,
         store_max_connections=s.store_max_connections,
         metrics_sink=s.metrics_sink,
-        default_tenant=s.default_tenant,
+        **_default_tenant(s),
         admin_writes_enabled=s.admin_writes_enabled,
         registry_version=doc.get("registry_version"),
         models=sorted(doc.get("models") or {}),
     )
+    return out
+
+
+def _default_tenant(s: InfraSettings) -> dict[str, Any]:
+    """`LLMQ_DEFAULT_TENANT` as its keyed hash; the name too with `LLMQ_TENANT_NAMES_ENABLED`.
+
+    `describe()` is served on a read route and logged at start: a raw tenant name there broke
+    "tenant names hashed" (review B-04).
+    """
+    name = s.default_tenant
+    out: dict[str, Any] = {
+        "default_tenant_hash": keyed_hash(s.id_hash_salt or "", name) if name else None
+    }
+    if s.tenant_names_enabled:
+        out["default_tenant"] = name
     return out
 
 

@@ -22,6 +22,12 @@ from llm_queue.engine.jobs import JobRunner, JobSettings, current_job
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import Message, NotReplicated, QueueSettings
 from llm_queue.errors import ConfigError
+from llm_queue.ids import HashedId, keyed_hash
+
+
+def _hash(value: str) -> str:
+    """The keyed hash a job runner is built with (its ids travel hashed)."""
+    return keyed_hash("test-salt", value)
 
 
 def events(caplog: pytest.LogCaptureFixture, name: str) -> list[logging.LogRecord]:
@@ -189,7 +195,7 @@ async def test_en7_stop_does_not_swallow_its_own_cancellation() -> None:
     """EN-7: `suppress(CancelledError)` around each await ate the cancel of `stop()` itself."""
     queues = FakeQueues(return_secs=1.0)
     queues.pending.append(_message())
-    runner = JobRunner(queues)  # type: ignore[arg-type]  # fake
+    runner = JobRunner(queues, hash_id=_hash)  # type: ignore[arg-type]  # fake
     started = asyncio.Event()
 
     async def job(_payload: dict[str, Any]) -> None:
@@ -210,7 +216,7 @@ async def test_en8_stop_lets_a_receive_in_flight_finish() -> None:
     """EN-8: with no job running, stop cancelled the loop inside RECEIVE: the message it took
     stayed hidden for the visibility time and was charged a failure."""
     queues = FakeQueues(receive_secs=0.3)
-    runner = JobRunner(queues)  # type: ignore[arg-type]  # fake
+    runner = JobRunner(queues, hash_id=_hash)  # type: ignore[arg-type]  # fake
 
     async def job(_payload: dict[str, Any]) -> None:
         return None
@@ -226,7 +232,7 @@ async def test_en8_stop_lets_a_receive_in_flight_finish() -> None:
 async def test_en29_idle_loop_waits_on_the_doorbell() -> None:
     """EN-29: an idle job loop polled RECEIVE ~7 times a second instead of the doorbell."""
     queues = FakeQueues()
-    runner = JobRunner(queues)  # type: ignore[arg-type]  # fake
+    runner = JobRunner(queues, hash_id=_hash)  # type: ignore[arg-type]  # fake
 
     async def job(_payload: dict[str, Any]) -> None:
         return None
@@ -246,7 +252,7 @@ async def test_en32_ack_gave_up_is_logged(
     queues = FakeQueues()
     queues.ack_error = ConnectionError("down")
     settings = QueueSettings(visibility_secs=0.2)  # acks are tried for one visibility time
-    runner = JobRunner(queues, settings=settings)  # type: ignore[arg-type]  # fake
+    runner = JobRunner(queues, settings=settings, hash_id=_hash)  # type: ignore[arg-type]  # fake
     real_sleep = asyncio.sleep
     monkeypatch.setattr(asyncio, "sleep", lambda _s: real_sleep(0))
     with caplog.at_level(logging.WARNING):
@@ -258,7 +264,7 @@ async def test_en32_ack_gave_up_is_logged(
 
 
 def _runner() -> JobRunner:
-    return JobRunner(FakeQueues())  # type: ignore[arg-type]  # fake
+    return JobRunner(FakeQueues(), hash_id=_hash)  # type: ignore[arg-type]  # fake
 
 
 async def _noop(_payload: dict[str, Any]) -> None:
@@ -309,6 +315,7 @@ def test_r3je6_register_job_in_caller_mode_is_refused() -> None:
         queues=None,
         settings=SimpleNamespace(queue_prefix="", queue_wait_replicas=0, queue_wait_ms=100),
         metrics=None,
+        hash_id=_hash,
     )
     queue = LLMQueue(engine, settings=SimpleNamespace(mode="caller"))  # type: ignore[arg-type]
     with pytest.raises(ConfigError, match="caller mode"):
@@ -349,7 +356,7 @@ async def test_r3je7_send_job_waits_for_replicas() -> None:
 
     queues = _SendQueues()
     wait = ReplicaWait(replicas=1, wait_ms=50)
-    runner = JobRunner(queues, replica_wait=wait)  # type: ignore[arg-type]  # fake
+    runner = JobRunner(queues, replica_wait=wait, hash_id=_hash)  # type: ignore[arg-type]  # fake
     await runner.send("j", {})
     assert queues.sent == [{"wait_replicas": 1, "wait_ms": 50}]
     queues.error = NotReplicated("0 of 1")
@@ -372,7 +379,7 @@ async def test_r3je9_a_redelivered_running_job_runs_once() -> None:
     """R3JE-9: a job whose hold lapsed was received again by the same process and ran twice
     (and the first run's ack was refused as stale)."""
     queues = _AckQueues()
-    runner = JobRunner(queues)  # type: ignore[arg-type]  # fake
+    runner = JobRunner(queues, hash_id=_hash)  # type: ignore[arg-type]  # fake
     release = asyncio.Event()
     runs = 0
 
@@ -424,7 +431,7 @@ async def test_r3je11_r3je13_failed_job_log(caplog: pytest.LogCaptureFixture) ->
 async def test_q13_context_and_dedupe() -> None:
     """Q13 (R3JE-1, -2): a job could not see its id or attempt; a repeated job_id queued twice."""
     queues = _SendQueues()
-    runner = JobRunner(queues)  # type: ignore[arg-type]  # fake
+    runner = JobRunner(queues, hash_id=_hash)  # type: ignore[arg-type]  # fake
     assert await runner.send("j", {}, job_id="abc") == "abc"
     assert await runner.send("j", {}, job_id="abc") == "abc"
     assert len(queues.sent) == 1  # the second send queued nothing
@@ -454,7 +461,7 @@ def test_q14_retry_delays_cover_about_an_hour() -> None:
 async def test_q14_retry_after_is_honoured() -> None:
     """Q14: the LLM call's `retry_after_secs` was ignored; the next try came after 5 s."""
     queues = FakeQueues()
-    runner = JobRunner(queues)  # type: ignore[arg-type]  # fake
+    runner = JobRunner(queues, hash_id=_hash)  # type: ignore[arg-type]  # fake
 
     async def job(_payload: dict[str, Any]) -> None:
         raise CallFailed("rate_limited", retry_after_secs=90)
@@ -469,7 +476,7 @@ async def test_q16_payload_limits() -> None:
     from decimal import Decimal
 
     limits = JobSettings(max_payload_bytes=1024)
-    runner = JobRunner(_SendQueues(), job_settings=limits)  # type: ignore[arg-type]  # fake
+    runner = JobRunner(_SendQueues(), job_settings=limits, hash_id=_hash)  # type: ignore[arg-type]  # fake
     with pytest.raises(CallFailed) as big:
         await runner.send("j", {"x": "a" * 2000})
     assert big.value.kind == "request_too_large"
@@ -482,7 +489,7 @@ async def test_q16_process_cap_over_all_names() -> None:
     """Q16 (R3JE-8): each job name had its own limit of 4 and no process-wide one."""
     queues = FakeQueues()
     limits = JobSettings(process_concurrency=1)
-    runner = JobRunner(queues, job_settings=limits)  # type: ignore[arg-type]  # fake
+    runner = JobRunner(queues, job_settings=limits, hash_id=_hash)  # type: ignore[arg-type]  # fake
     release = asyncio.Event()
     running = 0
     peak = 0
@@ -508,7 +515,7 @@ async def test_q17_a_job_returned_too_often_is_dead() -> None:
     """Q17: a job longer than the drain was returned at every deploy and never ended."""
     queues = FakeQueues()
     limits = JobSettings(max_returns=2)
-    runner = JobRunner(queues, job_settings=limits)  # type: ignore[arg-type]  # fake
+    runner = JobRunner(queues, job_settings=limits, hash_id=_hash)  # type: ignore[arg-type]  # fake
     await runner._give_back("j", _message(), "x")
     assert len(queues.returned) == 1
     await runner._give_back("j", _message(), "x")
@@ -520,7 +527,7 @@ async def test_q18_job_calls_carry_the_sender_ids() -> None:
     """Q18 (R3JE-15): job calls took the context of whoever called start(), not the sender."""
     from llm_queue.context import current_context, request_context
 
-    runner = JobRunner(_SendQueues())  # type: ignore[arg-type]  # fake
+    runner = JobRunner(_SendQueues(), hash_id=_hash)  # type: ignore[arg-type]  # fake
     seen: list[Any] = []
 
     async def job(_payload: dict[str, Any]) -> None:
@@ -533,7 +540,15 @@ async def test_q18_job_calls_carry_the_sender_ids() -> None:
     with request_context(priority=True, user_id="starter"):
         run = runner._run("j", message, (asyncio.Semaphore(0),))
         await asyncio.create_task(run, context=contextvars.Context())
-    assert (seen[0].user_id, seen[0].tenant_id, seen[0].priority) == ("u1", "t1", False)
+    # As their keyed hashes (review RQ-6), marked so the job's calls do not hash them again.
+    assert (seen[0].user_id, seen[0].tenant_id, seen[0].priority) == (
+        _hash("u1"),
+        _hash("t1"),
+        False,
+    )
+    assert isinstance(seen[0].tenant_id, HashedId)
+    assert b"u1" not in body
+    assert b"t1" not in body
 
 
 def test_job_settings_from_env() -> None:
@@ -563,7 +578,7 @@ async def test_q15_dead_jobs_in_status_and_api() -> None:
 
     queues.dead_letters = dead_letters  # type: ignore[attr-defined]  # fake
     queues.depth = depth  # type: ignore[attr-defined]  # fake
-    runner = JobRunner(queues)  # type: ignore[arg-type]  # fake
+    runner = JobRunner(queues, hash_id=_hash)  # type: ignore[arg-type]  # fake
     assert await runner.dead_letters("j") == [
         {"id": "9-0", "job_id": "x", "fails": 18, "payload": {}}
     ]

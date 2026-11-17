@@ -18,7 +18,8 @@ llm-queue --actor ann requests cancel --id r-1 --yes   # cancels, audited as ann
   settings and no store.
 - `--actor NAME` (before the resource) records who made a change in the audit; without it the
   OS user is used, looked up only by commands that write (`uid:<n>` when the user has no passwd
-  entry, as in a container run under a bare UID). 1-200 characters without control characters.
+  entry, as in a container run under a bare UID). 1-128 characters without control characters,
+  checked by every write before it acts (registry, requests, dead letters, purges, drains).
 - A command that changes something is a **dry run unless given `--yes`**: it prints what it
   would do. There is no `--dry-run` flag.
 - Values of `registry set path=value` are JSON when they parse (`400`, `true`, `["a"]`), else
@@ -41,7 +42,7 @@ app.include_router(llmq.http_router(), prefix="/internal/llm-queue")
 | Argument | Default | Does |
 |---|---|---|
 | `admin_token` | `LLMQ_ADMIN_TOKEN` | Guards writes, and reads too. A value or a callable read on every request (a rotated secret needs no restart) |
-| `admin_read_token` | `LLMQ_ADMIN_READ_TOKEN` | Guards reads only (`GET` routes and `POST /tenants/hash`) |
+| `admin_read_token` | `LLMQ_ADMIN_READ_TOKEN` | Guards reads only (`GET` routes) |
 | `admin_header` | `LLMQ_ADMIN_HEADER` (`X-LLMQ-Token`) | The header that carries either token, compared in constant time |
 | `dependencies` | none | The app's own admin check (FastAPI dependencies), on every route but the probes and `/metrics`, with or without tokens |
 | `allow_writes` | `LLMQ_ADMIN_WRITES_ENABLED` (false) | Mount the write routes |
@@ -50,13 +51,18 @@ app.include_router(llmq.http_router(), prefix="/internal/llm-queue")
 | `metrics_route` | false | An open `GET /metrics`: the Prometheus exposition of a `LLMQ_METRICS_SINK=prometheus` process (extra `metrics`) |
 | `insecure_reads` | false | Mount the read routes with no token and no `dependencies` (local development only) |
 
+A tenant is named by its hash on every `GET` route (`?tenant_hash=H`, `-` for calls with no
+tenant): a name in a URL reaches proxy and access logs, so `?tenant=NAME` is refused with 400.
+Get the hash first with `llm-queue tenants hash NAME` (or `POST /tenants/hash`, write guard);
+the CLI and Python take `tenant=NAME` and hash it locally.
+
 Guards:
 
 | Guard | Routes | Needs |
 |---|---|---|
 | open | `GET /health/live`, `GET /health/ready`, `GET /metrics` | nothing |
-| read | every other `GET` route, `POST /tenants/hash` | the read token or the admin token in `admin_header`, or `dependencies` (both when both are set) |
-| write | every other `POST` route | the admin token, or `dependencies` plus the `X-LLMQ-Admin` header (a browser cannot send either cross-site without a CORS preflight, so a page an admin visits cannot post with the admin's cookies); `allow_writes=True`; an actor |
+| read | every other `GET` route | the read token or the admin token in `admin_header`, or `dependencies` (both when both are set) |
+| write | every other `POST` route, `POST /tenants/hash` (it writes nothing, but with the hashes the read routes show it would tell a read token which tenant a hash is; it is never mounted without a write guard) | the admin token, or `dependencies` plus the `X-LLMQ-Admin` header (a browser cannot send either cross-site without a CORS preflight, so a page an admin visits cannot post with the admin's cookies); `allow_writes=True`; an actor |
 
 The router refuses to be built (`ConfigError`) with no token and no `dependencies` (unless
 `insecure_reads=True`), with write routes but neither the admin token nor `dependencies`, and

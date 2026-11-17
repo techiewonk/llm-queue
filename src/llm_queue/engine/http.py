@@ -40,7 +40,7 @@ from llm_queue.errors import (
     StoreUnavailable,
     UnknownModel,
 )
-from llm_queue.registry.store import RegistryConflict
+from llm_queue.registry.store import ACTOR_MAX_CHARS, RegistryConflict
 
 if TYPE_CHECKING:
     from llm_queue.engine.admin import AdminServices
@@ -53,7 +53,6 @@ RETRY_AFTER_SECS = 1
 # Bounds on what a client sends before anything reads the store or diffs the registry (FO-15).
 MAX_ID_CHARS = 256
 MAX_EDIT_PATHS = 100
-MAX_ACTOR_CHARS = 128
 # Strict mode (review B-21, owner Q12): an admin token is the only guard on the write routes and
 # can be guessed online, so each configured token must be at least this long.
 MIN_TOKEN_CHARS = 32
@@ -63,6 +62,10 @@ MAX_VALUE_BYTES = 65_536
 BODY_MAX_BYTES = 1_048_576
 # Store answers that mean "refusing for a while", not "bad request".
 _STORE_REFUSALS = ("BUSY", "LOADING", "MASTERDOWN", "MISCONF", "NOREPLICAS", "OOM", "READONLY")
+TENANT_IN_URL = (
+    "a tenant name stays out of URLs: pass tenant_hash (get it with `llm-queue tenants hash "
+    "NAME` or POST /tenants/hash)"
+)
 Token = str | Callable[[], str | None] | None
 
 
@@ -379,7 +382,9 @@ def status_router(
     def who(request: Any) -> str:
         if actor is not None:
             return f"http:{actor(request)}"
-        claimed = request.headers.get(actor_header, "").strip()[:MAX_ACTOR_CHARS]
+        # Cut to fit `token:` within the one actor limit (review B-06): control characters
+        # in a claimed name are refused by the audit's `check_actor` (400).
+        claimed = request.headers.get(actor_header, "").strip()[: ACTOR_MAX_CHARS - 6]
         return f"token:{claimed or 'unknown'}"
 
     def reply(result: Response) -> Any:
@@ -396,6 +401,8 @@ def status_router(
     def mounts(op: Op) -> bool:
         if op.guard == "read" and not reads:
             return False
+        if op.guard == "write" and not (guarded or writes_by_token):
+            return False  # never open: e.g. `tenants.hash` (B-22) with only a read token
         return {
             "always": True,
             "writes": allow_writes,
@@ -420,6 +427,10 @@ def status_router(
                     fields[name] = _from_query(param, query.getlist(name))
                 except ValueError:
                     return reply((400, {"error": f"bad {name} ({_signature(op)})"}))
+            if "tenant" in fields and "tenant_hash" in params:
+                # A name in a URL reaches proxy and access logs the library cannot redact
+                # (review B-05): GET routes take the hash only.
+                return reply((400, {"error": TENANT_IN_URL}))
         else:
             raw = await _read_body(request, body_max_bytes)
             if raw is None:

@@ -19,7 +19,9 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from llm_queue.errors import UnsupportedEnvelopeError
 
-VERSION = 2
+# 3 (0.2.0): `tenant_id` and `user_id` carry keyed hashes, not raw ids (D1). A 0.1.1 worker
+# returns a v3 message (newer); this release refuses a v2 one: drain 0.1.1 first (review B-02).
+VERSION = 3
 Op = Literal["converse", "invoke_model", "chat", "embeddings"]
 AllowFallback = Literal["all", "regions", "none"]
 # A key no request field uses: `{"__b64__": ...}` written by a caller as data was decoded too,
@@ -166,7 +168,9 @@ def parse(data: bytes | str) -> Envelope:
     if raw["v"] > VERSION:
         raise UnsupportedEnvelopeError(f"message version {raw['v']} is newer than {VERSION}")
     if raw["v"] < VERSION:
-        raise ValueError(f"message version {raw['v']} is not supported (this library reads 2)")
+        raise ValueError(
+            f"message version {raw['v']} is not supported (this library reads {VERSION})"
+        )
     if raw.pop(_HAS_BYTES, False):
         raw["params"] = decode_bytes(raw.get("params"))
     return Envelope.model_validate(raw)
