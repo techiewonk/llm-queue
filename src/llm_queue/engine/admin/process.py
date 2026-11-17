@@ -59,6 +59,10 @@ def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> 
     s = settings
     if s is None:
         return out
+    if not s.enabled:  # LLMQ_ENABLED=false: nothing else was read
+        out.update(enabled=False, environment=s.environment, drain_file=bool(s.drain_file))
+        return out
+    out["enabled"] = True
     doc = orjson.loads(s.registry_document()) if (s.registry or s.registry_file) else {}
     out["execution_mode"] = s.execution_mode
     # Kinds and ids of the secrets sources and the mapped setting names: never a value.

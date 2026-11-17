@@ -81,6 +81,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `key_expiry_publish_failed` | warning | engine/runtime.py |
 | `llmq_admin` | info | engine/audit.py, engine/requests_admin.py |
 | `llmq_call_finished` | info | engine/runtime.py |
+| `llmq_disabled` | info | disabled.py (`LLMQ_ENABLED=false`: once at `start()`, with `describe()`: version, `enabled: false`, environment, whether a drain file is watched) |
 | `llmq_purge` | info | engine/purge.py |
 | `llmq_registry_audit` | info | registry/store.py |
 | `llmq_start_failed` | error | fastapi.py (`on_start_error="log"`: the app stays up, not ready) |

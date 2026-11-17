@@ -65,6 +65,14 @@ index (below).
 
 ### Added
 
+- The off switch `LLMQ_ENABLED` (default `true`; 0.2.0 H1). `false` makes `from_env()` return a
+  disabled queue (`llmq.enabled` False) that reads no other setting but `LLMQ_ENVIRONMENT` and
+  the drain file: the factories return None (the app's direct path), direct calls, jobs,
+  `status()` and admin store operations raise the new `QueueDisabled` (`config_error`, not
+  retryable; HTTP 503 `reason: disabled`, CLI exit 1), `install()` mounts only the two probes
+  (`enabled: false`), `health()` / `describe()` say so, `llmq_disabled` is logged once at start,
+  and the drain file still fails readiness. The fifth step of the switch ladder
+  (docs/how-to/modes.md).
 - Local execution mode: `LLMQ_EXECUTION_MODE=local` (default `queue`) runs every call in its
   own process straight against the provider, with the same API, classes, LangChain adapters
   and `install()`, and never contacts the store (no store client is built; `LLMQ_STORE_URL`
@@ -193,6 +201,8 @@ index (below).
 
 ### Removed
 
+- `queue_ready(enabled, llmq=None)` loses `enabled`: it is `queue_ready(llmq=None)`. The app's own
+  flag is replaced by `LLMQ_ENABLED=false`, whose queue is ready unless draining.
 - `LLMQ_TENANT_INDEX` and its cross-model index `P:tenant:H:reqs` (with
   `PurgeService.index_call`): a tenant purge of `queued` / `running` calls reads the request
   index of each model. `LLMQ_PURGE_BATCH` (now `LLMQ_ADMIN_BATCH`).
