@@ -277,6 +277,9 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   deploy therefore waits for the new pod to run those calls.
 - A registry account's `api_key_ref` / `external_id_ref` that names a process setting
   (`llm_queue.engine.settings.SETTING_NAMES`) is refused, whatever its prefix.
+- A failed secrets refresh is retried after min(cache, 30 s) spread by +-20 %, so a fleet does
+  not retry in step; a store login refused with the cached password re-reads the secrets at once
+  (at most every 5 s), so a rotated `LLMQ_STORE_PASSWORD` needs no cache period.
 
 ### Removed
 
