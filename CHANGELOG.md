@@ -251,8 +251,40 @@ index (below).
   routes: a token or `dependencies`, plus `X-LLMQ-Admin`) and an open `GET /drain` (status
   only). They reach one process; multi-process pods use the drain file.
 - `JobRunner.resume()`.
+- A late failure or cancel reply after a stored success no longer marks the call
+  `failed`/`cancelled`: the next call with that app request id got `new`, deleted the success
+  and ran again (double spend). A `done` call stays done; a direct run whose step after the
+  stored result raises returns the success instead of the failure.
+- A registration replayed by the store client after a lost reply answers its first outcome
+  (`new`), not `attached` to its own record (a 6 s wait before sending, and a call missing from
+  the tenant index). A replayed end-of-call script logs `settle_replayed` instead of
+  `ack_stale_receipt` and the `llmq_stale_acks_total` / grant-lost double-run alarms.
+- `LLMQueue.stop()` stops receiving calls and jobs first, then drains: calls taken while jobs
+  drained got only the rest of the drain (streams failed `worker_shutdown`, others ran again
+  elsewhere). This is also `fastapi.install()`'s shutdown.
+- `resume_receiving()` is thread-safe, as `pause_receiving()` is.
+- The health safeguard "never disable a model's last usable deployment" counts only
+  deployments that take calls (enabled, account enabled, not blocked, inside residency).
+- A cancel that lands while a call's admission is in flight gives the grant back at once
+  (slot and budget); its slot was held up to a lease and its budget never refunded.
+- A pause also hands back calls waiting between two attempts (retry backoff); they kept the
+  drain open until their deadline.
+- A retry after a failed attempt on a fallback model asks the call's own model first, then
+  the fallback rule again; it stayed on the fallback model for good.
+- Admin HTTP: a dead letter id that is not `<ms>-<seq>` and any request the store refuses
+  answer 400 (500 with a traceback before); a POST body above `LLMQ_ADMIN_BODY_MAX_BYTES`
+  (new, default 1 MiB) answers 413, a body value above 64 KiB 400.
 
 ### Changed
+
+- Key expiry: the store's mode wins. The first engine sets `P:expiry`; afterwards only
+  `swept` replaces `native`, and a process whose `LLMQ_KEY_EXPIRY` differs follows the store
+  and logs `key_expiry_conflict` (pods with different settings flipped the mode every minute,
+  leaving evictable keys on `volatile-*` stores). A change is announced, so every process's
+  own writes follow it at once. To go back to `native`, stop every process and delete
+  `P:expiry`.
+- `cancel()` needs a registered request id: a cancel that lands before the call registers is
+  dropped by the registration (documented; unchanged behaviour).
 
 - `pause_receiving()` now hands held calls (waiting for budget, not started) back to the
   queue at once, for another pod (`LLMQ_DRAIN_HANDBACK_ENABLED`, default true; false keeps
