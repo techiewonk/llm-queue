@@ -2144,8 +2144,8 @@ class Engine:
     async def cancel(self, request_id: str, *, source: str = "api") -> None:
         """Cancel a call for every caller of its id: a waiting one never starts, running ones end.
 
-        Anyone may cancel any id (owner Q5); each cancel is logged with its `source`. One
-        pipelined round trip (two before, FE-21).
+        Anyone may cancel any id (owner Q5); each cancel is logged with its `source`. The id
+        must be registered: a cancel that lands before the registration is dropped by it (A-9).
         """
         await self._cancel_batch([request_id], source=source)
 

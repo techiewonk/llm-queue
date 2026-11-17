@@ -302,6 +302,11 @@ unless `dry_run=False`, and `state` (default `waiting`) leaves calls that alread
 pass `state="all"` to stop a running one too. `llmq.admin.requests.get(request_id)` returns
 `{status, final}` (None when unknown).
 
+**A cancel needs a registered id.** A cancel of an id no call has registered yet (one about to
+start in another process, say) is dropped when that call registers: a new run never takes over
+a cancel mark left by an earlier run of its id, and the two cannot be told apart. Cancel after
+the call started (its `request_status` is not empty), or have the caller give up its own call.
+
 **Request ids:** a call sent again with the id of a call that **succeeded** gets the same
 answer without running again (while the result is kept). An id whose last run failed,
 expired or was cancelled **runs again**.
