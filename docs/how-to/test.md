@@ -40,7 +40,7 @@ answer; they never skip silently. Engine tests run on both Valkey and Redis.
 | `a12`, `a13`, `a14`, `a17` | status / CLI / HTTP; embeddings; front door, jobs, sync, LangChain; streaming | `test_ops.py`, `test_embed.py`, `test_front.py`, `test_stream.py` |
 | `store` | failover options, readiness, preStop, HTTP writes + `scripts/failover.py` drill | `test_store_and_http.py` |
 | `load` | `scripts/load.py`: 2,000 calls over 3 workers (all succeed, none left held); 300 calls on a 600 RPM model (at most burst + rate served, the rest `rate_limited`, none past its deadline) | |
-| `gates` | `scripts/gates.py`: B17, B19, B22, B23, B33, B34, B56 / B93, B91, B92, B94-B97 (~20 min) | |
+| `gates` | `scripts/gates.py`: B17, B19, B22, B23, B33, B34, B56 / B93, B91, B92, B94-B97, and the 0.2.0 gates BL1, G-T1, G-T2 (~26 min) | |
 | `samples` | `scripts/samples.py`: the ten samples on fakellm (`--live` real Bedrock, `--store env` a TLS store) | |
 | `scenarios` | `scripts/scenarios.py`: fault scenarios x 3 loads, plus the Docker failover drills | |
 | `unit` | every unit test, no stack needed | `tests/unit` |
@@ -64,6 +64,7 @@ python scripts/scenarios.py S4 --load under          # one, while fixing it
 python scripts/scenarios.py --group store            # a group
 python scripts/scenarios.py all --profile prod       # production timers
 python scripts/scenarios.py all --jobs 1             # one run at a time (default 4)
+python scripts/scenarios.py D1 T1 --quick           # short D1, small T1: a harness smoke
 python scripts/check.py scenarios --quick            # every scenario, one load each
 ```
 
@@ -74,14 +75,15 @@ python scripts/check.py scenarios --quick            # every scenario, one load 
 | `--jobs` | runs at a time (default 4; 1 runs them one by one) |
 | `--group` | `worker`, `store`, `provider`, `registry`, `caller`, `clients`, `pairs`, `failover` |
 | `--seed` | seed of every random choice (printed at the start; the same in `gates.py` and `soak.py`), to replay a run |
+| `--quick` | D1 shortened (6 s before the drain file, 4 s after SIGTERM) and T1 at 30 calls a tenant: proves the harness, not the design |
 
 | Group | Scenarios |
 |---|---|
-| worker | S1 killed, S2 graceful restart, S3 all down then back |
+| worker | S1 killed, S2 graceful restart, S3 all down then back; D1 rolling deploy through the drain file (2 pods x 3 processes, 50 calls/s, 30 % waiting for budget; drain file on pod 1, SIGTERM 5 s later: 0 lost, waiting calls on pod 2 within 2 s, pod 1 exits in its grace period; `at` only, ~1 min) |
 | store | S4 blocked, S5 half-open, S8 keys reset, S9 out of memory, S10 slow; S6 / S7 / S11 failover drills on Docker nodes; L2 streams, L3 separate queue store blocked, L4 embeddings, each under faults |
 | provider (fakellm) | P1 throttled, P2 5xx, P3 hangs, P4 model not in region, P5 bad credentials, P7 every region down |
 | registry | R1 rpm cut live, R2 region disabled, R3 kill switch, R4 bad edit refused |
-| caller | C1 cancel, C2 caller process dies, C3 duplicate request id |
+| caller | C1 cancel, C2 caller process dies, C3 duplicate request id; T1 tenant isolation (300 calls a tenant, a baseline wave then one where tenant A's calls are moved, cancelled and a worker killed: B served and untouched, B's p95 wait within 10 % of the baseline, A's moved calls first, index empty, no native TTL under `swept`; ~3 min a load) |
 | clients | M1 many caller pods on one model, M2 services on different registry versions, M3 caller-only and worker-only pods |
 | pairs | X1-X8: two faults at once (store block + worker kill, rpm cut + throttle ...) |
 
@@ -108,7 +110,16 @@ ceiling at least 80 %) and fails when no baseline exists, so record one per mach
 ```bash
 python scripts/gates.py B34 --record-baseline   # store this machine's B34 numbers
 python scripts/gates.py B34 --seed 7            # replay a run
+python scripts/gates.py BL1 G-T1 G-T2 --short   # the 0.2.0 gates scaled down (a harness smoke)
 ```
+
+| Gate | What it proves | Pass mark |
+|---|---|---|
+| BL1 | local mode against a provider quota: 4 processes, `LLMQ_EXECUTION_MODE=local`, `LLMQ_LOCAL_PROCESS_COUNT=4`, 150 % of the rpm offered for 3 min (`--short` 40 s) | fakellm never over its rpm in a wall-clock minute (+2); every call answered or `rate_limited` on time |
+| G-T1 | the request index's cost: B19's burst with the index off, then on (`--short` 400 calls a side) | store scripts per call unchanged; REGISTER_SEND + SETTLE_DONE median store time within +50 us |
+| G-T2 | admin at scale: 10,000 waiting calls of 20 tenants, no worker (`--short` 1,000) | `list` 100 rows <= 20 ms, `count` one tenant <= 100 ms, reprioritize 1,000 <= 2 s, cancel 10,000 <= 3 s |
+
+`--quick` leaves out B17, B91, B92, BL1 and G-T2.
 
 ## Benchmark
 

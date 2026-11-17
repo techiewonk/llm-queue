@@ -149,8 +149,9 @@ CI (`.github/workflows/ci.yml`) runs ruff, format, mypy and the unit tests on Py
 (`--resolution lowest-direct`), the LangChain 0.3 adapters, and unit plus integration tests
 against the same Docker stack on Python 3.12, 3.13 and 3.14 (with coverage on 3.12). The
 nightly workflow (`.github/workflows/nightly.yml`, 02:17 UTC or by hand) runs the slow
-drills CI cannot run on every push: `scenarios.py all --load under`, `gates.py --quick` and
-a 10-minute soak, all on fakellm, and keeps `reports/` for 7 days. It also runs the engine
+drills CI cannot run on every push: `scenarios.py all --load under`, `gates.py --quick`,
+a 10-minute soak, `evict_drill.py --calls 500` (both policies) and `failover.py` on Valkey
+and on Redis 7.4 (`--image redis:7.4-alpine`), all on fakellm, and keeps `reports/` for 7 days. It also runs the engine
 integration tests with `LLMQ_TEST_KEY_EXPIRY=swept` (CI runs them with `auto`, which is
 `native` on the stack's `noeviction` stores).
 

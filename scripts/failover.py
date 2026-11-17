@@ -16,6 +16,7 @@ body is unique).
 
     python scripts/failover.py                  # all three
     python scripts/failover.py slowdns          # one
+    python scripts/failover.py --image redis:7.4-alpine          # the nodes on Redis 7.4
 """
 
 from __future__ import annotations
@@ -43,6 +44,8 @@ from llm_queue import CallFailed, LLMQueue  # noqa: E402
 NODES = {"a": ("llmqfo-a", free_port()), "b": ("llmqfo-b", free_port())}
 NETWORK = "llmqfo"
 IMAGE = "valkey/valkey:8.1-alpine"
+CLI, SERVER = "valkey-cli", "valkey-server"  # `use_image` switches them for a Redis image
+REDIS_74 = "redis:7.4-alpine"  # the `--image` the nightly also runs (gap G18)
 PROXY_PORT = free_port()
 RUN_SECS = 30
 EVENT_AT_SECS = 8
@@ -59,9 +62,17 @@ def docker(*args: str, check: bool = True) -> str:
     return proc.stdout.strip()
 
 
+def use_image(image: str) -> None:
+    """Run the nodes on `image`: Valkey's or Redis' (`redis-cli`, `redis-server`)."""
+    global IMAGE, CLI, SERVER
+    IMAGE = image
+    redis = image.split("/")[-1].startswith("redis")
+    CLI, SERVER = ("redis-cli", "redis-server") if redis else ("valkey-cli", "valkey-server")
+
+
 def role(node: str) -> str:
     """`master` or `slave`."""
-    return docker("exec", NODES[node][0], "valkey-cli", "role").splitlines()[0]
+    return docker("exec", NODES[node][0], CLI, "role").splitlines()[0]
 
 
 def nodes_up() -> None:
@@ -73,7 +84,7 @@ def nodes_up() -> None:
     docker("run", "-d", "--name", name_a, "--network", NETWORK, "-p", f"{port_a}:6379", IMAGE)
     docker(
         "run", "-d", "--name", name_b, "--network", NETWORK, "-p", f"{port_b}:6379", IMAGE,
-        "valkey-server", "--replicaof", name_a, "6379",
+        SERVER, "--replicaof", name_a, "6379",
     )  # fmt: skip
     wait_link()
 
@@ -82,7 +93,7 @@ def wait_link() -> None:
     """Until the replica's link to the primary is up (20 s at most)."""
     for _ in range(40):
         replica = "b" if role("a") == "master" else "a"
-        info = docker("exec", NODES[replica][0], "valkey-cli", "info", "replication", check=False)
+        info = docker("exec", NODES[replica][0], CLI, "info", "replication", check=False)
         if "master_link_status:up" in info:
             return
         time.sleep(0.5)
@@ -138,7 +149,7 @@ def environment(prefix: str, fake_url: str) -> dict[str, str]:
 async def drill(scenario: str) -> bool:
     """Run one scenario; print per-second results; True when it meets the pass mark."""
     if role("a") != "master":  # the previous scenario failed over: swap back
-        docker("exec", NODES["b"][0], "valkey-cli", "FAILOVER")
+        docker("exec", NODES["b"][0], CLI, "FAILOVER")
         await asyncio.sleep(2)
     await asyncio.to_thread(wait_link)
     # Each resource is undone on its own, in reverse, even if a later start or an earlier
@@ -215,7 +226,7 @@ async def _drill(scenario: str, stack: contextlib.AsyncExitStack) -> bool:
             print(f"  [{time.monotonic() - started:.1f}s] node back")
             return
         # In a thread: a blocking call here stalled the drill's own callers mid-traffic.
-        await asyncio.to_thread(docker, "exec", NODES["a"][0], "valkey-cli", "FAILOVER")
+        await asyncio.to_thread(docker, "exec", NODES["a"][0], CLI, "FAILOVER")
         # FT-34: confirm the switch really happened before moving the name.
         for _ in range(50):
             if (await asyncio.to_thread(role, "a")) == "slave":
@@ -268,10 +279,19 @@ async def _drill(scenario: str, stack: contextlib.AsyncExitStack) -> bool:
 def main() -> int:
     """Run the chosen scenarios on fresh containers; exit 1 if any fails."""
     known = ["failover", "slowdns", "restart"]
-    chosen = sys.argv[1:] or known
+    args = sys.argv[1:]
+    if "--image" in args:  # before the names: `--image redis:7.4-alpine failover`
+        at = args.index("--image")
+        if at + 1 >= len(args):
+            print(__doc__)
+            return 2
+        use_image(args[at + 1])
+        del args[at : at + 2]
+    chosen = args or known
     if set(chosen) - set(known):  # `--help` once started the Docker nodes and a drill
         print(__doc__)
         return 2
+    print(f"  nodes: {IMAGE}", flush=True)
     os.environ.update({"AWS_ACCESS_KEY_ID": "aws-main", "AWS_SECRET_ACCESS_KEY": "fake"})
     os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
     try:  # a failed nodes_up still removes what it started (CO-17)
