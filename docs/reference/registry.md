@@ -226,7 +226,7 @@ An entry listed in both `confirmed` and `fallback`, or twice, is refused.
 | `blocked_regions` | `[]` | Regions no call may use (live) |
 | `blocked_accounts` | `[]` | Accounts no call may use (live) |
 
-A rollback (`llm-queue registry publish --from-version N`) keeps the live `routing` blocks and
+A rollback (`llm-queue registry rollback N --yes`) keeps the live `routing` blocks and
 kill switch, and its reply lists what it kept.
 
 ## Residency

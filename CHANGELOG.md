@@ -7,6 +7,54 @@ public API (see STABILITY.md).
 
 ## [Unreleased]
 
+### Removed and renamed (admin API)
+
+Every admin operation is now one service method under `llmq.admin`, and the `llm-queue` CLI and
+the HTTP routes are generated from one operations table, so the three agree (see
+[Admin API](docs/reference/admin-api.md)). Every write takes `actor`, is audited, and is a dry run
+by default on every surface. No old name is kept:
+
+| 0.1.x | 0.2.0 |
+|---|---|
+| `llmq.purge.<method>(...)` | `llmq.admin.purge.<method>(...)` (returns the report dict; dry run unless `dry_run=False`) |
+| `PurgeService.plan_model` / `plan_deployment` / `plan_tenant` | `model` / `deployment` / `tenant` with the default `dry_run=True` |
+| `PurgeService` methods: `dry_run=False` by default | `dry_run=True` by default: pass `dry_run=False` to purge |
+| `llmq.purge.cancel_scheduled(target)` | `llmq.admin.purge.unschedule(target, actor=, dry_run=False)` |
+| `llmq.registry` (the `RegistryStore`) | `llmq.admin.registry` (`get`, `versions`, `diff`, `schema`, `set`, `publish`, `rollback`; `.current` read-only), `llmq.admin.models`, `.deployments`, `.blocks`, `.audit` |
+| `llmq.registry.set_enabled(m, d, False, actor=)` | `llmq.admin.deployments.disable(m, d, actor=, dry_run=False)` |
+| `llmq.registry.block(region=, on=, actor=)` | `llmq.admin.blocks.add(region=, actor=, dry_run=False)` / `.remove(...)` |
+| `llmq.registry.log(count)` | `llmq.admin.audit.list(count)` |
+| `llmq.cancel(request_id)` | `llmq.admin.requests.cancel(request_ids=[id], state="all", actor=, dry_run=False)` |
+| `llmq.job_dead_letters(name)` / `llmq.redrive_jobs(name)` | `llmq.admin.dlq.list(job=name)` / `llmq.admin.dlq.redrive(job=name, actor=, dry_run=False)` |
+| `PurgeRefused` | `AdminRefused` (category `bad_request`, HTTP 409) |
+| `llm-queue request ID` | `llm-queue requests get ID` |
+| `llm-queue cancel ID ... --yes` | `llm-queue requests cancel --id ID ... [--state waiting\|running\|all] --yes` |
+| `llm-queue block` / `unblock --region R` | `llm-queue blocks add` / `remove --region R --yes` |
+| `llm-queue drain M --yes --wait --timeout S` | `llm-queue models drain M --wait-secs S --yes` |
+| `llm-queue settings get --model M [--deployment D]` | `llm-queue models get M`, `llm-queue deployments get M D` |
+| `llm-queue registry enable` / `disable M D` | `llm-queue deployments enable` / `disable M D --yes` |
+| `llm-queue registry log` | `llm-queue audit list` |
+| `llm-queue registry gc` | `llm-queue purge removed` |
+| `llm-queue registry publish --from-version N` | `llm-queue registry rollback N` |
+| `--dry-run` on every changing command | Gone: every change is a dry run until `--yes` (registry `set` / `publish` too) |
+| `POST /registry/block` (`on: false` to lift) | `POST /blocks`, `POST /blocks/remove` |
+| `POST /registry/gc` | `POST /purge/removed` |
+| `POST /purge/scheduled/cancel` | `POST /purge/unschedule` |
+| `POST /registry` body: the values | Body `{values, model?, dry_run?}`; a dry run by default |
+| `GET /drain` open | `GET /drain` needs a read guard |
+| Read routes mounted open with no guard (a warning) | Not mounted: with no token and no `dependencies` only the probes and `/metrics` are (warning `admin_routes_unauthenticated`), unless `insecure_reads=True` |
+
+New settings: `LLMQ_ADMIN_READ_TOKEN` (read routes only), `LLMQ_ADMIN_WRITES_ENABLED` (false),
+`LLMQ_ADMIN_ACTOR_HEADER` (`X-LLMQ-Actor`: a write under the token guard is audited as
+`token:<value>`, `token:unknown` without it), `LLMQ_ADMIN_INDEX_CACHE_SECS` (2),
+`LLMQ_ADMIN_DLQ_BODIES_ENABLED` (false). New: `GET /` admin index with a live summary;
+`AdminServices.from_env()` for admin workers and the CLI; routes for registry versions, diff,
+schema, publish and rollback, audit, models, deployments, blocks, queues, jobs, dead letters and
+`describe`; log event `llmq_admin` per audited write. Requests listed, counted, reprioritized or
+extended by model and tenant, a cancel by model or tenant, `tenants list` and `purge queue` are
+in the table and answer `AdminRefused("requests service not available")` until the per-model
+request index ships.
+
 ### Added
 
 - Registry placeholders: the boot document (`LLMQ_REGISTRY` / `LLMQ_REGISTRY_FILE`) may hold

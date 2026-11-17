@@ -26,8 +26,9 @@ sequenceDiagram
   `LLMQ_JOB_CONCURRENCY`).
 - A job that raises is retried, so make it safe to run twice (for example, upsert by id).
 - When the retries run out (5 s doubling to 5 minutes, for about an hour) the job is
-  **dead-lettered**. `job_dead_letters(name)` lists the dead jobs (id, job id, fails, payload);
-  once the cause is fixed, `redrive_jobs(name)` sends them back to run again. The sample cuts the
+  **dead-lettered**. `llmq.admin.dlq.list(job=name)` lists the dead jobs (entry id, failures,
+  job id); once the cause is fixed, `llmq.admin.dlq.redrive(job=name, actor=..., dry_run=False)`
+  sends them back to run again. The sample cuts the
   retry settings (`LLMQ_JOB_RETRY_*`) to under a second so this shows within the run; an app
   keeps the defaults.
 - LLM calls inside a job go through the same queue and budgets as user calls, at normal priority.

@@ -14,7 +14,7 @@ flowchart LR
 
 ## Key points
 
-- The sample turns deployments off with a live registry edit (what `llm-queue registry disable`
+- The sample turns deployments off with a live registry edit (what `llm-queue deployments disable`
   does), and turns them back on at the end.
 - A model with a `model_fallback` rule is served by its fallback model, and `meta.fallback`
   says so.

@@ -147,9 +147,10 @@ wires an `Engine` with its store clients, a `RegistryStore` and `Providers(Clien
 keeps a builder for the caller-only engine of sync calls too.
 
 Its methods are thin: `converse` / `chat` / `call`, `converse_stream` / `chat_stream`, `embed`,
-the `*_sync` twins, `register_job` / `send_job`, `cancel`, `status`, `request_status`, `health`,
-`registry` (admin: publish, live edit, rollback), `purge`, `http_router`, `pause_receiving` and
-`stop`. It guards the misuses that would otherwise hang: a call from another event loop, from a
+the `*_sync` twins, `register_job` / `send_job`, `status`, `request_status`, `health`,
+`describe`, `admin` (every admin operation: registry, models, deployments, blocks, requests,
+dead letters, jobs, purges, drain), `http_router`, `pause_receiving` / `resume_receiving` /
+`drain` and `stop`. It guards the misuses that would otherwise hang: a call from another event loop, from a
 forked child, or after `stop()` raises `LLMQueueError`
 ([One LLMQueue per process](clients.md#one-llmqueue-per-process)). The first started queue is
 the LangChain default.
@@ -325,10 +326,12 @@ visible, retries a failure after 5 s doubling to 300 s for about an hour, then d
 
 ### HTTP router, CLI and adapters
 
-- `llmq.http_router()` (extra `http`): FastAPI routes `/health/live`, `/health/ready`,
-  `/metrics` (Prometheus sink), `/status`, `/requests/{id}`, `/registry` (writes only with
-  `allow_writes=True`) and the purge routes. The app puts its own auth on everything but health.
-  The `llm-queue` command covers the same ground. See [CLI and HTTP](../reference/cli-http.md).
+- Admin API (`engine/admin/`): one operations table (`engine/admin/ops.py`) lists every admin
+  operation; `llmq.admin` (`AdminServices`) holds one service method per operation, and the
+  `llm-queue` command and the FastAPI routes of `llmq.http_router()` (extra `http`) are
+  generated from the table and call the same methods. Every write takes an actor, is audited,
+  and is a dry run by default. Health, readiness and `/metrics` are open; every other route
+  needs a token or the app's `dependencies`. See [Admin API](../reference/admin-api.md).
 - `langchain/`: `QueuedChatBedrockConverse`, `QueuedBedrockEmbeddings`, `QueuedChatOpenAI`,
   `QueuedOpenAIEmbeddings`. The OpenAI ones use `http_transport.py`, an httpx transport that
   answers the OpenAI SDK in process with `llmq.chat` and `llmq.embed`.
@@ -339,8 +342,8 @@ visible, retries a failure after 5 s doubling to 300 s for about an hour, then d
 ### Purge service (`engine/purge.py`)
 
 `PurgeService` deletes the store state of a removed model or deployment, or of one tenant, with
-a dry run first, an audit entry and a `PurgeReport`. `LLMQueue.purge`, the CLI and the HTTP
-routes all call it. **Auto purge** (`LLMQ_AUTO_PURGE`, on by default) runs in the worker
+a dry run by default, an audit entry and a `PurgeReport`. `llmq.admin.purge`, the CLI and the
+HTTP routes all call it. **Auto purge** (`LLMQ_AUTO_PURGE`, on by default) runs in the worker
 sweeper's loop: when a reload drops a model or deployment, one worker (lock `P:lock:purge`)
 schedules it in `P:purge` with a grace (`LLMQ_PURGE_GRACE_SECS`, 900 s) and purges it when due if
 it is still absent. See [Purge store state](../how-to/purge.md) and the
@@ -415,7 +418,9 @@ calls per queued call ([Performance](performance.md)). See
 
 | Module | Role |
 |---|---|
-| `core.py` | `LLMQueue`: `from_env`, `start`, `pause_receiving`, `stop`, calls, streams, `embed`, `*_sync` (private loop, caller-only engine), jobs, `cancel`, status, `health`, `registry`, `purge`, `http_router`; the fork and loop guards |
+| `core.py` | `LLMQueue`: `from_env`, `start`, `pause_receiving`, `stop`, calls, streams, `embed`, `*_sync` (private loop, caller-only engine), jobs, status, `health`, `describe`, `admin`, `http_router`, drain; the fork and loop guards |
+| `engine/admin/` | The operations table (`ops.py`) and `AdminServices`: registry, audit, models, deployments, blocks, requests, tenants, queues, dead letters, jobs, purges, status, drain |
+| `engine/audit.py` | `Audit`: one audit entry per admin write |
 | `engine/runtime.py` | `Engine`: caller (register, send, wait, `store_down`), worker (receive, admit, hold, run, attempts, retries, fallback, settle), direct path, cancel, every background loop |
 | `engine/_admission_lua.py`, `engine/admission.py` | `PICK_TAKE`, `FINISH`, `UNDO`, `RELEASE`, `RENEW`, `SWEEP`, `REREGISTER` and their Python wrapper (`Ask`, `Decision`) |
 | `engine/queue.py` | `StreamQueues`, doorbells, receive claims, dead letters, `ReplicaWait` |
@@ -430,7 +435,7 @@ calls per queued call ([Performance](performance.md)). See
 | `engine/purge.py` | `PurgeService`, auto purge |
 | `engine/jobs.py`, `engine/offload.py`, `engine/metrics.py`, `engine/hooks.py` | Jobs; S3 offload; EMF and Prometheus sinks; named hooks |
 | `engine/settings.py`, `tuning.py`, `engine/store_client.py`, `engine/keys.py` | `LLMQ_*` settings; `Tuning`; the store client factory (retries, `READONLY` reconnect, TLS checks); key names |
-| `engine/http.py`, `engine/cli.py` | FastAPI router; the `llm-queue` command |
+| `engine/http.py`, `engine/cli.py` | The FastAPI routes and the `llm-queue` command, both generated from the operations table |
 | `registry/` | `settings.py` (every setting), `schema.py`, `validate.py`, `resolve.py`, `store.py` + `_lua.py` (publish, edit, audit, rollback, reload), `json_schema.py` |
 | `clients/` | `ClientHub`, `ClientPool`, `BedrockHTTP` (aiohttp transport), `Providers` (Bedrock, OpenAI-compatible), attempt timers |
 | `providers/` | Error classification; embedding codecs |

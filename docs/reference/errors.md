@@ -2,8 +2,8 @@
 
 Everything raised to callers is an `LLMQueueError`. A failed call raises `CallFailed` with a
 `kind`; bad configuration raises `ConfigError` (or one of its subclasses); an admin operation the
-store cannot serve raises `StoreUnavailable`; a purge that would delete state still in use raises
-`PurgeRefused`.
+store cannot serve raises `StoreUnavailable`; an admin operation that is refused (a purge that would
+delete state still in use, a service this build does not have) raises `AdminRefused`.
 
 ```text
 LLMQueueError
@@ -14,7 +14,7 @@ LLMQueueError
 │   ├── LiveEditRefused   a live edit touched fields that change only with a deploy
 │   ├── UnknownModel      a model name not in the registry (also a KeyError)
 │   └── MissingExtra      an optional feature's extra is not installed (also an ImportError)
-├── PurgeRefused          a purge would delete state still in use; nothing was deleted
+├── AdminRefused          an admin operation was refused; nothing was changed
 └── StoreUnavailable      the store cannot serve an admin operation (also a ConnectionError)
 ```
 
@@ -38,7 +38,8 @@ becomes `if not llm_queue.error_retryable(exc): stop`.
 | `ConfigError` and its subclasses (`RegistryError`, `LiveEditRefused`, `UnknownModel`, `MissingExtra`) | `config_error` | False |
 | `RegistryConflict` | `config_error` | True: the same publish or edit can succeed once the other writes are done |
 | `StoreUnavailable` | `unavailable` | True |
-| `PurgeRefused`, a plain `LLMQueueError`, anything else | `internal` | False |
+| `AdminRefused` | `bad_request` | False |
+| A plain `LLMQueueError`, anything else | `internal` | False |
 
 `UnknownModel` is `config_error`, not `bad_request`: the model name comes from the app's code or
 configuration, and it is a `ConfigError`, so both views agree.
@@ -115,27 +116,33 @@ them as server-side, not as a bad request:
 
 ## StoreUnavailable
 
-Raised by `cancel`, `status`, `request_status`, `send_job` and the registry's reads and edits
+Raised by `status`, `request_status`, `send_job` and the admin operations (`llmq.admin.*`)
 when the state store is unreachable, read-only (after a failover) or full. Calls never raise it;
 they raise `CallFailed` (`queue_unavailable`). It is also a `ConnectionError`. Retry after the
 store is back; see [Operate](../how-to/operate.md#store-failover).
 
-## PurgeRefused
+## AdminRefused
 
-Raised by a `PurgeService` purge (`llmq.purge`, `PurgeService.from_env()`, the CLI and the HTTP
-purge routes) that would delete state still in use, or that needs a setting that is off.
-Nothing was deleted. It is a direct `LLMQueueError`, not a `ConfigError`. Raised when:
+Raised by an admin operation (`llmq.admin.*`, `AdminServices.from_env()`, the CLI and the HTTP
+routes) that was refused; nothing was changed. Category `bad_request`, not retryable: the same
+request gets the same answer. It is a direct `LLMQueueError`, not a `ConfigError`. It replaces
+0.1.x's `PurgeRefused`. Raised when:
 
-- `model(alias)` names a model the stored registry still has (pass `force=True`, or remove it
-  from the registry first);
-- `deployment(alias, "account/name")` names a deployment the stored registry still has (same);
-- `tenant(..., remove=...)` asks for `queued` or `running` while `LLMQ_TENANT_INDEX` is off (the
-  per-tenant call index is needed to find the calls).
+- `purge.model(alias)` names a model the stored registry still has (pass `force=True`, or remove
+  it from the registry first);
+- `purge.deployment(alias, "account/name")` names a deployment the stored registry still has
+  (same);
+- `purge.tenant(..., remove=...)` asks for `queued` or `running` while `LLMQ_TENANT_INDEX` is off
+  (the per-tenant call index is needed to find the calls);
+- a process-local operation (`drain.*`) runs without a queue (`AdminServices.from_env()`);
+- an operation needs the per-model request index service, which this build does not have yet:
+  `requests list`, `count`, `reprioritize`, `extend`, a cancel by model or tenant, `tenants
+  list` and `purge queue` answer `requests service not available`.
 
-A dry run (`plan_*`, `dry_run=True`) raises it too, so a plan shows the refusal before you
-purge. The HTTP routes answer 409 with `{"error": ...}` and no `Retry-After`; the CLI prints the
-message and exits 1. A bad argument (an unknown `remove` part) is a `ConfigError` instead. See
-[Purge store state](../how-to/purge.md).
+A dry run (the default of every write) raises it too, so the report shows the refusal before
+anything changes. The HTTP routes answer 409 with `{"error": ...}` and no `Retry-After`; the CLI
+prints the message and exits 1. A bad argument (an unknown `remove` part) is a `ConfigError`
+(HTTP 400) instead. See [Admin API](admin-api.md) and [Purge store state](../how-to/purge.md).
 
 ## ConfigError
 

@@ -123,7 +123,7 @@ Store-outage lines (`receive_failed`, `heartbeat_failed`, `store_down`, `hold_fa
 | Stuck queue | `llmq_oldest_waiting_seconds`, `llmq_held_waiting`, `llmq_queue_waiting` | Held but not granted: budget (`llmq_rpm_used` vs limit). Not taken: workers (`llmq_ready`, `llmq_loop_died_total`) |
 | Lease leak | `llmq_swept_total`, `llmq_stuck_calls_total` | `held_call_stuck` lines name the call and its grants |
 | Budget exhausted | `llmq_admission_wait_seconds`, `llmq_rpm_used / llmq_rpm_limit` | `llm-queue status --model M` |
-| Throttled region | `llmq_attempts_total{result="throttled"}` by region, `llmq_alert_quota_above_observed` | Block the region (`llm-queue block --region R`) or lower its rpm |
+| Throttled region | `llmq_attempts_total{result="throttled"}` by region, `llmq_alert_quota_above_observed` | Block the region (`llm-queue blocks add --region R --yes`) or lower its rpm |
 | Store failover | `llmq_store_up`, `llmq_store_errors_total`, `llmq_outage_memo_active` | `/health/ready` body per pod; `llmq_store_resets_total` after it |
 | Credentials | `llmq_credentials_failed_total` by account, region | `account_credentials_failed` lines carry `error_type` and the message |
 | Dead loop | `llmq_loop_died_total` by loop | `/health/live` body names it (`reason`); `background_loop_died` line |

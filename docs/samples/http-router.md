@@ -16,9 +16,12 @@ flowchart LR
 
 - `llmq.http_router()` returns an `APIRouter` (install the `http` extra).
 - `/health/live` and `/health/ready` take no auth, so the Kubernetes probes can reach them.
-  Every other route runs the app's admin dependencies.
-- Writes (live registry edits, region and account blocks) stay off unless `allow_writes=True`.
-  Each write is audited under the `actor` you return.
+  Every other route runs the app's admin dependencies (or needs `LLMQ_ADMIN_READ_TOKEN` /
+  `LLMQ_ADMIN_TOKEN`); `GET /` lists every mounted route with a live summary.
+- Writes (live registry edits, region and account blocks, purges) stay off unless
+  `allow_writes=True`. Each write is a dry run unless its body says `"dry_run": false`, and is
+  audited under the `actor` you return. Every route is listed in
+  [Admin API](../reference/admin-api.md).
 - `metrics_route=True` adds `GET /metrics`: the Prometheus exposition of a Prometheus sink
   (`LLMQ_METRICS_SINK=prometheus`, or `metrics=PrometheusSink()` as in the sample; install the
   `metrics` extra). It is open like the probes, so a scraper needs no admin credentials.
@@ -54,4 +57,5 @@ after /drain: GET /health/ready -> 503
 The live output will be refreshed on the next live run (`python scripts/samples.py --live`); the
 last one, on 2026-11-14, ran this sample before its current code.
 
-See also: [CLI and HTTP](../reference/cli-http.md), [Operate](../how-to/operate.md).
+See also: [Admin API](../reference/admin-api.md), [CLI and HTTP](../reference/cli-http.md),
+[Operate](../how-to/operate.md).

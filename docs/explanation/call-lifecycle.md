@@ -14,7 +14,7 @@ which lists fields, lifetimes and code references.
 | 3 | [embed](#3-embed) | `embed`, `embed_sync`, embeddings adapters |
 | 4 | [Direct path](#4-direct-path) | Sync calls, kill switch, `queue_pct`, queue store down |
 | 5 | [Fallback](#5-fallback-across-deployments-and-models) | Budget exhausted, deployments broken or failing |
-| 6 | [Cancel](#6-cancel) | `llmq.cancel(id)`, a cancelled awaiting task, a purge |
+| 6 | [Cancel](#6-cancel) | `llmq.admin.requests.cancel`, a cancelled awaiting task, a purge |
 | 7 | [Duplicate request_id](#7-duplicate-request_id) | The app reuses its own `request_id` |
 | 8 | [Timeouts and deadlines](#8-timeouts-and-deadlines) | Every call |
 | 9 | [Caller gone](#9-caller-gone) | The calling process died |
@@ -325,7 +325,7 @@ sequenceDiagram
 
 | Trigger | What happens |
 |---|---|
-| `llmq.cancel(id)`, CLI, HTTP | `CANCEL` (one pipelined round trip per 500 ids) on calls not yet final; logged `call_cancel` with `source` |
+| `llmq.admin.requests.cancel(request_ids=...)`, CLI `requests cancel`, `POST /requests/cancel` | `CANCEL` on calls not yet final (waiting ones only unless `state` says `running` / `all`); audited; logged `call_cancel` with `source=admin` |
 | The awaiting task is cancelled (`asyncio` cancel, a client disconnect) | The process's one canceller batches it: the call is cancelled for every caller of the id. A direct run in this process is stopped at once |
 | A tenant purge with `remove=queued` or `running` | Normal cancels with `source=purge` |
 | `fail_fast` after a failed send that may have reached the store | A cancel written behind, so the app's retry does not make a second run |
@@ -642,7 +642,7 @@ sequenceDiagram
 | `model(alias)` | app, CLI, HTTP, auto | every [`{m:alias}:*`][madm] key, its queues [`{q}:*`][q] and doorbells; refused while the registry has the model, unless `force` |
 | `deployment(alias, "account/name")` | app, CLI, HTTP, auto | [`rate:D`][bud], [`ac:D`, `cb:D`, `terr:D`, `thr:D:*`][health], [`lease:D:*`][lease], fields of `health` and `rot`, `sticky:*` pointing at it; waits for running calls (`LLMQ_PURGE_WAIT_SECS`, 300) unless auto |
 | `tenant(id, remove=...)` | app, CLI, HTTP | [`tf:t:H`, `tf:s:H`][tf], the tenant in `tf:act` and `tf:w` (weight sum corrected); `queued` / `running` cancel its calls via [`P:tenant:H:reqs`][exp] |
-| `removed()` | app, CLI (`registry gc`), HTTP | `model` and `deployment` for everything the registry no longer has |
+| `removed()` | app, CLI (`purge removed`), HTTP | `model` and `deployment` for everything the registry no longer has |
 
 Auto purge runs only in workers; the first tick after start is a baseline. Every real purge is
 audited ([`P:{reg}:audit`][reg]), logged `llmq_purge` and counted. Bookkeeping keys:

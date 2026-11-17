@@ -54,11 +54,11 @@ an app pod does. At the end the runner deletes every key under the run's prefix.
 | [03 Embed](embed.md) | `embed` on Titan (1 text per request) and Cohere (96, `input_type`); `EmbedResult` usage; `register_embedding_family` | Indexing documents and search queries |
 | [04 Sync](sync.md) | `converse_sync` / `embed_sync` on the direct path | Scripts, Celery tasks, sync libraries |
 | [05 Errors and fallback](errors-and-fallback.md) | Model fallback; `CallFailed.kind`, typed `Kind`, to branch on | Every caller |
-| [06 Jobs](jobs.md) | `register_job(concurrency=)` / `send_job`, LLM calls inside a job; dead letters and `redrive_jobs` | Ingestion, nightly re-embedding, batch work |
-| [07 Status and registry](status-and-registry.md) | `status`, `request_status`, live `registry.set`, audit `log`, `health`; tenant `fairness` set live | Admin pages, runbooks, readiness checks |
+| [06 Jobs](jobs.md) | `register_job(concurrency=)` / `send_job`, LLM calls inside a job; dead letters and `llmq.admin.dlq.redrive` | Ingestion, nightly re-embedding, batch work |
+| [07 Status and registry](status-and-registry.md) | `status`, `request_status`, live `llmq.admin.registry.set`, `llmq.admin.audit.list`, `health`; tenant `fairness` set live | Admin pages, runbooks, readiness checks |
 | [08 LangChain](langchain.md) | `QueuedChatBedrockConverse` (with tools and `queue_streaming=True`), `QueuedBedrockEmbeddings` | LangChain / LangGraph chains, agents, RAG |
 | [09 HTTP router](http-router.md) | `http_router` on FastAPI: probes, admin routes, `GET /metrics`, `/drain` | Admin API, Kubernetes probes, the preStop hook |
-| [10 Purge](purge.md) | `llmq.purge`: a tenant purge planned then run, a deployment purge refused then planned with `force`; `PurgeReport.as_dict()` | Admin jobs, tenant offboarding, cleanup after a registry change |
+| [10 Purge](purge.md) | `llmq.admin.purge`: a tenant purge as a dry run then run, a deployment purge refused then planned with `force`; the report dict | Admin jobs, tenant offboarding, cleanup after a registry change |
 
 ## The registry they share
 

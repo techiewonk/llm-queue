@@ -8,8 +8,9 @@ runbooks and readiness checks.
 - `status(model)` shows waiting calls, calls in progress, and each deployment's RPM / TPM used
   and left this minute, its health and its breaker.
 - `request_status(id)` follows a single call.
-- `registry.set` changes a safe setting live in every pod. Each change is audited, and
-  `registry.log` lists the changes.
+- `llmq.admin.registry.set(values, model=, actor=, dry_run=False)` changes a safe setting live
+  in every pod (without `dry_run=False` it only returns the diff it would make). Each change is
+  audited, and `llmq.admin.audit.list()` lists the changes.
 - Per-tenant fairness (`fairness` in the registry, off by default) is a live setting too:
   `quota` caps each tenant's rpm / tpm, `share` splits the budget by weight and lends what is
   unused, `fair_queue` serves waiting tenants round robin. A call's tenant is its `tenant_id`,

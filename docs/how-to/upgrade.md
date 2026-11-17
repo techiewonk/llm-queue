@@ -3,6 +3,47 @@
 What an app has to do when it moves to a new release, newest first. The full list of changes is
 in [CHANGELOG.md](../project/changelog.md).
 
+## From 0.1.1 to 0.2.0: the admin API
+
+Every admin operation moved under `llmq.admin`, and the CLI commands and HTTP routes were
+renamed to match one operations table ([Admin API](../reference/admin-api.md)). Nothing old is
+kept. Every write is now a **dry run by default** on Python, the CLI and HTTP: add
+`dry_run=False` in code and `--yes` on the CLI (it replaces `--dry-run`, which is gone).
+
+| 0.1.x | 0.2.0 |
+|---|---|
+| `llmq.purge.<method>(...)` | `llmq.admin.purge.<method>(...)` (returns the report dict; dry run unless `dry_run=False`) |
+| `PurgeService.plan_model` / `plan_deployment` / `plan_tenant` | `model` / `deployment` / `tenant` with the default `dry_run=True` |
+| `PurgeService` methods: `dry_run=False` by default | `dry_run=True` by default: pass `dry_run=False` to purge |
+| `llmq.purge.cancel_scheduled(target)` | `llmq.admin.purge.unschedule(target, actor=, dry_run=False)` |
+| `llmq.registry` (the `RegistryStore`) | `llmq.admin.registry` (`get`, `versions`, `diff`, `schema`, `set`, `publish`, `rollback`; `.current` read-only), `llmq.admin.models`, `.deployments`, `.blocks`, `.audit` |
+| `llmq.registry.set_enabled(m, d, False, actor=)` | `llmq.admin.deployments.disable(m, d, actor=, dry_run=False)` |
+| `llmq.registry.block(region=, on=, actor=)` | `llmq.admin.blocks.add(region=, actor=, dry_run=False)` / `.remove(...)` |
+| `llmq.registry.log(count)` | `llmq.admin.audit.list(count)` |
+| `llmq.cancel(request_id)` | `llmq.admin.requests.cancel(request_ids=[id], state="all", actor=, dry_run=False)` |
+| `llmq.job_dead_letters(name)` / `llmq.redrive_jobs(name)` | `llmq.admin.dlq.list(job=name)` / `llmq.admin.dlq.redrive(job=name, actor=, dry_run=False)` |
+| `PurgeRefused` | `AdminRefused` (category `bad_request`, HTTP 409) |
+| `llm-queue request ID` | `llm-queue requests get ID` |
+| `llm-queue cancel ID ... --yes` | `llm-queue requests cancel --id ID ... [--state waiting\|running\|all] --yes` |
+| `llm-queue block` / `unblock --region R` | `llm-queue blocks add` / `remove --region R --yes` |
+| `llm-queue drain M --yes --wait --timeout S` | `llm-queue models drain M --wait-secs S --yes` |
+| `llm-queue settings get --model M [--deployment D]` | `llm-queue models get M`, `llm-queue deployments get M D` |
+| `llm-queue registry enable` / `disable M D` | `llm-queue deployments enable` / `disable M D --yes` |
+| `llm-queue registry log` | `llm-queue audit list` |
+| `llm-queue registry gc` | `llm-queue purge removed` |
+| `llm-queue registry publish --from-version N` | `llm-queue registry rollback N` |
+| `--dry-run` on every changing command | Gone: every change is a dry run until `--yes` (registry `set` / `publish` too) |
+| `POST /registry/block` (`on: false` to lift) | `POST /blocks`, `POST /blocks/remove` |
+| `POST /registry/gc` | `POST /purge/removed` |
+| `POST /purge/scheduled/cancel` | `POST /purge/unschedule` |
+| `POST /registry` body: the values | Body `{values, model?, dry_run?}`; a dry run by default |
+| `GET /drain` open | `GET /drain` needs a read guard |
+| Read routes mounted open with no guard (a warning) | Not mounted: with no token and no `dependencies` only the probes and `/metrics` are (warning `admin_routes_unauthenticated`), unless `insecure_reads=True` |
+
+With no token and no `dependencies` the HTTP router mounts only the probes and `/metrics` (pass
+`insecure_reads=True` to keep open reads on an internal port). Set `LLMQ_ADMIN_READ_TOKEN` for dashboards that only
+read, and `LLMQ_ADMIN_WRITES_ENABLED=true` (or `allow_writes=True`) where writes are wanted.
+
 ## From 0.1.0b2 to 0.1.0b3
 
 0.1.0b3 keeps the message format and the key layout of 0.1.0b2, so pods of both releases can
@@ -57,7 +98,7 @@ Leftover `P:expiry`, `P:ttl` and `P:purge` keys are harmless to 0.1.0b2.
 | Auto purge is on (`LLMQ_AUTO_PURGE=true`): a model or deployment dropped from the registry has its store state deleted after `LLMQ_PURGE_GRACE_SECS` (900) unless it comes back | Nothing, or set `LLMQ_AUTO_PURGE=false` to keep the 0.1.0b2 behaviour. If you raised `timeout_max_secs` above 900, raise the grace to at least the same |
 | `llm-queue registry gc` prints the purge report: `deleted_keys` and `dry_run` instead of `would_delete` | Update scripts that parse its output |
 | `registry gc` also purges removed deployments of live models, and keeps a removed model's queue that still holds messages unless `--force` | Add `--force` where you relied on it deleting such queues |
-| New error `PurgeRefused` (HTTP 409) | Catch it where you call the purge service; see [Errors](../reference/errors.md#purgerefused) |
+| New error `PurgeRefused` (HTTP 409) | Catch it where you call the purge service; see [Errors](../reference/errors.md#adminrefused) (renamed `AdminRefused` in 0.2.0) |
 
 See [Purge store state](purge.md) and [Run on a shared cache store](shared-cache-store.md).
 

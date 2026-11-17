@@ -132,7 +132,7 @@ Audit retention is `LLMQ_AUDIT_RETENTION_DAYS`, not a tuning field.
 
 | Field | Default | Range | Meaning |
 |---|---|---|---|
-| `registry.history_size` | 20 | 2 or more (whole) | Registry versions kept for `registry publish --from-version` (rollback) |
+| `registry.history_size` | 20 | 2 or more (whole) | Registry versions kept for `registry rollback` (rollback) |
 | `registry.edit_retries` | 3 | above 0 to 10 (whole) | Retries of a live edit that raced another one (each backs off up to 2 s) |
 
 ## Registry settings
@@ -140,7 +140,7 @@ Audit retention is `LLMQ_AUDIT_RETENTION_DAYS`, not a tuning field.
 Each setting may be set at some of the levels deployment > model > account > defaults; the most
 specific one wins, except objects marked *merged*, which combine key by key across levels.
 `all four` means defaults, account, model and deployment. Every timeout and wait is at most one
-day (86400 s). `llm-queue settings get --model M [--deployment D]` prints the effective value
+day (86400 s). `llm-queue models get M` (and `deployments get M D`) prints the effective value
 of every setting and the level it came from.
 
 | Setting | Levels | Default | Range | Meaning |

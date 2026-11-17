@@ -46,6 +46,10 @@ with Amazon Bedrock and OpenAI-compatible servers (such as vLLM), and with LangC
 - **Purge as a service.** Delete the store state of removed models, deployments and tenants,
   with dry runs and an audit, from Python, the CLI or HTTP, and automatically after a registry
   change. See [Purge store state](https://techiewonk.github.io/llm-queue/how-to/purge/).
+- **One admin API.** Every admin operation (registry, models, deployments, blocks, calls, dead
+  letters, jobs, purges, drain) is one method under `llmq.admin`, with the same command in
+  `llm-queue` and the same route in the FastAPI router: audited, guarded by read and write
+  tokens, and a dry run by default.
 - **A live registry.** Accounts, models and every setting live in one JSON document, validated
   with every problem listed at once, published to the store, edited live with an audit trail
   and rolled back; a JSON Schema is printed by `llm-queue registry schema`.

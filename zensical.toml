@@ -29,6 +29,7 @@ nav = [
     { "10 Purge" = "samples/purge.md" },
   ] },
   { "How-to guides" = [
+    { "Integrate with an app" = "how-to/integrate.md" },
     { "Configure" = "how-to/configure.md" },
     { "Bedrock APIs and IAM" = "how-to/bedrock.md" },
     { "Tune" = "how-to/tune.md" },
@@ -67,6 +68,7 @@ nav = [
     { "Store keys" = "reference/store-keys.md" },
     { "Errors" = "reference/errors.md" },
     { "Log events" = "reference/log-events.md" },
+    { "Admin API" = "reference/admin-api.md" },
     { "CLI and HTTP" = "reference/cli-http.md" },
     { "Extension points" = "reference/extension-points.md" },
     { "API" = "reference/api.md" },

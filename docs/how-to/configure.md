@@ -219,7 +219,8 @@ its JSON Schema are in [Registry document](../reference/registry.md).
 To see the effective value of each setting for a model and the level it came from:
 
 ```bash
-llm-queue settings get --model gpt120b
+llm-queue models get gpt120b                        # every setting with its level
+llm-queue deployments get gpt120b aws-main/us-east-1  # one deployment's settings and state
 ```
 
 ## Live edits
@@ -246,16 +247,20 @@ raises `LiveEditRefused`; an edit that keeps losing a race with other edits rais
 Ways to edit:
 
 ```bash
-llm-queue registry set --model gpt120b rpm=400       # path=value ... (JSON values)
-llm-queue registry disable gpt120b aws-main/ap-south-1  # turn one deployment off
-llm-queue registry diff                              # what is live but not in this config
-llm-queue registry log --count 20                    # the audit trail
-llm-queue registry publish --from-version N          # roll back to version N
+llm-queue registry set --model gpt120b rpm=400              # a dry run: the diff it would make
+llm-queue registry set --model gpt120b rpm=400 --yes        # path=value ... (JSON values)
+llm-queue deployments disable gpt120b aws-main/ap-south-1 --yes  # turn one deployment off
+llm-queue registry diff                                     # what is live but not in this config
+llm-queue audit list --count 20                             # the audit trail
+llm-queue registry rollback N --yes                         # roll back to version N
 ```
 
-From code, `llmq.registry` is the registry store (for example
-`await llmq.registry.set_enabled(model, deployment, False, actor="me")`); over HTTP,
-`POST /registry` when the router allows writes (see [Operate](operate.md#http-router)).
+Every change is a dry run (the diff it would make, after every check) until `--yes`. From code,
+`llmq.admin.registry` and its neighbours do the same (for example
+`await llmq.admin.deployments.disable(model, deployment, actor="me", dry_run=False)`;
+`llmq.admin.registry.current` is the registry this process runs on); over HTTP, `POST /registry`
+and the other write routes when the router allows writes (see
+[Admin API](../reference/admin-api.md)).
 
 Every edit is audited under its actor (`--actor` on the CLI; `actor=` in code and HTTP) and kept
 for `LLMQ_AUDIT_RETENTION_DAYS` (90). The last 20 versions are kept for rollback

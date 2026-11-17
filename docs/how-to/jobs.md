@@ -58,15 +58,20 @@ logged `job_failed outcome=dead` at error level with the traceback, and counted 
 Dead jobs:
 
 ```python
-dead = await llmq.job_dead_letters("index_documents")        # id, job_id, fails, payload
-await llmq.redrive_jobs("index_documents")                    # run them again
+dlq = llmq.admin.dlq
+dead = await dlq.list(job="index_documents")                  # {queue, letters: [id, src, fails]}
+await dlq.redrive(job="index_documents", actor="ops", dry_run=False)  # run them again
 ```
 
 ```bash
 llm-queue dlq list --job index_documents
 llm-queue dlq redrive --job index_documents --yes
 llm-queue queues list                                         # job queues included
+llm-queue jobs list                                           # per job: waiting, held, dead
 ```
+
+`dlq show ENTRY_ID --job J --unsafe` prints one dead job with its payload (bodies are left out
+otherwise).
 
 `status()` lists every job name a worker consumed lately (`jobs`: waiting and dead letters), and
 the `job_dead_letters` alert turns on while a job name has any dead job.

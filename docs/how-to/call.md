@@ -290,13 +290,17 @@ stream cut mid-answer) and `request_id`. Every kind and what to do is in
 ## Cancel and look up a call
 
 ```python
-await llmq.cancel(request_id)           # waiting: never starts; running: the attempt is cancelled
+await llmq.admin.requests.cancel(request_ids=[request_id], state="all", actor="me", dry_run=False)
 await llmq.request_status(request_id)   # status of one call
 ```
 
 **Cancel wins:** a cancel stops the call for every caller waiting on that id, and a caller
-that attaches to the id afterwards gets `cancelled` too. Any code (or `llm-queue cancel ID
---yes`, audited) may cancel any id; each cancel is logged and counted with its source.
+that attaches to the id afterwards gets `cancelled` too. Any code (or `llm-queue requests cancel
+--id ID --yes`) may cancel any id; each admin cancel is audited, and every cancel is logged
+(`call_cancel`) and counted with its source. Like every admin write, the cancel is a dry run
+unless `dry_run=False`, and `state` (default `waiting`) leaves calls that already run alone:
+pass `state="all"` to stop a running one too. `llmq.admin.requests.get(request_id)` returns
+`{status, final}` (None when unknown).
 
 **Request ids:** a call sent again with the id of a call that **succeeded** gets the same
 answer without running again (while the result is kept). An id whose last run failed,

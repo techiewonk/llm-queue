@@ -5,27 +5,27 @@ admin jobs, offboarding and runbooks.
 
 ```mermaid
 flowchart LR
-  admin["Admin job or route"] --> plan["plan_tenant / plan_deployment<br/>(dry run)"]
-  plan -- "PurgeReport" --> admin
-  admin --> purge["tenant(..., actor=)"]
+  admin["Admin job or route"] --> plan["purge.tenant / purge.deployment<br/>(dry run, the default)"]
+  plan -- "report" --> admin
+  admin --> purge["tenant(..., actor=, dry_run=False)"]
   purge -- "UNLINK, audit purge_tenant" --> store[("Valkey / Redis")]
-  plan -. "still in the registry" .-> refused["PurgeRefused (409)"]
+  plan -. "still in the registry" .-> refused["AdminRefused (409)"]
 ```
 
 ## Key points
 
-- `llmq.purge` is the `PurgeService` of a started queue; `PurgeService.from_env()` builds one
-  for an admin worker without a queue.
-- Every purge has a dry run (`plan_tenant`, `plan_deployment`, `plan_model`, or
-  `dry_run=True`) that reports what it would delete and changes nothing.
-- Each returns a `PurgeReport`; `report.as_dict()` is JSON-ready for an admin API: keys and
-  hash fields deleted, queues, what was skipped and why.
-- A real purge is audited (`purge_tenant` in `registry.log`), logged `llmq_purge` and counted
-  in `llmq_purged_keys_total{kind}`. The tenant id is hashed as admission hashes it; the report
-  names only the hash.
-- A purge of state still in use raises `PurgeRefused` (HTTP 409 on the built-in routes): here, a
+- `llmq.admin.purge` holds the purges of a built queue; `AdminServices.from_env()` builds the
+  same services for an admin worker without a queue.
+- Every purge is a dry run unless `dry_run=False`: it reports what it would delete and changes
+  nothing.
+- Each returns the purge report as a JSON-ready dict for an admin API: keys and hash fields
+  deleted, queues, what was skipped and why.
+- A real purge is audited (`purge_tenant` in `llmq.admin.audit.list()`), logged `llmq_purge`
+  and counted in `llmq_purged_keys_total{kind}`. The tenant id is hashed as admission hashes it;
+  the report names only the hash.
+- A purge of state still in use raises `AdminRefused` (HTTP 409 on the built-in routes): here, a
   deployment the registry still has. `force=True` overrides it.
-- The same purges run from the CLI (`llm-queue purge ...`) and the
+- The same purges run from the CLI (`llm-queue purge ...`, `--yes` to act) and the
   [HTTP router](http-router.md) with `allow_writes=True`.
 
 ## Code
@@ -48,4 +48,4 @@ plan deployment (force): {"target": "gpt20b/aws-main/us-east-1", "kind": "deploy
 This sample has not run on real Bedrock yet; its live output will be added on the next live run
 (`python scripts/samples.py --live`).
 
-See also: [Purge store state](../how-to/purge.md), [Errors](../reference/errors.md#purgerefused).
+See also: [Purge store state](../how-to/purge.md), [Errors](../reference/errors.md#adminrefused).

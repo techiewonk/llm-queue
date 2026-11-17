@@ -51,7 +51,7 @@ from fastapi import Depends
 
 app.include_router(
     llmq.http_router(
-        dependencies=[Depends(require_admin)],   # required with allow_writes
+        dependencies=[Depends(require_admin)],   # or LLMQ_ADMIN_TOKEN
         allow_writes=True,
         actor=lambda request: request.state.user.email,
     ),
@@ -59,26 +59,36 @@ app.include_router(
 )
 ```
 
-- `allow_writes=True` without `dependencies` raises `ConfigError`: write routes are never
-  mounted without the app's own auth.
-- `POST /registry` and `POST /registry/block` take a JSON body (`/registry/block`:
-  `{"region": ..., "account": ..., "on": true}`) and need the `X-LLMQ-Admin` header with any
-  non-empty value. A browser cannot send either cross-site without a CORS preflight, so a page an
-  admin visits cannot post an edit with the admin's cookies.
-- `actor(request)` returns the authenticated name the audit records; never a client-supplied
-  value. Actors are 1-200 characters without control characters.
-- **Guard the read routes too.** With no `dependencies`, `/status`, `/requests/{id}` and
-  `/registry` are open to anyone who reaches the app, and `/registry` lists account names,
-  regions, model ids, `base_url`s and routing blocks (only role ARNs and secret references are
-  redacted). The router logs `admin_routes_unauthenticated` when it is built that way; mount it
-  without `dependencies` only behind the app's own auth or on an internal-only port.
+- Two tokens, both optional and read on every request (rotation needs no restart), carried in
+  `LLMQ_ADMIN_HEADER` (`X-LLMQ-Token`): `LLMQ_ADMIN_READ_TOKEN` opens the read routes only;
+  `LLMQ_ADMIN_TOKEN` opens reads and writes. The app's `dependencies` apply on top of them.
+- **Reads are guarded too.** `/registry` lists account names, regions, model ids, `base_url`s
+  and routing blocks (only role ARNs and secret references are redacted). With no token and no
+  `dependencies` the router mounts only the open routes and logs
+  `admin_routes_unauthenticated`; `insecure_reads=True` mounts the reads open, for an
+  internal-only port behind the app's own auth. Write routes with no write guard raise
+  `ConfigError`. Only `/health/live`,
+  `/health/ready` and `/metrics` are always open.
+- Write routes are mounted only with `allow_writes=True` (default
+  `LLMQ_ADMIN_WRITES_ENABLED=false`) and need the admin token or `dependencies`; the read token
+  never writes. With `dependencies` alone, a write also needs the `X-LLMQ-Admin` header with any
+  non-empty value. Every write takes a JSON body. A browser cannot send the token header, the
+  `X-LLMQ-Admin` header or a JSON body cross-site without a CORS preflight, so a page an admin
+  visits cannot post an edit with the admin's cookies.
+- Every write is a dry run unless its body says `"dry_run": false`, and is audited under an
+  actor: `actor(request)` (the authenticated name, never a client-supplied value; 1-200
+  characters without control characters), else, with the token, `token:<X-LLMQ-Actor>`
+  (`token:unknown` without the header). A shared token has no identity: the `X-LLMQ-Actor`
+  value is a claimed name, labelled as such; apps with real auth pass `actor=`.
+- `GET /dlq/{entry_id}?unsafe=true` returns message bodies (prompts) only with
+  `LLMQ_ADMIN_DLQ_BODIES_ENABLED=true`.
 - Bodies and ids are bounded before any store read: at most 100 paths per edit, ids and names
   of at most 256 characters.
 
 ```bash
-curl -X POST https://app/llmq/registry/block \
-  -H "Authorization: Bearer $TOKEN" -H "X-LLMQ-Admin: 1" \
-  -H "Content-Type: application/json" -d '{"region": "ap-south-2", "on": true}'
+curl -X POST https://app/llmq/blocks \
+  -H "X-LLMQ-Token: $LLMQ_ADMIN_TOKEN" -H "X-LLMQ-Actor: ann@example.com" \
+  -H "Content-Type: application/json" -d '{"region": "ap-south-2", "dry_run": false}'
 ```
 
 ## 5. Limit live edits
@@ -100,7 +110,8 @@ also match each pod's own deploy config: a stored document that differs is refus
   it; do not pass it through from a client request.
 - Anyone who can call the queue (or reach the store) may cancel any request id, and a cancel
   stops the call for every caller of that id. Every cancel is logged (`call_cancel`) and counted
-  (`llmq_cancels_total{source}`); `llm-queue cancel ID --yes` also writes the audit trail.
+  (`llmq_cancels_total{source}`); an admin cancel (`llm-queue requests cancel --id ID --yes`,
+  `POST /requests/cancel`, `llmq.admin.requests.cancel`) also writes the audit trail.
 
 ## 7. Prompt text
 

@@ -148,11 +148,13 @@ readiness (see
 ```bash
 llm-queue status                # every model
 llm-queue status --model M      # one model: deployments, budgets used, health, queues, blocks
-llm-queue request ID            # one call
+llm-queue requests get ID       # one call
+llm-queue ops                   # every operation, and a summary of the store
 ```
 
-The same from code: `await llmq.status(model)`, `await llmq.request_status(request_id)`; over
-HTTP: `GET /status`, `GET /requests/{id}`.
+The same from code: `await llmq.status(model)`, `await llmq.admin.requests.get(request_id)`;
+over HTTP: `GET /status`, `GET /requests/{id}`, and `GET /` for the admin index with a live
+summary (version, readiness, drain, stores, registry, models, jobs, scheduled purges).
 
 ## Alerts
 
@@ -177,22 +179,26 @@ examples: [Monitor](monitor.md).
 ## Change things at run time
 
 ```bash
-llm-queue registry set --model M rpm=400    # live edit (audited)
-llm-queue registry disable M aws-main/ap-south-1
-llm-queue block --region R                  # stop using a region (or --account A)
-llm-queue unblock --region R
-llm-queue drain M --yes --wait              # disable a model for new calls; serve waiting ones
-llm-queue dlq list --model M                # dead letters; also show, redrive, purge
-llm-queue purge model M --dry-run           # what a purge of a removed model would delete
-llm-queue purge tenant T --yes              # a tenant's fairness state (also: deployment)
+llm-queue registry set --model M rpm=400 --yes      # live edit (audited)
+llm-queue deployments disable M aws-main/ap-south-1 --yes
+llm-queue blocks add --region R --yes               # stop using a region (or --account A)
+llm-queue blocks remove --region R --yes
+llm-queue models drain M --wait-secs 600 --yes      # disable a model for new calls; serve waiting ones
+llm-queue requests cancel --id ID --yes             # cancel calls by id (waiting ones by default)
+llm-queue dlq list --model M                        # dead letters; also show, redrive, purge
+llm-queue purge model M                             # what a purge of a removed model would delete
+llm-queue purge tenant T --yes                      # a tenant's fairness state (also: deployment)
 ```
 
-Commands that delete or move data (`drain`, `dlq redrive`, `dlq purge`, `registry gc`,
-`purge model|deployment|tenant`, `cancel`) need `--yes`; `--dry-run` shows what they would do. `llm-queue dlq list --job J`
-lists dead jobs. Purges are described in [Purge](purge.md).
+Every command that changes something is a **dry run** until `--yes`: it prints what it would
+do and changes nothing. `llm-queue dlq list --job J` lists dead jobs. Purges are described in
+[Purge](purge.md). `requests cancel --state running|all` also cancels calls that already run;
+cancelling by model or tenant, `requests list|count|reprioritize|extend` and `tenants list`
+answer `requests service not available` until the per-model request index service ships.
 
-`--actor NAME` records who made a change. Live edits and their limits are in
-[Configure](configure.md#live-edits). Every command is in [CLI and HTTP](../reference/cli-http.md).
+`--actor NAME` (default the OS user) records who made a change in the audit (`llm-queue audit
+list`). Live edits and their limits are in [Configure](configure.md#live-edits). Every
+operation, on every surface, is in [Admin API](../reference/admin-api.md).
 
 ## HTTP router
 
@@ -207,10 +213,15 @@ app.include_router(
 )
 ```
 
-This gives `/status`, `/requests/{id}` and `/registry` behind your dependencies, and
-`/health/live` and `/health/ready` without them. `allow_writes=True, actor=fn` adds
-`POST /registry` and `POST /registry/block`, audited under `actor(request)`. Write routes need
-`dependencies` (else `ConfigError`), a JSON body and the `X-LLMQ-Admin` header; see
+This mounts every read operation of the [Admin API](../reference/admin-api.md) (`GET /` lists
+them with a live summary) behind your dependencies, or behind `LLMQ_ADMIN_READ_TOKEN` /
+`LLMQ_ADMIN_TOKEN` without any; `/health/live`, `/health/ready` (and `/metrics` with
+`metrics_route=True`) stay open. With no token and no dependencies the router mounts only those
+open routes and logs `admin_routes_unauthenticated`, unless `insecure_reads=True`. `allow_writes=True` (default
+`LLMQ_ADMIN_WRITES_ENABLED`) adds the write routes: registry edits, blocks, model and deployment
+switches, dead letters, cancels and purges. A write needs the admin token, or `dependencies`
+plus the `X-LLMQ-Admin` header; it is audited under `actor(request)`, or `token:<X-LLMQ-Actor>`
+with the token; its `dry_run` defaults to true. See
 [Secure a deployment](secure.md#4-protect-the-http-write-routes).
 
 ## Store failover

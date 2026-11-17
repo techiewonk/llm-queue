@@ -3,12 +3,14 @@
 Every structured log event the library writes, by name. Each line is `event key=value ...`
 (structlog key-value format; the app configures the renderer). Use the name to search and alarm;
 the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alarming on.
+`llmq_admin` is written once per audited admin write (`actor`, `op`, `path`, `after`: counts,
+never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, ...).
 
 | Event | Level | Where |
 |---|---|---|
 | `account_credentials_failed` | error | engine/runtime.py |
-| `ack_stale_receipt` | warning | engine/runtime.py |
 | `admin_routes_unauthenticated` | warning | engine/http.py |
+| `ack_stale_receipt` | warning | engine/runtime.py |
 | `admission_config_missing` | error | engine/runtime.py |
 | `alerts_failed` | warning | engine/runtime.py |
 | `audit_entry_unreadable` | warning | registry/store.py |
@@ -18,7 +20,7 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `bad_dead_letter` | warning | engine/runtime.py |
 | `bad_message` | warning | engine/runtime.py |
 | `bell_failed` | warning | engine/runtime.py |
-| `call_cancel` | info | engine/cli.py, engine/purge.py, engine/runtime.py |
+| `call_cancel` | info | engine/admin/requests.py, engine/purge.py, engine/runtime.py |
 | `caller_gone` | warning | engine/runtime.py |
 | `cancel_after_stop` | warning | engine/runtime.py |
 | `cancel_cleanup_failed` | warning | engine/runtime.py |
@@ -46,8 +48,6 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `direct_run_failed` | warning | engine/runtime.py |
 | `drain_callback_failed` | warning | drain.py |
 | `drain_file_seen` | info | drain.py |
-| `drain_requested` | info | engine/http.py |
-| `drain_resumed` | info | engine/http.py |
 | `emf_lines_dropped` | warning | engine/metrics.py |
 | `fallback_shape_skipped` | info | engine/runtime.py |
 | `finish_failed` | warning | engine/requests.py, engine/runtime.py |
@@ -79,6 +79,7 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `job_upkeep_failed` | warning | engine/jobs.py |
 | `key_expiry_changed` | warning | engine/runtime.py |
 | `key_expiry_publish_failed` | warning | engine/runtime.py |
+| `llmq_admin` | info | engine/audit.py |
 | `llmq_call_finished` | info | engine/runtime.py |
 | `llmq_purge` | info | engine/purge.py |
 | `llmq_registry_audit` | info | registry/store.py |
@@ -102,7 +103,7 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `purge_deferred` | warning | engine/purge.py (a due auto purge waits: the stored registry could not be read, was refused, or this process runs on its own config) |
 | `purge_failed` | warning | engine/purge.py, engine/runtime.py |
 | `purge_scheduled` | info | engine/purge.py |
-| `purge_unscheduled` | info | engine/purge.py, engine/http.py |
+| `purge_unscheduled` | info | engine/purge.py |
 | `queue_store_down` | warning | engine/runtime.py |
 | `receive_reclaimed` | warning | engine/runtime.py |
 | `redelivered_while_held` | warning | engine/runtime.py |

@@ -76,7 +76,7 @@ flowchart LR
   end
   subgraph admin["Registry and admin"]
     PUB(["PUBLISH / EDIT"])
-    GC(["purge / registry gc"])
+    GC(["purge / purge removed"])
     TS(["TTL_SWEEP"])
   end
   G1["Registry<br/>{reg}:*, {m}:cfg"]
@@ -114,9 +114,9 @@ flowchart LR
 `PICK_TAKE` reads the registry group (`cfg`) and the request records (`res`, `cancel`,
 `callers`, `caller`, `epoch`) on every ask (`_admission_lua.py:360-389`). `PUBLISH` deletes a
 removed model's `cfg`, `health`, `rot`, `inprog` and waiter keys (`registry/_lua.py:73-79`);
-a model purge (auto after `LLMQ_PURGE_GRACE_SECS`, `registry gc`, or `llmq.purge`) deletes
+a model purge (auto after `LLMQ_PURGE_GRACE_SECS`, `purge removed`, or `llmq.admin.purge`) deletes
 every `{m:ALIAS}` key and the empty queues of a model no longer in the registry
-(`purge.py:515-557`; `registry gc` runs `PurgeService.removed`, `cli.py:286-289`). A
+(`purge.py:515-557`; `purge removed` runs `PurgeService.removed`). A
 deployment purge and a tenant purge delete less; see [Purge](../how-to/purge.md). In `swept`
 mode `TTL_SWEEP` deletes every due key in `P:ttl`. Alerts (`P:alert:*`) and debug captures are written by the runtime only.
 
@@ -373,7 +373,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | stream |
 | Store | state |
 | Schema | One entry per publish, live edit or CLI cancel: `actor`, `op` (`publish`, `edit`, `cancel`), `version`, `diff` (JSON list of `{path, before, after}`, secrets redacted), `ts` (secs, float). |
-| Written by | `audit()` in `PUBLISH` / `EDIT` `registry/_lua.py:17-21`; CLI `cancel` `cli.py:369-380`. |
+| Written by | `audit()` in `PUBLISH` / `EDIT` `registry/_lua.py:17-21`; every admin write `Audit.write` `engine/audit.py`. |
 | Read by | `RegistryStore.history` `registry/store.py:873`. |
 | Lifetime (native) | No TTL. Trimmed on each Lua audit write: `MAXLEN ~ 10000` (`AUDIT_MAX_ENTRIES`, `registry/_lua.py:11`) and `MINID` now minus `LLMQ_AUDIT_RETENTION_DAYS` (90 d, `registry/store.py:462`). The CLI cancel entry trims by `MAXLEN` only. |
 | Swept mode | No expiry, in both modes. |
@@ -390,7 +390,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Store | state |
 | Schema | Field = registry version, value = that version's whole document JSON. |
 | Written by | `PUBLISH` `registry/_lua.py:63-69` (keeps the newest `Tuning.registry.history_size`, 20). |
-| Read by | `RegistryStore.versions` `registry/store.py:895`; rollback `registry/store.py:912`; `registry gc` / auto purge (`_aliases_in_history` `purge.py:781-789`). |
+| Read by | `RegistryStore.versions` `registry/store.py:895`; rollback `registry/store.py:912`; `purge removed` / auto purge (`_aliases_in_history` `purge.py:781-789`). |
 | Lifetime (native) | No TTL. Oldest versions are `HDEL`ed past `history_size` (`tuning.py:120`). |
 | Swept mode | No expiry, in both modes. |
 | Count | Bounded: 20 documents by default. |
@@ -851,7 +851,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | string |
 | Store | state |
 | Schema | `1`: a cancel is pending for this id (any caller's cancel wins for all). |
-| Written by | `CANCEL` `requests.py:345-356` (`SET ... EX`), from `cancel()` `runtime.py:1759-1763` and CLI `cli.py:363-365`. |
+| Written by | `CANCEL` `requests.py:345-356` (`SET ... EX`), from `cancel()` `runtime.py:1759-1763` and the admin cancel `engine/admin/requests.py`. |
 | Read by | `PICK_TAKE` `_admission_lua.py:371`; `register` `requests.py:130`; `REREGISTER` `_admission_lua.py:1069`; `_check_cancels` (`MGET`) `runtime.py:1814-1815`. |
 | Lifetime (native) | `LLMQ_STATUS_TTL_SECS` (1800 s). |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
@@ -1116,7 +1116,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Store | queue |
 | Schema | Job names some worker consumed lately (for `status()` and the CLI). Job messages themselves use the queue keys above with `NAME` = `QP` + `jobs-<name>`. |
 | Written by | `JobRunner._upkeep` `jobs.py:399-400` (`SADD`, `EXPIRE` dead-letter retention). |
-| Read by | `StatusReader.jobs` `status.py:216-217`; CLI `queues` `cli.py:445-446`. |
+| Read by | `StatusReader.jobs` `status.py:216-217`; `queues.list` / `jobs.list` `engine/admin/queues.py`. |
 | Lifetime (native) | Fixed `LLMQ_JOB_DEAD_RETENTION_SECS` (7 days), set again every upkeep (10 s). |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
 | Count | 1 per prefix and queue prefix. |
@@ -1367,7 +1367,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Swept mode | No expiry, in both modes. |
 | Count | 1 per prefix. Usually empty; one member per dropped model or deployment within its grace. |
 | If evicted (`volatile-*`, native mode) | Not evictable: the key has no TTL. |
-| If evicted (`allkeys-*`) | Scheduled auto purges are forgotten: the dropped model's or deployment's state stays until a manual purge or `registry gc`. |
+| If evicted (`allkeys-*`) | Scheduled auto purges are forgotten: the dropped model's or deployment's state stays until a manual purge or `purge removed`. |
 | Deleted by | Never (members only). |
 
 #### `P:lock:purge`

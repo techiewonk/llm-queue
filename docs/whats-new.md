@@ -1,5 +1,30 @@
 # What's new
 
+## 0.2.0 (unreleased): one admin API
+
+Every admin operation is one method under `llmq.admin`; the `llm-queue` CLI and the HTTP routes
+are generated from the same table, so an operation exists on every surface or is documented as
+missing. Every write takes an actor, is audited, and is a dry run until you say otherwise.
+
+```python
+await llmq.admin.models.disable("gpt120b", actor="ops")                  # the diff it would make
+await llmq.admin.models.disable("gpt120b", actor="ops", dry_run=False)   # done, audited
+await llmq.admin.dlq.redrive(model="gpt120b", actor="ops", dry_run=False)
+print(await llmq.admin.audit.list(count=5))
+```
+
+```bash
+llm-queue models disable gpt120b          # dry run
+llm-queue --actor ops models disable gpt120b --yes
+curl -H "X-LLMQ-Token: $READ_TOKEN" https://app/llmq/   # every route and a live summary
+```
+
+`LLMQ_ADMIN_READ_TOKEN` opens the read routes, `LLMQ_ADMIN_TOKEN` reads and writes. Old names
+(`llmq.purge`, `llmq.registry`, `llmq.cancel`, `job_dead_letters`, `redrive_jobs`,
+`PurgeRefused`, CLI `request` / `cancel` / `block` / `drain` / `registry gc` ...) are gone: the
+mapping is in [Upgrade](how-to/upgrade.md#from-011-to-020-the-admin-api). The examples in the
+0.1.0b3 section below use the names of that release. Read [Admin API](reference/admin-api.md).
+
 ## 0.1.0b3
 
 0.1.0b3 lets llm-queue share a cache store that evicts, and deletes the store state of what you
