@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from llm_queue._version import __version__
 from llm_queue.context import RequestContext, current_context, request_context
-from llm_queue.engine.errors import KINDS, CallFailed, Kind
+from llm_queue.engine.errors import KIND_CATEGORIES, KINDS, CallFailed, Kind
 from llm_queue.engine.hooks import (
     CallContext,
     DeploymentView,
@@ -26,12 +26,16 @@ from llm_queue.engine.hooks import (
     register_sticky_key,
 )
 from llm_queue.errors import (
+    CATEGORIES,
+    Category,
     ConfigError,
     LLMQueueError,
     MissingExtra,
     PurgeRefused,
     StoreUnavailable,
     UnknownModel,
+    error_category,
+    error_retryable,
 )
 from llm_queue.tuning import (
     BedrockOptions,
@@ -121,10 +125,13 @@ _LAZY = {
 }
 
 __all__ = [
+    "CATEGORIES",
     "KINDS",
+    "KIND_CATEGORIES",
     "BedrockOptions",
     "CallContext",
     "CallFailed",
+    "Category",
     "ConcurrencyStatus",
     "ConfigError",
     "DeploymentStatus",
@@ -175,6 +182,8 @@ __all__ = [
     "__version__",
     "current_context",
     "current_job",
+    "error_category",
+    "error_retryable",
     "register_account_kind",
     "register_admission",
     "register_balancer",

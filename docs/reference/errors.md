@@ -18,6 +18,47 @@ LLMQueueError
 └── StoreUnavailable      the store cannot serve an admin operation (also a ConnectionError)
 ```
 
+## Category and retryable
+
+Every `LLMQueueError` has two computed properties, for logs, dashboards and retry rules:
+
+- `category`: one of `throttled`, `timeout`, `bad_request`, `unavailable`, `config_error`,
+  `cancelled`, `internal` (`llm_queue.CATEGORIES`; the type is `llm_queue.Category`).
+- `retryable`: True when a later retry by the caller can succeed. The queue already retried
+  inside the call (other regions, models, attempts), so this is about the caller trying again
+  later, not about retrying at once.
+
+`llm_queue.error_category(exc)` and `llm_queue.error_retryable(exc)` answer for any exception:
+an exception that is not an `LLMQueueError` is `internal` and not retryable. A retry rule
+becomes `if not llm_queue.error_retryable(exc): stop`.
+
+| Error | `category` | `retryable` |
+|---|---|---|
+| `CallFailed` | by `kind`, see below (an unknown kind is `internal`, False) | by `kind` |
+| `ConfigError` and its subclasses (`RegistryError`, `RegistryConflict`, `LiveEditRefused`, `UnknownModel`, `MissingExtra`) | `config_error` | False |
+| `StoreUnavailable` | `unavailable` | True |
+| `PurgeRefused`, a plain `LLMQueueError`, anything else | `internal` | False |
+
+`UnknownModel` is `config_error`, not `bad_request`: the model name comes from the app's code or
+configuration, and it is a `ConfigError`, so both views agree.
+
+| `CallFailed.kind` | `category` | `retryable` |
+|---|---|---|
+| `rate_limited`, `queue_full` | `throttled` | True |
+| `deadline_exceeded` | `timeout` | True |
+| `invalid_request`, `context_length_exceeded`, `request_too_large`, `request_id_conflict`, `result_expired`, `rejected` | `bad_request` | False |
+| `model_unavailable`, `queue_unavailable`, `retry_budget_exhausted`, `worker_lost`, `worker_shutdown` | `unavailable` | True |
+| `model_disabled`, `provider_error` | `unavailable` | False |
+| `no_deployment` | `config_error` | False |
+| `credentials_unavailable` | `config_error` | True |
+| `cancelled` | `cancelled` | False |
+| `dead_lettered` | `internal` | False |
+
+The table is `llm_queue.KIND_CATEGORIES` (kind -> `(category, retryable)`). `model_disabled`
+waits for an operator; `provider_error` is a fatal provider answer or `max_attempts` already
+spent; `credentials_unavailable` is configuration, but STS outages pass, so a later retry can
+work; `dead_lettered` already killed `max_receives` workers.
+
 A plain `LLMQueueError` is raised for a queue object used where it cannot work: a call from a
 forked child of the process that started the queue, an async call from another event loop, a
 sync call on the queue's own event-loop thread, or `start()` on a stopped queue. See

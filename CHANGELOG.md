@@ -7,6 +7,17 @@ public API (see STABILITY.md).
 
 ## [Unreleased]
 
+### Added
+
+- `category` and `retryable` on every `LLMQueueError` (C1): `category` is one of `throttled`,
+  `timeout`, `bad_request`, `unavailable`, `config_error`, `cancelled`, `internal`
+  (`llm_queue.CATEGORIES`); `retryable` is True when a later retry by the caller can succeed
+  (the queue already retried). A `CallFailed` takes both from its kind
+  (`llm_queue.KIND_CATEGORIES`); `llm_queue.error_category(exc)` and
+  `llm_queue.error_retryable(exc)` answer for any exception (`internal` / False for one that is
+  not llm-queue's). Computed, so pickling is unchanged. See
+  [Errors](docs/reference/errors.md#category-and-retryable).
+
 ## [0.1.1] - 2026-11-17
 
 The first release that installs without `--pre`: `pip install llm-queue` (or
