@@ -24,6 +24,27 @@ public API (see STABILITY.md).
   provider quota and the share to use; the budget is `floor(quota x budget_pct)`. Setting
   `rpm` and `quota_rpm` (or `tpm` and `quota_tpm`) on one level is refused, as is a share that
   rounds a quota down to 0. `ResolvedRegistry.quota()` returns the quota behind a budget.
+- `llm_queue.fastapi.install(app, llmq=None, *, prefix="/internal/llm-queue",
+  on_start_error="raise", drain_secs=None, mount_admin=True, context_middleware=True,
+  context=None, **router_options)` (extra `http`): wraps the app's lifespan so the queue
+  starts before the app's startup and stops after its shutdown, adds the request context
+  middleware and mounts `http_router(**router_options)` under the prefix, with the drain
+  routes when a token or `dependencies` guards them. `llmq=None` builds
+  `LLMQueue.from_env()`. `on_start_error="log"` keeps the app up after a failed start
+  (`llmq_start_failed`; queued calls fail at once, readiness false). The lower-level
+  `serve(app, llmq)` (an async context manager for your own lifespan) and `mount(app, llmq)`
+  are in the same module. See [Use with FastAPI](docs/how-to/fastapi.md).
+- `llm_queue.RequestContextMiddleware(app, *, tenant_id=None, user_id=None, session_id=None,
+  priority=None)` (`llm_queue.asgi`, pure ASGI, HTTP and websocket): each value a constant or
+  a callable of the ASGI scope (sync or async).
+- Background helpers: `llm_queue.background()` (`request_context(priority=False)`),
+  `@llm_queue.background_priority` (sync and coroutine functions),
+  `llm_queue.create_background_task(coro, *, name=None)` (keeps the task referenced until done;
+  logs `background_task_failed`) and `llm_queue.run_in_thread(fn, *args, **kwargs)` (a daemon
+  thread in a copy of the context; logs `background_thread_failed`). Each keeps the ids and
+  drops the priority.
+- `LLMQueue.ready`: sync readiness (started, registry loaded, not draining, and in strict mode
+  no evicting store); `llm_queue.queue_ready(enabled, llmq=None)` for an app's own probe.
 
 ### Changed
 

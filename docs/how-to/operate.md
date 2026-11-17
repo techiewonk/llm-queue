@@ -17,6 +17,9 @@ async def lifespan(app):
     await llmq.stop()               # drain: LLMQ_DRAIN_SECS (25 s) for jobs and calls together
 ```
 
+With FastAPI, `llm_queue.fastapi.install(app, llmq)` does this, mounts the routes and adds the
+request context middleware in one call (see [Use with FastAPI](fastapi.md)).
+
 Start one queue per process, after any fork (in each gunicorn / uvicorn worker, in Celery's
 `worker_process_init`); see [Clients and connections](../explanation/clients.md#one-llmqueue-per-process).
 

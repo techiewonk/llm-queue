@@ -239,7 +239,10 @@ with request_context(priority=True, session_id=sid, user_id=uid, tenant_id=tid):
     reply = await llmq.converse("gpt120b", request)
 ```
 
-An argument passed to a call overrides the context.
+An argument passed to a call overrides the context. For a context per HTTP or websocket request
+(`RequestContextMiddleware`) and for background work at background priority (`background()`,
+`@background_priority`, `create_background_task`, `run_in_thread`), see
+[Use with FastAPI](fastapi.md#background-work).
 
 ## LangChain
 
