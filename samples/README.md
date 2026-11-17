@@ -14,7 +14,7 @@ the environment.
 | `06_jobs.py` | `register_job(concurrency=)` / `send_job`: work that runs at least once, LLM calls inside; a failing job dead-lettered, `llmq.admin.dlq.list(job=)` / `dlq.redrive(job=)` | Ingestion, nightly re-embedding, any batch work that should not block a request |
 | `07_status_and_registry.py` | `status`, `request_status`, live `registry.set`, audit `log`, `health`; tenant `fairness` turned on live and read from `status` | Admin pages, runbooks, readiness checks |
 | `08_langchain.py` | `QueuedChatBedrockConverse` (with tools) and `QueuedBedrockEmbeddings` | LangChain / LangGraph chains, agents, RAG: drop-in for `ChatBedrockConverse` / `BedrockEmbeddings` |
-| `09_http_router.py` | `http_router` on FastAPI: health without auth, status / registry behind the app's admin check, audited writes (`actor=`), `GET /metrics` (`metrics_route=True`), `/drain` with `pause_receiving()` | Admin API and Kubernetes probes; the preStop hook |
+| `09_http_router.py` | `llm_queue.fastapi.install()`: health without auth, status / registry behind the app's admin check (constant-time compare), audited writes (`actor=`), `GET /metrics` (`metrics_route=True`), the drain routes (`POST /drain`, `POST /resume`); `LLMQ_DRAIN_FILE` for a preStop hook | Admin API and Kubernetes probes; the preStop hook |
 | `10_purge.py` | `llmq.admin.purge`: a tenant purge as a dry run then for real, a deployment purge refused (`AdminRefused`) then shown with `force=True`; reports as JSON dicts | Admin jobs, tenant offboarding, cleanup after a model or deployment leaves the registry |
 
 `registry.json` defines the four models the samples use: chat `gpt120b` (falls back to `gpt20b`)
@@ -73,8 +73,9 @@ async def lifespan(app):
     await llmq.stop(drain_secs=20)  # one budget for running jobs and calls together
 ```
 
-`09_http_router.py` shows the `/drain` endpoint for the preStop hook and the health routes for
-the probes. Outside dev, `LLMQ_STORE_URL` must be `rediss://` and `LLMQ_ID_HASH_SALT` set.
+`09_http_router.py` shows `install()` with the drain routes (`POST /drain`, `POST /resume`) and
+the health routes for the probes; a pod with several processes drains through `LLMQ_DRAIN_FILE`
+(the preStop hook touches it). Outside dev, `LLMQ_STORE_URL` must be `rediss://` and `LLMQ_ID_HASH_SALT` set.
 
 ## Measured on real Bedrock (us-east-1, 2026-11-12)
 
