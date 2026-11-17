@@ -11,23 +11,65 @@ Timeouts, pool sizes and loop pacing are set in code; see [Tune](tune.md).
 
 ## Process settings
 
-`LLMQueue.from_env()` reads `LLMQ_*` from the environment. With `secrets=` (a function from a
-name to a value or `None`), each name is looked up there first, then in the environment:
+`LLMQueue.from_env()` reads `LLMQ_*` from the environment. With a secrets source
+(`LLMQ_SECRETS_SOURCE`, see [Secrets](#secrets)) or `secrets=` (a function from a name to a
+value or `None`), each name is looked up there first, then in the environment:
 
 ```python
 llmq = LLMQueue.from_env(secrets=my_secret_lookup)
 ```
 
 `LLMQ_STORE_PASSWORD` and `LLMQ_QUEUE_STORE_PASSWORD` are read on every new connection (from
-`secrets=`, else the environment), so a rotated password is picked up without a restart. To
+the secrets, else the environment), so a rotated password is picked up without a restart. To
 avoid environment variables entirely, pass a mapping: `LLMQueue.from_env(environ={...},
 secrets=...)`.
+
+### Secrets
+
+Where secrets come from is configuration, not code: another app with other secret names or
+another secret store changes two variables. In a Kubernetes manifest:
+
+```yaml
+- {name: LLMQ_SECRETS_SOURCE, value: "aws-secretsmanager:${ENV}/researchassistant/secret"}
+- {name: LLMQ_SECRET_NAMES, value: '{"LLMQ_STORE_HOST":"valkey_host","LLMQ_STORE_PORT":"valkey_port","LLMQ_STORE_PASSWORD":"valkey_key","LLMQ_ID_HASH_SALT":"llmq_id_hash_salt"}'}
+```
+
+- `LLMQ_SECRETS_SOURCE` lists sources tried in order for each name:
+  `aws-secretsmanager:<secret-id>` (one secret holding a JSON object; the pod role's
+  credentials; region `LLMQ_SECRETS_REGION`, else `AWS_REGION`), `file:<path>` (a mounted
+  secret volume with one file per key, a `.json` file or a `.env` file), `env` and `none` (the
+  default). `${NAME}` and `${NAME:-default}` are expanded from the environment (`ENV` above).
+- `LLMQ_SECRET_NAMES` gives each setting's key in the secret. `secret_names=` in code is merged
+  over it (the argument wins per setting).
+- Values are cached for `LLMQ_SECRETS_CACHE_SECS` (300) and read again after, so a rotated
+  store password reaches the next new connection within that time. A source that cannot be read
+  at start (missing, denied) stops `from_env` with a `ConfigError` naming it; a key it does not
+  hold is unset, and the environment and `defaults=` are asked next.
+- The same source serves the store passwords, `LLMQ_ADMIN_TOKEN`, `LLMQ_JOB_*`, the account
+  secrets (`api_key_ref`, `external_id_ref`), registry placeholders, the `llm-queue` CLI,
+  `AdminServices.from_env` and `PurgeService.from_env`.
+- `describe()` shows the sources (kind and secret id) and the mapped setting names, never a
+  value.
+
+Precedence: `secrets=` in code wins over `LLMQ_SECRETS_SOURCE` (which is then not read); then
+the environment; then `defaults=`. To build the same lookup in code:
+
+```python
+from llm_queue.secrets import secrets_from_config
+
+lookup = secrets_from_config("file:/etc/llmq,aws-secretsmanager:prod/app", cache_secs=60)
+llmq = LLMQueue.from_env(secrets=lookup, secret_names={"LLMQ_STORE_PASSWORD": "valkey_key"})
+```
+
+An app's own store is a class with `kind`, `label` and `load() -> Mapping[str, str]` (the
+`llm_queue.secrets.SecretSource` protocol), wrapped in `SecretReader([source], cache_secs=...)`.
 
 ### Layers: secrets, environment, defaults
 
 `from_env` reads every `LLMQ_*` name from three layers, highest first:
 
-1. `secrets=`: a function from a name to a value or `None` (Secrets Manager, Vault);
+1. the secrets: `secrets=` (a function from a name to a value or `None`), else the
+   `LLMQ_SECRETS_SOURCE` sources;
 2. `environ=` (default `os.environ`);
 3. `defaults=`: a mapping the app keeps in code, used for any name the two above leave unset.
 
@@ -48,8 +90,8 @@ llmq = LLMQueue.from_env(
 )
 ```
 
-- `secret_names` asks the secret under its own name instead of the `LLMQ_*` name; the order of
-  the layers does not change. It covers every setting read through the layers: the store
+- `secret_names` (merged over `LLMQ_SECRET_NAMES`) asks the secret under its own name instead
+  of the `LLMQ_*` name; the order of the layers does not change. It covers every setting read through the layers: the store
   passwords, `LLMQ_ADMIN_TOKEN`, `LLMQ_JOB_*` and the account secrets.
 - A secret wins over the environment, as in 0.1. For the environment to win over a secret,
   build the environment yourself: `environ=collections.ChainMap(os.environ, secret_map)`.
