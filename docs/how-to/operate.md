@@ -23,6 +23,9 @@ request context middleware in one call (see [Use with FastAPI](fastapi.md)).
 Start one queue per process, after any fork (in each gunicorn / uvicorn worker, in Celery's
 `worker_process_init`); see [Clients and connections](../explanation/clients.md#one-llmqueue-per-process).
 
+To run without the store (outage, migration, a service without one), see the switch ladder in
+[Queue and local modes](modes.md).
+
 ## Deploys and restarts
 
 1. A **preStop hook** pauses the pod: it touches `LLMQ_DRAIN_FILE` (every process of the pod

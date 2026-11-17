@@ -8,7 +8,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 
 | Event | Level | Where |
 |---|---|---|
-| `account_credentials_failed` | error | engine/runtime.py |
+| `account_credentials_failed` | error | engine/runtime.py, engine/local.py |
 | `admin_routes_unauthenticated` | warning | engine/http.py |
 | `ack_stale_receipt` | warning | engine/runtime.py |
 | `admission_config_missing` | error | engine/runtime.py |
@@ -42,7 +42,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `confirm_failed` | warning | engine/runtime.py |
 | `dead_letter_reply_failed` | warning | engine/runtime.py |
 | `debug_capture_failed` | warning | engine/runtime.py |
-| `deployment_disabled` | error | engine/runtime.py |
+| `deployment_disabled` | error | engine/runtime.py, engine/local.py |
 | `deployment_failing_last_usable` | error | engine/runtime.py |
 | `deployment_recovered` | info | engine/runtime.py |
 | `direct_run_failed` | warning | engine/runtime.py |
@@ -84,6 +84,8 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `llmq_purge` | info | engine/purge.py |
 | `llmq_registry_audit` | info | registry/store.py |
 | `llmq_start_failed` | error | fastapi.py (`on_start_error="log"`: the app stays up, not ready) |
+| `local_attempt_failed` | warning | engine/local.py (one provider attempt on the local executor: `local` mode or `store_down: static_cap`, field `path`) |
+| `local_mode_started` | info | core.py (`LLMQ_EXECUTION_MODE=local`: process count, concurrency, an `LLMQ_MODE` that does not apply) |
 | `message_needs_newer_library` | warning | engine/runtime.py |
 | `metric_dropped` | warning | engine/metrics.py |
 | `model_loop_died` | error | engine/runtime.py |
@@ -133,7 +135,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `replicas_short` | warning | engine/store_guard.py |
 | `request_extended` | info | engine/requests_admin.py |
 | `request_moved` | info | engine/requests_admin.py |
-| `request_unusable` | error | engine/runtime.py |
+| `request_unusable` | error | engine/runtime.py, engine/local.py |
 | `result_drop_skipped` | warning | engine/requests.py |
 | `result_reader_error` | warning | engine/runtime.py |
 | `result_sweep_failed` | warning | engine/runtime.py |
@@ -145,8 +147,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `state_store_reset_detected` | error | engine/runtime.py |
 | `queue_store_unreachable_at_start` | error | engine/runtime.py |
 | `state_store_unreachable_at_start` | error | engine/runtime.py |
-| `static_cap_attempt_failed` | warning | engine/runtime.py |
-| `stop_metrics_flush_failed` | warning | engine/runtime.py |
+| `stop_metrics_flush_failed` | warning | engine/runtime.py, engine/local.py |
 | `stop_reclaim_failed` | warning | engine/runtime.py |
 | `stop_return_failed` | warning | engine/runtime.py |
 | `stop_return_timeout` | warning | engine/runtime.py |

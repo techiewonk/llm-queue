@@ -147,7 +147,7 @@ from 0.1 s to 600 s. Alert gauges are named `llmq_alert_<name>`, labels `model` 
 
 | Name | Kind | Labels | Unit | From | Meaning |
 |---|---|---|---|---|---|
-| `llmq_calls_total` | counter | model, account, region, outcome, tenant | Count | worker | Calls finished by a worker, by outcome (ok or the error kind); account and region of the last deployment tried, '-' when none was; tenant: its `LLMQ_METRICS_TENANTS` label, `other` when not listed, `-` with no tenant |
+| `llmq_calls_total` | counter | model, account, region, outcome, path, tenant | Count | worker | Calls finished, by outcome (ok or the error kind) and path (`queue`, `direct`, `static_cap`, `local`, `dead_letter`); account and region of the last deployment tried, '-' when none was; tenant: its `LLMQ_METRICS_TENANTS` label, `other` when not listed, `-` with no tenant |
 | `llmq_caller_failures_total` | counter | model, outcome | Count | caller | Every failure a caller saw, by kind: also those no worker counts (rejected, queue_full, queue_unavailable, a caller-side deadline) |
 | `llmq_attempts_total` | counter | model, account, region, result | Count | worker | Provider attempts by result: ok, throttled, retryable, model_error, auth, target, or the request error kind |
 | `llmq_tokens_input_total` | counter | model, account, region | Count | worker | Input tokens of successful calls |

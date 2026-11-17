@@ -43,6 +43,7 @@ from llm_queue.engine.cross_checks import start_warnings
 from llm_queue.engine.envelope import Meta, Reply
 from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.jobs import JobFn, JobRunner, JobSettings
+from llm_queue.engine.local import LocalEngine, LocalLimits, LocalRegistry
 from llm_queue.engine.metrics import Metrics, sink_for
 from llm_queue.engine.offload import ResultOffload
 from llm_queue.engine.purge import PurgeSettings
@@ -52,7 +53,7 @@ from llm_queue.engine.runtime import Engine, EngineSettings
 from llm_queue.engine.settings import STORE_POOL_MARGIN, InfraSettings, Layers
 from llm_queue.engine.store_client import Secrets, secret_store_client
 from llm_queue.engine.store_guard import store_op
-from llm_queue.errors import ConfigError, LLMQueueError
+from llm_queue.errors import ConfigError, LLMQueueError, LocalModeRefused
 from llm_queue.registry.store import RegistryStore
 from llm_queue.tuning import Tuning
 
@@ -131,6 +132,9 @@ class ModelStatus(TypedDict):
     dead_letters: int
     deployments: list[DeploymentStatus]
     fairness: NotRequired[FairnessStatus]  # only when `fairness.mode` is on
+    # Local mode (LLMQ_EXECUTION_MODE=local): `local`, and this process's slots of the model.
+    mode: NotRequired[str]
+    concurrency: NotRequired[ConcurrencyStatus]
 
 
 class JobStatus(TypedDict):
@@ -150,6 +154,9 @@ class StatusReport(TypedDict):
     blocked_accounts: list[str]
     models: list[ModelStatus]
     jobs: NotRequired[list[JobStatus]]
+    # Local mode: `local`, and the LLMQ_LOCAL_PROCESS_COUNT that divides every budget.
+    mode: NotRequired[str]
+    process_count: NotRequired[int]
 
 
 class RequestStatus(TypedDict, total=False):
@@ -196,6 +203,9 @@ class Health(TypedDict):
     draining_since: NotRequired[float | None]
     # Why not ready: `draining` first, else the evicting store's policy (strict mode).
     not_ready_reason: NotRequired[str]
+    # `queue` or `local` (LLMQ_EXECUTION_MODE); local mode has no stores (`stores` is empty).
+    mode: NotRequired[str]
+    running: NotRequired[int]  # local mode: calls in flight in this process
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,10 +236,10 @@ class LLMQueue:
 
     def __init__(
         self,
-        engine: Engine,
+        engine: Engine | LocalEngine,
         *,
         settings: InfraSettings | None = None,
-        builder: Callable[[], Engine] | None = None,
+        builder: Callable[[], Engine | LocalEngine] | None = None,
         offload: ResultOffload | None = None,
         job_settings: JobSettings | None = None,
         tuning: Tuning | None = None,
@@ -242,6 +252,8 @@ class LLMQueue:
         client timeouts with the registry (R3CF-10).
         """
         self._engine = engine
+        # LLMQ_EXECUTION_MODE=local: calls run in this process, no store (engine/local.py).
+        self._local = isinstance(engine, LocalEngine)
         self.settings = settings
         # LLMQ_ADMIN_TOKEN / LLMQ_ADMIN_READ_TOKEN, read per request; `from_env` sets them.
         self._admin_token: Callable[[], str | None] = lambda: None
@@ -303,6 +315,10 @@ class LLMQueue:
         settings = InfraSettings.from_env(
             environ, secrets=secrets, defaults=defaults, secret_names=secret_names
         )
+        if settings.execution_mode == "local":  # no store client at all (engine/local.py)
+            return cls._from_env_local(
+                settings, layers, secrets is not None, metrics, worker_id, credentials, tuning
+            )
         jobs = JobSettings.from_env(layers)  # the same layers as every other setting
         # This process's id prefix: the argument, LLMQ_WORKER_ID, else pod (or host) and pid; the
         # engine adds a random tail, so two processes never share one.
@@ -368,7 +384,8 @@ class LLMQueue:
                 caller_ttl_secs=settings.caller_ttl_secs,
                 drain_secs=settings.drain_secs,
                 drain_handback_enabled=settings.drain_handback_enabled,
-                local_limit_cap=settings.local_limit_cap,
+                local_process_count=settings.local_process_count,
+                local_concurrency=settings.local_concurrency,
                 id_hash_salt=settings.id_hash_salt or "",
                 cfg_reload_secs=settings.cfg_reload_secs,
                 queue_failover_secs=settings.queue_failover_secs,
@@ -408,6 +425,82 @@ class LLMQueue:
         queue._admin_token = lambda: layers.get("LLMQ_ADMIN_TOKEN")
         queue._admin_read_token = lambda: layers.get("LLMQ_ADMIN_READ_TOKEN")
         return queue
+
+    @classmethod
+    def _from_env_local(
+        cls,
+        settings: InfraSettings,
+        layers: Layers,
+        has_secrets: bool,
+        metrics: Metrics | None,
+        worker_id: str | None,
+        credentials: Callable[[Any], Mapping[str, Any] | None] | None,
+        tuning: Tuning | None,
+    ) -> LLMQueue:
+        """`from_env` in local mode: the registry document and provider clients, no store.
+
+        Every call runs in this process against the provider with the local budgets
+        (`LLMQ_LOCAL_PROCESS_COUNT`, `LLMQ_LOCAL_CONCURRENCY`); the sync calls' private engine
+        shares them, so the process has one budget.
+        """
+        worker_id = worker_id or settings.worker_id or _default_worker_id()
+        tuning = tuning or Tuning()
+        if problems := tuning.problems(
+            queue_wait_ms=settings.queue_wait_ms, result_ttl_secs=settings.result_ttl_secs
+        ):
+            raise ConfigError("invalid tuning:\n  " + "\n  ".join(problems))
+        sink = metrics or sink_for(
+            settings.metrics_sink,
+            static={"environment": settings.environment},
+            properties={"pod": worker_id, "version": __version__},
+        )
+        document = orjson.loads(settings.registry_document())
+        engine_settings = EngineSettings(
+            drain_secs=settings.drain_secs,
+            id_hash_salt=settings.id_hash_salt or "",
+            local_process_count=settings.local_process_count,
+            local_concurrency=settings.local_concurrency,
+            timings=tuning.engine,
+            admin=AdminSettings.from_infra(settings),  # the tenant metric labels
+        )
+        limits = LocalLimits(process_count=settings.local_process_count, timings=tuning.engine)
+        pool_kwargs: dict[str, Any] = {
+            "bedrock_endpoint_url": settings.bedrock_endpoint_url,
+            "sts_endpoint_url": settings.sts_endpoint_url,
+            "session_name": f"llmq-{settings.environment}-{worker_id}",
+            "options": tuning.bedrock,
+            "openai_options": tuning.openai,
+            "warm": tuning.warm,
+        }
+        if credentials is not None:
+            pool_kwargs["credentials"] = credentials
+        if has_secrets:
+            pool_kwargs["secrets"] = layers.secret  # `secret_names` apply to accounts too
+
+        def build() -> LocalEngine:
+            registry = LocalRegistry(
+                document,
+                prefix=settings.key_prefix,
+                allowed_hosts=settings.base_url_allowed_hosts,
+            )
+            return LocalEngine(
+                registry,
+                Providers(ClientPool(**pool_kwargs)),
+                settings=engine_settings,
+                worker_id=worker_id,
+                metrics=sink,
+                limits=limits,
+            )
+
+        queue = cls(build(), settings=settings, builder=build, tuning=tuning)
+        queue._admin_token = lambda: layers.get("LLMQ_ADMIN_TOKEN")
+        queue._admin_read_token = lambda: layers.get("LLMQ_ADMIN_READ_TOKEN")
+        return queue
+
+    def _refuse_local(self, operation: str) -> None:
+        """`LocalModeRefused` for a store-only operation in local mode."""
+        if self._local:
+            raise LocalModeRefused(operation)
 
     # ---------------------------------------------------------------- guards (C2)
 
@@ -507,7 +600,17 @@ class LLMQueue:
             worker=mode in ("both", "worker"), caller=mode in ("both", "caller")
         )
         self._cross_check()
-        if mode in ("both", "worker"):
+        if self._local:
+            # One line saying how this process runs: calls go straight to the provider, and
+            # the worker / caller role (LLMQ_MODE) does not apply.
+            logger.info(
+                "local_mode_started",
+                worker=self._engine.worker_id,
+                process_count=self._engine.settings.local_process_count,
+                concurrency=self._engine.settings.local_concurrency,
+                ignored_mode=mode if mode != "both" else None,
+            )
+        elif mode in ("both", "worker"):
             self._check_store_pool()
             await self._jobs.start()
         from llm_queue.langchain import get_default_queue, set_default_queue
@@ -614,6 +717,11 @@ class LLMQueue:
     def draining(self) -> bool:
         """True between `pause_receiving()` (or the drain file) and `resume_receiving()`."""
         return bool(self._engine.draining)
+
+    @property
+    def execution_mode(self) -> str:
+        """`queue` (calls through the store) or `local` (in this process, no store)."""
+        return "local" if self._local else "queue"
 
     @property
     def draining_since(self) -> float | None:
@@ -831,7 +939,7 @@ class LLMQueue:
 
     # ---------------------------------------------------------------- sync (direct path)
 
-    def _run_sync[T](self, make: Callable[[Engine], Coroutine[Any, Any, T]]) -> T:
+    def _run_sync[T](self, make: Callable[[Engine | LocalEngine], Coroutine[Any, Any, T]]) -> T:
         """Run a call from sync code: on the started queue's loop, else on the private loop."""
         self._check(same_loop=False, work=True)
         loop = self._loop
@@ -874,7 +982,7 @@ class LLMQueue:
         """`converse` on the direct path from sync code (same budgets, no queue)."""
         kwargs = self._call_kwargs(priority, **kw)
 
-        async def run(engine: Engine) -> Reply:
+        async def run(engine: Engine | LocalEngine) -> Reply:
             return await engine.call(model, request, force_direct=True, **kwargs)
 
         return self._run_sync(run)
@@ -930,6 +1038,7 @@ class LLMQueue:
         dead-lettered); None (the default) lets it run as long as it takes. `ConfigError` in
         `caller` mode, which runs no jobs: the job waited unseen (R3JE-6).
         """
+        self._refuse_local("jobs")
         if self.settings is not None and self.settings.mode == "caller":
             raise ConfigError(f"job {name}: a process in caller mode runs no jobs")
         self._jobs.register(name, fn, timeout_secs=timeout_secs, concurrency=concurrency)
@@ -946,6 +1055,7 @@ class LLMQueue:
         `invalid_request` for a payload that is not JSON.
         """
         self._check(work=True)
+        self._refuse_local("jobs")
         try:
             return await self._jobs.send(name, payload, job_id=job_id)
         except QueueFull as exc:
@@ -980,13 +1090,16 @@ class LLMQueue:
 
         One method per operation, the same the CLI and the HTTP routes call; every write
         takes `actor` and is a dry run unless `dry_run=False`. See docs/reference/admin-api.md.
+        In local mode the store-only operations raise `LocalModeRefused`.
         """
         if self._admin is None:
             from llm_queue.engine.admin import AdminServices
 
-            self._admin = AdminServices.for_engine(
-                self._engine, settings=self.settings, process=self
-            )
+            engine = self._engine
+            if isinstance(engine, LocalEngine):
+                self._admin = AdminServices.for_local(engine, settings=self.settings, process=self)
+            else:
+                self._admin = AdminServices.for_engine(engine, settings=self.settings, process=self)
         return self._admin
 
     def http_router(
@@ -1045,7 +1158,7 @@ class LLMQueue:
 
 
 async def _embed(
-    engine: Engine,
+    engine: Engine | LocalEngine,
     model: str,
     texts: Sequence[str],
     input_type: str | None,
@@ -1172,14 +1285,16 @@ def _private_loop() -> _PrivateLoop:
 class _SyncRunner:
     """A caller-only engine of one queue on the shared private loop (clients come lazily)."""
 
-    def __init__(self, build: Callable[[], Engine], offload: ResultOffload | None) -> None:
+    def __init__(
+        self, build: Callable[[], Engine | LocalEngine], offload: ResultOffload | None
+    ) -> None:
         self._private = _private_loop()
         self._offload = offload
         self._closing = False
         self._lock = threading.Lock()
         self._calls: set[Future[Any]] = set()
 
-        async def boot() -> Engine:
+        async def boot() -> Engine | LocalEngine:
             engine = build()
             try:
                 await engine.start(worker=False, caller=True)
@@ -1197,9 +1312,9 @@ class _SyncRunner:
                 raise
             return engine
 
-        self._engine: Engine = self._private.submit(boot()).result()
+        self._engine: Engine | LocalEngine = self._private.submit(boot()).result()
 
-    def run[T](self, fn: Callable[[Engine], Coroutine[Any, Any, T]]) -> T:
+    def run[T](self, fn: Callable[[Engine | LocalEngine], Coroutine[Any, Any, T]]) -> T:
         """Run one call on the private loop and wait for it."""
         # The check and the add are one step under the lock that close() takes: a call
         # submitted after close() took its snapshot ran on the stopped engine (CO-7).

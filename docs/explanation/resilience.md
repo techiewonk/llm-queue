@@ -29,7 +29,7 @@ flowchart TD
   X([A store command fails]) --> Y{Where?}
   Y -- "caller, before the send" --> SD{store_down rule}
   SD -- pause --> SP[Ping every second,<br/>then run the call normally]
-  SD -- static_cap --> SC[Run without the store,<br/>at most LLMQ_LOCAL_LIMIT_CAP per process]
+  SD -- static_cap --> SC[Run on the local executor,<br/>budgets / LLMQ_LOCAL_PROCESS_COUNT]
   SD -- fail_fast --> SF([queue_unavailable])
   Y -- "caller, after the send" --> SW[Wait for the store<br/>never run the call twice]
   Y -- "worker" --> WT[Mark store trouble,<br/>retry; give grants back on errors]
@@ -40,8 +40,9 @@ flowchart TD
 
 Applies when the state store fails before the call was sent (registering). `pause` (default): ping
 every second until the call's timeout, then run it normally, else `queue_unavailable`. `static_cap`:
-run without the store, at most `LLMQ_LOCAL_LIMIT_CAP` (10) calls per process and model, confirmed
-deployments in order, no budgets (quotas may be exceeded). `fail_fast`: `queue_unavailable` at once.
+run on the local executor (the one `LLMQ_EXECUTION_MODE=local` uses): each budget divided by
+`LLMQ_LOCAL_PROCESS_COUNT` per process, at most `LLMQ_LOCAL_CONCURRENCY` (10) calls per process and
+model, retries, breakers and fallbacks in memory. `fail_fast`: `queue_unavailable` at once.
 A call already sent never takes this path: its caller waits for the store until its deadline (before,
 it could run twice). A streaming call fails `queue_unavailable` (chunks travel through the store).
 

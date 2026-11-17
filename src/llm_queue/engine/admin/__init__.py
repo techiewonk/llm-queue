@@ -8,7 +8,8 @@ unless `dry_run=False` (D3).
 
 From a running queue: `llmq.admin`. Without one (a script, an admin worker):
 `async with AdminServices.from_env() as admin:`; process-local operations (`drain.*`) then
-refuse with `AdminRefused`.
+refuse with `AdminRefused`. In local mode (`LLMQ_EXECUTION_MODE=local`, `for_local`) the
+store-only operations raise `LocalModeRefused` (see `engine/admin/local.py`).
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ from llm_queue.engine.settings import InfraSettings
 from llm_queue.engine.status import StatusReader
 
 if TYPE_CHECKING:
+    from llm_queue.engine.local import LocalEngine
     from llm_queue.engine.runtime import Engine
 
 __all__ = ["BY_ID", "OPERATIONS", "AdminContext", "AdminServices", "NotLoaded", "Op", "Param"]
@@ -124,6 +126,47 @@ class AdminServices:
         return cls(ctx)
 
     @classmethod
+    def for_local(
+        cls, engine: LocalEngine | None, *, settings: InfraSettings | None, process: Any = None
+    ) -> AdminServices:
+        """The services of a local-mode queue: store-only operations raise `LocalModeRefused`.
+
+        `engine` None (the standalone CLI): only what the settings and the document answer.
+        """
+        from llm_queue.engine.admin import local
+
+        if engine is not None:
+            registry, hash_id = engine.registry, engine.hash_id
+        else:
+            assert settings is not None
+            from llm_queue.engine.local import LocalRegistry
+
+            registry = LocalRegistry(
+                orjson.loads(settings.registry_document()),
+                prefix=settings.key_prefix,
+                allowed_hosts=settings.base_url_allowed_hosts,
+            )
+            salt = settings.id_hash_salt or ""
+
+            def hash_id(value: str) -> str:
+                return keyed_hash(salt, value)
+
+        ctx = local.LocalContext(registry, settings, hash_id, engine=engine, process=process)
+        admin = cls.__new__(cls)
+        parts: dict[str, Any] = {name: local.StoreOnly(name) for name in local.STORE_ONLY}
+        parts.update(
+            context=ctx,
+            registry=local.LocalRegistryAdmin(ctx),
+            tenants=local.LocalTenantsAdmin(ctx),
+            status=local.LocalStatusAdmin(ctx),
+            drain=local.LocalDrainAdmin(ctx),
+            ops=local.LocalOpsAdmin(ctx),
+            _owned=[],
+        )
+        vars(admin).update(parts)
+        return admin
+
+    @classmethod
     def from_env(
         cls,
         environ: Mapping[str, str] | None = None,
@@ -137,6 +180,8 @@ class AdminServices:
 
         env = dict(os.environ if environ is None else environ)
         settings = InfraSettings.from_env(env, secrets=secrets)
+        if settings.execution_mode == "local":  # no store to talk to
+            return cls.for_local(None, settings=settings)
         cap, options = settings.store_max_connections, Tuning().store
         lookup = secrets or env.get
         state = secret_store_client(settings.store_url, lookup, "LLMQ_STORE_PASSWORD", cap, options)

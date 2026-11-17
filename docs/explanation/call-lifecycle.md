@@ -489,7 +489,7 @@ flowchart TD
   X([A store command fails]) --> Y{Where?}
   Y -- "caller, before the send" --> SD{model's store_down}
   SD -- "pause (default)" --> SP[Wait on one shared write probe per process,<br/>a ping a second, then retry with the same id]
-  SD -- static_cap --> SC[Run without the store:<br/>LLMQ_LOCAL_LIMIT_CAP per process and model,<br/>confirmed deployments in order, no budgets]
+  SD -- static_cap --> SC[Run on the local executor:<br/>budgets / LLMQ_LOCAL_PROCESS_COUNT,<br/>LLMQ_LOCAL_CONCURRENCY per process and model]
   SD -- fail_fast --> SF([queue_unavailable at once])
   Y -- "caller, after the send" --> SW[Wait for the store,<br/>never run the call twice]
   Y -- worker --> WT[Store trouble noted: callers count as alive,<br/>grants given back on errors, loops retry]
@@ -500,7 +500,7 @@ flowchart TD
 | Rule | What it does |
 |---|---|
 | `pause` | Every paused call in a process waits on one probe (a bounded write, not a `PING`: a read-only replica answers `PING`). When it succeeds, calls resume spread over up to 0.5 s, retried with the same request id (so a send that did reach the store is attached, not run twice) and only the time left |
-| `static_cap` | At most `LLMQ_LOCAL_LIMIT_CAP` (10) calls per process and model, straight to the provider; quotas may be exceeded. The result is written behind once the store is back, so a copy that did get queued meets `done` |
+| `static_cap` | Runs on the local executor of `LLMQ_EXECUTION_MODE=local` ([Modes](../how-to/modes.md)): each deployment's rpm / tpm divided by `LLMQ_LOCAL_PROCESS_COUNT` as this process's budget, at most `LLMQ_LOCAL_CONCURRENCY` (10) calls per process and model, with the usual retries, breakers and region / model fallback, all in memory. The result is written behind once the store is back, so a copy that did get queued meets `done` |
 | `fail_fast` | `queue_unavailable` at once; a cancel is written behind for a send that may have landed |
 | Outage memo | A call that saw the store down sets a memo for `outage_memo_secs` (3 s): `fail_fast` and `static_cap` calls answer at once without trying the store; `pause` calls join the waiting ones. A successful store probe ends the memo |
 | Store refuses writes | `OOM`, `MISCONF`, `NOREPLICAS`, `BUSY`, `READONLY` count as down for writes: the same rules; the message says why |

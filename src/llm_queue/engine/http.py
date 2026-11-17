@@ -31,6 +31,7 @@ from llm_queue.errors import (
     AdminRefused,
     ConfigError,
     LLMQueueError,
+    LocalModeRefused,
     MissingExtra,
     StoreUnavailable,
     UnknownModel,
@@ -56,8 +57,9 @@ def error_response(exc: BaseException) -> Response:
     """The status code and body of an admin error (design 2.8); re-raises a non-admin error.
 
     `UnknownModel` 404; `RegistryConflict` 409 retryable; `AdminRefused` 409; a missing
-    registry or a store outage 503; any other `ConfigError` (bad input, refused edit) 400;
-    another `LLMQueueError` (a stopped queue) 409.
+    registry or a store outage 503; a store-only operation of a local-mode queue
+    (`LocalModeRefused`) 503 with `reason: local_mode`; any other `ConfigError` (bad input,
+    refused edit) 400; another `LLMQueueError` (a stopped queue) 409.
     """
     if isinstance(exc, UnknownModel):
         return 404, {"error": str(exc)}
@@ -69,6 +71,8 @@ def error_response(exc: BaseException) -> Response:
         return 503, {"error": "state store unavailable"}
     if isinstance(exc, AdminRefused):
         return 409, {"error": str(exc)}
+    if isinstance(exc, LocalModeRefused):
+        return 503, {"error": str(exc), "reason": "local_mode", "mode": "local"}
     if isinstance(exc, ConfigError):
         return 400, {"error": str(exc)}
     if isinstance(exc, LLMQueueError):

@@ -214,6 +214,272 @@ def _takes_calls(view: ResolvedRegistry, alias: str) -> bool:
     )
 
 
+def shape_ok(
+    view: ResolvedRegistry,
+    target: str,
+    op: str,
+    params: Mapping[str, Any],
+    *,
+    stream: bool,
+) -> bool:
+    """Whether a fallback model can serve a call of shape `op` (Q40).
+
+    Same shape: always. The other shape: not for a stream (its events are not converted),
+    and only when the request converts (`shapes.unconvertible`); either is logged.
+    """
+    target_op = _op_of(view, target)
+    if not shapes.converts(op, target_op):
+        return True
+    if stream:
+        logger.info("fallback_shape_skipped", model=target, reason="stream")
+        return False
+    reason = shapes.unconvertible(params, op, target_op)
+    if reason is not None:
+        logger.info("fallback_shape_skipped", model=target, reason=reason)
+        return False
+    return True
+
+
+def may_spill(
+    view: ResolvedRegistry,
+    alias: str,
+    env: Envelope,
+    age: float,
+    cause: str,
+    rule_name: str,
+) -> bool:
+    """Whether a call may use fallback regions / models now: rule or `fallback_policy`."""
+    allowed = ("all", "regions") if rule_name == "fallback" else ("all",)
+    rule = view.value(alias, rule_name)
+    if env.allow_fallback not in allowed or not rule:
+        return False
+    policy_name = view.value(alias, "fallback_policy")
+    policy = hooks.get("fallback_policy", policy_name)
+    if policy is not None:
+        ctx = hooks.CallContext(
+            alias, env.request_id, env.priority, env.session_id, env.user_id, env.tenant_id, age
+        )
+        default = cause in rule["on"] and age >= float(rule["after_secs"])
+        return bool(
+            hooks.call_safely(
+                "fallback_policy", policy_name, policy, cause, age, rule, ctx, default=default
+            )
+        )
+    return cause in rule["on"] and age >= float(rule["after_secs"])
+
+
+def request_params(
+    view: ResolvedRegistry, alias: str, env: Envelope, dep: str | None
+) -> dict[str, Any]:
+    """The provider request for `alias` (and deployment `dep`): defaults, limits, params.
+
+    Served by a fallback model (`alias` is not the call's model, RESCAN P6), the caller's
+    model-specific fields are dropped (`additionalModelRequestFields`; tool fields too
+    when the target's `supports_tools` is false) and an output above the target's limit is
+    clamped, never rejected: the caller asked another model for it.
+    """
+    entry = view.registry.models[alias]
+    params: Mapping[str, Any] = env.params or {}
+    limits = view.value(alias, "inference_limits", dep) or {}
+    if alias != env.model:
+        dropped: tuple[str, ...] = _MODEL_SPECIFIC
+        if not view.value(alias, "supports_tools"):
+            dropped = (*dropped, *_TOOL_FIELDS)
+        params = {k: v for k, v in params.items() if k not in dropped}
+        limits = {**limits, "on_exceed": "clamp"}
+    op = _served_op(view, alias, env)
+    if op != env.op:
+        # A fallback model of the other provider (Q40): its own request shape, its own
+        # defaults and limits applied after.
+        try:
+            params = shapes.request(params, env.op, op)
+        except shapes.ShapeError as exc:
+            raise inference.InferenceRejected(f"{alias}: {exc}") from exc
+    embedding = entry.type == "embedding"
+    request = inference.apply(
+        entry.provider,
+        op,
+        params,
+        view.value(alias, "inference", dep) or {},
+        limits,
+        codec=codec_for(entry.provider, entry.model_id, entry.family) if embedding else None,
+    )
+    extra = view.value(alias, "params", dep) if dep else None
+    return inference.merge_params(request, extra or {})
+
+
+def estimate_of(
+    view: ResolvedRegistry, alias: str, env: Envelope, params: Mapping[str, Any]
+) -> tokens.Estimate:
+    """The token estimate admission charges for `params` on model `alias`."""
+    entry = view.registry.models[alias]
+    return tokens.estimate(
+        env.op,
+        params,
+        embedding=entry.type == "embedding",
+        default_output_tokens=int(_by_deployment(view, alias, "default_output_tokens")),
+        output_weight=float(view.value(alias, "tpm_output_weight")),
+        estimator=view.value(alias, "token_estimator"),
+    )
+
+
+def log_outcome(
+    metrics: Metrics,
+    worker_id: str,
+    env: Envelope,
+    alias: str,
+    account: str,
+    region: str,
+    outcome: str,
+    meta: Meta | None,
+    path: str,
+    *,
+    tenant_label: str,
+    **fields: Any,
+) -> None:
+    """Count one finished call and log `llmq_call_finished` (every path: R3OB-5, R3OB-8).
+
+    `path`: queue, direct, static_cap, local or dead_letter (a label of
+    `llmq_calls_total`). Static-cap and dead-lettered calls were in no counter and no record.
+    `tenant_label`: the call's `tenant` label (`TenantLabels`, 0.2.0 T6).
+    """
+    labels = {"model": alias, "account": account or "-", "region": region or "-"}
+    metrics.count(
+        "llmq_calls_total", 1.0, outcome=outcome, path=path, tenant=tenant_label, **labels
+    )
+    if meta is not None:
+        metrics.count("llmq_tokens_input_total", float(meta.tokens_in or 0), **labels)
+        metrics.count("llmq_tokens_output_total", float(meta.tokens_out or 0), **labels)
+        if meta.fallback:
+            metrics.count("llmq_fallback_total", kind=meta.fallback, model=env.model)
+    fields.setdefault("deployment", meta.deployment if meta else None)
+    fields.setdefault("attempts", meta.attempts if meta else None)
+    logger.info(
+        "llmq_call_finished",
+        request_id=env.request_id,
+        model=env.model,
+        served_model=alias,
+        outcome=outcome,
+        path=path,
+        priority=env.priority,
+        account=account or None,
+        region=region or None,
+        worker=worker_id,
+        fallback=meta.fallback if meta else None,
+        tokens_in=meta.tokens_in if meta else None,
+        tokens_out=meta.tokens_out if meta else None,
+        provider_ms=meta.provider_ms if meta else None,
+        user=env.user_id,  # keyed hashes already (D1; RESCAN X10)
+        tenant=env.tenant_id,
+        **fields,
+    )
+
+
+def build_envelope(
+    view: ResolvedRegistry,
+    model: str,
+    params: Mapping[str, Any],
+    *,
+    caller: str,
+    metrics: Metrics,
+    priority: bool = False,
+    timeout_secs: float | None = None,
+    max_wait_secs: float | None = None,
+    request_id: str | None = None,
+    session_id: str | None = None,
+    user_id: str | None = None,
+    tenant_id: str | None = None,
+    hash_id: Callable[[str], str],
+    allow_fallback: str = "all",
+    allowed_regions: Sequence[str] | None = None,
+    allowed_accounts: Sequence[str] | None = None,
+    stream: bool = False,
+    stream_id: str | None = None,
+    vectors: bool = False,
+) -> tuple[str, Envelope]:
+    """A call's model (a disabled one's fallback) and envelope, checked as every path needs.
+
+    One copy for the queue engine and the local executor (`LLMQ_EXECUTION_MODE=local`): a
+    disabled model's fallback, `max_message_bytes`, the call's timeout and the `admission`
+    hook. Raises `CallFailed` for a call that cannot run. The envelope carries only keyed
+    hashes (`hash_id`) of `user_id` and `tenant_id` (owner D1, 0.2.0): the message, its dead
+    letter and the worker never hold a raw id; the admission hook still sees the raw ones.
+    """
+    alias = view.registry.alias_of(model)
+    rid = request_id or stream_id or new_id()
+    # The caller's shape (its model's provider), kept when a fallback model of the other
+    # provider serves it: the request and reply are converted on the worker (Q40).
+    op = _op_of(view, alias)
+    if view.effective(alias, "enabled").level == "model" and not view.value(alias, "enabled"):
+        rule = view.value(alias, "model_fallback")
+        if not rule or allow_fallback != "all" or not rule["models"]:
+            raise CallFailed("model_disabled", f"{alias} is disabled", request_id=rid)
+        # The first target that can take calls: one disabled itself (model, every
+        # deployment or every account) got them all and failed each (RESCAN R8). A target
+        # of another shape needs a request that converts, and never takes a stream.
+        targets = [item["model"] for item in rule["models"]]
+        usable = [
+            t
+            for t in targets
+            if t in view.registry.models
+            and _takes_calls(view, t)
+            and shape_ok(view, t, op, params, stream=stream)
+        ]
+        if not usable:
+            raise CallFailed(
+                "model_unavailable",
+                f"{alias} is disabled and no fallback model is enabled (or none takes this "
+                "request's shape)",
+                request_id=rid,
+            )
+        alias = usable[0]
+    # Here, not in the front door, so every path meets it: async and sync calls, streams,
+    # embeddings, jobs and the LangChain adapters (plan C1). One orjson pass over the params,
+    # kept for the message itself (FO-21: it was encoded a second time by `dumps`).
+    encoded = encode_params(params)
+    size, limit = len(encoded[0]), int(view.value(alias, "max_message_bytes"))
+    if size > limit:
+        raise CallFailed(  # one kind for every too-big call (owner Q38)
+            "request_too_large",
+            f"the message is {size} bytes, above max_message_bytes {limit} (raise it on the "
+            "model, or send large files by reference)",
+            request_id=rid,
+        )
+    timeout = _call_timeout_secs(view, alias, timeout_secs)
+    envelope = Envelope(
+        request_id=rid,
+        op=op,
+        model=alias,
+        params=dict(params),
+        priority=priority,
+        caller=caller,
+        timeout_secs=timeout,
+        max_wait_secs=max_wait_secs or view.value(alias, "max_wait_secs"),
+        allow_fallback=allow_fallback,
+        allowed_regions=tuple(allowed_regions) if allowed_regions else None,
+        allowed_accounts=tuple(allowed_accounts) if allowed_accounts else None,
+        session_id=session_id,
+        user_id=hash_id(user_id) if user_id else None,
+        tenant_id=hash_id(tenant_id) if tenant_id else None,
+        app_request_id=request_id is not None,
+        stream=stream,
+        vectors=vectors,
+    )
+    envelope.keep_params_json(encoded)
+    envelope.keep_tenant_name(tenant_id)
+    hook_name = view.value(alias, "admission")
+    hook = hooks.get("admission", hook_name)
+    if hook is not None:
+        ctx = hooks.CallContext(alias, rid, priority, session_id, user_id, tenant_id)
+        verdict = hooks.call_safely(
+            "admission", hook_name, hook, ctx, default=None, metrics=metrics
+        )
+        if isinstance(verdict, hooks.Reject):
+            metrics.count("llmq_caller_failures_total", model=alias, outcome="rejected")
+            raise CallFailed("rejected", verdict.reason, request_id=rid)
+    return alias, envelope
+
+
 @dataclass(frozen=True, slots=True)
 class EngineSettings:
     """Process-level settings (plan §3.18 infrastructure table)."""
@@ -229,7 +495,11 @@ class EngineSettings:
     sweep_secs: float = 10.0
     receive_batch: int = 10
     caller_margin_secs: float = 5.0
-    local_limit_cap: int = 10
+    # The local executor (engine/local.py): `local` mode and `store_down: static_cap`. Budgets
+    # are each deployment's rpm / tpm divided by `local_process_count`; at most
+    # `local_concurrency` calls per model and process run at once.
+    local_process_count: int = 1
+    local_concurrency: int = 10
     drain_secs: float = 25.0  # k8s grace 30 s: calls still running then are given back (C3)
     # LLMQ_DRAIN_HANDBACK_ENABLED (0.2.0 A1, owner Q2): a pause returns held calls at once.
     drain_handback_enabled: bool = True
@@ -739,7 +1009,23 @@ class Engine:
         # every region of it down (scenario P5).
         self._bad_accounts: dict[tuple[str, str], _Backoff] = {}
         self._idle = asyncio.Event()
-        self._static: dict[str, asyncio.Semaphore] = {}
+        from llm_queue.engine.local import LocalExecutor, LocalLimits  # imports this module
+
+        # `store_down: static_cap` runs here, on the executor of local mode (0.2.0).
+        self.local = LocalExecutor(
+            providers,
+            LocalLimits(
+                process_count=self.settings.local_process_count, timings=self.settings.timings
+            ),
+            view=lambda: self.registry.current,
+            concurrency=self.settings.local_concurrency,
+            worker_id=self.worker_id,
+            metrics=self.metrics,
+            hash_id=self.hash_id,
+            tenant_label=self._tenant_label,
+            # Read at each call, so the engine's own `_params` (and a test's stand-in) serves.
+            params=lambda view, alias, env, dep: self._params(view, alias, env, dep),
+        )
         self._rng = random.Random()
         self.chunks = ChunkReader(
             state,
@@ -1143,80 +1429,28 @@ class Engine:
         `vectors` (from `embed()`) lets an embedding reply come back as its packed vectors.
         """
         view = self.registry.current
-        alias = view.registry.alias_of(model)
-        rid = request_id or stream_id or new_id()
-        # The caller's shape (its model's provider), kept when a fallback model of the other
-        # provider serves it: the request and reply are converted on the worker (Q40).
-        op = _op_of(view, alias)
-        if view.effective(alias, "enabled").level == "model" and not view.value(alias, "enabled"):
-            rule = view.value(alias, "model_fallback")
-            if not rule or allow_fallback != "all" or not rule["models"]:
-                raise CallFailed("model_disabled", f"{alias} is disabled", request_id=rid)
-            # The first target that can take calls: one disabled itself (model, every
-            # deployment or every account) got them all and failed each (RESCAN R8). A target
-            # of another shape needs a request that converts, and never takes a stream.
-            targets = [item["model"] for item in rule["models"]]
-            usable = [
-                t
-                for t in targets
-                if t in view.registry.models
-                and _takes_calls(view, t)
-                and self._shape_ok(view, t, op, params, stream=stream)
-            ]
-            if not usable:
-                raise CallFailed(
-                    "model_unavailable",
-                    f"{alias} is disabled and no fallback model is enabled (or none takes this "
-                    "request's shape)",
-                    request_id=rid,
-                )
-            alias = usable[0]
-        # Here, not in the front door, so every path meets it: async and sync calls, streams,
-        # embeddings, jobs and the LangChain adapters (plan C1). One orjson pass over the params,
-        # kept for the message itself (FO-21: it was encoded a second time by `dumps`).
-        encoded = encode_params(params)
-        size, limit = len(encoded[0]), int(view.value(alias, "max_message_bytes"))
-        if size > limit:
-            raise CallFailed(  # one kind for every too-big call (owner Q38)
-                "request_too_large",
-                f"the message is {size} bytes, above max_message_bytes {limit} (raise it on the "
-                "model, or send large files by reference)",
-                request_id=rid,
-            )
-        timeout = _call_timeout_secs(view, alias, timeout_secs)
-        envelope = Envelope(
-            request_id=rid,
-            op=op,
-            model=alias,
-            params=dict(params),
-            priority=priority,
+        alias, envelope = build_envelope(
+            view,
+            model,
+            params,
             caller=self.worker_id,
-            timeout_secs=timeout,
-            max_wait_secs=max_wait_secs or view.value(alias, "max_wait_secs"),
-            allow_fallback=allow_fallback,
-            allowed_regions=tuple(allowed_regions) if allowed_regions else None,
-            allowed_accounts=tuple(allowed_accounts) if allowed_accounts else None,
+            metrics=self.metrics,
+            priority=priority,
+            timeout_secs=timeout_secs,
+            max_wait_secs=max_wait_secs,
+            request_id=request_id,
             session_id=session_id,
-            # Only keyed hashes travel (owner D1, 0.2.0): the message, its dead letter and the
-            # worker never hold a raw tenant or user id.
-            user_id=self.hash_id(user_id) if user_id else None,
-            tenant_id=self.hash_id(tenant_id) if tenant_id else None,
-            app_request_id=request_id is not None,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            hash_id=self.hash_id,
+            allow_fallback=allow_fallback,
+            allowed_regions=allowed_regions,
+            allowed_accounts=allowed_accounts,
             stream=stream,
+            stream_id=stream_id,
             vectors=vectors,
         )
-        envelope.keep_params_json(encoded)
-        envelope.keep_tenant_name(tenant_id)
-        hook_name = view.value(alias, "admission")
-        hook = hooks.get("admission", hook_name)
-        if hook is not None:
-            ctx = hooks.CallContext(alias, rid, priority, session_id, user_id, tenant_id)
-            verdict = hooks.call_safely(
-                "admission", hook_name, hook, ctx, default=None, metrics=self.metrics
-            )
-            if isinstance(verdict, hooks.Reject):
-                self.metrics.count("llmq_caller_failures_total", model=alias, outcome="rejected")
-                raise CallFailed("rejected", verdict.reason, request_id=rid)
+        rid, timeout = envelope.request_id, envelope.timeout_secs
         direct = force_direct or self._direct_route(view, alias, rid, user_id)
         try:
             with self._caller_ref(rid):
@@ -1239,22 +1473,8 @@ class Engine:
         *,
         stream: bool,
     ) -> bool:
-        """Whether a fallback model can serve a call of shape `op` (Q40).
-
-        Same shape: always. The other shape: not for a stream (its events are not converted),
-        and only when the request converts (`shapes.unconvertible`); either is logged.
-        """
-        target_op = _op_of(view, target)
-        if not shapes.converts(op, target_op):
-            return True
-        if stream:
-            logger.info("fallback_shape_skipped", model=target, reason="stream")
-            return False
-        reason = shapes.unconvertible(params, op, target_op)
-        if reason is not None:
-            logger.info("fallback_shape_skipped", model=target, reason=reason)
-            return False
-        return True
+        """`shape_ok`: whether a fallback model can serve a call of shape `op`."""
+        return shape_ok(view, target, op, params, stream=stream)
 
     @contextlib.contextmanager
     def _caller_ref(self, rid: str) -> Iterator[None]:
@@ -2159,71 +2379,13 @@ class Engine:
                 return True
 
     async def _static_cap(self, view: ResolvedRegistry, alias: str, envelope: Envelope) -> Reply:
-        """Run without the store: at most `local_limit_cap` calls per process and model."""
-        entry = view.registry.models[alias]
-        cap = self._static.setdefault(alias, asyncio.Semaphore(self.settings.local_limit_cap))
-        provider = self.providers.get(entry.provider)
-        error: BaseException | None = None
-        kind = "provider_error"
-        async with cap:
-            for dep in view.deployments(alias, "confirmed"):
-                if not view.value(alias, "enabled", dep.key) or view.outside_residency(dep):
-                    continue
-                route = route_for(view, dep)
-                try:
-                    params = self._params(view, alias, envelope, dep.key)
-                except inference.InferenceRejected as exc:
-                    # One error family: `on_exceed: reject` raised its own type to the app on
-                    # this path (RV-EN14).
-                    raise CallFailed(
-                        "invalid_request", str(exc), request_id=envelope.request_id
-                    ) from exc
-                budget = float(view.value(alias, "attempt_timeout_secs", dep.key))
-                timing = Timing(budget, float(view.value(alias, "stream_idle_secs")), budget)
-                served_op = _served_op(view, alias, envelope)
-                try:
-                    result = await provider.call(
-                        served_op,
-                        params,
-                        route,
-                        timing,
-                        **_api_kwargs(provider, view, alias),
-                    )
-                except Exception as exc:
-                    # Classified as `_attempt` does (audit RT-19): every error was retried on
-                    # each deployment unlogged and the final kind was always `provider_error`.
-                    error = exc
-                    info = provider.classify(exc)
-                    logger.warning(
-                        "static_cap_attempt_failed",
-                        model=alias,
-                        deployment=dep.key,
-                        error_type=type(exc).__name__,
-                        kind=str(info.kind),
-                    )
-                    request_kind = request_error_kind(exc, info)
-                    if request_kind is not None:  # the request itself: another region refuses too
-                        raise CallFailed(
-                            request_kind, str(exc), request_id=envelope.request_id
-                        ) from exc
-                    if info.kind is ErrorKind.THROTTLE:
-                        kind = "rate_limited"
-                    continue
-                meta = Meta(
-                    served_model=alias,
-                    deployment=dep.key,
-                    attempts=1,
-                    tokens_in=result.usage.input_tokens,
-                    tokens_out=result.usage.output_tokens,
-                    provider_request_id=result.request_id,
-                )
-                # Tokens spent with no record before: the store is down, so only here (R3OB-5).
-                self._outcome(envelope, alias, dep.account, dep.region, "ok", meta, "static_cap")
-                response = shapes.reply(result.response, envelope.op, served_op, model=alias)
-                return Reply(request_id=envelope.request_id, ok=True, response=response, meta=meta)
-        raise CallFailed(
-            kind, str(error or "no usable deployment"), request_id=envelope.request_id
-        ) from error
+        """Run without the store, on the local executor (engine/local.py, path `static_cap`).
+
+        The same per-process budgets, concurrency cap, retries and fallbacks as
+        `LLMQ_EXECUTION_MODE=local`: each rpm / tpm divided by `LLMQ_LOCAL_PROCESS_COUNT`, at
+        most `LLMQ_LOCAL_CONCURRENCY` calls per model in this process.
+        """
+        return await self.local.run(view, alias, envelope, path="static_cap")
 
     def _start_direct(self, env: Envelope) -> asyncio.Task[None]:
         """Start a direct run; its caller watches the task (`_wait_result`, `watch`)."""
@@ -2966,24 +3128,8 @@ class Engine:
         cause: str,
         rule_name: str,
     ) -> bool:
-        """Whether a call may use fallback regions / models now: rule or `fallback_policy`."""
-        allowed = ("all", "regions") if rule_name == "fallback" else ("all",)
-        rule = view.value(alias, rule_name)
-        if env.allow_fallback not in allowed or not rule:
-            return False
-        policy_name = view.value(alias, "fallback_policy")
-        policy = hooks.get("fallback_policy", policy_name)
-        if policy is not None:
-            ctx = hooks.CallContext(
-                alias, env.request_id, env.priority, env.session_id, env.user_id, env.tenant_id, age
-            )
-            default = cause in rule["on"] and age >= float(rule["after_secs"])
-            return bool(
-                hooks.call_safely(
-                    "fallback_policy", policy_name, policy, cause, age, rule, ctx, default=default
-                )
-            )
-        return cause in rule["on"] and age >= float(rule["after_secs"])
+        """`may_spill`: whether a call may use fallback regions / models now."""
+        return may_spill(view, alias, env, age, cause, rule_name)
 
     def _ask(
         self,
@@ -3109,41 +3255,8 @@ class Engine:
     def _params(
         self, view: ResolvedRegistry, alias: str, env: Envelope, dep: str | None
     ) -> dict[str, Any]:
-        """The provider request for `alias` (and deployment `dep`): defaults, limits, params.
-
-        Served by a fallback model (`alias` is not the call's model, RESCAN P6), the caller's
-        model-specific fields are dropped (`additionalModelRequestFields`; tool fields too
-        when the target's `supports_tools` is false) and an output above the target's limit is
-        clamped, never rejected: the caller asked another model for it.
-        """
-        entry = view.registry.models[alias]
-        params: Mapping[str, Any] = env.params or {}
-        limits = view.value(alias, "inference_limits", dep) or {}
-        if alias != env.model:
-            dropped: tuple[str, ...] = _MODEL_SPECIFIC
-            if not view.value(alias, "supports_tools"):
-                dropped = (*dropped, *_TOOL_FIELDS)
-            params = {k: v for k, v in params.items() if k not in dropped}
-            limits = {**limits, "on_exceed": "clamp"}
-        op = _served_op(view, alias, env)
-        if op != env.op:
-            # A fallback model of the other provider (Q40): its own request shape, its own
-            # defaults and limits applied after.
-            try:
-                params = shapes.request(params, env.op, op)
-            except shapes.ShapeError as exc:
-                raise inference.InferenceRejected(f"{alias}: {exc}") from exc
-        embedding = entry.type == "embedding"
-        request = inference.apply(
-            entry.provider,
-            op,
-            params,
-            view.value(alias, "inference", dep) or {},
-            limits,
-            codec=codec_for(entry.provider, entry.model_id, entry.family) if embedding else None,
-        )
-        extra = view.value(alias, "params", dep) if dep else None
-        return inference.merge_params(request, extra or {})
+        """`request_params`: the provider request for `alias` (and deployment `dep`)."""
+        return request_params(view, alias, env, dep)
 
     def _charged(self, view: ResolvedRegistry, alias: str, held: _Held) -> tokens.Estimate:
         """The token estimate admission charges: from model-level params, cached per view."""
@@ -3158,15 +3271,7 @@ class Engine:
     def _estimate(
         self, view: ResolvedRegistry, alias: str, env: Envelope, params: Mapping[str, Any]
     ) -> tokens.Estimate:
-        entry = view.registry.models[alias]
-        return tokens.estimate(
-            env.op,
-            params,
-            embedding=entry.type == "embedding",
-            default_output_tokens=int(_by_deployment(view, alias, "default_output_tokens")),
-            output_weight=float(view.value(alias, "tpm_output_weight")),
-            estimator=view.value(alias, "token_estimator"),
-        )
+        return estimate_of(view, alias, env, params)
 
     async def _try(self, held: _Held) -> bool:
         """Admit a newly received call; start it when granted. True when it stays held.
@@ -4421,43 +4526,18 @@ class Engine:
         path: str,
         **fields: Any,
     ) -> None:
-        """Count one finished call and log `llmq_call_finished` (every path: R3OB-5, R3OB-8).
-
-        `path`: queue, direct, static_cap or dead_letter. Static-cap and dead-lettered calls
-        were in no counter and no record.
-        """
-        labels = {"model": alias, "account": account or "-", "region": region or "-"}
-        self.metrics.count(
-            "llmq_calls_total",
-            1.0,
-            outcome=outcome,
-            tenant=self._tenant_label(env.tenant_id),
-            **labels,
-        )
-        if meta is not None:
-            self.metrics.count("llmq_tokens_input_total", float(meta.tokens_in or 0), **labels)
-            self.metrics.count("llmq_tokens_output_total", float(meta.tokens_out or 0), **labels)
-            if meta.fallback:
-                self.metrics.count("llmq_fallback_total", kind=meta.fallback, model=env.model)
-        fields.setdefault("deployment", meta.deployment if meta else None)
-        fields.setdefault("attempts", meta.attempts if meta else None)
-        logger.info(
-            "llmq_call_finished",
-            request_id=env.request_id,
-            model=env.model,
-            served_model=alias,
-            outcome=outcome,
-            path=path,
-            priority=env.priority,
-            account=account or None,
-            region=region or None,
-            worker=self.worker_id,
-            fallback=meta.fallback if meta else None,
-            tokens_in=meta.tokens_in if meta else None,
-            tokens_out=meta.tokens_out if meta else None,
-            provider_ms=meta.provider_ms if meta else None,
-            user=env.user_id,  # keyed hashes already (D1; RESCAN X10)
-            tenant=env.tenant_id,
+        """`log_outcome` with this engine's sink, id and hash."""
+        log_outcome(
+            self.metrics,
+            self.worker_id,
+            env,
+            alias,
+            account,
+            region,
+            outcome,
+            meta,
+            path,
+            tenant_label=self._tenant_label(env.tenant_id),
             **fields,
         )
 
@@ -4517,7 +4597,11 @@ class Engine:
         else:
             stores = cached[1]
         loaded = self.registry._current is not None
-        out: dict[str, Any] = {"live": self._live(), "ready": bool(self.ready and loaded)}
+        out: dict[str, Any] = {
+            "live": self._live(),
+            "ready": bool(self.ready and loaded),
+            "mode": "queue",
+        }
         out["draining"] = self._paused
         out["draining_since"] = self._draining_since
         if self._paused:

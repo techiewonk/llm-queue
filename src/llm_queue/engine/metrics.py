@@ -95,10 +95,11 @@ _DEP = "model deployment"
 METRICS: dict[str, MetricSpec] = {
     # ---- per call (worker)
     "llmq_calls_total": _c(
-        "model account region outcome tenant",
-        "Calls finished by a worker, by outcome (ok or the error kind); account and region "
-        "of the last deployment tried, '-' when none was; tenant: its LLMQ_METRICS_TENANTS "
-        "label, 'other' when not listed, '-' with no tenant",
+        "model account region outcome path tenant",
+        "Calls finished, by outcome (ok or the error kind) and path (queue, direct, "
+        "static_cap, local, dead_letter); account and region of the last deployment tried, "
+        "'-' when none was; tenant: its LLMQ_METRICS_TENANTS label, 'other' when not listed, "
+        "'-' with no tenant",
     ),
     "llmq_caller_failures_total": _c(
         "model outcome",

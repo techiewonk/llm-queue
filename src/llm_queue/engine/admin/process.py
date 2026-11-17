@@ -59,8 +59,21 @@ def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> 
     s = settings
     if s is None:
         return out
-    store = urlsplit(s.store_url)
     doc = orjson.loads(s.registry_document()) if (s.registry or s.registry_file) else {}
+    out["execution_mode"] = s.execution_mode
+    if s.execution_mode == "local":  # no store: its settings do not apply
+        out.update(
+            environment=s.environment,
+            local_process_count=s.local_process_count,
+            local_concurrency=s.local_concurrency,
+            metrics_sink=s.metrics_sink,
+            default_tenant=s.default_tenant,
+            admin_writes_enabled=s.admin_writes_enabled,
+            registry_version=doc.get("registry_version"),
+            models=sorted(doc.get("models") or {}),
+        )
+        return out
+    store = urlsplit(s.store_url)
     out.update(
         mode=s.mode,
         environment=s.environment,
@@ -107,6 +120,7 @@ class OpsAdmin:
                 "version": __version__,
                 "worker": engine.worker_id if engine is not None else None,
                 "mode": settings.mode if settings else None,
+                "execution_mode": "queue",
                 "environment": settings.environment if settings else None,
             },
             "process": None,

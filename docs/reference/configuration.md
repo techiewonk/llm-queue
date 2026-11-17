@@ -195,7 +195,7 @@ of every setting and the level it came from.
 | `sticky` | defaults, model | none | object, fields below | Keeps a session on one deployment (prompt caches) |
 | `fallback` | defaults, model | none | object, fields below | When the `fallback` regions are used |
 | `model_fallback` | model | none | object, fields below | When calls spill to other models (protected). A target may use another provider: [converted](#fallback-to-a-model-of-another-provider) |
-| `store_down` | defaults, model | `pause` | `pause`, `static_cap`, `fail_fast` | What calls do while the store is down: wait, run direct under `LLMQ_LOCAL_LIMIT_CAP` per process, or fail at once. A detected outage is remembered for a few seconds, so `fail_fast` and `static_cap` answer within about 100 ms |
+| `store_down` | defaults, model | `pause` | `pause`, `static_cap`, `fail_fast` | What calls do while the store is down: wait, run on the local executor (budgets divided by `LLMQ_LOCAL_PROCESS_COUNT`, `LLMQ_LOCAL_CONCURRENCY` per process and model), or fail at once. A detected outage is remembered for a few seconds, so `fail_fast` and `static_cap` answer within about 100 ms |
 | `queue_pct` | defaults, model | 100 | 0 to 100 (whole) | Share of calls queued (by request id hash); the rest run direct (a canary) |
 | `worker_slots` | defaults, model | 20 | 1 to 1000 (whole) | Calls a worker runs at once per model (deploy only: a live edit does not change it) |
 | `queue` | defaults, model | see fields | object, fields below | *merged*: the model's queue |
