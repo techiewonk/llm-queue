@@ -718,10 +718,9 @@ class LLMQueue:
         During a store outage each process then takes the model's whole rpm / tpm, and the
         pods together go over the provider quota (review L-5, owner Q-12).
         """
-        view = getattr(self._engine.registry, "current", None)
-        count = getattr(self._engine.settings, "local_process_count", 1)
-        if view is None or count != 1:
+        if not isinstance(self._engine, Engine) or self._engine.settings.local_process_count != 1:
             return
+        view = self._engine.registry.current
         models = sorted(
             alias
             for alias in view.registry.models
