@@ -39,18 +39,20 @@ flowchart LR
 --8<-- "samples/09_http_router.py"
 ```
 
-## Output (fakellm, 2026-11-16)
+## Output (fakellm, 2026-11-17)
 
 ```text
-GET /health/ready -> 200 {'live': True, 'ready': True, 'worker': '4beb9df1d0551a', 'version': '0.1.0b2', 'registry_version': 1, 'held': 0, 'heartbeat_age_secs': 0.0, 'stores': {'state': 'ok', 'queue': 'ok'}, 'eviction_policy': 'noeviction'}
+GET /health/ready -> 200 {'live': True, 'ready': True, 'draining': False, 'draining_since': None, 'worker': 'api-7f9c:12-9bb228', 'version': '0.1.1', 'registry_version': 1, 'held': 0, 'heartbeat_age_secs': 0.0, 'stores': {'state': 'ok', 'queue': 'ok'}, 'eviction_policy': 'noeviction', 'key_expiry': 'native'}
 GET /status without the admin header -> 401
 GET /requests/{id} -> done
+GET / -> 48 routes, registry v1
 GET /metrics -> 200, 76 llmq_ series
-  aws-main/us-east-1: rpm 5/60
+  aws-main/us-east-1: rpm 4/60
 POST /registry without X-LLMQ-Admin -> 403
+POST /registry rpm=50 (dry run) -> [{'path': 'models.gpt20b.rpm', 'before': 60, 'after': 50}]
 POST /registry rpm=50 -> [{'path': 'models.gpt20b.rpm', 'before': 60, 'after': 50}]
-POST /registry/block us-east-1 on=True -> 200
-POST /registry/block us-east-1 on=False -> 200
+POST /blocks us-east-1 -> ['us-east-1']
+POST /blocks/remove us-east-1 -> []
 after /drain: GET /health/ready -> 503
 ```
 

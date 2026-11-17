@@ -34,15 +34,15 @@ flowchart LR
 --8<-- "samples/10_purge.py"
 ```
 
-## Output (fakellm, 2026-11-16)
+## Output (fakellm, 2026-11-17)
 
 ```text
-plan tenant: {"target": "tenant:c9a7e476bacbbf87", "kind": "tenant", "deleted_keys": 1, "queues": [], "skipped": [], "dry_run": true, "actor": "plan", "deleted_fields": 2, "cancelled": 0}
+plan tenant: {"target": "tenant:c9a7e476bacbbf87", "kind": "tenant", "deleted_keys": 1, "queues": [], "skipped": [], "dry_run": true, "actor": "sample", "deleted_fields": 2, "cancelled": 0}
 purge tenant: {"target": "tenant:c9a7e476bacbbf87", "kind": "tenant", "deleted_keys": 1, "queues": [], "skipped": [], "dry_run": false, "actor": "sample", "deleted_fields": 2, "cancelled": 0}
 audit: op=purge_tenant actor=sample
 plan tenant again: deleted_keys=0
 plan deployment aws-main/us-east-1: refused (deployment gpt20b/aws-main/us-east-1 is still in the registry: remove it first, or pass force=True)
-plan deployment (force): {"target": "gpt20b/aws-main/us-east-1", "kind": "deployment", "deleted_keys": 3, "queues": [], "skipped": [], "dry_run": true, "actor": "plan", "deleted_fields": 3, "cancelled": 0}
+plan deployment (force): {"target": "gpt20b/aws-main/us-east-1", "kind": "deployment", "deleted_keys": 3, "queues": [], "skipped": [], "dry_run": true, "actor": "sample", "deleted_fields": 3, "cancelled": 0}
 ```
 
 This sample has not run on real Bedrock yet; its live output will be added on the next live run

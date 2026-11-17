@@ -25,19 +25,20 @@ runbooks and readiness checks.
 --8<-- "samples/07_status_and_registry.py"
 ```
 
-## Output (fakellm, 2026-11-16)
+## Output (fakellm, 2026-11-17)
 
 ```text
-request 01a1e2cf4564776bbda5902ad4967f38: state=done
-aws-main/us-east-1: rpm 3/60 tpm 36/100000 healthy=True breaker=closed
+request 01a1ea27bf6173668077caace10bcf66: state=done
+aws-main/us-east-1: rpm 2/60 tpm 21/100000 healthy=True breaker=closed
 waiting={'priority': 0, 'normal': 0} in_progress=0
+plan: [{'path': 'models.gpt20b.rpm', 'before': 60, 'after': 45}]
 gpt20b rpm 60 -> 45 (live)
-  audit: {'id': '1794806598887-0', 'actor': 'sample', 'op': 'edit', 'version': '1', 'diff': [{'path': 'models.gpt20b.rpm', 'before': 60, 'after': 45}], 'ts': '1794806598.8877'}
-  audit: {'id': '1794806590436-0', 'actor': 'sample', 'op': 'edit', 'version': '1', 'diff': [{'path': 'models.gpt20b.deployments.aws-main.overrides.us-east-1.enabled', 'before': False, 'after': None}], 'ts': '1794806590.4367'}
-  audit: {'id': '1794806590427-0', 'actor': 'sample', 'op': 'edit', 'version': '1', 'diff': [{'path': 'models.gpt120b.deployments.aws-main.overrides.us-east-1.enabled', 'before': False, 'after': None}], 'ts': '1794806590.4278'}
+  audit: {'id': '1794929838507-0', 'actor': 'sample', 'op': 'edit', 'version': '1', 'diff': [{'path': 'models.gpt20b.rpm', 'before': 60, 'after': 45}], 'ts': '1794929838.5072'}
+  audit: {'id': '1794929832579-0', 'actor': 'sample', 'op': 'dlq_redrive', 'version': '', 'diff': [{'path': 'dlq.llmqsample-03c07bf1-jobs-sync_feed', 'before': {'dead_letters': 1}, 'after': {'moved': 1}}], 'ts': '1794929832.576724'}
+  audit: {'id': '1794929827054-0', 'actor': 'sample', 'op': 'edit', 'version': '1', 'diff': [{'path': 'models.gpt20b.deployments.aws-main.overrides.us-east-1.enabled', 'before': False, 'after': None}], 'ts': '1794929827.055'}
 fairness on: {'mode': 'quota', 'active_tenants': 1, 'waiting_within_share': 0}
 fairness off: in status: False
-health: {'live': True, 'ready': True, 'worker': '404211cf7799fd', 'version': '0.1.0b2', 'registry_version': 1, 'held': 0, 'heartbeat_age_secs': 2.4, 'stores': {'state': 'ok', 'queue': 'ok'}, 'eviction_policy': 'noeviction'}
+health: {'live': True, 'ready': True, 'draining': False, 'draining_since': None, 'worker': 'api-7f9c:12-9bb228', 'version': '0.1.1', 'registry_version': 1, 'held': 0, 'heartbeat_age_secs': 2.4, 'stores': {'state': 'ok', 'queue': 'ok'}, 'eviction_policy': 'noeviction', 'key_expiry': 'native'}
 ```
 
 The second and third audit entries come from [sample 05](errors-and-fallback.md) turning its
