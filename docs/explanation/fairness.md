@@ -10,10 +10,19 @@ call's own arguments. A call with neither counts under one shared tenant, so cal
 are not exempt. Set `tenant_id` in trusted code (a router, after authentication): a caller that
 sets its own id can claim another tenant's share. The same applies to `priority=True`.
 
-The raw id never leaves the worker. The store keys hold its keyed hash (`LLMQ_ID_HASH_SALT`,
-the same hash as sticky keys and status records), metrics never carry a tenant label, and
-`status()` shows counts only. Raw ids appear only where the operator writes them: `weights`
-and `quotas` in the registry document.
+The raw id never leaves the caller (0.2.0, owner D1). The call's message, its dead letter and
+the store keys hold only its keyed hash (`LLMQ_ID_HASH_SALT`, the same hash as sticky keys and
+status records); worker-side hooks (balancer, fallback policy, sticky key) see the hashes too,
+only the caller's `admission` hook sees the raw ids. Metrics carry a `tenant` label only for
+the tenants listed in `LLMQ_METRICS_TENANTS` (by a label you choose), and `status()` shows
+counts and hashes. Raw ids appear only where the operator writes them: `weights` and `quotas`
+in the registry file, and those names are replaced by their hashes when the file is read
+(owner D2), so only hashes reach the store. A live edit (`registry set`) must name the hash
+(`llm-queue tenants hash NAME`).
+
+The request index (`P:{m:ALIAS}:tq:H`, 0.2.0) uses the tenant id only: a call with no tenant
+is indexed under `-`, never under its user id, because an admin "tenant" is the app's tenant.
+For a call with a tenant both hashes are the same.
 
 ## Three modes
 

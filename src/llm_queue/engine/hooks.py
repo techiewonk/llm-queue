@@ -42,7 +42,12 @@ class DeploymentView:
 
 @dataclass(frozen=True, slots=True)
 class CallContext:
-    """What hooks see of a call (no prompt text)."""
+    """What hooks see of a call (no prompt text).
+
+    The `admission` hook runs in the caller and sees the raw `user_id` / `tenant_id`; every
+    worker-side hook (balancer, fallback policy, sticky key) sees their keyed hashes, which is
+    all a call's message carries (owner D1, 0.2.0).
+    """
 
     model: str
     request_id: str

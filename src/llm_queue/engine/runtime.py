@@ -61,7 +61,7 @@ from llm_queue.engine.envelope import (
 )
 from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.expiry import TTL_SWEEP, Expiry, decide
-from llm_queue.engine.fairness import Fairness, fairness_for
+from llm_queue.engine.fairness import Fairness, fairness_for, tenant_hash_of
 from llm_queue.engine.health import Health
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.metrics import GaugeSet, Metrics, NullSink
@@ -1089,13 +1089,16 @@ class Engine:
             allowed_regions=tuple(allowed_regions) if allowed_regions else None,
             allowed_accounts=tuple(allowed_accounts) if allowed_accounts else None,
             session_id=session_id,
-            user_id=user_id,
-            tenant_id=tenant_id,
+            # Only keyed hashes travel (owner D1, 0.2.0): the message, its dead letter and the
+            # worker never hold a raw tenant or user id.
+            user_id=self.hash_id(user_id) if user_id else None,
+            tenant_id=self.hash_id(tenant_id) if tenant_id else None,
             app_request_id=request_id is not None,
             stream=stream,
             vectors=vectors,
         )
         envelope.keep_params_json(encoded)
+        envelope.keep_tenant_name(tenant_id)
         hook_name = view.value(alias, "admission")
         hook = hooks.get("admission", hook_name)
         if hook is not None:
@@ -1500,10 +1503,10 @@ class Engine:
         direct: bool,
     ) -> Reply:
         rid = envelope.request_id
-        user_id, session_id = envelope.user_id, envelope.session_id
+        user_hash, session_id = envelope.user_id, envelope.session_id  # the user id is hashed
         record: dict[str, Any] = {
             "caller": self.worker_id,
-            "user_hash": self.hash_id(user_id or session_id or ""),
+            "user_hash": user_hash or self.hash_id(session_id or ""),
             "params_hash": params_hash({"m": alias, "p": params}),
             "model": alias,
             "priority": priority,
@@ -1615,7 +1618,7 @@ class Engine:
 
     def _index_tenant_hash(self, envelope: Envelope) -> str:
         """The call's tenant as the index names it: its keyed hash, or `-` for none."""
-        return self.hash_id(envelope.tenant_id) if envelope.tenant_id else "-"
+        return envelope.tenant_id or "-"  # already the keyed hash (D1)
 
     async def embed(
         self,
@@ -2851,7 +2854,8 @@ class Engine:
     def _fairness(self, view: ResolvedRegistry, alias: str, held: _Held) -> Fairness | None:
         """The call's tenant fairness on model `alias` (None when its `fairness` is off).
 
-        The tenant is the call's tenant id, else its user id; only its keyed hash leaves here.
+        The tenant is the call's tenant id, else its user id: the keyed hashes its message
+        carries (D1), looked up in the registry's hashed `weights` / `quotas` (D2).
         """
         setting = view.value(alias, "fairness")
         if setting.get("mode", "off") == "off":
@@ -2859,9 +2863,7 @@ class Engine:
         env = held.envelope
         return fairness_for(
             setting,
-            env.tenant_id,
-            env.user_id,
-            self.hash_id,
+            tenant_hash_of(env.tenant_id, env.user_id, self.hash_id),
             burst=float(view.value(alias, "rate_burst")),
             window=str(view.value(alias, "rate_window")),
             round_=held.fair_rounds.get(alias),
@@ -4245,8 +4247,8 @@ class Engine:
             tokens_in=meta.tokens_in if meta else None,
             tokens_out=meta.tokens_out if meta else None,
             provider_ms=meta.provider_ms if meta else None,
-            user=self.hash_id(env.user_id) if env.user_id else None,
-            tenant=self.hash_id(env.tenant_id) if env.tenant_id else None,  # (RESCAN X10)
+            user=env.user_id,  # keyed hashes already (D1; RESCAN X10)
+            tenant=env.tenant_id,
             **fields,
         )
 

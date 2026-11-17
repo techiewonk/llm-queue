@@ -6,6 +6,8 @@ source and a few process limits. Every problem is reported at once.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import math
 import os
 import re
@@ -516,8 +518,20 @@ class InfraSettings:
     def registry_document(self) -> str:
         """The registry JSON from `LLMQ_REGISTRY` or the file `LLMQ_REGISTRY_FILE`.
 
-        Placeholders expanded (see `_read_document`). `ConfigError` when neither is set, the
-        file cannot be read, the text is not JSON (or YAML), an object repeats a key or a
-        placeholder names an unset variable without a default.
+        Placeholders expanded (see `_read_document`). Tenant names in `fairness.weights` /
+        `quotas` are replaced by their keyed hashes (`LLMQ_ID_HASH_SALT`, owner D2): only
+        hashes reach the store, matching the hashes a call's message carries. `ConfigError`
+        when neither is set, the file cannot be read, the text is not JSON (or YAML), an object
+        repeats a key or a placeholder names an unset variable without a default.
         """
-        return _read_document(self.registry, self.registry_file, self.placeholder_lookup)
+        from llm_queue.engine.fairness import hash_tenant_names
+
+        text = _read_document(self.registry, self.registry_file, self.placeholder_lookup)
+        document = parse_document(text)
+        salt = (self.id_hash_salt or "").encode()
+
+        def hash_id(value: str) -> str:
+            return hmac.new(salt, value.encode(), hashlib.sha256).hexdigest()[:16]
+
+        hashed = hash_tenant_names(document, hash_id)
+        return text if hashed == document else to_json(hashed)

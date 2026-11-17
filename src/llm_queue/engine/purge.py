@@ -23,7 +23,6 @@ import orjson
 from llm_queue._logging import get_logger
 from llm_queue.engine._codec import text as _text
 from llm_queue.engine.expiry import native
-from llm_queue.engine.fairness import tenant_of
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import StreamQueues
 from llm_queue.engine.requests import RequestStore
@@ -611,7 +610,7 @@ class PurgeService:
         actor: str,
         dry_run: bool,
     ) -> PurgeReport:
-        h = self._hash(tenant_of(tenant_id, None))
+        h = self._hash(tenant_id)
         # The tenant's calls in flight, from the request index of each model (T1): read only
         # when its calls are to go or its `tf:need` entries to be dropped.
         by_model: dict[str, list[str]] = {}
