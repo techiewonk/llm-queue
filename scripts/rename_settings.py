@@ -15,14 +15,18 @@ what's-new sections, `docs/internal`):
 * every short name read in `src` as a whole string literal (`get("AUTO_PURGE"`,
   `number("TTL_SWEEP_BATCH", ...)`, `read_bool(layers, "ADMIN_DLQ_BODIES_ENABLED"`, the purge
   tuples, `_SECRETS_SETTINGS`), which a call-pattern regex missed (review B-01);
-* the Python surfaces (owner Q2: `InfraSettings.mode` -> `role`, `.worker_id` ->
-  `.instance_id`, `.default_tenant` -> `.tenant_default`, `from_env(worker_id=)`, the
-  `describe()` and `GET /` keys), from `PY_RULES` below;
+* the Python surfaces (owner Q2): every `InfraSettings` field follows its variable
+  (`auto_purge` -> `purge_auto_enabled`, `mode` -> `role`, `worker_id` -> `instance_id`,
+  `default_tenant` -> `tenant_default`, `secret_names` -> `secrets_names`, ...), with
+  `from_env(worker_id=)`, the `describe()` keys and the `GET /` keys (`field_rules`, `PY_RULES`);
+* lower-case forms (`llmq_key_expiry` in page anchors and slugs) and short names in a test's
+  `match="..."`;
 
 then moves `PENDING_RENAMES` into `RENAMED` (so an old name is reported at start) and
-regenerates every `rename-table` block. Afterwards run the unit tests: a rule of `PY_RULES` that
-matched nothing is printed, and tests that build `InfraSettings` by keyword may need the new
-field names.
+regenerates every `rename-table` block. A rule that matched nothing is printed (the code moved:
+check by hand). Afterwards run `ruff format .` and `ruff check .`: the longer names push a few
+comment and message lines past 100 characters (8 on the trial run of 2026-11-18, fixed by hand),
+then the unit tests (the trial run passed them all) and `scripts/check_docs.py`.
 """
 
 from __future__ import annotations
@@ -59,29 +63,41 @@ BEGIN, END = "rename-table: begin", "rename-table: end"
 
 ADMIN = ("src/llm_queue/engine/admin/process.py", "src/llm_queue/engine/admin/local.py")
 CODE = ("src/", "tests/", "samples/", "scripts/")
+SETTINGS_PY = ("src/llm_queue/engine/settings.py",)
+# InfraSettings fields follow their variable (`LLMQ_AUTO_PURGE` -> `auto_purge`), and
+# test_config_docs reads each documented variable as the field of that name, so every field is
+# renamed with its variable. Most names mean only the setting and are renamed as whole words
+# wherever they appear (`field_rules`); these three are common words or also a message field
+# (`Meta.queue_wait_ms` is the wait a call had) and get the targeted rules below.
+TARGETED_FIELDS = frozenset({"mode", "worker_id", "queue_wait_ms"})
 # (files or prefixes, pattern, replacement): applied in order, after the environment names.
 PY_RULES: tuple[tuple[tuple[str, ...], str, str], ...] = (
     # InfraSettings fields and the constructor call in from_layers.
+    (SETTINGS_PY, r'(?m)^(\s+)mode: str = "both"', r'\1role: str = "both"'),
+    (SETTINGS_PY, r'(?m)^(\s+)worker_id: str = ""', r'\1instance_id: str = ""'),
+    (SETTINGS_PY, r"(?m)^(\s+)queue_wait_ms: int = 100$", r"\1replica_wait_ms: int = 100"),
+    (SETTINGS_PY, r"(?m)^(\s+)mode=mode,$", r"\1role=mode,"),
+    (SETTINGS_PY, r"(?m)^(\s+)worker_id=worker_id,$", r"\1instance_id=worker_id,"),
+    (SETTINGS_PY, r"\bqueue_wait_ms=number\(", "replica_wait_ms=number("),
+    # The engine's own settings carry the replica wait under the same name.
     (
-        ("src/llm_queue/engine/settings.py",),
-        r'(?m)^(\s+)mode: str = "both"',
-        r'\1role: str = "both"',
+        ("src/llm_queue/engine/runtime.py",),
+        r"(?m)^(\s+)queue_wait_ms: int = 100  #",
+        r"\1replica_wait_ms: int = 100  #",
     ),
+    ((*CODE, "docs/"), r"\b(settings|s|set_)\.mode\b", r"\1.role"),
+    ((*CODE, "docs/"), r"\b(settings|s|set_)\.worker_id\b", r"\1.instance_id"),
+    ((*CODE, "docs/"), r"\bsettings\.queue_wait_ms\b", "settings.replica_wait_ms"),
     (
-        ("src/llm_queue/engine/settings.py",),
-        r'(?m)^(\s+)worker_id: str = ""',
-        r'\1instance_id: str = ""',
+        CODE,
+        r"\bqueue_wait_ms=settings\.replica_wait_ms",
+        "replica_wait_ms=settings.replica_wait_ms",
     ),
-    (("src/llm_queue/engine/settings.py",), r"(?m)^(\s+)mode=mode,$", r"\1role=mode,"),
-    (
-        ("src/llm_queue/engine/settings.py",),
-        r"(?m)^(\s+)worker_id=worker_id,$",
-        r"\1instance_id=worker_id,",
-    ),
-    # Reads of those fields.
-    (CODE, r"\b(settings|s)\.mode\b", r"\1.role"),
-    (CODE, r"\b(settings|s)\.worker_id\b", r"\1.instance_id"),
-    ((*CODE, "docs/"), r"\bdefault_tenant\b", "tenant_default"),
+    (("src/llm_queue/tuning.py",), r"\bqueue_wait_ms\b", "replica_wait_ms"),
+    (CODE, r"\bproblems\(queue_wait_ms=", "problems(replica_wait_ms="),
+    # Test doubles of the settings (`SimpleNamespace(mode="caller")`, engine settings).
+    (("tests/",), r"\bSimpleNamespace\(mode=", "SimpleNamespace(role="),
+    (("tests/",), r"(replica_wait_count=\d+, )queue_wait_ms=", r"\1replica_wait_ms="),
     # LLMQueue.from_env(worker_id=) -> instance_id=.
     (
         ("src/llm_queue/core.py",),
@@ -110,7 +126,17 @@ PY_RULES: tuple[tuple[tuple[str, ...], str, str], ...] = (
     (ADMIN, r'"mode": settings\.role', '"role": settings.role'),
 )
 # What --check still reports as an old Python name once the rules ran.
-PY_LEFT = re.compile(r"\b(?:settings|s)\.(?:mode|worker_id|default_tenant)\b|\bdefault_tenant\b")
+PY_LEFT = re.compile(r"\b(?:settings|s)\.(?:mode|worker_id|queue_wait_ms)\b")
+
+
+def field_rules(pending: dict[str, str]) -> list[tuple[tuple[str, ...], str, str]]:
+    """Whole-word renames of the InfraSettings fields of `pending` (not `TARGETED_FIELDS`)."""
+    rules = []
+    for old, new in pending.items():
+        field, target = old[len("LLMQ_") :].lower(), new[len("LLMQ_") :].lower()
+        if field not in TARGETED_FIELDS:
+            rules.append(((*CODE, "docs/", "README.md"), rf"(?<!\w){field}(?!\w)", target))
+    return rules
 
 
 def tables() -> tuple[dict[str, str], dict[str, str]]:
@@ -208,7 +234,10 @@ def main() -> int:
         else None
     )
     merged = {old: pending.get(new, new) for old, new in renamed.items()} | pending
-    used = [0] * len(PY_RULES)
+    rules = [*field_rules(pending), *PY_RULES]  # fields first: the test rules expect new ones
+    lower = {old.lower(): new.lower() for old, new in pending.items()}  # page anchors, slugs
+    lower_re = re.compile(r"(?<!\w)(" + "|".join(sorted(lower, key=len, reverse=True)) + r")(?!\w)")
+    used = [0] * len(rules)
     left = 0
     for path in files():
         rel = path.relative_to(ROOT).as_posix()
@@ -223,7 +252,15 @@ def main() -> int:
                 part = full.sub(lambda m: pending[m.group(1)], part)
             if short is not None and rel.startswith("src/") and rel.endswith(".py"):
                 part = short.sub(lambda m: m.group(1) + short_map[m.group(2)] + m.group(1), part)
-            for i, (where, pattern, repl) in enumerate(PY_RULES):
+            if short_map and rel.startswith("tests/"):  # `match="DEBUG_CAPTURE_FROM_CONFIG ..."`
+                part = re.sub(
+                    r"""(match=["'])(""" + "|".join(short_map) + r")(?!\w)",
+                    lambda m: m.group(1) + short_map[m.group(2)],
+                    part,
+                )
+            if lower:
+                part = lower_re.sub(lambda m: lower[m.group(1)], part)
+            for i, (where, pattern, repl) in enumerate(rules):
                 if any(rel == w or (w.endswith("/") and rel.startswith(w)) for w in where):
                     part, n = re.subn(pattern, repl, part)
                     used[i] += n
@@ -248,7 +285,7 @@ def main() -> int:
     if not only_tables:
         for i, n in enumerate(used):
             if not n:
-                print("PY_RULES rule matched nothing (check by hand):", PY_RULES[i][1])
+                print("rule matched nothing (check by hand):", rules[i][1])
     return 0
 
 

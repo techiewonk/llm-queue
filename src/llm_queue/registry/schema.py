@@ -426,7 +426,10 @@ def _account(
     for key in ("external_id_ref", "api_key_ref"):
         ref = texts[key]
         if ref and ref in SETTING_NAMES:  # review B-03: a process setting is never an account's
-            out.error(f"{path}.{key}", f"`{ref}` is a process setting, not an account secret")
+            out.error(
+                f"{path}.{key}",
+                f"`{ref}` is a process setting (a process secret), not an account secret",
+            )
         elif ref and not _SECRET_REF_RE.match(ref):
             # Any other name could be the store password or the pod's own AWS keys, sent as a
             # Bearer token to a base_url the registry author chose.
