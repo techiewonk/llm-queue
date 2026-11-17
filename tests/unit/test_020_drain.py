@@ -1,7 +1,7 @@
 """0.2.0 drain API (plan A1-A5) without a store: the drain file watcher, settings and routes.
 
 The behaviour on a real store (hand-back, resume, jobs, the file pausing two queues) is in
-tests/integration/engine/test_020_drain.py.
+tests/integration/engine/test_020_drain_store.py.
 """
 
 from __future__ import annotations

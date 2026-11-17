@@ -2,7 +2,7 @@
 
 `install()` / `serve()` / `mount()` against a recording queue double, the request context
 middleware on HTTP and websocket, the background helpers and `LLMQueue.ready`. The same
-wiring on a real store is in tests/integration/engine/test_020_fastapi.py.
+wiring on a real store is in tests/integration/engine/test_020_fastapi_store.py.
 """
 
 from __future__ import annotations
