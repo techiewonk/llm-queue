@@ -263,6 +263,9 @@ class _FakeEngine:
     async def start(self, **kw: Any) -> None:
         return None
 
+    def pause_receiving(self) -> None:
+        return None  # `stop()` pauses first (A-2)
+
     async def stop(self, **kw: Any) -> None:
         return None
 

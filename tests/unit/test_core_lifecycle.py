@@ -47,6 +47,9 @@ class _Engine:
         self.tasks.append("reload")
         await self._step("start")
 
+    def pause_receiving(self) -> None:
+        return None  # `stop()` pauses first (A-2)
+
     async def stop(self, **kw: Any) -> None:
         self.tasks.clear()
         await self._step("stop")
