@@ -453,6 +453,65 @@ end
 return {marked, started}
 """
 
+# An admin cancel that also answers the calls still waiting (0.2.0 T2, gate G-T2): CANCEL's mark,
+# then for each marked call whose job is still `queued` RESULT_PUT's final write (index drop,
+# result once, status `cancelled`), all in one script per batch. It was CANCEL, a pipelined
+# re-read of every id and a pipeline of one RESULT_PUT per id: 10,000 ids took 9 s. Once the
+# mark is set no worker can start the call, so answering it here is the reply a worker would
+# write (its message is acked by the worker that takes it: PICK_TAKE answers `done`); a call
+# that started is left to its worker. Its callers are woken by WAKE, the admin's last step.
+# KEYS: job, cancel, callers, status, result of each call. ARGV: cancel ttl secs, cancel
+# channel, only state (as CANCEL), result ttl secs, keep secs (records and status), n, the n
+# request ids, the n reply bodies, then status field / value pairs. Reply: {the ids marked, how
+# many started (only state), the ids answered}.
+CANCEL_SETTLE = (
+    _STATUS_FN
+    + """
+local n = tonumber(ARGV[6])
+local ttl, res_ttl = tonumber(ARGV[1]) * 1000, tonumber(ARGV[4]) * 1000
+local keep = tonumber(ARGV[5])
+local marked, started, answered = {}, 0, {}
+for i = 1, n do
+  local b, rid = 5 * (i - 1), ARGV[6 + i]
+  local job = KEYS[b + 1]
+  local rec = redis.call('HMGET', job, 'state', 'ix')
+  local state = rec[1]
+  if state ~= 'done' and state ~= 'failed' and state ~= 'expired' and state ~= 'cancelled' then
+    if ARGV[3] ~= '' and state ~= ARGV[3] then
+      started = started + 1
+    else
+      X.set(KEYS[b + 2], '1', ttl)
+      redis.call('PUBLISH', ARGV[2], rid)
+      table.insert(marked, rid)
+      if state == 'queued' then
+        -- RESULT_PUT's `index_drop` and `final_write` for a job known to exist and not final
+        -- (two reads fewer per call): the result only if none, the claim `cancelled`.
+        if rec[2] then redis.call('ZREM', rec[2], rid) end
+        X.set(KEYS[b + 5], ARGV[6 + n + i], res_ttl, true)
+        redis.call('HSET', job, 'state', 'cancelled')
+        X.expire(job, keep * 1000)
+        X.expire(KEYS[b + 3], keep * 1000)
+        set_status(KEYS[b + 4], 'cancelled', keep, 7 + 2 * n)
+        table.insert(answered, rid)
+      end
+    end
+  end
+end
+return {marked, started, answered}
+"""
+)
+
+# Wake the callers of answered calls, as RESULT_PUT does (each caller's done channel gets the
+# request id). KEYS: the callers set of each call. ARGV: done-channel prefix, the request ids.
+WAKE = """
+for i = 1, #KEYS do
+  for _, caller in ipairs(redis.call('SMEMBERS', KEYS[i])) do
+    redis.call('PUBLISH', ARGV[1] .. caller, ARGV[1 + i])
+  end
+end
+return #KEYS
+"""
+
 # Extend a call's deadline (0.2.0 T2, owner D6). KEYS: job, callers, status. ARGV: the new
 # deadline (store ms), how long the records outlive it (ms: caller margin + status TTL), the
 # caller margin (ms, the index scores a deadline plus it), the done-channel prefix
@@ -620,6 +679,8 @@ class RequestStore:
         self._drop_read = client.register_script(pre + RESULT_DROP)
         self._status = client.register_script(pre + STATUS_SET)
         self._cancel = client.register_script(pre + CANCEL)
+        self._cancel_settle = client.register_script(pre + CANCEL_SETTLE)
+        self._wake = client.register_script(WAKE)
         self._settle_done = client.register_script(pre + SETTLE_DONE)
         self._extend = client.register_script(pre + EXTEND)
 
@@ -786,37 +847,6 @@ class RequestStore:
             # (2) stored this very marker: its object stays.
             await self._delete_object(data[len(MARKER) :].decode())
         return int(written) != 0
-
-    async def put_results(
-        self, replies: Sequence[Reply], *, final_state: str, status: Mapping[str, Any]
-    ) -> int:
-        """`put_result` of many small replies in one pipelined round trip; how many written.
-
-        For final replies the store makes up itself (an admin cancel answering waiting calls):
-        one script per id, one round trip for all (a 50k cancel made 50k serial round trips).
-        """
-        if not replies:
-            return 0
-        async with self._client.pipeline(transaction=False) as pipe:
-            for reply in replies:
-                job, callers, status_key, result = self._req(reply.request_id)
-                await self._put(
-                    [result, job, callers, status_key],
-                    [
-                        reply.dumps(),
-                        self.result_ttl_secs,
-                        final_state,
-                        self.status_ttl_secs,
-                        f"{self.keys.prefix}:done:",
-                        reply.request_id,
-                        "1",
-                        self.status_ttl_secs,
-                        *_pairs(status),
-                    ],
-                    client=pipe,
-                )
-            written = await pipe.execute()
-        return sum(1 for w in written if w)
 
     async def put_result_settled(
         self,
@@ -1075,6 +1105,79 @@ class RequestStore:
         ]
         reply = await self._cancel(keys, [ttl_secs, channel, only_state or "", *request_ids])
         return [_text(rid) for rid in reply[0]], int(reply[1])
+
+    async def cancel_settle(
+        self,
+        request_ids: Sequence[str],
+        *,
+        ttl_secs: int,
+        channel: str,
+        only_state: str | None,
+        reply: Reply,
+        batch: int,
+    ) -> tuple[list[str], int, list[str]]:
+        """`cancel_ids`, and each marked call still `queued` answered with `reply` (an admin).
+
+        `reply` with each call's request id is stored as its result and its status set to
+        `cancelled`, as `put_result` would (`CANCEL_SETTLE`). One script per `batch` ids, all
+        sent in one pipelined round trip (a round trip per batch: 10,000 ids took 4 s in gate
+        G-T2). Returns (marked, started, answered); the answered calls' callers are woken by
+        `wake`, which the caller sends once it is done.
+        """
+        if not request_ids:
+            return [], 0, []
+        # The body of each id: the reply with its id spliced in (one dumps, not one per id).
+        head, sep, tail = reply.model_copy(update={"request_id": ""}).dumps().partition(b'""')
+        assert sep, "Reply.dumps() starts with its request id"
+        async with self._client.pipeline(transaction=False) as pipe:
+            for start in range(0, len(request_ids), batch):
+                part = request_ids[start : start + batch]
+                keys: list[str] = []
+                for rid in part:
+                    job, callers, status, result = self._req(rid)
+                    keys += [job, self.keys.request(rid, "cancel"), callers, status, result]
+                await self._cancel_settle(
+                    keys,
+                    [
+                        ttl_secs,
+                        channel,
+                        only_state or "",
+                        self.result_ttl_secs,
+                        self.status_ttl_secs,
+                        len(part),
+                        *part,
+                        *(head + orjson.dumps(rid) + tail for rid in part),
+                        "error",
+                        reply.error or "cancelled",
+                    ],
+                    client=pipe,
+                )
+            replies = await pipe.execute()
+        marked = [_text(rid) for out in replies for rid in out[0]]
+        answered = [_text(rid) for out in replies for rid in out[2]]
+        return marked, sum(int(out[1]) for out in replies), answered
+
+    async def wake(self, request_ids: Sequence[str], *, batch: int) -> None:
+        """Wake every caller waiting on these ids (their results are stored): one round trip.
+
+        One script per `batch` ids. Kept apart from `cancel_settle` so a cancel can finish
+        its own writes first: woken callers in the cancel's process (an admin beside an app,
+        gate G-T2) ran 10,000 result reads between its last round trips. One transaction, so
+        every reply comes back after the last publish, not one per script with the woken
+        callers' reads run between them (10,000 ids in gate G-T2: 0.9 s, 0.5 s in one; the
+        store is held for one SMEMBERS and the publishes per id).
+        """
+        if not request_ids:
+            return
+        async with self._client.pipeline(transaction=True) as pipe:
+            for start in range(0, len(request_ids), batch):
+                part = request_ids[start : start + batch]
+                await self._wake(
+                    [self.keys.request(rid, "callers") for rid in part],
+                    [f"{self.keys.prefix}:done:", *part],
+                    client=pipe,
+                )
+            await pipe.execute()
 
     async def extend(self, request_id: str, *, deadline_ms: int, margin_secs: float) -> str:
         """Move a call's deadline to `deadline_ms` (store ms) everywhere it lives (`EXTEND`).

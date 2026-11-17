@@ -439,6 +439,23 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
 - Admin HTTP: a dead letter id that is not `<ms>-<seq>` and any request the store refuses
   answer 400 (500 with a traceback before); a POST body above `LLMQ_ADMIN_BODY_MAX_BYTES`
   (new, default 1 MiB) answers 413, a body value above 64 KiB 400.
+- Request admin at scale (gate G-T2, 10,000 waiting calls of 20 tenants): `list` read three
+  commands per call in a pipeline and every tenant's next page; it is now one script that
+  merges the tenants' indexes, then one script for the records and one for the stages
+  (100 rows: 47 to 13 ms). Scans (`count`, `cancel`, reprioritize) send all their record and
+  stage scripts in one round trip, and a cancel marks its calls and answers the waiting ones
+  (result, status `cancelled`) in one script per `LLMQ_ADMIN_BATCH` ids, all in one round
+  trip (it was a mark, a re-read and one result script per id), then writes its audit entry
+  and wakes the callers last: cancelling 10,000 took 9.6 s, now 1.3 s; reprioritizing 1,000
+  1.9 s, now 0.8 s. Gate G-T2 waits out its callers' first result reads before it measures
+  and times with `perf_counter` (Windows' `monotonic` ticks every 15.6 ms).
+- A smooth window whose bucket holds one call (`rpm x rate_burst` below 2: rpm 9 to 19 at the
+  default `rate_burst` 0.1, rpm 900 at 0.001) granted nothing for about half of all limits:
+  the GCRA check summed `tat + cost x per - now - burst x per`, where `now + per` rounds on
+  13-digit milliseconds, and a call that exactly fills the bucket came out a few 1e-5 ms over,
+  so every call ended `rate_limited` at `max_wait_secs`. The check now subtracts `now` first
+  (exact for an idle bucket), in the admission script, the tenant share clock and local mode.
+  Budgets stay exact and a waiting priority call still goes first.
 
 ## [0.1.1] - 2026-11-17
 

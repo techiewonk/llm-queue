@@ -121,7 +121,9 @@ class _Bucket:
         tat = max(self.tat, now)
         if cost > self._size():
             return 0.0 if tat <= now else tat - now
-        return max(0.0, tat + cost * per - now - self._size() * per)
+        # `tat - now` first, as the script: summed from `tat`, an idle bucket of one rounded
+        # above 0 for about half of all limits and never let a call in.
+        return max(0.0, (tat - now) + (cost - self._size()) * per)
 
     def take(self, cost: float, now: float) -> None:
         """Charge `cost` (after `wait` said it fits)."""
@@ -163,7 +165,7 @@ class _Bucket:
         if self.mode == "fixed":
             return max(0.0, self.limit - self._carried(int(now // 60)))
         per = 60.0 / self.limit
-        return max(0.0, (now + self._size() * per - max(self.tat, now)) / per)
+        return max(0.0, self._size() - (max(self.tat, now) - now) / per)
 
     def used_now(self, now: float) -> int:
         """Units taken this minute (after refunds)."""
