@@ -24,7 +24,6 @@ import orjson
 from llm_queue._logging import get_logger
 from llm_queue.engine._codec import text as _text
 from llm_queue.engine.expiry import native
-from llm_queue.engine.fairness import tenant_of
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import StreamQueues
 from llm_queue.engine.requests import RequestStore
@@ -103,8 +102,9 @@ class PurgeSettings:
     """Defaults of the purge methods (`LLMQ_*`); a method argument overrides each.
 
     `auto` / `grace_secs`: auto purge after a registry drop; `wait` / `wait_secs`: a deployment
-    purge waits for its running calls; `batch`: keys per UNLINK pipeline; `tenant_default`:
-    what a tenant purge removes; `tenant_index`: the per-tenant request index is written.
+    purge waits for its running calls; `batch`: keys per UNLINK pipeline (`LLMQ_ADMIN_BATCH`);
+    `tenant_default`: what a tenant purge removes; `request_index`: calls are indexed per model
+    and tenant (`LLMQ_REQUEST_INDEX_ENABLED`), which a purge of queued or running calls reads.
     """
 
     auto: bool = True
@@ -114,7 +114,7 @@ class PurgeSettings:
     http_wait_secs: float = 60.0  # LLMQ_HTTP_PURGE_WAIT_SECS: the most an HTTP purge waits
     batch: int = 500
     tenant_default: frozenset[str] = frozenset({"keys"})
-    tenant_index: bool = False
+    request_index: bool = True
 
     @classmethod
     def from_infra(cls, settings: InfraSettings) -> PurgeSettings:
@@ -125,9 +125,9 @@ class PurgeSettings:
             wait=settings.purge_wait,
             wait_secs=float(settings.purge_wait_secs),
             http_wait_secs=float(settings.http_purge_wait_secs),
-            batch=int(settings.purge_batch),
+            batch=int(settings.admin_batch),
             tenant_default=frozenset(settings.tenant_purge_default.split(",")),
-            tenant_index=settings.tenant_index,
+            request_index=settings.request_index_enabled,
         )
 
 
@@ -328,7 +328,8 @@ class PurgeService:
 
         `tenant_id` is the raw id (hashed as admission hashes it). `remove` (default
         `LLMQ_TENANT_PURGE_DEFAULT`): `keys`, `queued` (cancel calls still waiting), `running`
-        (cancel every call); the last two need `LLMQ_TENANT_INDEX`, else `AdminRefused`.
+        (cancel every call); the last two read the request index of each model (T3), so they
+        need `LLMQ_REQUEST_INDEX_ENABLED` (on by default), else `AdminRefused`.
         """
         parts = self.settings.tenant_default if remove is None else frozenset(remove)
         unknown = parts - set(TENANT_PURGE_PARTS)
@@ -336,10 +337,10 @@ class PurgeService:
             raise ConfigError(
                 f"remove must be a non-empty subset of {', '.join(TENANT_PURGE_PARTS)}"
             )
-        if parts & {"queued", "running"} and not self.settings.tenant_index:
+        if parts & {"queued", "running"} and not self.settings.request_index:
             raise AdminRefused(
-                "removing a tenant's queued or running calls needs the per-tenant request "
-                "index: set LLMQ_TENANT_INDEX=true (it indexes calls made from then on)"
+                "removing a tenant's queued or running calls reads the request index: it is off "
+                "(LLMQ_REQUEST_INDEX_ENABLED=false)"
             )
         view = await self._view()
         aliases = list(models) if models is not None else sorted(view.registry.models)
@@ -359,7 +360,7 @@ class PurgeService:
     ) -> PurgeReport:
         """Purge every model and deployment the store has state of and the registry has not.
 
-        What `registry gc` runs. Queues of removed models go only when empty unless `force`;
+        What `purge removed` runs. Queues of removed models go only when empty unless `force`;
         `wait` / `wait_secs` as in `deployment` (defaults `LLMQ_PURGE_WAIT[_SECS]`), per
         deployment.
         """
@@ -464,32 +465,6 @@ class PurgeService:
                 await self._state.zrem(self._schedule_key, target)
         finally:
             await self._unlock([lock], [self._owner])
-
-    # ---------------------------------------------------------------- public: tenant index
-
-    async def index_call(
-        self,
-        tenant_id: str | None,
-        user_id: str | None,
-        request_id: str,
-        *,
-        now_ms: int,
-        keep_ms: int,
-    ) -> None:
-        """Add a call to its tenant's request index (only with `LLMQ_TENANT_INDEX`).
-
-        Scored by the call's deadline (`now_ms + keep_ms`, store ms); entries past their
-        deadline are pruned on each write, so the index holds only calls that can still run.
-        """
-        if not self.settings.tenant_index:
-            return
-        key = self._index_key(self._hash(tenant_of(tenant_id, user_id)))
-        async with self._state.pipeline(transaction=False) as pipe:
-            pipe.zadd(key, {request_id: now_ms + keep_ms})
-            pipe.zremrangebyscore(key, "-inf", now_ms)
-            # Lives as long as its longest call: set when none, else only lengthened.
-            self.expiry.expire(pipe, key, (keep_ms + 60_000) / 1000, grow=True)
-            await pipe.execute()
 
     # ---------------------------------------------------------------- the purges
 
@@ -612,17 +587,29 @@ class PurgeService:
         actor: str,
         dry_run: bool,
     ) -> PurgeReport:
-        h = self._hash(tenant_of(tenant_id, None))
-        index = self._index_key(h)
-        rids: list[str] = []
-        if self.settings.tenant_index:
-            rids = [_text(r) for r in await self._state.zrange(index, 0, -1)]
+        h = self._hash(tenant_id)
+        # The tenant's calls in flight, from the request index of each model (T1): read only
+        # when its calls are to go or its `tf:need` entries to be dropped.
+        by_model: dict[str, list[str]] = {}
+        if self.settings.request_index:
+            now_ms = await self._now_ms()
+            async with self._state.pipeline(transaction=False) as pipe:
+                for alias in aliases:
+                    pipe.zrangebyscore(self.keys.request_index(alias, h), now_ms, "+inf")
+                found = await pipe.execute()
+            by_model = {
+                alias: [_text(r) for r in rids]
+                for alias, rids in zip(aliases, found, strict=True)
+                if rids
+            }
+        every = [rid for rids in by_model.values() for rid in rids]
         cancelled = 0
-        if parts & {"queued", "running"} and rids:
-            cancelled = await self._cancel_tenant(rids, parts, dry_run=dry_run)
+        if parts & {"queued", "running"} and every:
+            cancelled = await self._cancel_tenant(every, parts, dry_run=dry_run)
         deleted = fields = 0
         if "keys" in parts:
             for alias in aliases:
+                rids = by_model.get(alias, [])
                 model = self.keys.model
                 reply = await self._tenant_script(
                     [
@@ -637,8 +624,8 @@ class PurgeService:
                 )
                 deleted += int(reply[0])
                 fields += int(reply[1])
-            if rids or await self._state.exists(index):
-                deleted += 1 if dry_run else await self._unlink(self._state, [index])
+        # The request index is not deleted: it lists calls still in flight, and each leaves it
+        # with its final write (a cancelled one too).
         # The report names the tenant by its hash: the raw id is never stored or logged.
         return PurgeReport(
             target=f"tenant:{h}",
@@ -667,7 +654,11 @@ class PurgeService:
         for start in range(0, len(chosen), self.settings.batch):
             batch = chosen[start : start + self.settings.batch]
             done += await store.cancel(
-                batch, ttl_secs=self._status_ttl_secs, channel=self.keys.cancel_channel
+                batch,
+                ttl_secs=self._status_ttl_secs,
+                channel=self.keys.cancel_channel,
+                # A call granted between the read and the script stays running (T2 only_state).
+                only_state=None if "running" in parts else "queued",
             )
             for rid in batch:
                 logger.info("call_cancel", request_id=rid, source="purge", by=self._owner)
@@ -719,9 +710,6 @@ class PurgeService:
     @property
     def _ttl_key(self) -> str:
         return f"{self.keys.prefix}:ttl"
-
-    def _index_key(self, h: str) -> str:
-        return f"{self.keys.prefix}:tenant:{h}:reqs"
 
     async def _view(self) -> ResolvedRegistry:
         """The registry as stored now (an admin purge must not act on a stale copy)."""

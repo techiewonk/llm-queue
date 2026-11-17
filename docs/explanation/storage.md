@@ -94,7 +94,6 @@ same in both [key expiry modes](#key-expiry-modes); only how they are kept diffe
 | `P:alert:NAME:LABELS` | string | An alert's last state | 1 day, set again every evaluation |
 | `P:health:WORKER` | string | Readiness write probe (each store) | 5 s |
 | `P:purge` | zset | Auto purges waiting for their grace (target `alias` or `alias/account/name` to due time, store ms) | no expiry; entries until purged or cancelled |
-| `P:tenant:H:reqs` | zset | With `LLMQ_TENANT_INDEX`: a tenant's calls (request id to deadline, store ms), for a tenant purge | the longest call + 60 s |
 | `P:expiry` | string | The store's key expiry mode: `native` or `swept` | no expiry |
 | `P:ttl` | zset | The expiry index (key to expire-at, store ms), used in `swept` mode | no expiry; members leave when swept |
 

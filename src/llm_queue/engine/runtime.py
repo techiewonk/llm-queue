@@ -61,10 +61,10 @@ from llm_queue.engine.envelope import (
 )
 from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.expiry import TTL_SWEEP, Expiry, decide
-from llm_queue.engine.fairness import Fairness, fairness_for
+from llm_queue.engine.fairness import Fairness, fairness_for, tenant_hash_of
 from llm_queue.engine.health import Health
 from llm_queue.engine.keys import Keys
-from llm_queue.engine.metrics import GaugeSet, Metrics, NullSink
+from llm_queue.engine.metrics import GaugeSet, Metrics, NullSink, TenantLabels
 from llm_queue.engine.offload import ResultOffload
 from llm_queue.engine.purge import PurgeService, PurgeSettings
 from llm_queue.engine.queue import (
@@ -74,7 +74,8 @@ from llm_queue.engine.queue import (
     QueueSettings,
     StreamQueues,
 )
-from llm_queue.engine.requests import RequestStore
+from llm_queue.engine.requests import IndexEntry, RequestStore, extend_notice
+from llm_queue.engine.requests_admin import AdminSettings, RequestsAdmin
 from llm_queue.engine.status import AlertEvaluator, StatusReader
 from llm_queue.engine.store_checks import UNKNOWN as UNKNOWN_POLICY
 from llm_queue.engine.store_checks import check_store, eviction_policy, eviction_warning
@@ -250,7 +251,9 @@ class EngineSettings:
     # `static_cap` then answer at once instead of re-trying the store (1.5-21.5 s per call).
     outage_memo_secs: float = 3.0
     timings: EngineTimings = field(default_factory=EngineTimings)  # `Tuning.engine`
-    purge: PurgeSettings = field(default_factory=PurgeSettings)  # LLMQ_*PURGE*, TENANT_INDEX
+    purge: PurgeSettings = field(default_factory=PurgeSettings)  # LLMQ_*PURGE*
+    # The request index and admin operations (LLMQ_REQUEST_INDEX_ENABLED, LLMQ_ADMIN_*, ...).
+    admin: AdminSettings = field(default_factory=AdminSettings)
 
 
 # ARGV: key prefix, request ids... Reply: {the 0-based indexes of the ids with a stored result,
@@ -431,12 +434,14 @@ class _Held:
     # Tenant fairness (fair_queue): the call's round per model, so a re-ask keeps its place.
     fair_rounds: dict[str, float] = field(default_factory=dict)
     tenant_waited: bool = False  # a share wait was counted for this call
+    # An admin extend (0.2.0 T2): the call's new deadline, store ms (0: none seen).
+    extended_ms: int = 0
 
     @property
     def position(self) -> float:
         """Queue position as a number (direct calls: their registration time)."""
         if self.message is not None:
-            return position_of(self.message.id)
+            return position_of(self.message.place)  # a moved call keeps its place (Q9)
         return float(self.position_ms * 1000)
 
 
@@ -637,6 +642,23 @@ class Engine:
             status_ttl_secs=self.settings.status_ttl_secs,
             owner=self.worker_id,
         )
+        # The admin side of requests (0.2.0 T2): list, count, get, cancel, reprioritize, extend
+        # by model and tenant; `llmq.admin.requests` wraps it.
+        self.requests_admin = RequestsAdmin(
+            state,
+            queue_client=queue_store,
+            keys=self.keys,
+            registry=registry,
+            queue_prefix=self.settings.queue_prefix,
+            hash_id=self.hash_id,
+            settings=self.settings.admin,
+            status_ttl_secs=self.settings.status_ttl_secs,
+            caller_margin_secs=self.settings.caller_margin_secs,
+            metrics=self.metrics,
+            owner=self.worker_id,
+        )
+        # The `tenant` label of llmq_calls_total / llmq_wait_seconds (0.2.0 T6, owner Q10).
+        self._tenant_label = TenantLabels(self.settings.admin.metrics_tenants, self.hash_id)
         self._tasks: list[asyncio.Task[None]] = []
         self._running: set[asyncio.Task[None]] = set()
         self._held: dict[str, _Held] = {}
@@ -660,6 +682,10 @@ class Engine:
         self._own_loop: asyncio.AbstractEventLoop | None = None  # the loop `start()` ran on
         self._started = False
         self._local_callers: dict[str, int] = {}  # request id -> coroutines waiting on it here
+        # Admin extends of calls waited on here (0.2.0 T2): request id -> the new deadline as
+        # this loop's time, and the timers of the waiting calls to reschedule.
+        self._extended_until: dict[str, float] = {}
+        self._call_timeouts: dict[str, set[asyncio.Timeout]] = {}
         self._wake: dict[str, asyncio.Event] = {}  # model -> wakes its receive loop
         self._beat_ok_mono = time.monotonic()  # last heartbeat that reached the store
         self._store_trouble_mono = -1e9  # monotonic time this process last saw the store fail
@@ -689,7 +715,15 @@ class Engine:
         self.ready = False
         self._direct_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.health = Health(state, self.keys)
-        self.status_reader = StatusReader(state, self.keys, self.queues, self.settings.queue_prefix)
+        self.status_reader = StatusReader(
+            state,
+            self.keys,
+            self.queues,
+            self.settings.queue_prefix,
+            requests=self.requests_admin,
+            request_index=self.settings.admin.request_index,
+            scan_max=self.settings.admin.scan_max,
+        )
         self.alerts = AlertEvaluator(state, self.keys)
         # Each part writes expiries in its store's mode (owner K4; set again at start).
         self.requests.expiry = self.alerts.expiry = self.purge.expiry = self.expiry
@@ -1163,13 +1197,16 @@ class Engine:
             allowed_regions=tuple(allowed_regions) if allowed_regions else None,
             allowed_accounts=tuple(allowed_accounts) if allowed_accounts else None,
             session_id=session_id,
-            user_id=user_id,
-            tenant_id=tenant_id,
+            # Only keyed hashes travel (owner D1, 0.2.0): the message, its dead letter and the
+            # worker never hold a raw tenant or user id.
+            user_id=self.hash_id(user_id) if user_id else None,
+            tenant_id=self.hash_id(tenant_id) if tenant_id else None,
             app_request_id=request_id is not None,
             stream=stream,
             vectors=vectors,
         )
         envelope.keep_params_json(encoded)
+        envelope.keep_tenant_name(tenant_id)
         hook_name = view.value(alias, "admission")
         hook = hooks.get("admission", hook_name)
         if hook is not None:
@@ -1238,6 +1275,7 @@ class Engine:
             else:
                 self._local_callers.pop(rid, None)
                 self._waiters.pop(rid, None)
+                self._extended_until.pop(rid, None)
             if not self._waiters:
                 self._idle.set()
 
@@ -1259,8 +1297,12 @@ class Engine:
         # down the store_down path with a fresh timeout, and the soak saw 135 answers come
         # after their deadline (20 s store block, 30 s calls).
         deadline = asyncio.get_running_loop().time() + call_secs + self.settings.caller_margin_secs
+        timer: asyncio.Timeout | None = None
         try:
-            async with asyncio.timeout_at(deadline):
+            async with asyncio.timeout_at(deadline) as timer:
+                # An admin extend moves this timer (`_extend_caller`, 0.2.0 T2).
+                self._call_timeouts.setdefault(rid, set()).add(timer)
+                self._apply_extend(rid, timer)
                 if (
                     self._store_waiting
                     and not stream
@@ -1331,6 +1373,43 @@ class Engine:
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.wait({cleanup}, timeout=max(0.0, remaining))
             raise
+        finally:
+            timers = self._call_timeouts.get(rid)
+            if timers is not None and timer is not None:
+                timers.discard(timer)
+                if not timers:
+                    self._call_timeouts.pop(rid, None)
+
+    def _apply_extend(self, rid: str, timer: asyncio.Timeout) -> None:
+        """Move a waiting call's timer to its extended deadline, when one was announced."""
+        until = self._extended_until.get(rid)
+        when = timer.when()
+        if until is not None and when is not None and until > when:
+            timer.reschedule(until)
+
+    def _extend_caller(self, rid: str, deadline_ms: int) -> None:
+        """An admin extended a call waited on here: move its timers, wake it to re-read.
+
+        `deadline_ms` is the worker's new deadline (store ms); the caller waits its margin
+        more, as it did for the first deadline.
+        """
+        if rid not in self._local_callers:
+            return
+        loop = asyncio.get_running_loop()
+        until = loop.time() + deadline_ms / 1000 - self.clock.now()
+        until += self.settings.caller_margin_secs
+        if until <= self._extended_until.get(rid, 0.0):
+            return
+        self._extended_until[rid] = until
+        for timer in self._call_timeouts.get(rid, ()):
+            self._apply_extend(rid, timer)
+        waiter = self._waiters.get(rid)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(None)
+
+    def _caller_until(self, rid: str, until: float) -> float:
+        """A waiting call's deadline (this loop's time), an admin extend included."""
+        return max(until, self._extended_until.get(rid, until))
 
     async def stream(
         self, model: str, params: Mapping[str, Any], *, meta_event: bool = False, **call: Any
@@ -1574,10 +1653,10 @@ class Engine:
         direct: bool,
     ) -> Reply:
         rid = envelope.request_id
-        user_id, session_id = envelope.user_id, envelope.session_id
+        user_hash, session_id = envelope.user_id, envelope.session_id  # the user id is hashed
         record: dict[str, Any] = {
             "caller": self.worker_id,
-            "user_hash": self.hash_id(user_id or session_id or ""),
+            "user_hash": user_hash or self.hash_id(session_id or ""),
             "params_hash": params_hash({"m": alias, "p": params}),
             "model": alias,
             "priority": priority,
@@ -1586,6 +1665,7 @@ class Engine:
         # Queues in the state store: register, send and confirm are one script (3 round trips
         # before). Not with `queue_wait_replicas`: that send needs its own WAIT.
         combined = not direct and self.queues_shared and not self.replica_wait.replicas_for("calls")
+        index = self._index_entry(envelope, alias, priority, call_secs)
 
         async def register() -> tuple[str, bool]:
             """The registration's outcome, and whether the call was sent with it.
@@ -1621,6 +1701,7 @@ class Engine:
                     max_waiting=settings.max_waiting,
                     retention_secs=settings.retention_secs,
                     keep_secs=call_secs,
+                    index=index,
                 )
             except QueueFull as exc:
                 raise CallFailed(
@@ -1629,8 +1710,6 @@ class Engine:
             return found.outcome, found.outcome in ("new", "takeover")
 
         outcome, sent = await register()
-        if outcome in ("new", "takeover"):
-            await self._index_tenant(envelope, call_secs)
         waiter = self._waiters.setdefault(rid, asyncio.get_running_loop().create_future())
         loop = asyncio.get_running_loop()
         until = loop.time() + call_secs + self.settings.caller_margin_secs
@@ -1638,14 +1717,14 @@ class Engine:
             run: asyncio.Task[None] | None = None  # the direct run, watched while waiting
             if outcome in ("new", "takeover") and not sent:
                 if direct:
-                    await self.requests.confirm(rid, keep_secs=call_secs, direct=True)
+                    await self.requests.confirm(rid, keep_secs=call_secs, direct=True, index=index)
                     run = self._start_direct(envelope)
                 else:
-                    await self._send(rid, envelope, view, alias, priority, call_secs)
+                    await self._send(rid, envelope, view, alias, priority, call_secs, index)
             reply = await self._wait_result(
                 rid,
                 waiter,
-                until - loop.time(),
+                self._caller_until(rid, until) - loop.time(),
                 recheck=outcome == "attached",
                 watch=run,
                 # A stored result is read at once: `done` waited for a wake-up nobody sent, up
@@ -1657,23 +1736,39 @@ class Engine:
             # The send this caller attached to never happened: register again.
             outcome, sent = await register()
 
-    async def _index_tenant(self, envelope: Envelope, call_secs: float) -> None:
-        """`LLMQ_TENANT_INDEX`: note a new call under its tenant, for a tenant purge (K2).
+    def _index_entry(
+        self, envelope: Envelope, alias: str, priority: bool, call_secs: float
+    ) -> IndexEntry | None:
+        """Where the call goes in the request index of its model and tenant (T1); None when off.
 
-        A failed write never fails the call: the purge only misses that call.
+        Written by the script that confirms the call (no round trip of its own), removed by
+        the one that writes its final state. The tenant is the call's tenant only (never the
+        user id, unlike fairness): `-` for none.
         """
-        if not self.settings.purge.tenant_index:
-            return
-        try:
-            await self.purge.index_call(
-                envelope.tenant_id,
-                envelope.user_id,
-                envelope.request_id,
-                now_ms=int(self.clock.now() * 1000),
-                keep_ms=int((call_secs + self.settings.caller_margin_secs) * 1000),
-            )
-        except Exception as exc:
-            logger.warning("tenant_index_failed", request_id=envelope.request_id, error=repr(exc))
+        admin = self.settings.admin
+        if not admin.request_index:
+            return None
+        tenant = self._index_tenant_hash(envelope)
+        keys: tuple[str, ...] = (
+            self.keys.request_index(alias, tenant),
+            self.keys.tenant_index(alias),
+        )
+        name = ""
+        if admin.tenant_names and tenant != "-" and envelope.tenant_name:
+            # Q5: the name stays out of the message; only this opt-in key holds it.
+            name = envelope.tenant_name
+            keys += (self.keys.tenant_names(alias),)
+        return IndexEntry(
+            keys=keys,
+            tenant_hash=tenant,
+            keep_ms=int((call_secs + self.settings.caller_margin_secs) * 1000),
+            cls="p" if priority else "n",
+            name=name,
+        )
+
+    def _index_tenant_hash(self, envelope: Envelope) -> str:
+        """The call's tenant as the index names it: its keyed hash, or `-` for none."""
+        return envelope.tenant_id or "-"  # already the keyed hash (D1)
 
     async def embed(
         self,
@@ -1706,6 +1801,7 @@ class Engine:
         alias: str,
         priority: bool,
         keep_secs: float,
+        index: IndexEntry | None = None,
     ) -> None:
         """Put the message on its queue and confirm the record; undo the record on failure.
 
@@ -1725,6 +1821,7 @@ class Engine:
         # store took the client's whole budget, about 21 s, before the failover (R3FM-3). A
         # shared store keeps the client's own timeouts (the call has no other path).
         floor_secs = self.settings.timings.health_probe_secs
+        message_id = ""  # unknown when too few replicas acknowledged (the send stands)
         while True:
             try:
                 try:
@@ -1733,7 +1830,7 @@ class Engine:
                         left = give_up - loop.time()
                         bound = left if left > 0 else floor_secs
                     async with asyncio.timeout(bound):
-                        await self.queues.send(
+                        message_id = await self.queues.send(
                             self._queue_name(view, alias, priority),
                             body,
                             settings,
@@ -1772,7 +1869,9 @@ class Engine:
                     raise _QueueDown from exc
                 raise
         try:
-            await self.requests.confirm(rid, keep_secs=keep_secs)
+            await self.requests.confirm(
+                rid, keep_secs=keep_secs, index=index, message_id=message_id
+            )
         except STORE_ERRORS as exc:  # the message is on the queue: never run it a second time
             logger.warning("confirm_failed", request_id=rid, error=str(exc))
 
@@ -1885,6 +1984,12 @@ class Engine:
                 continue
             data = message["data"]
             rid = data.decode() if isinstance(data, bytes) else str(data)
+            extended = extend_notice(rid)
+            if extended is not None:  # an admin extend (0.2.0 T2), not a cancel
+                held = self._held.get(extended[0])
+                if held is not None:
+                    held.extended_ms = max(held.extended_ms, extended[1])
+                continue
             held = self._held.get(rid)
             if held is None:
                 continue
@@ -2281,6 +2386,7 @@ class Engine:
                 waiter = self._rearm(rid, waiter)
         tries = 0
         while True:
+            until = self._caller_until(rid, until)  # an admin extend moves it (0.2.0 T2)
             try:
                 reply = await self.requests.take_result(rid)
                 gone = reply is None and (recheck or rid in self._gone) and await self._lost(rid)
@@ -2312,7 +2418,7 @@ class Engine:
                     partial_text=reply.partial_text,
                     request_id=rid,
                 )
-            left = until - loop.time()
+            left = self._caller_until(rid, until) - loop.time()
             if left <= 0:
                 raise CallFailed("deadline_exceeded", "no reply in time", request_id=rid)
             # The wake-up comes by pub/sub (published with the result), or from this process's
@@ -2513,6 +2619,10 @@ class Engine:
                 if isinstance(message["data"], bytes)
                 else str(message["data"])
             )
+            extended = extend_notice(rid)
+            if extended is not None:  # an admin extend (0.2.0 T2): the call waits longer
+                self._extend_caller(*extended)
+                continue
             waiter = self._waiters.get(rid)
             if waiter is not None and not waiter.done():
                 waiter.set_result(None)
@@ -2716,6 +2826,14 @@ class Engine:
                 self.queues.fail(message, self._queue_settings(self.registry.current, alias)),
             )
             return False
+        try:
+            priority = message.queue == self._queue_name(self.registry.current, alias, True)
+        except KeyError:  # removed by a reload meanwhile: the name's suffix says the class
+            priority = message.queue.endswith("-priority")
+        if env.priority != priority:
+            # The class is the queue's, not the body's: a reprioritize moves the message and
+            # never rewrites its body (0.2.0 T2).
+            env = env.model_copy(update={"priority": priority})
         current = self._held.get(env.request_id)
         if current is not None:
             # Already held here (RESCAN A1): its hold lapsed and the same message came back, or
@@ -2785,7 +2903,24 @@ class Engine:
     # ================================================================ worker: admission
 
     def _deadline(self, held: _Held) -> float:
-        return held.position_ms / 1000.0 + held.envelope.timeout_secs
+        """The call's deadline, store secs: its send time + its timeout, or an admin extend."""
+        return max(held.position_ms / 1000.0 + held.envelope.timeout_secs, held.extended_ms / 1000)
+
+    async def _past_deadline(self, held: _Held, now: float) -> bool:
+        """True when the call is past its deadline, an admin extend read from the store first.
+
+        A worker that took the call after the extend's notice never saw it: the job's `dl` is
+        read here, once, only when the deadline it knows is reached (no read per call).
+        """
+        if now < self._deadline(held):
+            return False
+        try:
+            raw = await self.state.hget(self.keys.request(held.envelope.request_id, "job"), "dl")
+        except (*STORE_ERRORS, ResponseError):
+            return True
+        if raw is not None:
+            held.extended_ms = max(held.extended_ms, int(float(text(raw))))
+        return now >= self._deadline(held)
 
     def _candidates(
         self,
@@ -2916,7 +3051,8 @@ class Engine:
     def _fairness(self, view: ResolvedRegistry, alias: str, held: _Held) -> Fairness | None:
         """The call's tenant fairness on model `alias` (None when its `fairness` is off).
 
-        The tenant is the call's tenant id, else its user id; only its keyed hash leaves here.
+        The tenant is the call's tenant id, else its user id: the keyed hashes its message
+        carries (D1), looked up in the registry's hashed `weights` / `quotas` (D2).
         """
         setting = view.value(alias, "fairness")
         if setting.get("mode", "off") == "off":
@@ -2924,9 +3060,7 @@ class Engine:
         env = held.envelope
         return fairness_for(
             setting,
-            env.tenant_id,
-            env.user_id,
-            self.hash_id,
+            tenant_hash_of(env.tenant_id, env.user_id, self.hash_id),
             burst=float(view.value(alias, "rate_burst")),
             window=str(view.value(alias, "rate_window")),
             round_=held.fair_rounds.get(alias),
@@ -3099,12 +3233,14 @@ class Engine:
 
         One copy of the two checks `_try`, `_hold` and `_direct_wait` each wrote (RT-21).
         """
-        if now >= self._deadline(held):
+        if await self._past_deadline(held, now):
             await self._finish_call(
                 held, "rate_limited", "no budget before the deadline", final="expired"
             )
             return True
         max_wait = held.envelope.max_wait_secs
+        if held.extended_ms:  # an extended call waits up to its new deadline (0.2.0 T2)
+            max_wait = None
         if max_wait is not None and now - held.position_ms / 1000.0 >= max_wait:
             await self._finish_call(
                 held,
@@ -3592,7 +3728,7 @@ class Engine:
                 left = self._deadline(held) - self.clock.now()
                 await asyncio.sleep(max(0.0, min(retry_secs, left)))
             while True:
-                if self.clock.now() >= self._deadline(held):
+                if await self._past_deadline(held, self.clock.now()):
                     await self._finish_call(held, "deadline_exceeded", f"last error: {kind}")
                     return
                 # The view now: one read before the failed attempt still offered a deployment
@@ -4247,7 +4383,10 @@ class Engine:
         start_secs = held.position_ms / 1000.0
         wait = max(0.0, held.first_seen_secs - start_secs)
         now = self.clock.now()
-        self.metrics.observe("llmq_wait_seconds", wait, model=env.model, priority=priority)
+        tenant = self._tenant_label(env.tenant_id)  # LLMQ_METRICS_TENANTS (0.2.0 T6)
+        self.metrics.observe(
+            "llmq_wait_seconds", wait, model=env.model, priority=priority, tenant=tenant
+        )
         admit = max(0.0, held.granted_secs - start_secs) if held.granted_secs else None
         if admit is not None:
             self.metrics.observe(
@@ -4288,7 +4427,13 @@ class Engine:
         were in no counter and no record.
         """
         labels = {"model": alias, "account": account or "-", "region": region or "-"}
-        self.metrics.count("llmq_calls_total", 1.0, outcome=outcome, **labels)
+        self.metrics.count(
+            "llmq_calls_total",
+            1.0,
+            outcome=outcome,
+            tenant=self._tenant_label(env.tenant_id),
+            **labels,
+        )
         if meta is not None:
             self.metrics.count("llmq_tokens_input_total", float(meta.tokens_in or 0), **labels)
             self.metrics.count("llmq_tokens_output_total", float(meta.tokens_out or 0), **labels)
@@ -4311,8 +4456,8 @@ class Engine:
             tokens_in=meta.tokens_in if meta else None,
             tokens_out=meta.tokens_out if meta else None,
             provider_ms=meta.provider_ms if meta else None,
-            user=self.hash_id(env.user_id) if env.user_id else None,
-            tenant=self.hash_id(env.tenant_id) if env.tenant_id else None,  # (RESCAN X10)
+            user=env.user_id,  # keyed hashes already (D1; RESCAN X10)
+            tenant=env.tenant_id,
             **fields,
         )
 
@@ -4330,11 +4475,27 @@ class Engine:
         )
         await self.state.set(self.keys.request(request_id, "debug"), body, ex=3600)
 
-    async def status(self, model: str | None = None) -> dict[str, Any]:
-        """Status of one model, or of everything (plan §3.12)."""
+    async def status(
+        self,
+        model: str | None = None,
+        *,
+        tenant: str | None = None,
+        tenant_hash: str | None = None,
+    ) -> dict[str, Any]:
+        """Status of one model, or of everything (plan §3.12).
+
+        With `tenant` (a raw name, hashed here) or `tenant_hash` (`-`: no tenant), the model's
+        report adds that tenant's block (0.2.0 T4); a tenant needs a model (`ConfigError`).
+        """
         view = self.registry.current
+        if tenant is not None and tenant_hash is not None:
+            raise ConfigError("give tenant or tenant_hash, not both")
+        h = self.hash_id(tenant) if tenant is not None else tenant_hash
         if model is not None:
-            return await self.status_reader.model(view, view.registry.alias_of(model))
+            alias = view.registry.alias_of(model)
+            return await self.status_reader.model(view, alias, tenant_hash=h)
+        if h is not None:
+            raise ConfigError("a tenant's status needs a model")
         return await self.status_reader.report(view)
 
     async def request_status(self, request_id: str) -> dict[str, Any]:

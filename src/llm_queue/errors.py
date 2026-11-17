@@ -90,9 +90,11 @@ class StoreUnavailable(LLMQueueError, ConnectionError):  # named for what it is
 class AdminRefused(LLMQueueError):
     """An admin operation that was refused; nothing was changed.
 
-    E.g. a purge of a model still in the registry without `force`, an operation whose
-    service is not available in this build or process, or one above a scan limit. Category
-    `bad_request` (HTTP 409, CLI exit 1): repeating it unchanged gets the same answer.
+    E.g. a purge of a model still in the registry without `force`, a purge of queued or
+    running calls while the request index is off (`LLMQ_REQUEST_INDEX_ENABLED=false`), an
+    operation whose service is not available in this build or process, or one that would read
+    more than `LLMQ_ADMIN_SCAN_MAX` index entries. Category `bad_request` (HTTP 409, CLI exit
+    1): repeating it unchanged gets the same answer.
     """
 
     _category = "bad_request"

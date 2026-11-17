@@ -164,7 +164,7 @@ class _Pipe:
 async def test_cancel_by_ids_is_dry_by_default_filters_and_is_audited() -> None:
     """Q5 / D9: an operator cancel is audited; `state` waiting leaves running calls alone."""
     client = MagicMock()
-    script = AsyncMock(return_value=1)
+    script = AsyncMock(return_value=[2, 0])  # CANCEL: [marked, started]
     client.register_script.return_value = script
     client.xadd = AsyncMock()
     replies = [b"queued", 0, b"running", 0, b"done", 0, b"queued", 1, None, 0]

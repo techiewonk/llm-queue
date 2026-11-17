@@ -20,7 +20,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `bad_dead_letter` | warning | engine/runtime.py |
 | `bad_message` | warning | engine/runtime.py |
 | `bell_failed` | warning | engine/runtime.py |
-| `call_cancel` | info | engine/admin/requests.py, engine/purge.py, engine/runtime.py |
+| `call_cancel` | info | engine/admin/requests.py, engine/purge.py, engine/requests_admin.py, engine/runtime.py |
 | `caller_gone` | warning | engine/runtime.py |
 | `cancel_after_stop` | warning | engine/runtime.py |
 | `cancel_cleanup_failed` | warning | engine/runtime.py |
@@ -79,7 +79,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `job_upkeep_failed` | warning | engine/jobs.py |
 | `key_expiry_changed` | warning | engine/runtime.py |
 | `key_expiry_publish_failed` | warning | engine/runtime.py |
-| `llmq_admin` | info | engine/audit.py |
+| `llmq_admin` | info | engine/audit.py, engine/requests_admin.py |
 | `llmq_call_finished` | info | engine/runtime.py |
 | `llmq_purge` | info | engine/purge.py |
 | `llmq_registry_audit` | info | registry/store.py |
@@ -131,6 +131,8 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `release_claims_failed` | warning | engine/runtime.py |
 | `release_return_failed` | warning | engine/runtime.py |
 | `replicas_short` | warning | engine/store_guard.py |
+| `request_extended` | info | engine/requests_admin.py |
+| `request_moved` | info | engine/requests_admin.py |
 | `request_unusable` | error | engine/runtime.py |
 | `result_drop_skipped` | warning | engine/requests.py |
 | `result_reader_error` | warning | engine/runtime.py |
@@ -162,7 +164,6 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `sweep_failed` | warning | engine/runtime.py |
 | `sync_call_on_event_loop` | warning | core.py |
 | `sync_engine_close_failed` | warning | core.py |
-| `tenant_index_failed` | warning | engine/runtime.py |
 | `ttl_sweep_failed` | warning | engine/runtime.py |
 | `undo_skipped` | warning | engine/admission.py |
 | `waiting_calls_lost` | warning | engine/runtime.py |

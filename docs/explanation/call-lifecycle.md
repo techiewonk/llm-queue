@@ -609,8 +609,10 @@ flowchart LR
 | `fair_queue` | Waiting calls reserve budget in tenant-round order: a tenant with 100 calls gets one per round | [`tf:t:H`, `tf:fq`][tf] |
 
 Cost: server time per admission script +9 % (`fair_queue`), +13 % (`quota`), +23 % (`share`)
-over off (measured 2026-11-15, local Valkey 8.1). With `LLMQ_TENANT_INDEX`, each new call is
-also added to [`P:tenant:H:reqs`][exp] for a tenant purge. See [Tenant fairness](fairness.md).
+over off (measured 2026-11-15, local Valkey 8.1). Each call is also in the request index of
+its model and tenant (`P:{m:ALIAS}:tq:H`, written on confirm and removed by its final write,
+`LLMQ_REQUEST_INDEX_ENABLED`), which admin operations and a tenant purge read. See
+[Tenant fairness](fairness.md).
 
 ## 15. Purge
 
@@ -641,7 +643,7 @@ sequenceDiagram
 |---|---|---|
 | `model(alias)` | app, CLI, HTTP, auto | every [`{m:alias}:*`][madm] key, its queues [`{q}:*`][q] and doorbells; refused while the registry has the model, unless `force` |
 | `deployment(alias, "account/name")` | app, CLI, HTTP, auto | [`rate:D`][bud], [`ac:D`, `cb:D`, `terr:D`, `thr:D:*`][health], [`lease:D:*`][lease], fields of `health` and `rot`, `sticky:*` pointing at it; waits for running calls (`LLMQ_PURGE_WAIT_SECS`, 300) unless auto |
-| `tenant(id, remove=...)` | app, CLI, HTTP | [`tf:t:H`, `tf:s:H`][tf], the tenant in `tf:act` and `tf:w` (weight sum corrected); `queued` / `running` cancel its calls via [`P:tenant:H:reqs`][exp] |
+| `tenant(id, remove=...)` | app, CLI, HTTP | [`tf:t:H`, `tf:s:H`][tf], the tenant in `tf:act` and `tf:w` (weight sum corrected); `queued` / `running` cancel its calls found in the request index `P:{m:ALIAS}:tq:H` |
 | `removed()` | app, CLI (`purge removed`), HTTP | `model` and `deployment` for everything the registry no longer has |
 
 Auto purge runs only in workers; the first tick after start is a baseline. Every real purge is

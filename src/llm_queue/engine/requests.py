@@ -161,15 +161,48 @@ end
 
 REGISTER = _REGISTER_FN + "return register(ARGV[10], ARGV[11])\n"
 
-# KEYS: REGISTER's, then the queue's keys (stream first, `_PARTS` order). ARGV: REGISTER's, then
-# body, max waiting, retention ms, doorbell key, keep secs, caller ttl, lease ms. Register, send
-# a new call and confirm it in one round trip when the queues share the state store (three
-# before). A full queue drops the record it just made. Reply: {outcome}, {outcome, message id}
-# or {'full', depth}.
+# The request index per model and tenant (0.2.0 T1): `P:{m:ALIAS}:tq:H` (request id -> the
+# call's deadline, store ms) and `P:{m:ALIAS}:tq` (tenant hash -> its latest deadline). Written
+# in the script that confirms a call (no extra round trip), removed by the script that writes
+# its final state. Lapsed entries are pruned on each add; the keys live 60 s past their latest
+# deadline (grow-only). The job record keeps where its entry is: `ix` (the `tq:H` key), `ixh`
+# (H), `mid` (the stream message id, '' for a direct run) and `q` (class `p` / `n`). `names`
+# (optional): `P:{m:ALIAS}:tqn`, the tenant's name beside its hash (`LLMQ_TENANT_NAMES_ENABLED`).
+_INDEX_FN = """
+local function index_add(job, ix, ixs, rid, h, keep_ms, mid, cls, names, name)
+  local now = X.now()
+  local dl = now + keep_ms
+  redis.call('HSET', job, 'ix', ix, 'ixh', h, 'mid', mid, 'q', cls)
+  redis.call('ZADD', ix, dl, rid)
+  redis.call('ZREMRANGEBYSCORE', ix, '-inf', '(' .. now)
+  redis.call('ZADD', ixs, 'GT', dl, h)
+  redis.call('ZREMRANGEBYSCORE', ixs, '-inf', '(' .. now)
+  local ms = keep_ms + 60000
+  if X.pttl(ix) < ms then X.expire(ix, ms) end
+  if X.pttl(ixs) < ms then X.expire(ixs, ms) end
+  if names and names ~= '' and name and name ~= '' then
+    redis.call('HSET', names, h, name)
+    if X.pttl(names) < ms then X.expire(names, ms) end
+  end
+end
+local function index_drop(job, rid)
+  local ix = redis.call('HGET', job, 'ix')
+  if ix then redis.call('ZREM', ix, rid) end
+end
+"""
+
+# KEYS: REGISTER's, then the queue's keys (stream first, `_PARTS` order), then (index on) the
+# request index `tq:H`, the tenant index `tq` and (names on) `tqn`. ARGV: REGISTER's, then body,
+# max waiting, retention ms, doorbell key, keep secs, caller ttl, lease ms, then (index on) the
+# tenant hash, the index keep ms, the class (`p` / `n`) and the tenant name ('' for none).
+# Register, send a new call and confirm it in one round trip when the queues share the state
+# store (three before). A full queue drops the record it just made and indexes nothing. Reply:
+# {outcome}, {outcome, message id} or {'full', depth}.
 REGISTER_SEND = (
     _NOW_MS
     + SEND_FN
     + _REGISTER_FN
+    + _INDEX_FN
     + """
 local outcome = register(ARGV[15], ARGV[16])
 if outcome ~= 'new' and outcome ~= 'takeover' then return {outcome} end
@@ -186,20 +219,34 @@ end
 redis.call('HSET', KEYS[1], 'confirmed', '1')
 X.expire(KEYS[1], tonumber(ARGV[14]) * 1000)
 X.expire(KEYS[2], tonumber(ARGV[14]) * 1000)
+if #KEYS >= 13 then
+  local rid = string.match(KEYS[1], ':{r:(.*)}:job$')
+  index_add(KEYS[1], KEYS[12], KEYS[13], rid, ARGV[17], tonumber(ARGV[18]), sent[2], ARGV[19],
+    KEYS[14], ARGV[20])
+end
 return {outcome, sent[2]}
 """
 )
 
-# KEYS: job, callers. ARGV: keep secs, '1' for a direct run. The send succeeded: the record
-# lives until the deadline plus the status TTL. A direct run is marked: if its process dies,
-# REGISTER takes the record over (AMEND FE-5).
-CONFIRM = """
+# KEYS: job, callers, then (index on) `tq:H`, `tq` and (names on) `tqn`. ARGV: keep secs, '1'
+# for a direct run, then (index on) the tenant hash, index keep ms, message id ('' direct),
+# class, request id, tenant name. The send succeeded: the record lives until the deadline plus
+# the status TTL, and the call is indexed. A direct run is marked: if its process dies,
+# REGISTER takes the record over (AMEND FE-5), and its confirm indexes it again.
+CONFIRM = (
+    _INDEX_FN
+    + """
 redis.call('HSET', KEYS[1], 'confirmed', '1')
 if ARGV[2] == '1' then redis.call('HSET', KEYS[1], 'direct', '1') end
 X.expire(KEYS[1], tonumber(ARGV[1]) * 1000)
 X.expire(KEYS[2], tonumber(ARGV[1]) * 1000)
+if #KEYS >= 4 then
+  index_add(KEYS[1], KEYS[3], KEYS[4], ARGV[7], ARGV[3], tonumber(ARGV[4]), ARGV[5], ARGV[6],
+    KEYS[5], ARGV[8])
+end
 return 1
 """
+)
 
 # KEYS: job, callers, status. ARGV: caller. The send failed: drop the unconfirmed record.
 ABANDON = """
@@ -237,12 +284,15 @@ end
 # channel prefix (`<prefix>:done:`), request id, then '1' to write the status too (its TTL and
 # field / value pairs follow). Writes the result only if none exists, marks the claim final,
 # writes the final status and wakes every caller waiting on this id (one round trip; the
-# status was a second). Reply: 1 written, 0 a result already existed.
+# status was a second). The call leaves the request index (T1). Reply: 1 written, 0 a result
+# already existed.
 RESULT_PUT = (
     _STATUS_FN
+    + _INDEX_FN
     + """
 local written = X.set(KEYS[1], ARGV[1], tonumber(ARGV[2]) * 1000, true)
 if redis.call('EXISTS', KEYS[2]) == 1 then
+  index_drop(KEYS[2], ARGV[6])
   redis.call('HSET', KEYS[2], 'state', ARGV[3])
   X.expire(KEYS[2], tonumber(ARGV[4]) * 1000)
 end
@@ -269,9 +319,11 @@ SETTLE_DONE = (
     _COMMON
     + _SETTLE
     + _STATUS_FN
+    + _INDEX_FN
     + """
 local written = X.set(KEYS[1], ARGV[4], tonumber(ARGV[5]) * 1000, true)
 if redis.call('EXISTS', KEYS[2]) == 1 then
+  index_drop(KEYS[2], ARGV[9])
   redis.call('HSET', KEYS[2], 'state', ARGV[6])
   X.expire(KEYS[2], tonumber(ARGV[7]) * 1000)
 end
@@ -336,24 +388,88 @@ return value
 """
 RESULT_DROP = _DROP_READ + "return 1\n"
 
-# KEYS: job, cancel of each call. ARGV: cancel ttl secs, cancel channel, then the request ids.
-# Cancel wins (owner decision Q3): any caller's cancel stops the call for every caller on its id,
-# with no read of the callers set in a round trip of its own (R3RC-1: that read-then-write never
-# cancelled a shared id, or cancelled a caller that attached in between). A call already final
-# is left alone, so a later run of its id (Q2) is not cancelled by a stale mark. An attach after
-# the mark waits on the same call and gets its `cancelled` reply. Reply: how many were marked.
+# KEYS: job, cancel of each call. ARGV: cancel ttl secs, cancel channel, only state ('' any
+# call not final; `queued`: only while its job is still `queued`, 0.2.0 T2), then the request
+# ids. Cancel wins (owner decision Q3): any caller's cancel stops the call for every caller on
+# its id, with no read of the callers set in a round trip of its own (R3RC-1: that
+# read-then-write never cancelled a shared id, or cancelled a caller that attached in between).
+# A call already final is left alone, so a later run of its id (Q2) is not cancelled by a stale
+# mark. An attach after the mark waits on the same call and gets its `cancelled` reply. Reply:
+# {marked, skipped because they started (only state `queued`)}.
 CANCEL = """
-local n = 0
+local n, started = 0, 0
 for i = 1, #KEYS / 2 do
   local state = redis.call('HGET', KEYS[2 * i - 1], 'state')
   if state ~= 'done' and state ~= 'failed' and state ~= 'expired' and state ~= 'cancelled' then
-    X.set(KEYS[2 * i], '1', tonumber(ARGV[1]) * 1000)
-    redis.call('PUBLISH', ARGV[2], ARGV[2 + i])
-    n = n + 1
+    if ARGV[3] ~= '' and state ~= ARGV[3] then
+      started = started + 1
+    else
+      X.set(KEYS[2 * i], '1', tonumber(ARGV[1]) * 1000)
+      redis.call('PUBLISH', ARGV[2], ARGV[3 + i])
+      n = n + 1
+    end
   end
 end
-return n
+return {n, started}
 """
+
+# Extend a call's deadline (0.2.0 T2, owner D6). KEYS: job, callers, status. ARGV: the new
+# deadline (store ms), how long the records outlive it (ms: caller margin + status TTL), the
+# caller margin (ms, the index scores a deadline plus it), the done-channel prefix
+# (`<prefix>:done:`), the cancel channel, the request id. The deadline lives in three places
+# and all three move here: the records (job `dl`, grown TTLs of job / callers / status and the
+# request index score), each worker holding the call (the notice on the cancel channel, every
+# worker reads it; a worker that receives it later reads `dl` before it expires the call) and
+# each waiting caller (the notice on its done channel: its timer is rescheduled). Only grows.
+# Reply: {'ok'} or {'final' | 'gone' | 'already' | 'past'}.
+EXTEND = """
+local state = redis.call('HGET', KEYS[1], 'state')
+if not state then return {'gone'} end
+if state == 'done' or state == 'failed' or state == 'expired' or state == 'cancelled' then
+  return {'final'}
+end
+local dl = tonumber(ARGV[1])
+if dl <= tonumber(redis.call('HGET', KEYS[1], 'dl') or '0') then return {'already'} end
+local now = X.now()
+if dl <= now then return {'past'} end
+redis.call('HSET', KEYS[1], 'dl', ARGV[1])
+local keep = dl - now + tonumber(ARGV[2])
+for i = 1, 3 do
+  if redis.call('EXISTS', KEYS[i]) == 1 and X.pttl(KEYS[i]) < keep then X.expire(KEYS[i], keep) end
+end
+local ix = redis.call('HGET', KEYS[1], 'ix')
+local h = redis.call('HGET', KEYS[1], 'ixh')
+if ix and h then
+  local score = dl + tonumber(ARGV[3])
+  redis.call('ZADD', ix, 'XX', 'GT', score, ARGV[6])
+  local ixs = string.sub(ix, 1, #ix - #h - 1)
+  redis.call('ZADD', ixs, 'GT', score, h)
+  local ms = score - now + 60000
+  if X.pttl(ix) < ms then X.expire(ix, ms) end
+  if X.pttl(ixs) < ms then X.expire(ixs, ms) end
+end
+local notice = '\\0x\\0' .. ARGV[1] .. '\\0' .. ARGV[6]
+for _, caller in ipairs(redis.call('SMEMBERS', KEYS[2])) do
+  redis.call('PUBLISH', ARGV[4] .. caller, notice)
+end
+redis.call('PUBLISH', ARGV[5], notice)
+return {'ok'}
+"""
+# The prefix of an extend notice on a done or cancel channel (a request id never starts with a
+# NUL): `\0x\0<deadline ms>\0<request id>`.
+EXTEND_NOTICE = "\0x\0"
+
+
+def extend_notice(data: str) -> tuple[str, int] | None:
+    """(request id, new deadline ms) of an extend notice; None for a plain request id."""
+    if not data.startswith(EXTEND_NOTICE):
+        return None
+    deadline, _, rid = data[len(EXTEND_NOTICE) :].partition("\0")
+    try:
+        return rid, int(deadline)
+    except ValueError:
+        return None
+
 
 # KEYS: status. ARGV: state, ttl, then field / value pairs (see `_STATUS_FN`).
 STATUS_SET = _STATUS_FN + "return set_status(KEYS[1], ARGV[1], tonumber(ARGV[2]), 3)\n"
@@ -364,6 +480,24 @@ class Registration:
     """What `register` found: new, attached, takeover, done, expired, conflict or cancelled."""
 
     outcome: str
+    message_id: str = ""  # `register_send`: the id of the message it sent ('' when none)
+
+
+@dataclass(frozen=True, slots=True)
+class IndexEntry:
+    """Where a call goes in the request index (T1): its model's keys and its tenant.
+
+    `keys`: the request index `tq:H`, the tenant index `tq` and, with tenant names on, `tqn`.
+    `tenant_hash` is H (`-` for no tenant), `keep_ms` how long the entry counts (the call's
+    deadline from now), `cls` its class (`p` / `n`), `name` the tenant name ('' unless names
+    are on).
+    """
+
+    keys: tuple[str, ...]
+    tenant_hash: str
+    keep_ms: int
+    cls: str
+    name: str = ""
 
 
 class RequestStore:
@@ -427,6 +561,7 @@ class RequestStore:
         self._status = client.register_script(pre + STATUS_SET)
         self._cancel = client.register_script(pre + CANCEL)
         self._settle_done = client.register_script(pre + SETTLE_DONE)
+        self._extend = client.register_script(pre + EXTEND)
 
     def _req(self, request_id: str) -> tuple[str, str, str, str]:
         k = self.keys
@@ -484,14 +619,20 @@ class RequestStore:
         max_waiting: int,
         retention_secs: int,
         keep_secs: float,
+        index: IndexEntry | None = None,
     ) -> Registration:
         """`register`, and for a new (or taken over) call its send and `confirm`, in one call.
 
         Only when the queue lives in this store. `QueueFull` above `max_waiting` (the record
-        just made is dropped, as `abandon` did).
+        just made is dropped, as `abandon` did). With `index`, a sent call is indexed in the
+        same script (T1).
         """
+        index_keys: list[str] = list(index.keys) if index else []
+        index_args: list[Any] = (
+            [index.tenant_hash, index.keep_ms, index.cls, index.name] if index else []
+        )
         reply = await self._register_send(
-            [*self._req(request_id), *queue_keys],
+            [*self._req(request_id), *queue_keys, *index_keys],
             [
                 user_hash,
                 params_hash,
@@ -509,23 +650,37 @@ class RequestStore:
                 int(keep_secs) + self.status_ttl_secs,
                 self.caller_ttl_secs,
                 self.lease_ms,
+                *index_args,
             ],
         )
         outcome = _text(reply[0])
         if outcome == "full":
             raise QueueFull(queue, int(reply[1]))
-        return Registration(outcome)
+        return Registration(outcome, _text(reply[1]) if len(reply) > 1 else "")
 
-    async def confirm(self, request_id: str, *, keep_secs: float, direct: bool = False) -> None:
+    async def confirm(
+        self,
+        request_id: str,
+        *,
+        keep_secs: float,
+        direct: bool = False,
+        index: IndexEntry | None = None,
+        message_id: str = "",
+    ) -> None:
         """The send succeeded: keep the record until the deadline plus the status TTL.
 
         `direct`: the call runs in this process, not from a queue; marked so that a caller of
-        the id takes the record over if this process dies (AMEND FE-5).
+        the id takes the record over if this process dies (AMEND FE-5). With `index`, the call
+        is indexed in the same script (T1); `message_id` is its stream message ('' direct).
         """
         job, callers, _, _ = self._req(request_id)
-        await self._confirm(
-            [job, callers], [int(keep_secs) + self.status_ttl_secs, "1" if direct else "0"]
-        )
+        args: list[Any] = [int(keep_secs) + self.status_ttl_secs, "1" if direct else "0"]
+        keys = [job, callers]
+        if index is not None:
+            keys += list(index.keys)
+            args += [index.tenant_hash, index.keep_ms, message_id, index.cls, request_id]
+            args.append(index.name)
+        await self._confirm(keys, args)
 
     async def abandon(self, request_id: str, *, caller: str) -> None:
         """The send failed: remove this caller's unconfirmed record."""
@@ -776,20 +931,63 @@ class RequestStore:
                 await asyncio.sleep(pause)
         return None  # not reached: the last pass returns or raises
 
-    async def cancel(self, request_ids: Sequence[str], *, ttl_secs: int, channel: str) -> int:
+    async def cancel(
+        self,
+        request_ids: Sequence[str],
+        *,
+        ttl_secs: int,
+        channel: str,
+        only_state: str | None = None,
+    ) -> int:
         """Mark calls cancelled and announce each on `channel`, in one script; how many.
 
         Cancel wins for a shared id (Q3, R3RC-1): every caller of it gets `cancelled`. A call
-        already final is skipped.
+        already final is skipped. `only_state="queued"`: only calls still waiting are marked
+        (a call granted meanwhile is left running; `cancel_counts` says how many).
         """
+        marked, _ = await self.cancel_counts(
+            request_ids, ttl_secs=ttl_secs, channel=channel, only_state=only_state
+        )
+        return marked
+
+    async def cancel_counts(
+        self,
+        request_ids: Sequence[str],
+        *,
+        ttl_secs: int,
+        channel: str,
+        only_state: str | None = None,
+    ) -> tuple[int, int]:
+        """`cancel`, returning (marked, skipped because they were no longer in `only_state`)."""
         if not request_ids:
-            return 0
+            return 0, 0
         keys = [
             k
             for rid in request_ids
             for k in (self.keys.request(rid, "job"), self.keys.request(rid, "cancel"))
         ]
-        return int(await self._cancel(keys, [ttl_secs, channel, *request_ids]))
+        reply = await self._cancel(keys, [ttl_secs, channel, only_state or "", *request_ids])
+        return int(reply[0]), int(reply[1])
+
+    async def extend(self, request_id: str, *, deadline_ms: int, margin_secs: float) -> str:
+        """Move a call's deadline to `deadline_ms` (store ms) everywhere it lives (`EXTEND`).
+
+        `margin_secs` is the callers' margin (the index scores a deadline plus it). Returns
+        `ok`, `final`, `gone`, `already` (not later than its current one) or `past`.
+        """
+        job, callers, status, _ = self._req(request_id)
+        reply = await self._extend(
+            [job, callers, status],
+            [
+                deadline_ms,
+                int((margin_secs + self.status_ttl_secs) * 1000),
+                int(margin_secs * 1000),
+                f"{self.keys.prefix}:done:",
+                self.keys.cancel_channel,
+                request_id,
+            ],
+        )
+        return _text(reply[0])
 
     async def set_status(self, request_id: str, state: str, **fields: Any) -> bool:
         """Write a status (False when a final state was already there)."""

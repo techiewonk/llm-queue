@@ -132,12 +132,11 @@ request gets the same answer. It is a direct `LLMQueueError`, not a `ConfigError
   it from the registry first);
 - `purge.deployment(alias, "account/name")` names a deployment the stored registry still has
   (same);
-- `purge.tenant(..., remove=...)` asks for `queued` or `running` while `LLMQ_TENANT_INDEX` is off
-  (the per-tenant call index is needed to find the calls);
-- a process-local operation (`drain.*`) runs without a queue (`AdminServices.from_env()`);
-- an operation needs the per-model request index service, which this build does not have yet:
-  `requests list`, `count`, `reprioritize`, `extend`, a cancel by model or tenant, `tenants
-  list` and `purge queue` answer `requests service not available`.
+- `purge.tenant(..., remove=...)` asks for `queued` or `running`, or a requests operation looks
+  calls up by model or tenant, while the request index is off
+  (`LLMQ_REQUEST_INDEX_ENABLED=false`: the index is needed to find the calls);
+- a requests operation would read more than `LLMQ_ADMIN_SCAN_MAX` index entries;
+- a process-local operation (`drain.*`) runs without a queue (`AdminServices.from_env()`).
 
 A dry run (the default of every write) raises it too, so the report shows the refusal before
 anything changes. The HTTP routes answer 409 with `{"error": ...}` and no `Retry-After`; the CLI

@@ -141,11 +141,17 @@ def test_a_long_wait_lands_in_a_finite_bucket() -> None:
 
 
 def test_every_listed_metric_has_help_and_bounded_labels() -> None:
-    """R3OB-14 / R3OB-12: one table; no label that a caller controls (request, user, tenant)."""
+    """R3OB-14 / R3OB-12: one table; no label that a caller controls (request, user, tenant).
+
+    0.2.0 T6 (owner Q10): `tenant` only on the two metrics it was asked for, with values bounded
+    by the `LLMQ_METRICS_TENANTS` allow-list (`other`, `-` otherwise).
+    """
+    with_tenant = {"llmq_calls_total", "llmq_wait_seconds"}
     for name, spec in METRICS.items():
         assert spec.help, name
         assert spec.help != name
-        assert not {"request_id", "user", "tenant", "session", "pod", "worker"} & set(spec.labels)
+        assert not {"request_id", "user", "session", "pod", "worker"} & set(spec.labels)
+        assert ("tenant" in spec.labels) == (name in with_tenant), name
 
 
 def test_a_process_that_lost_the_alert_lock_clears_its_gauges() -> None:

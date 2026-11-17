@@ -47,6 +47,7 @@ from llm_queue.engine.metrics import Metrics, sink_for
 from llm_queue.engine.offload import ResultOffload
 from llm_queue.engine.purge import PurgeSettings
 from llm_queue.engine.queue import QueueFull
+from llm_queue.engine.requests_admin import AdminSettings
 from llm_queue.engine.runtime import Engine, EngineSettings
 from llm_queue.engine.settings import STORE_POOL_MARGIN, InfraSettings, Layers
 from llm_queue.engine.store_client import Secrets, secret_store_client
@@ -381,6 +382,7 @@ class LLMQueue:
                 debug_capture_allowed=settings.debug_capture_from_config,
                 timings=tuning.engine,
                 purge=PurgeSettings.from_infra(settings),
+                admin=AdminSettings.from_infra(settings),
             )
             return Engine(
                 state,

@@ -162,7 +162,7 @@ Reply returned to the app</pre></div>
         <tr><td><code>LLMQ_AUDIT_RETENTION_DAYS</code></td><td>90</td><td>Registry audit stream (also capped near 10,000)</td></tr>
         <tr><td><code>LLMQ_AUTO_PURGE</code> / <code>LLMQ_PURGE_GRACE_SECS</code></td><td>on / 900</td><td>Delete a removed model's or deployment's keys after the grace</td></tr>
         <tr><td><code>LLMQ_PURGE_WAIT</code> / <code>_WAIT_SECS</code></td><td>true / 300</td><td>A deployment purge waits for its running calls</td></tr>
-        <tr><td><code>LLMQ_TENANT_INDEX</code> / <code>LLMQ_TENANT_PURGE_DEFAULT</code></td><td>false / keys</td><td>Per-tenant call index (needed to cancel a tenant's calls) / what a tenant purge removes</td></tr>
+        <tr><td><code>LLMQ_REQUEST_INDEX_ENABLED</code> / <code>LLMQ_TENANT_PURGE_DEFAULT</code></td><td>true / keys</td><td>Request index per model and tenant (needed to find a tenant's calls) / what a tenant purge removes</td></tr>
         <tr><td>Registry <code>queue.retention_secs</code>, <code>dlq_retention_secs</code></td><td>86400</td><td>Queue stream and dead-letter trimming</td></tr>
         <tr><td>Registry <code>sticky.idle_ttl_secs</code></td><td>1800</td><td>Session-to-deployment stickiness</td></tr>
       </tbody>

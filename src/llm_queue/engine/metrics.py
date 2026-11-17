@@ -16,7 +16,7 @@ import queue
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
@@ -34,6 +34,31 @@ Kind = Literal["counter", "histogram", "gauge"]
 # wait landed in +Inf (R3OB-14).
 WAIT_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0)
 CALL_BUCKETS = (0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0)
+
+
+TENANT_OTHER = "other"  # the `tenant` label of a tenant not in LLMQ_METRICS_TENANTS
+TENANT_NONE = "-"  # ... of a call with no tenant
+
+
+class TenantLabels:
+    """The `tenant` metric label of a call (0.2.0 T6, owner Q10): an allow-list.
+
+    `pairs` are (tenant name, label) from `LLMQ_METRICS_TENANTS`; only their keyed hashes are
+    kept (a call's message carries the hash, D1). A tenant not listed is `other`, no tenant
+    `-`: the label is always there and its values are bounded (at most 50 + 2).
+    """
+
+    __slots__ = ("_by_hash",)
+
+    def __init__(self, pairs: Sequence[tuple[str, str]], hash_id: Callable[[str], str]) -> None:
+        """Hash each listed name once; the names themselves are not kept."""
+        self._by_hash = {hash_id(name): label for name, label in pairs}
+
+    def __call__(self, tenant_hash: str | None) -> str:
+        """The label of a call whose tenant hash is `tenant_hash`."""
+        if not tenant_hash:
+            return TENANT_NONE
+        return self._by_hash.get(tenant_hash, TENANT_OTHER)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,9 +95,10 @@ _DEP = "model deployment"
 METRICS: dict[str, MetricSpec] = {
     # ---- per call (worker)
     "llmq_calls_total": _c(
-        "model account region outcome",
+        "model account region outcome tenant",
         "Calls finished by a worker, by outcome (ok or the error kind); account and region "
-        "of the last deployment tried, '-' when none was",
+        "of the last deployment tried, '-' when none was; tenant: its LLMQ_METRICS_TENANTS "
+        "label, 'other' when not listed, '-' with no tenant",
     ),
     "llmq_caller_failures_total": _c(
         "model outcome",
@@ -89,8 +115,9 @@ METRICS: dict[str, MetricSpec] = {
     "llmq_tokens_output_total": _c("model account region", "Output tokens of successful calls"),
     "llmq_fallback_total": _c("kind model", "Successful calls served by a fallback"),
     "llmq_wait_seconds": _h(
-        "model priority",
-        "Queue wait: from send until a worker took the call (budget hold not included)",
+        "model priority tenant",
+        "Queue wait: from send until a worker took the call (budget hold not included); "
+        "tenant as on llmq_calls_total",
         WAIT_BUCKETS,
     ),
     "llmq_admission_wait_seconds": _h(

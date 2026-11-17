@@ -120,6 +120,26 @@ request index ships.
   `aliases(registry)` maps model ids to aliases; `boot_registry(registry)` returns the parsed
   registry. See [Use LangChain models](docs/how-to/langchain.md).
 - `LLMQueue.embed_one(model, text, **kw)` and `embed_one_sync(...)` (H8): one text's vector.
+- Requests by model and tenant (T): every call in flight is indexed under its model and tenant
+  hash (`P:{m:ALIAS}:tq:H`, `P:{m:ALIAS}:tq`) by the scripts that send and end it (no extra
+  round trip; `LLMQ_REQUEST_INDEX_ENABLED`, on). `RequestsAdmin` (`Engine.requests_admin`,
+  `engine/requests_admin.py`) lists, counts and gets calls by model and tenant, and cancels,
+  reprioritizes and extends them: dry run by default, audited with counts and the tenant hash
+  only. Cancel defaults to waiting calls and answers them `cancelled` at once; reprioritize
+  moves waiting messages to the other class's queue (`MOVE`) keeping their deadline and place
+  (stream field `pos`), never a call a worker holds; extend moves one call's deadline in the
+  records, the workers and the waiting callers. `status(model, tenant=...)` adds the tenant's
+  calls by stage and fairness numbers; every model report adds `tenants` and `request_index`.
+  `llmq_calls_total` and `llmq_wait_seconds` get a `tenant` label bounded by
+  `LLMQ_METRICS_TENANTS`. New settings: `LLMQ_TENANT_NAMES_ENABLED`, `LLMQ_ADMIN_BATCH`,
+  `LLMQ_ADMIN_SCAN_MAX`, `LLMQ_REQUESTS_LIST_MAX`, `LLMQ_REQUESTS_MOVE_BATCH`,
+  `LLMQ_REQUESTS_MOVE_BYTES`, `LLMQ_METRICS_TENANTS`.
+
+### Removed
+
+- `LLMQ_TENANT_INDEX` and its cross-model index `P:tenant:H:reqs` (with
+  `PurgeService.index_call`): a tenant purge of `queued` / `running` calls reads the request
+  index of each model. `LLMQ_PURGE_BATCH` (now `LLMQ_ADMIN_BATCH`).
 
 ### Changed
 
@@ -131,7 +151,13 @@ request index ships.
   were refused as "both set"; the conflict group now lets the secret's form win.
 - `STORE_POOL_MARGIN` moved from `llm_queue.core` to `llm_queue.engine.settings`; the internal
   `core._SecretFirst` mapping was replaced by `Layers`.
-
+- Messages carry only keyed hashes of `tenant_id` and `user_id` (owner D1): stream bodies and
+  dead letters no longer hold them in clear. Worker-side hooks (balancer, fallback policy,
+  sticky key) see the hashes; the caller's admission hook still sees the raw ids. Tenant names
+  in the boot registry's `fairness.weights` / `quotas` are replaced by their hashes when the
+  file is read (D2), so only hashes reach the store. A live edit must name the hash.
+- The admission class of a received call follows the queue it came from, not its body (a
+  reprioritized call is served in its new class). Calls sent by an older pod are not indexed.
 - `breaker_probe_secs` left unset is now the larger of 60 and the deployment's
   `attempt_timeout_secs`, so a registry with an attempt timeout above 60 s and no probe time
   loads instead of being refused. An explicit value below the attempt timeout is still refused.

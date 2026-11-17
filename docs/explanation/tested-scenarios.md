@@ -123,6 +123,7 @@ flight when a fault hit. The table adds each scenario's own rule.
 | R3 | registry | Live edit: `routing.kill_switch` on, then off | Calls sent while the switch was on ran in the caller (direct path), none by a worker; same budgets | none |
 | R4 | registry | Live edit with `rpm: -5` | The edit raises `RegistryError`; the registry version is unchanged | none |
 | C1 | caller | 40 calls to a 2 s model; 20 cancelled after 0.5 s | At most 40 provider calls; no cancelled call answered; the other calls served or refused on time | none |
+| T1 | caller | S-T (0.2.0): tenants A and B send 30 calls each to a model at 2 calls/s; at 2 s A's waiting calls are moved to the priority queue, at 4 s A's waiting calls are cancelled, at 5 s a worker is killed | Every B call served, none moved or cancelled; A's calls moved; every cancelled A call ends `cancelled` within 2 s (+1 s clock slack); the model's request index is empty at the end | none |
 | C2 | caller | A caller process with 100 waiting calls (model at 60 RPM) is killed | Its calls stop reaching the provider once its caller TTL has passed; at most a computed bound of them ran | none |
 | C3 | caller | Two callers send the same request id at once | Exactly one provider call; both callers get the same reply | none |
 | X1 | pairs | S4 + S1 | As S4 | on-time kinds |

@@ -1,7 +1,8 @@
 """Per-tenant fairness without a store: the setting, its checks, and the ask it builds.
 
-`fairness` is off by default (the ask then carries nothing); the tenant is the tenant id, else
-the user id; only the keyed hash leaves `fairness_for`; the registry refuses a quota with no
+`fairness` is off by default (the ask then carries nothing); the tenant is the tenant hash, else
+the user hash (messages carry only hashes, D1); registry tenant names are hashed at load (D2);
+the registry refuses a quota with no
 cap and a mode it does not know, and warns about settings the mode never reads.
 """
 
@@ -15,7 +16,13 @@ from typing import Any
 import pytest
 
 from llm_queue.engine.admission import Ask, Candidate
-from llm_queue.engine.fairness import NO_TENANT, Fairness, fairness_for, tenant_of
+from llm_queue.engine.fairness import (
+    NO_TENANT,
+    Fairness,
+    fairness_for,
+    hash_tenant_names,
+    tenant_hash_of,
+)
 from llm_queue.registry import check, load_registry
 
 FIXTURES = Path(__file__).parents[1] / "registry" / "fixtures"
@@ -43,19 +50,19 @@ def test_off_by_default(small: dict[str, Any]) -> None:
     view = load_registry(small)
     setting = view.value("gpt20b", "fairness")
     assert setting["mode"] == "off"
-    assert fairness_for(setting, "acme", "u1", _hash) is None
+    assert fairness_for(setting, "h(acme)") is None
 
 
 def test_tenant_then_user_then_shared() -> None:
-    assert tenant_of("acme", "u1") == "acme"
-    assert tenant_of(None, "u1") == "u1"
-    assert tenant_of(None, None) == NO_TENANT
+    assert tenant_hash_of("ht", "hu", _hash) == "ht"
+    assert tenant_hash_of(None, "hu", _hash) == "hu"
+    assert tenant_hash_of(None, None, _hash) == _hash(NO_TENANT)
 
 
 def test_share_weights_and_default() -> None:
-    setting = {"mode": "share", "weights": {"acme": 3}, "default_weight": 2, "active_secs": 30}
-    heavy = fairness_for(setting, "acme", None, _hash)
-    other = fairness_for(setting, "globex", None, _hash)
+    setting = {"mode": "share", "weights": {"h(acme)": 3}, "default_weight": 2, "active_secs": 30}
+    heavy = fairness_for(setting, "h(acme)")
+    other = fairness_for(setting, "h(globex)")
     assert heavy is not None
     assert other is not None
     assert (heavy.weight, other.weight) == (3.0, 2.0)
@@ -63,9 +70,9 @@ def test_share_weights_and_default() -> None:
 
 
 def test_quota_per_tenant_override() -> None:
-    setting = {"mode": "quota", "rpm": 10, "tpm": 1000, "quotas": {"acme": {"rpm": 50}}}
-    acme = fairness_for(setting, "acme", None, _hash, window="fixed")
-    other = fairness_for(setting, None, "u1", _hash)
+    setting = {"mode": "quota", "rpm": 10, "tpm": 1000, "quotas": {"h(acme)": {"rpm": 50}}}
+    acme = fairness_for(setting, "h(acme)", window="fixed")
+    other = fairness_for(setting, "h(u1)")
     assert acme is not None
     assert other is not None
     assert (acme.rpm, acme.tpm, acme.window) == (50, 1000, "fixed")
@@ -74,12 +81,27 @@ def test_quota_per_tenant_override() -> None:
 
 def test_body_has_only_the_hash() -> None:
     """The script sees the keyed hash of the tenant, never the raw id."""
-    fair = fairness_for({"mode": "fair_queue"}, "acme-raw", None, _hash, round_=7.0)
+    fair = fairness_for({"mode": "fair_queue"}, "h(acme-raw)", round_=7.0)
     assert fair is not None
     body = fair.body()
     assert body["h"] == "h(acme-raw)"
-    assert "acme-raw" not in json.dumps({k: v for k, v in body.items() if k != "h"})
     assert body["fr"] == 7.0
+
+
+def test_registry_tenant_names_are_hashed_at_load() -> None:
+    """D2: the boot document names tenants; only their hashes go on."""
+    doc = {
+        "defaults": {"fairness": {"mode": "share", "weights": {"acme": 2}}},
+        "models": {
+            "m": {"fairness": {"mode": "quota", "quotas": {"acme": {"rpm": 5}}}},
+            "n": {"type": "chat"},
+        },
+    }
+    out = hash_tenant_names(doc, _hash)
+    assert out["defaults"]["fairness"]["weights"] == {"h(acme)": 2}
+    assert out["models"]["m"]["fairness"]["quotas"] == {"h(acme)": {"rpm": 5}}
+    assert out["models"]["n"] == {"type": "chat"}
+    assert doc["defaults"]["fairness"]["weights"] == {"acme": 2}  # the input is not changed
 
 
 def test_ask_without_fairness_sends_no_tf() -> None:

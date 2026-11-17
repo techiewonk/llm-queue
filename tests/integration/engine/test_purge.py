@@ -6,8 +6,8 @@ Against the real stores (Valkey and Redis): each purge kind as a dry run, for re
 
 from __future__ import annotations
 
+import asyncio
 import copy
-import dataclasses
 import json
 from typing import Any
 
@@ -16,6 +16,7 @@ import redis.asyncio
 from engine_testkit import CHAT, Make, registry
 
 from llm_queue.engine.cli import amain
+from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.purge import PurgeService, PurgeSettings, keyed_hash
 from llm_queue.errors import AdminRefused
 from llm_queue.registry.store import RegistryStore
@@ -175,14 +176,24 @@ async def test_tenant_purge_fixes_the_weight_sum(store: redis.asyncio.Redis, pre
     assert not await store.exists(f"{m}tf:w")  # the last tenant: the hash goes
 
 
-async def test_tenant_calls_need_the_index(store: redis.asyncio.Redis, prefix: str) -> None:
-    svc = await _service(store, prefix)
-    with pytest.raises(AdminRefused, match="LLMQ_TENANT_INDEX"):
-        await svc.tenant("acme", actor="ops", dry_run=False, remove={"keys", "queued"})
-    indexed = await _service(store, prefix, tenant_index=True)
-    for rid, state in (("q1", "queued"), ("r1", "running")):
-        await indexed.index_call("acme", None, rid, now_ms=0, keep_ms=10**15)
+async def test_tenant_calls_come_from_the_request_index(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """T3: a tenant purge of queued / running calls reads the T1 index of each model."""
+    off = await _service(store, prefix, request_index=False)
+    with pytest.raises(AdminRefused, match="LLMQ_REQUEST_INDEX_ENABLED"):
+        await off.tenant("acme", actor="ops", dry_run=False, remove={"keys", "queued"})
+    indexed = await _service(store, prefix)
+    h = keyed_hash(SALT, "acme")
+    other = keyed_hash(SALT, "beta")
+    for rid, state, model, tenant in (
+        ("q1", "queued", "big", h),
+        ("r1", "running", "small", h),
+        ("b1", "queued", "big", other),
+    ):
+        await store.zadd(f"{prefix}:{{m:{model}}}:tq:{tenant}", {rid: 10**15})
         await store.hset(f"{prefix}:{{r:{rid}}}:job", "state", state)
+    await store.zadd(f"{prefix}:{{m:big}}:tq:{h}", {"lapsed": 1})  # past its deadline
     plan = await indexed.tenant("acme", actor="plan", remove={"queued"})
     assert plan.cancelled == 1
     done = await indexed.tenant("acme", actor="ops", dry_run=False, remove={"queued"})
@@ -195,8 +206,8 @@ async def test_tenant_calls_need_the_index(store: redis.asyncio.Redis, prefix: s
         "acme", actor="ops", dry_run=False, remove={"running", "keys"}
     )
     assert everything.cancelled == 2  # every indexed call (the cancel API counts a repeat)
-    h = keyed_hash(SALT, "acme")
-    assert not await store.exists(f"{prefix}:tenant:{h}:reqs")
+    assert not await store.exists(f"{prefix}:{{r:b1}}:cancel")  # another tenant: untouched
+    assert not await store.exists(f"{prefix}:{{r:lapsed}}:cancel")
 
 
 async def test_removed_purges_models_and_deployments(
@@ -291,25 +302,29 @@ async def test_cli_purge_dry_run_and_refusal(store: redis.asyncio.Redis, prefix:
     dry = await amain(["purge", "model", "ghost"], env)
     assert (dry["deleted_keys"], dry["dry_run"]) == (1, True)
     assert await store.exists(f"{prefix}:{{m:ghost}}:cfg")
+    off = {**env, "LLMQ_REQUEST_INDEX_ENABLED": "false"}
     with pytest.raises(AdminRefused):
-        await amain(["purge", "tenant", "acme", "--remove", "queued"], env)
+        await amain(["purge", "tenant", "acme", "--remove", "queued"], off)
     done = await amain(["--actor", "ops", "purge", "removed", "--yes"], env)
     assert (done["deleted_keys"], done["actor"]) == (1, "ops")
 
 
-async def test_engine_indexes_calls_by_tenant_when_asked(make: Make) -> None:
-    """`LLMQ_TENANT_INDEX`: each new call goes into its tenant's index (off: none is written)."""
-    engine, _ = await make()
-    assert (await engine.call("small", CHAT, tenant_id="acme")).ok
+async def test_engine_purges_a_tenants_calls_from_the_index(make: Make) -> None:
+    """T3: a running call of the tenant is found in the request index and cancelled."""
+    slow = {"defaults": {"latency_ms": {"p50": 3000, "p95": 3000}}}
+    engine, _ = await make({"small": {"timeout_secs": 30, "attempt_timeout_secs": 20}}, slow)
+    task = asyncio.create_task(engine.call("small", CHAT, tenant_id="acme"))
     h = engine.hash_id("acme")
-    key = f"{engine.keys.prefix}:tenant:{h}:reqs"
-    assert not await engine.state.exists(key)
-    on = PurgeSettings(tenant_index=True)
-    engine.settings = dataclasses.replace(engine.settings, purge=on)
-    engine.purge.settings = on
-    reply = await engine.call("small", CHAT, tenant_id="acme")
-    assert reply.ok
-    assert await engine.state.zcard(key) == 1
+    key = engine.keys.request_index("small", h)
+    for _ in range(100):
+        if await engine.state.zcard(key):
+            break
+        await asyncio.sleep(0.02)
+    report = await engine.purge.tenant("acme", actor="ops", dry_run=False, remove={"running"})
+    assert report.cancelled == 1
+    with pytest.raises(CallFailed, match="cancelled"):
+        await task
+    assert await engine.state.zcard(key) == 0  # the cancelled call's final write removed it
 
 
 async def test_auto_purge_waits_when_the_registry_cannot_be_read(

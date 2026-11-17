@@ -23,18 +23,18 @@ def test_purge_settings_defaults_and_validation() -> None:
         {
             **DEV,
             "LLMQ_AUTO_PURGE": "off",
-            "LLMQ_TENANT_INDEX": "on",
+            "LLMQ_REQUEST_INDEX_ENABLED": "off",
             "LLMQ_TENANT_PURGE_DEFAULT": "running, keys",
-            "LLMQ_PURGE_BATCH": "50",
+            "LLMQ_ADMIN_BATCH": "50",
         }
     )
     got = PurgeSettings.from_infra(custom)
-    assert (got.auto, got.tenant_index, got.batch) == (False, True, 50)
+    assert (got.auto, got.request_index, got.batch) == (False, False, 50)
     assert got.tenant_default == frozenset({"keys", "running"})
     for name, value in (
         ("LLMQ_AUTO_PURGE", "maybe"),
         ("LLMQ_TENANT_PURGE_DEFAULT", "keys,everything"),
-        ("LLMQ_PURGE_BATCH", "0"),
+        ("LLMQ_ADMIN_BATCH", "0"),
     ):
         with pytest.raises(ConfigError, match=name):
             InfraSettings.from_env({**DEV, name: value})
@@ -65,7 +65,7 @@ def test_key_expiry_and_purge_switches_are_validated() -> None:
         ("LLMQ_KEY_EXPIRY", "sometimes"),
         ("LLMQ_HTTP_PURGE_WAIT_SECS", "4000"),
         ("LLMQ_PURGE_WAIT", "maybe"),
-        ("LLMQ_TENANT_INDEX", "maybe"),
+        ("LLMQ_REQUEST_INDEX_ENABLED", "maybe"),
         ("LLMQ_TTL_SWEEP_BATCH", "6000"),
     ):
         with pytest.raises(ConfigError, match=name):

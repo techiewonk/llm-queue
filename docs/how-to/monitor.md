@@ -82,6 +82,13 @@ rollover. Their gauges suit dashboards better than paging.
   `llmq_region_blocked`.
 - Pods: `llmq_ready`, `llmq_store_up`, `llmq_held_calls`, `llmq_heartbeat_age_seconds`,
   `llmq_outage_memo_active`, `llmq_build_info` (which version runs where).
+- Tenants (0.2.0): list the tenants to watch in `LLMQ_METRICS_TENANTS` (`acme,globex=t2`, at most
+  50); `llmq_calls_total` and `llmq_wait_seconds` then carry `tenant="acme"` / `"t2"`, every other
+  tenant `other` and calls with no tenant `-`. The label is always present (fixed cardinality).
+- One tenant now: `status(model, tenant=...)` (engine `Engine.status`) adds a `tenant` block (its
+  hash, waiting / held / running / cancelling calls, oldest wait and, with `fairness` on, its
+  weight, quota, use this minute, slots and activity); every model report has `tenants`
+  (`active` tenants and their `indexed_calls`) and `request_index`.
 
 ## Logs Insights
 
@@ -140,13 +147,13 @@ from 0.1 s to 600 s. Alert gauges are named `llmq_alert_<name>`, labels `model` 
 
 | Name | Kind | Labels | Unit | From | Meaning |
 |---|---|---|---|---|---|
-| `llmq_calls_total` | counter | model, account, region, outcome | Count | worker | Calls finished by a worker, by outcome (ok or the error kind); account and region of the last deployment tried, '-' when none was |
+| `llmq_calls_total` | counter | model, account, region, outcome, tenant | Count | worker | Calls finished by a worker, by outcome (ok or the error kind); account and region of the last deployment tried, '-' when none was; tenant: its `LLMQ_METRICS_TENANTS` label, `other` when not listed, `-` with no tenant |
 | `llmq_caller_failures_total` | counter | model, outcome | Count | caller | Every failure a caller saw, by kind: also those no worker counts (rejected, queue_full, queue_unavailable, a caller-side deadline) |
 | `llmq_attempts_total` | counter | model, account, region, result | Count | worker | Provider attempts by result: ok, throttled, retryable, model_error, auth, target, or the request error kind |
 | `llmq_tokens_input_total` | counter | model, account, region | Count | worker | Input tokens of successful calls |
 | `llmq_tokens_output_total` | counter | model, account, region | Count | worker | Output tokens of successful calls |
 | `llmq_fallback_total` | counter | kind, model | Count | worker | Successful calls served by a fallback |
-| `llmq_wait_seconds` | histogram | model, priority | Seconds | worker | Queue wait: from send until a worker took the call (budget hold not included) |
+| `llmq_wait_seconds` | histogram | model, priority, tenant | Seconds | worker | Queue wait: from send until a worker took the call (budget hold not included); tenant as on `llmq_calls_total` |
 | `llmq_admission_wait_seconds` | histogram | model, priority | Seconds | worker | From send until the call's first grant: queue wait plus the wait for budget |
 | `llmq_call_seconds` | histogram | model, outcome | Seconds | worker | From send until the call finished, by outcome |
 | `llmq_provider_seconds` | histogram | model, account, region | Seconds | worker | Duration of each provider attempt |
