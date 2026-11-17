@@ -480,13 +480,15 @@ def _read_document(
     registry: str | None,
     registry_file: str | None,
     lookup: Callable[[str], str | None] | None = None,
+    used: set[str] | None = None,
 ) -> str:
     """The registry JSON from the variable or the file, refused when it repeats a key.
 
     `${NAME}` placeholders are expanded with `lookup` (default: `os.environ`) after parsing,
     so the repeated-key check sees the document as written and the expanded text is checked
-    again (`registry.interpolate`). A file ending `.yaml` / `.yml` is read as YAML (extra
-    `yaml`). Text without placeholders is returned as it is.
+    again (`registry.interpolate`; credentials are refused). A file ending `.yaml` / `.yml` is
+    read as YAML (extra `yaml`). Text without placeholders is returned as it is. `used`
+    collects the names the placeholders read.
     """
     yaml_file = False
     if registry:
@@ -503,7 +505,7 @@ def _read_document(
     document = load_yaml(text) if yaml_file else parse_document(text)
     if "${" not in text and not yaml_file:
         return text
-    return to_json(expand(document, lookup or os.environ.get))
+    return to_json(expand(document, lookup or os.environ.get, used=used))
 
 
 @dataclass(frozen=True, slots=True)
@@ -677,13 +679,17 @@ class InfraSettings:
         if registry and registry_file:
             problems.append("set one of LLMQ_REGISTRY and LLMQ_REGISTRY_FILE, not both")
         elif registry or registry_file:
+            used: set[str] = set()
             try:
-                document = boot = orjson.loads(_read_document(registry, registry_file, placeholder))
+                text = _read_document(registry, registry_file, placeholder, used)
+                document = boot = orjson.loads(text)
             except ConfigError as exc:
                 problems.append(str(exc))
             except ValueError as exc:  # orjson refuses what `json` took (NaN): R3CF-1
                 problems.append(f"registry is not valid JSON: {exc}")
             else:
+                if used:  # the names only: a value never reaches a log line
+                    logger.info("registry_placeholders", names=sorted(used))
                 accounts = document.get("accounts") if isinstance(document, dict) else None
                 kinds = [a.get("kind") for a in (accounts or {}).values() if isinstance(a, dict)]
                 if strict and "openai" in kinds and not hosts:

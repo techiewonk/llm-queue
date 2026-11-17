@@ -107,7 +107,10 @@ index (below).
   a JSON list, object, number or boolean becomes that value. An unset name without a default
   stops the start, naming the variable and its JSON path. Expansion runs on the parsed
   document, so a value cannot break the JSON, and repeated keys are still refused. Stored
-  documents and live edits are never expanded.
+  documents and live edits are never expanded. A placeholder may not read a credential
+  (`LLMQ_*_PASSWORD`, `LLMQ_*_TOKEN`, `LLMQ_ID_HASH_SALT`, `LLMQ_SECRET*`, the AWS key
+  variables): the expanded document is stored and served by `GET /registry`. The names read
+  are logged at start (`registry_placeholders`), never the values.
 - YAML registry files: a `LLMQ_REGISTRY_FILE` ending `.yaml` / `.yml` is read as YAML (new
   extra `llm-queue[yaml]`), with repeated keys refused like in JSON.
 - `residency.allowed_regions: "auto"`: every region the document's deployments use (and their

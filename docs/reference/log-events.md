@@ -118,6 +118,7 @@ never a tenant name); `call_cancel` carries `source` (`api`, `admin`, `purge`, .
 | `registry_metric_failed` | debug | registry/store.py |
 | `registry_needs_newer_library` | warning | registry/store.py |
 | `registry_older_ignored` | info | registry/store.py |
+| `registry_placeholders` | info | engine/settings.py (the `names` the boot registry's placeholders read; never a value) |
 | `registry_published` | info | registry/store.py |
 | `registry_reload_failed` | error | registry/store.py |
 | `registry_reload_failed` | warning | registry/store.py |

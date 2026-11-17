@@ -8,6 +8,10 @@ backslashes or newlines cannot break the document's quoting. Forms, inside any s
 * `${NAME:-default}`: `default` when `NAME` is unset or empty (as in a shell).
 * `$${`: a literal `${`.
 
+A placeholder may not read a credential (`CREDENTIAL_NAMES`: the store passwords, the admin
+tokens, the id salt, the secrets settings and the AWS keys): the expanded document is stored
+and served by `GET /registry`, so one would leak in clear (review B-09, owner Q11).
+
 A string that is exactly one placeholder becomes a typed value when the text it expands to is
 a JSON list, object, number, `true` / `false` or a quoted JSON string (the escape that keeps
 `"12345"` text). Expanded text is never expanded again, and keys are never expanded. Only the
@@ -32,6 +36,18 @@ _NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # A JSON number, or true / false: a whole-string placeholder expanding to one becomes that type.
 _SCALAR_RE = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?\Z|true\Z|false\Z")
 YAML_SUFFIXES = (".yaml", ".yml")
+# Names a placeholder may never read (any case): `LLMQ_*_PASSWORD`, `LLMQ_*_TOKEN`, the id
+# salt, `LLMQ_SECRET*` / `LLMQ_SECRETS_*` and the AWS credential variables.
+CREDENTIAL_NAMES = re.compile(
+    r"LLMQ_\w+_(?:PASSWORD|TOKEN)|LLMQ_ID_HASH_SALT|LLMQ_SECRETS?(?:_\w+)?"
+    r"|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN",
+    re.IGNORECASE,
+)
+
+
+def credential_name(name: str) -> bool:
+    """True when `name` is a credential a registry placeholder may not read."""
+    return CREDENTIAL_NAMES.fullmatch(name) is not None
 
 
 class _Placeholder:
@@ -88,8 +104,17 @@ class _Expander:
     def __init__(self, lookup: Lookup) -> None:
         self.lookup = lookup
         self.problems: list[str] = []
+        self.used: set[str] = set()
 
     def value_of(self, ph: _Placeholder, path: str) -> str | None:
+        where = path or "the top level"
+        if credential_name(ph.name):  # never looked up, default or not
+            self.problems.append(
+                f"`{ph.name}` (at {where}) names a credential, which a registry placeholder may "
+                "not read: the document is stored and served"
+            )
+            return None
+        self.used.add(ph.name)
         value = self.lookup(ph.name)
         if ph.default is not None and not value:
             return ph.default
@@ -147,10 +172,15 @@ class _Expander:
         return node
 
 
-def expand(document: Any, lookup: Lookup) -> Any:
-    """`document` with every placeholder expanded; `ConfigError` listing every problem."""
+def expand(document: Any, lookup: Lookup, *, used: set[str] | None = None) -> Any:
+    """`document` with every placeholder expanded; `ConfigError` listing every problem.
+
+    `used` (when given) collects the names the placeholders read, never their values.
+    """
     expander = _Expander(lookup)
     out = expander.walk(document, "")
+    if used is not None:
+        used |= expander.used
     if expander.problems:
         raise ConfigError("registry placeholders:\n  " + "\n  ".join(expander.problems))
     return out

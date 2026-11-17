@@ -253,8 +253,13 @@ JSON list, object, number or `true` / `false`: `"${EMBED_REGIONS:-[\"ap-south-1\
 `"${CHAT_RPM:-100}"` a number. To keep a number as text, give the variable a quoted JSON string
 (`ACCOUNT_ID='"012345678901"'`). Inside a longer string the value is inserted as text. Expanded
 text is not expanded again, keys are never expanded, and values never appear in an error
-message. A value expanded into the document is published to the store with it, so keep
-credentials in the `*_ref` fields, not in placeholders.
+message. A value expanded into the document is published to the store with it and served by
+`GET /registry`, so keep credentials in the `*_ref` fields, not in placeholders: a placeholder
+that names a credential is refused (the load fails naming it and its path, with or without a
+default, and it is never looked up). Refused, in any case: `LLMQ_*_PASSWORD`, `LLMQ_*_TOKEN`,
+`LLMQ_ID_HASH_SALT`, `LLMQ_SECRET*` / `LLMQ_SECRETS_*`, `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`. At start `registry_placeholders` logs the
+names the document read, never their values.
 
 A `LLMQ_REGISTRY_FILE` ending in `.yaml` or `.yml` is read as YAML, for comments (install
 `llm-queue[yaml]`); repeated keys, non-text keys and `.nan` / `.inf` are refused.

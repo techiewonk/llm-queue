@@ -31,6 +31,11 @@ The registry names secrets; it never holds them:
 - The value is looked up in the secrets (`from_env(secrets=)`, else `LLMQ_SECRETS_SOURCE`)
   first, then the environment.
 - Audit entries and the HTTP router redact `role_arn`, `external_id_ref` and `api_key_ref`.
+- Registry `${NAME}` placeholders may not name a credential: `LLMQ_*_PASSWORD`,
+  `LLMQ_*_TOKEN`, `LLMQ_ID_HASH_SALT`, `LLMQ_SECRET*` / `LLMQ_SECRETS_*`,
+  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` are refused at start
+  (the expanded document is stored and served by `GET /registry`). The names a document read
+  are logged (`registry_placeholders`), never the values.
 
 ### Read secrets from a secret store, not the manifest
 
