@@ -20,11 +20,14 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 import orjson
 from redis.connection import parse_url, to_bool
 
+from llm_queue._logging import get_logger
 from llm_queue.engine.expiry import KEY_EXPIRY_MODES
 from llm_queue.engine.store_guard import WAIT_SCOPES, parse_scopes
 from llm_queue.errors import ConfigError
 from llm_queue.registry.interpolate import YAML_SUFFIXES, expand, load_yaml, to_json
 from llm_queue.registry.validate import parse_document
+
+logger = get_logger(__name__)
 
 PREFIX = "LLMQ_"
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
@@ -64,6 +67,18 @@ CONFLICT_GROUPS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("REGISTRY",), ("REGISTRY_FILE",)),
 )
 _TRUE, _FALSE = ("true", "1", "yes", "on"), ("false", "0", "no", "off")
+# Settings that no longer exist (review B-15, owner RV4). One still set in the environment or
+# `defaults=` is reported at start: a `ConfigError` when strict, else a `setting_renamed` /
+# `setting_removed` warning, so an old manifest never silently gets the default. Old name ->
+# new name, and old name -> what to do instead; the env-rename wave adds its names here.
+RENAMED: dict[str, str] = {
+    "LLMQ_LOCAL_LIMIT_CAP": "LLMQ_LOCAL_CONCURRENCY",  # one name for local mode and static_cap
+    "LLMQ_PURGE_BATCH": "LLMQ_ADMIN_BATCH",
+}
+REMOVED: dict[str, str] = {
+    "LLMQ_TENANT_INDEX": "tenant purges read each model's request index "
+    "(LLMQ_REQUEST_INDEX_ENABLED)",
+}
 # Where secrets come from is never itself read from a secret (llm_queue.secrets.SETTINGS).
 _SECRETS_SETTINGS = frozenset(
     PREFIX + n
@@ -273,6 +288,29 @@ class Layers(Mapping[str, str]):
     def __len__(self) -> int:
         """How many names `__iter__` yields."""
         return len(dict.fromkeys([*self._env, *self._defaults]))
+
+
+def old_names(layers: Layers, *, strict: bool) -> list[str]:
+    """Renamed or removed settings still set (`RENAMED`, `REMOVED`): problems when strict.
+
+    Outside strict mode each is logged (`setting_renamed` / `setting_removed`) and `[]` is
+    returned. Only the environment and `defaults=` are looked at (secrets cannot be listed).
+    """
+    problems: list[str] = []
+    for name in sorted(set(layers)):
+        if name in RENAMED:
+            event, text = "setting_renamed", f"{name} was renamed {RENAMED[name]}: set that instead"
+        elif name in REMOVED:
+            event, text = "setting_removed", f"{name} was removed: {REMOVED[name]}"
+        else:
+            continue
+        if layers.get(name) is None:
+            continue
+        if strict:
+            problems.append(text)
+        else:
+            logger.warning(event, setting=name, use=RENAMED.get(name), hint=text)
+    return problems
 
 
 def read_bool(layers: Mapping[str, Any], name: str, default: bool, problems: list[str]) -> bool:
@@ -613,6 +651,7 @@ class InfraSettings:
         if environment == "production":
             environment = "prod"
         strict = environment not in DEV_ENVIRONMENTS
+        problems += old_names(layers, strict=strict)
         host = str(get("STORE_HOST", "") or "").strip() or None
         if store and "STORE_URL" in layers.conflicts():
             problems.append(

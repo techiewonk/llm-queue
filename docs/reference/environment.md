@@ -131,8 +131,21 @@ How calls run (see [Modes](../how-to/modes.md) for when to switch and how to und
 |---|---|---|---|
 | `LLMQ_EXECUTION_MODE` | `queue` | `queue`, `local` | `queue`: calls go through the store's queues and shared budgets. `local`: every call runs in this process straight against the provider, with the same API, classes, LangChain adapters and `install()`; no store client is built (`LLMQ_STORE_URL` is not needed), store-only operations raise `LocalModeRefused` (HTTP 503) and `LLMQ_MODE` does not apply |
 | `LLMQ_LOCAL_PROCESS_COUNT` | 1 | above 0 to 100000 (whole) | The local executor's share of each budget: every deployment's (and account's shared) `rpm` / `tpm` is divided by this in each process. Set it to the processes sharing the quota (pods x workers). Used in `local` mode and by `store_down: static_cap`. A fixed ceiling, read at start: it does not follow autoscaling, so set it to the most processes that may run at once (fewer running leave quota unused, more go over it). `local_mode_started` logs the share each process takes per model; queue mode logs `static_cap_process_count_unset` at start when a model uses `static_cap` and this is left at 1 |
-| `LLMQ_LOCAL_CONCURRENCY` | 10 | above 0 to 100000 (whole) | Calls in flight per model and process on the local executor (`local` mode and `store_down: static_cap`; async and sync calls together); priority calls get a free slot first. |
+| `LLMQ_LOCAL_CONCURRENCY` | 10 | above 0 to 100000 (whole) | Calls in flight per model and process on the local executor (`local` mode and `store_down: static_cap`; async and sync calls together); priority calls get a free slot first. The one setting for both: the old `LLMQ_LOCAL_LIMIT_CAP` is reported as renamed |
 | `LLMQ_STATIC_CAP_WAIT_SECS` | 5 | 0 to 3600 | The longest a `store_down: static_cap` call waits for a budget or a breaker during a store outage, below its own `max_wait_secs`; then `rate_limited`. Retries and their backoff are not capped |
+
+## Renamed and removed settings
+
+A setting that no longer exists is never ignored in silence: when one is still set in the
+environment or `defaults=`, a strict environment refuses to start (`ConfigError` naming the
+new setting) and a dev one logs `setting_renamed` / `setting_removed` (the name, never the
+value). The list is `RENAMED` / `REMOVED` in `llm_queue.engine.settings`:
+
+- `LLMQ_LOCAL_LIMIT_CAP`: renamed `LLMQ_LOCAL_CONCURRENCY` (one setting for local mode and
+  `store_down: static_cap`).
+- `LLMQ_PURGE_BATCH`: renamed `LLMQ_ADMIN_BATCH`.
+- `LLMQ_TENANT_INDEX`: removed; tenant purges read each model's request index
+  (`LLMQ_REQUEST_INDEX_ENABLED`).
 
 ## Environment, names and process
 

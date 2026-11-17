@@ -181,6 +181,10 @@ index (below).
 - `LLMQ_TENANT_INDEX` and its cross-model index `P:tenant:H:reqs` (with
   `PurgeService.index_call`): a tenant purge of `queued` / `running` calls reads the request
   index of each model. `LLMQ_PURGE_BATCH` (now `LLMQ_ADMIN_BATCH`).
+- A renamed or removed setting still set (`LLMQ_LOCAL_LIMIT_CAP`, `LLMQ_PURGE_BATCH`,
+  `LLMQ_TENANT_INDEX`) is reported at start: a `ConfigError` naming the new setting when
+  strict, the `setting_renamed` / `setting_removed` warning in dev (`RENAMED` / `REMOVED` in
+  `llm_queue.engine.settings`). Before, the old name was ignored and the default used.
 
 ### Changed
 
@@ -214,7 +218,8 @@ index (below).
   share the quota; start logs `static_cap_process_count_unset` when a model uses `static_cap`
   and it is left at 1. `Engine.stop()` drains `static_cap` calls with the others and ends
   those still running with `worker_shutdown` (it never waited for them).
-  `LLMQ_LOCAL_LIMIT_CAP` is removed: set `LLMQ_LOCAL_CONCURRENCY` instead (same default, 10).
+  `LLMQ_LOCAL_LIMIT_CAP` is renamed `LLMQ_LOCAL_CONCURRENCY` (same default, 10), the one
+  setting for local mode and `static_cap`.
   The `static_cap_attempt_failed` log event is now `local_attempt_failed` (field `path`).
 - `llmq_calls_total` has a `path` label (`queue`, `direct`, `static_cap`, `local`,
   `dead_letter`); `health()` has `mode`.
