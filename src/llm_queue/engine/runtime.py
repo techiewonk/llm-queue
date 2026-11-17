@@ -74,7 +74,7 @@ from llm_queue.engine.queue import (
     QueueSettings,
     StreamQueues,
 )
-from llm_queue.engine.requests import IndexEntry, RequestStore, extend_notice
+from llm_queue.engine.requests import IndexEntry, RequestStore, Settled, extend_notice
 from llm_queue.engine.requests_admin import AdminSettings, RequestsAdmin
 from llm_queue.engine.status import AlertEvaluator, StatusReader
 from llm_queue.engine.store_checks import UNKNOWN as UNKNOWN_POLICY
@@ -706,6 +706,7 @@ class _Held:
     tenant_waited: bool = False  # a share wait was counted for this call
     # An admin extend (0.2.0 T2): the call's new deadline, store ms (0: none seen).
     extended_ms: int = 0
+    answered: bool = False  # its success is stored: a later step's error never fails it (A-1)
 
     @property
     def position(self) -> float:
@@ -2457,6 +2458,16 @@ class Engine:
             if decision is not None:
                 await self._run(held, decision, 1, alias)
         except Exception as exc:
+            if held.answered:
+                # A step after the stored success raised (A-1): the caller reads the success;
+                # a failure reply here told it the call failed.
+                logger.warning(
+                    "direct_run_after_result_failed",
+                    request_id=env.request_id,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+                return
             # The failure is also stored, best effort and time-bound: it wrote no reply, so
             # callers attached from other processes waited to their deadline, and a retry of the
             # id attached to the dead record for 30 min (FE-5).
@@ -4238,6 +4249,7 @@ class Engine:
         await self._through_outage(
             lambda: self.requests.put_result(reply, final_state="done", status=status)
         )
+        held.answered = True
         # Settled from here: a failure below must neither renew the grant nor refund the whole
         # estimate of a call that succeeded (`_release`). `return_exceptions`: a FINISH refused
         # (out of memory) raised out of the gather while the ack ran on as an orphan, and the
@@ -4297,7 +4309,7 @@ class Engine:
             outcome="ok",
             latency_ms=latency,
         )
-        out: list[tuple[bool, bool, int]] = []
+        out: list[Settled] = []
 
         async def write() -> None:
             out.append(
@@ -4313,11 +4325,16 @@ class Engine:
             )
 
         await self._through_outage(write, held)
+        held.answered = True
         held.grants.discard((alias, owner))  # settled: never renewed or refunded again
-        _, acked, settled = out[-1]
-        if settled == 0:
+        _, acked, settled, replayed = out[-1]
+        if replayed:
+            # The script ran before and its reply was lost (a retried connection): its ack
+            # and settle happened then. Not a double run (A-7).
+            logger.info("settle_replayed", request_id=env.request_id, model=env.model)
+        elif settled == 0:
             self.admission.grant_lost(alias, env.request_id)
-        if not acked:
+        if not acked and not replayed:
             logger.warning("ack_stale_receipt", request_id=env.request_id, model=env.model)
             self.metrics.count("llmq_stale_acks_total", model=env.model)
         self._drop(held)
