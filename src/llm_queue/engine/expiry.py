@@ -7,7 +7,8 @@ with native TTLs (late by at most one sweep), and none can be evicted (owner dec
 
 The mode is the store's, not a process's: `P:expiry` holds `native` or `swept` (no TTL) and
 every script reads it. A missing key means `native` (a part used without a started engine,
-which runs no sweeper); the engine publishes the mode at start, each minute and after a reset.
+which runs no sweeper). The first process to start sets it; after that only `swept` may
+replace `native`, and a process whose setting differs follows the store (owner Q-6).
 """
 
 from __future__ import annotations
@@ -91,6 +92,20 @@ end
 # ZADD left a key with no expiry at all when the ZADD failed (review B3).
 _SET = "return X.set(KEYS[1], ARGV[1], tonumber(ARGV[2]), ARGV[3] == '1') and 1 or 0"
 
+# KEYS: the mode key. ARGV: the mode a process wants. The store's mode wins once set (owner
+# Q-6): only `swept` replaces `native` (always safe), nothing else moves it. Processes with
+# different explicit settings flipped it every minute, and each `native` minute on a
+# `volatile-*` store left evictable keys (review A-12). Reply: {mode now, mode before ('' none)}.
+_ADOPT = """
+local current = redis.call('GET', KEYS[1])
+if current == ARGV[1] then return {current, current} end
+if (current ~= 'native' and current ~= 'swept') or ARGV[1] == 'swept' then
+  redis.call('SET', KEYS[1], ARGV[1])
+  return {ARGV[1], current or ''}
+end
+return {current, current}
+"""
+
 # KEYS: the index. ARGV: batch. Deletes the due keys of one batch; returns how many.
 TTL_SWEEP = """
 local t = redis.call('TIME')
@@ -142,6 +157,7 @@ class Expiry:
         self.mode = mode
         self._clock = clock
         self._set_scripts: dict[int, Any] = {}  # per client: `X.set` as one script
+        self._adopt_scripts: dict[int, Any] = {}  # per client: `_ADOPT`
 
     @property
     def swept(self) -> bool:
@@ -187,8 +203,25 @@ class Expiry:
             script = self._set_scripts[id(client)] = client.register_script(self.lua(_SET))
         return bool(await script(keys=[key], args=[value, ms, "1" if nx else "0"]))
 
+    async def adopt(self, client: Any, wanted: str) -> tuple[str, str | None]:
+        """Ask for `wanted`, follow the store's mode; returns (the mode now, the one replaced).
+
+        The store's mode wins once set; only `swept` replaces `native` (owner Q-6). The mode
+        replaced is None when nothing changed.
+        """
+        script = self._adopt_scripts.get(id(client))
+        if script is None:
+            script = self._adopt_scripts[id(client)] = client.register_script(_ADOPT)
+        reply = await script(keys=[self.mode_key], args=[wanted])
+        now, before = (v.decode() if isinstance(v, bytes) else str(v) for v in reply)
+        self.mode = now
+        return now, (before if before not in ("", now) else None)
+
     async def publish_mode(self, client: Any, mode: str) -> str | None:
-        """Make `mode` the store's; returns the mode it replaced when it was another one."""
+        """Force `mode` as the store's (tests, an operator); the mode it replaced, if another.
+
+        Processes follow it at their next `adopt` (each minute).
+        """
         old = await client.set(self.mode_key, mode, get=True)
         self.mode = mode
         before = old.decode() if isinstance(old, bytes) else old

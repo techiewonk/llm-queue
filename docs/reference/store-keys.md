@@ -241,7 +241,7 @@ What the library checks:
 |---|---|---|
 | Cluster mode (`INFO cluster`) | `start()` | `ConfigError`: refused (`store_checks.py:67-94`, `runtime.py:740-742`) |
 | `maxmemory-policy` (`CONFIG GET`, else `INFO memory`; `unknown` if neither works) | `start()`, then every 12 store probes (about 1 minute) | Logs `store_eviction_policy` when `eviction_warning(policy, mode)` warns (`store_checks.py:51-64,90-94`): `allkeys-*` always; `volatile-*` only with native TTLs. Re-read by `_read_policies` (`runtime.py:4326-4339`, `POLICY_EVERY_ROUNDS` = 12, `HEALTH_PROBE_EVERY_SECS` = 5 s, `runtime.py:110,119`) |
-| Key expiry mode | `start()`, every minute, after a store reset | `_apply_expiry` (`runtime.py:4349-4361`) writes `decide(LLMQ_KEY_EXPIRY, policy)` (`expiry.py:97-105`) to each store's `P:expiry`; a change logs `key_expiry_changed` (warning), a failed write `key_expiry_publish_failed` (warning, `_publish_expiry_safely` `runtime.py:4342-4347`). Until a process has published its mode it reports the mode its setting asks for (`native` for `auto`) |
+| Key expiry mode | `start()`, every minute, after a store reset | `_apply_expiry` asks each store's `P:expiry` for `decide(LLMQ_KEY_EXPIRY, policy)` (`Expiry.adopt`: the store's mode wins, only `swept` replaces `native`); a change logs `key_expiry_changed` (warning) and is announced on `P:expiry:changed` (pub/sub, every process follows at once), a differing explicit setting `key_expiry_conflict` (warning), a failed write `key_expiry_publish_failed` (warning, `_publish_expiry_safely` `runtime.py:4342-4347`). Until a process has published its mode it reports the mode its setting asks for (`native` for `auto`) |
 | Readiness, strict (`LLMQ_ENVIRONMENT` not `dev`/`local`/`test`/`ci`; unset is strict) | each `health_check()` | `_evicting()` returns a reason: `ready: false` with `not_ready_reason` (`runtime.py:4252-4257,4301-4309`); gauge `llmq_ready` 0 (`runtime.py:4502-4510`) |
 | Readiness, dev | each `health_check()` | Ready; warning at start only; `eviction_policy` and `key_expiry` in `health()` (`runtime.py:4267-4270`) |
 | Gauges | each metrics tick | `llmq_store_eviction_unsafe{store}` 1 when unsafe in the store's mode; `llmq_key_expiry_swept{store}` 1 in `swept` (`runtime.py:4503-4507`) |
@@ -1383,7 +1383,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Type | string |
 | Store | state and queue |
 | Schema | `native` or `swept`: the store's key expiry mode. Each store has its own (a separate queue store too). |
-| Written by | `_apply_expiry` `runtime.py:4349-4361` through `Expiry.publish_mode` `expiry.py:161-166` (`SET ... GET`): at `start()` (`_publish_expiry_safely`, `runtime.py:748`), every minute (`_read_policies` `runtime.py:4340`) and after a store reset (`_check_epoch` `runtime.py:4946`). Until then a process reports the mode its setting asks for (`native` for `auto`). |
+| Written by | `_apply_expiry` through `Expiry.adopt` (`_ADOPT`: set when missing, else only `native` to `swept`; the store's mode wins, owner Q-6): at `start()` (`_publish_expiry_safely`, `runtime.py:748`), every minute (`_read_policies` `runtime.py:4340`) and after a store reset (`_check_epoch` `runtime.py:4946`). Until then a process reports the mode its setting asks for (`native` for `auto`). |
 | Read by | Every script that sets an expiry: `X.swept()` `expiry.py:31-34` (one `GET` per script run). |
 | Lifetime (native) | No TTL. |
 | Swept mode | No expiry, in both modes. |

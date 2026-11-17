@@ -192,12 +192,16 @@ example, a caller that died is seen as gone after 45 to 55 s instead of 45 s.
 **Where the mode lives.** The mode belongs to the store, not to a process: `P:expiry` holds
 `native` or `swept` (no TTL), and every script reads it. **A missing `P:expiry` means
 `native`.** So a part used without a started engine (the CLI, a purge service) follows whatever
-the store says, and a store that never saw an engine uses native TTLs. A started engine writes
-the mode at `start()`, every minute (when it reads the eviction policy again) and after a store
-reset. A change logs `key_expiry_changed` (warning, with `store`, `policy`, `before` and
-`mode`); a failed write logs `key_expiry_publish_failed` (warning) and is retried a minute later.
-Until a process has published its mode, it reports the mode its setting asks for (`native` for
-`auto`). With a separate queue store, each store has its own `P:expiry` and `P:ttl`.
+the store says, and a store that never saw an engine uses native TTLs. A started engine asks
+for its mode at `start()`, every minute (when it reads the eviction policy again) and after a
+store reset. **The store's mode wins:** the first engine sets it; after that only `swept` may
+replace `native` (it is safe on every policy), nothing moves `swept` back to `native` by itself,
+and an engine that asked for another mode follows the store's. A change logs
+`key_expiry_changed` (warning, with `store`, `policy`, `before` and `mode`) and is announced on
+the store, so every process's own writes follow it at once, not at its next minute; a failed
+write logs `key_expiry_publish_failed` (warning) and is retried a minute later. Until a process
+has read the mode, it reports the mode its setting asks for (`native` for `auto`). With a
+separate queue store, each store has its own `P:expiry` and `P:ttl`.
 
 **`auto` (the default).** The engine reads the store's `maxmemory-policy` (`CONFIG GET`, else
 `INFO memory`, as on ElastiCache) and picks:
@@ -209,9 +213,12 @@ Until a process has published its mode, it reports the mode its setting asks for
 | `allkeys-*` | `swept` (the safer one) | No: `allkeys-*` can evict keys with no TTL (queues, registry), so no mode makes it safe |
 | unknown (unreadable) | `swept` | Yes |
 
-`LLMQ_KEY_EXPIRY=native` or `swept` forces the mode. `native` on a `volatile-*` store makes a
-strict-mode process unready. Give every process of one prefix the same setting: the last one to
-write `P:expiry` wins, and each logs `key_expiry_changed` when it flips the mode.
+`LLMQ_KEY_EXPIRY=native` or `swept` asks for that mode. `native` on a `volatile-*` store makes a
+strict-mode process unready. Give every process of one prefix the same setting: a process whose
+setting differs from the store's mode follows the store and logs `key_expiry_conflict` (warning,
+with `store`, `setting` and `mode`, once per mode). To move a store from `swept` back to
+`native` (a store changed to `noeviction`), stop every process, then `DEL P:expiry`; the first
+engine to start sets the mode again.
 
 **Switching modes.** In `swept` mode, setting an expiry also clears the key's native TTL
 (`PERSIST`); in `native` mode it also removes the key's `P:ttl` member; reading a key's time

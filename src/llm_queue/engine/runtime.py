@@ -60,6 +60,8 @@ from llm_queue.engine.envelope import (
     parse,
 )
 from llm_queue.engine.errors import CallFailed
+from llm_queue.engine.expiry import NATIVE as NATIVE_EXPIRY
+from llm_queue.engine.expiry import SWEPT as SWEPT_EXPIRY
 from llm_queue.engine.expiry import TTL_SWEEP, Expiry, decide
 from llm_queue.engine.fairness import Fairness, fairness_for, tenant_hash_of
 from llm_queue.engine.health import Health
@@ -993,6 +995,9 @@ class Engine:
         first = self.settings.key_expiry if self.settings.key_expiry != "auto" else "native"
         self.expiry = Expiry(self.keys.prefix, self.clock.now, first)
         self.queue_expiry = self.expiry
+        # A store's mode change is announced here; every process's result reader follows it.
+        self._expiry_channel = f"{self.keys.prefix}:expiry:changed"
+        self._expiry_conflict: dict[str, str] = {}  # per store: the mode a conflict was logged
         if queue_store is not None:
             self.queue_expiry = Expiry(self.keys.prefix, self.clock.now, first)
         self._ttl_sweeps = [(self.expiry, state.register_script(TTL_SWEEP))]
@@ -2800,7 +2805,9 @@ class Engine:
         while True:
             try:
                 if not subscribed:
-                    await self._pubsub.subscribe(self.keys.done_channel(self.worker_id))
+                    await self._pubsub.subscribe(
+                        self.keys.done_channel(self.worker_id), self._expiry_channel
+                    )
                     subscribed = True
                     alive.reset()
                     # Results published while unsubscribed were missed: every waiter re-reads.
@@ -2828,6 +2835,9 @@ class Engine:
                 if isinstance(message["data"], bytes)
                 else str(message["data"])
             )
+            if text(message.get("channel") or b"") == self._expiry_channel:
+                self._expiry_notice(rid)  # pipelines follow a mode change at once (A-10)
+                continue
             extended = extend_notice(rid)
             if extended is not None:  # an admin extend (0.2.0 T2): the call waits longer
                 self._extend_caller(*extended)
@@ -4827,18 +4837,39 @@ class Engine:
             logger.warning("key_expiry_publish_failed", error=str(exc))
 
     async def _apply_expiry(self) -> None:
-        """Set each store's key expiry mode from `LLMQ_KEY_EXPIRY` and its eviction policy."""
+        """Ask each store for the mode `LLMQ_KEY_EXPIRY` and its policy want; follow the store's.
+
+        The store's mode wins (owner Q-6): an explicit setting that differs logs
+        `key_expiry_conflict` once per mode; a change is announced to every process (A-10).
+        """
         stores = [("state", self.state, self.expiry)]
         if self._queue_store is not None:
             stores.append(("queue", self._queue_store, self.queue_expiry))
         for name, client, expiry in stores:
             policy = self._eviction.get(name, UNKNOWN_POLICY)
-            mode = decide(self.settings.key_expiry, policy)
-            replaced = await expiry.publish_mode(client, mode)
+            wanted = decide(self.settings.key_expiry, policy)
+            mode, replaced = await expiry.adopt(client, wanted)
             if replaced:
                 logger.warning(
                     "key_expiry_changed", store=name, policy=policy, before=replaced, mode=mode
                 )
+                await self.state.publish(self._expiry_channel, f"{name}\0{mode}")
+            explicit = self.settings.key_expiry != "auto"
+            if explicit and mode != wanted and self._expiry_conflict.get(name) != mode:
+                logger.warning(
+                    "key_expiry_conflict",
+                    store=name,
+                    setting=self.settings.key_expiry,
+                    mode=mode,
+                    hint="the store's mode wins; only swept replaces native by itself",
+                )
+            self._expiry_conflict[name] = mode if explicit and mode != wanted else ""
+
+    def _expiry_notice(self, data: str) -> None:
+        """Follow another process's change of a store's key expiry at once (A-10)."""
+        name, _, mode = data.partition("\0")
+        if name in ("state", "queue") and mode in (NATIVE_EXPIRY, SWEPT_EXPIRY):
+            self._expiry_of(name).mode = mode
 
     async def _ttl_sweeper(self) -> None:
         """The expiry index sweep: one process at a time (`P:lock:ttlsweep`), every sweep."""

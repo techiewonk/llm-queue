@@ -7,6 +7,7 @@ RESULT_PUT and SETTLE_DONE scripts answer what the first run did.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from typing import Any
 
 import orjson
@@ -373,3 +374,59 @@ async def test_g20_a_tenant_at_its_quota_is_not_served_by_the_fallback_model(
         other = await engine.call("big", CHAT, tenant_id="globex", timeout_secs=5)
         assert other.meta.served_model == "small"
     assert stats(fake, f"{SMALL}@r1")["calls"] == 2  # globex only: acme was never run there
+
+
+# ---------------------------------------------------------------- A-10, A-12 (G17)
+
+
+async def test_a12_the_stores_expiry_mode_wins_over_a_differing_setting(
+    make: Make, store: redis.asyncio.Redis
+) -> None:
+    """A-12 (owner Q-6): pods with different explicit `LLMQ_KEY_EXPIRY` flipped the mode.
+
+    Each `native` minute on a `volatile-*` store left evictable keys. Now the store's mode
+    wins: an `auto` pod on a volatile store moves it to `swept`; a pod set to `native`
+    follows it (and logs a conflict), and nothing moves it back to `native` by itself.
+    """
+    first, _ = await make()
+    second, _ = await make()
+    second.settings = dataclasses.replace(second.settings, key_expiry="native")
+    first._eviction["state"] = "volatile-lru"  # as read from a shared cache store
+    await first._apply_expiry()
+    mode_key = first.expiry.mode_key
+    assert await store.get(mode_key) == b"swept"
+    for _ in range(2):  # every minute's re-publish: it flipped back to native before
+        await second._apply_expiry()
+        assert await store.get(mode_key) == b"swept"
+    assert second.expiry.mode == "swept"
+    assert second._expiry_conflict["state"] == "swept"
+    first._eviction["state"] = "noeviction"  # `auto` would ask for native now: not by itself
+    await first._apply_expiry()
+    assert await store.get(mode_key) == b"swept"
+    key = f"{second.keys.prefix}:a12"
+    async with second.state.pipeline(transaction=False) as pipe:
+        pipe.set(key, "1")
+        second.expiry.expire(pipe, key, 60)
+        await pipe.execute()
+    assert await store.pttl(key) == -1  # indexed, not a native (evictable) TTL
+
+
+async def test_a10_a_mode_change_reaches_every_process_at_once(
+    make: Make, store: redis.asyncio.Redis
+) -> None:
+    """A-10: pipelines followed another process's mode change only at their minute re-read.
+
+    For up to a minute after native -> swept, chunk streams and retry counters got native
+    TTLs (evictable mid-stream). The change is now announced and followed at once.
+    """
+    first, _ = await make()
+    second, _ = await make(worker=False)  # a caller-only process follows too
+    await store.set(first.expiry.mode_key, "native")
+    first.expiry.mode = second.expiry.mode = "native"
+    first._eviction["state"] = "volatile-lru"
+    await first._apply_expiry()
+    loop = asyncio.get_running_loop()
+    until = loop.time() + 2.0  # the minute re-read is far off
+    while second.expiry.mode != "swept":
+        assert loop.time() < until, "the change notice never arrived"
+        await asyncio.sleep(0.02)
