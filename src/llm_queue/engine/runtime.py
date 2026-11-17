@@ -87,7 +87,7 @@ from llm_queue.engine.streaming import (
     replay_events,
     text_of,
 )
-from llm_queue.errors import ConfigError, ErrorKind, UnsupportedEnvelopeError
+from llm_queue.errors import ConfigError, ErrorKind, LLMQueueError, UnsupportedEnvelopeError
 from llm_queue.ids import new_id
 from llm_queue.providers.classify import (
     error_family,
@@ -230,6 +230,8 @@ class EngineSettings:
     caller_margin_secs: float = 5.0
     local_limit_cap: int = 10
     drain_secs: float = 25.0  # k8s grace 30 s: calls still running then are given back (C3)
+    # LLMQ_DRAIN_HANDBACK_ENABLED (0.2.0 A1, owner Q2): a pause returns held calls at once.
+    drain_handback_enabled: bool = True
     # LLMQ_ID_HASH_SALT: the key of every user / session id hash; never in repr() (X10).
     id_hash_salt: str = field(default="", repr=False)
     cfg_reload_secs: float = 30.0  # LLMQ_CFG_RELOAD_SECS: how often the registry is re-read
@@ -653,6 +655,10 @@ class Engine:
         self._stopping = False
         self._closed = False  # `stop()` cancelled the background tasks: start no new one
         self._paused = False
+        self._draining_since: float | None = None  # wall time of the pause (0.2.0 A3)
+        self._handing_back: asyncio.Task[None] | None = None  # a pause's hand-back (A1)
+        self._own_loop: asyncio.AbstractEventLoop | None = None  # the loop `start()` ran on
+        self._started = False
         self._local_callers: dict[str, int] = {}  # request id -> coroutines waiting on it here
         self._wake: dict[str, asyncio.Event] = {}  # model -> wakes its receive loop
         self._beat_ok_mono = time.monotonic()  # last heartbeat that reached the store
@@ -787,7 +793,9 @@ class Engine:
         self._loop(self._store_prober(), "store_prober")
         self._loop(self.requests.check_lifecycle(), "offload_lifecycle")  # Q23
         self._loop(self.registry.run(self.settings.cfg_reload_secs), "registry_reload")
-        self.ready = True
+        self._own_loop = asyncio.get_running_loop()
+        self._started = True
+        self.ready = not self._paused  # a pause before the start holds
 
     def _loop(self, work: Coroutine[Any, Any, None], name: str) -> None:
         """Start a background loop, named: `stop_task_failed` logged `Task-123` (FE-19)."""
@@ -845,13 +853,78 @@ class Engine:
             )
 
     def pause_receiving(self) -> None:
-        """Not ready, and take no new calls from the queues; running and held calls go on.
+        """Not ready, and take no new calls from the queues; running calls go on.
 
         The first step of a shutdown, for a preStop hook: the load balancer stops sending
-        requests while this pod finishes its work. `stop()` follows.
+        requests while this pod finishes its work. With `drain_handback_enabled` (default on,
+        `LLMQ_DRAIN_HANDBACK_ENABLED`) calls held here waiting for budget go back to the queue
+        at once, for another pod (0.2.0 A1). Sync and callable from any thread: the hand-back
+        is scheduled on the engine's loop, and `stop()` waits for it.
         """
         self.ready = False
+        if self._draining_since is None:
+            self._draining_since = time.time()
         self._paused = True
+        loop = self._own_loop
+        if not (self._worker and self.settings.drain_handback_enabled) or loop is None:
+            return  # a caller holds no queued calls; an engine never started has none
+        with contextlib.suppress(RuntimeError):  # the loop is closed: nothing to hand back
+            loop.call_soon_threadsafe(self._start_hand_back)
+
+    def _start_hand_back(self) -> None:
+        """On the engine's loop: return the held calls in one tracked task (`stop()` awaits it)."""
+        if self._stopping or self._closed or not self._paused:
+            return  # stopping hands them back itself; a resume came first
+        if self._handing_back is not None and not self._handing_back.done():
+            return
+        until = asyncio.get_running_loop().time() + HAND_BACK_FLOOR_SECS
+        self._handing_back = asyncio.create_task(
+            self._hand_back_held(until), name="llmq:drain_hand_back"
+        )
+
+    def resume_receiving(self) -> None:
+        """Undo `pause_receiving`: receive again, and ready when started (0.2.0 A2).
+
+        `LLMQueueError` once `stop()` began: a stopped engine cannot take calls again.
+        """
+        if self._stopping or self._closed:
+            raise LLMQueueError("this engine is stopped; it cannot resume receiving")
+        self._paused = False
+        self._draining_since = None
+        self.ready = self._started
+        for wake in self._wake.values():  # receive loops waiting out the pause
+            wake.set()
+
+    @property
+    def draining(self) -> bool:
+        """True between `pause_receiving()` and `resume_receiving()`."""
+        return self._paused
+
+    @property
+    def draining_since(self) -> float | None:
+        """Wall time (Unix seconds) of the pause, None when not draining."""
+        return self._draining_since
+
+    def drain_status(self) -> dict[str, Any]:
+        """What `GET /drain` answers: draining, since, held (waiting for budget) and running."""
+        held = list(self._held.values())
+        return {
+            "draining": self._paused,
+            "since": self._draining_since,
+            "held": sum(1 for h in held if h.run is None),
+            "running": sum(1 for h in held if h.run is not None and not h.run.done()),
+        }
+
+    async def wait_running(self, timeout_secs: float) -> bool:
+        """Wait up to `timeout_secs` for the hand-back and every running call; True when idle."""
+        loop = asyncio.get_running_loop()
+        until = loop.time() + max(0.0, timeout_secs)
+        handing = self._handing_back
+        if handing is not None and not handing.done():
+            await asyncio.wait({handing}, timeout=max(0.0, until - loop.time()))
+        if self._running:
+            await asyncio.wait(set(self._running), timeout=max(0.0, until - loop.time()))
+        return not self._running and (handing is None or handing.done())
 
     async def stop(self, drain_secs: float | None = None) -> None:
         """Shut down in order (plan §3.18): not ready, stop receiving, finish running calls.
@@ -864,6 +937,10 @@ class Engine:
         until = loop.time() + drain
         self.ready = False
         self._stopping = True
+        handing = self._handing_back
+        if handing is not None and not handing.done():
+            # A pause's hand-back first (A1); it runs under its own floor deadline.
+            await asyncio.gather(handing, return_exceptions=True)
         await self._hand_back_held(until)
         if self._running:
             await asyncio.wait(set(self._running), timeout=max(0.0, until - loop.time()))
@@ -2458,7 +2535,13 @@ class Engine:
             if alias not in self.registry.current.registry.models:
                 return  # removed by a reload; `_sync_model_loops` starts it again if it returns
             if self._paused:
-                await asyncio.sleep(0.2)
+                if rung is not None:  # the doorbell token it took: another pod's to answer
+                    with contextlib.suppress(*STORE_ERRORS, RedisError):
+                        await self.queues.ring_again(rung)
+                    rung = None
+                with contextlib.suppress(TimeoutError):  # a resume wakes it at once
+                    await asyncio.wait_for(wake.wait(), 0.2)
+                wake.clear()
                 continue
             try:
                 got = await self._receive_once(alias)
@@ -2559,13 +2642,18 @@ class Engine:
                     await self._dead_lettered(alias, letter.body)
                 except Exception as exc:
                     logger.warning("dead_letter_reply_failed", model=alias, error=str(exc))
-            while rest:
+            # A pause during the receive: what it took goes back unadmitted (0.2.0 A1).
+            while rest and not self._hand_back_on_pause():
                 if await self._admit_new(alias, rest.pop(0)):
                     break
         finally:
             if rest:
                 await self._return_all(rest)
         return bool(messages)
+
+    def _hand_back_on_pause(self) -> bool:
+        """Paused, with held calls handed back (`drain_handback_enabled`): admit nothing new."""
+        return self._paused and self.settings.drain_handback_enabled
 
     async def _return_all(self, messages: Sequence[Message]) -> None:
         """Return messages to their queue together; a failure is logged and skips only itself.
@@ -2971,10 +3059,11 @@ class Engine:
             return False
         if await self._model_fallback(view, alias, held, 1, now - held.position_ms / 1000.0):
             return False
-        if self._stopping:
+        if self._stopping or self._hand_back_on_pause():
             # Received while `stop()` ran, after it handed the held calls back: a hold here
             # ended at once without returning the message, hidden for the drain plus its
-            # visibility time and charged a failure (FE-2).
+            # visibility time and charged a failure (FE-2). The same for a receive in flight
+            # at a pause, after its hand-back (0.2.0 A1): another pod runs it.
             await self._release(held)
             return False
         key = (alias, _cls(env))
@@ -4268,12 +4357,17 @@ class Engine:
             stores = cached[1]
         loaded = self.registry._current is not None
         out: dict[str, Any] = {"live": self._live(), "ready": bool(self.ready and loaded)}
+        out["draining"] = self._paused
+        out["draining_since"] = self._draining_since
+        if self._paused:
+            # The operator's action is the first reason (0.2.0 A3); it was a bare 503.
+            out["not_ready_reason"] = "draining"
         evicting = self._evicting()
         if evicting:
             # Strict mode and a store that may evict queue keys, results and caller keys
             # (owner Q10): not ready, with the reason. It was a warning at start only.
             out["ready"] = False
-            out["not_ready_reason"] = evicting
+            out.setdefault("not_ready_reason", evicting)
         if not out["live"]:
             out["live_reason"] = self._not_live_reason()
         out["worker"] = self.worker_id

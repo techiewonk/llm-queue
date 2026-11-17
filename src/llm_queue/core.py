@@ -16,6 +16,7 @@ import contextlib
 import os
 import socket
 import threading
+import time
 import weakref
 from collections.abc import (
     AsyncGenerator,
@@ -37,6 +38,7 @@ from llm_queue._logging import get_logger
 from llm_queue._version import __version__
 from llm_queue.clients import ClientPool, Providers
 from llm_queue.context import current_context
+from llm_queue.drain import DrainWatcher
 from llm_queue.engine.cross_checks import start_warnings
 from llm_queue.engine.envelope import Meta, Reply
 from llm_queue.engine.errors import CallFailed
@@ -188,6 +190,11 @@ class Health(TypedDict):
     eviction_policy: str
     queue_eviction_policy: NotRequired[str]
     key_expiry: str  # `native` or `swept` (LLMQ_KEY_EXPIRY, engine/expiry.py)
+    # Between `pause_receiving()` and `resume_receiving()` (0.2.0 A3); since: Unix seconds.
+    draining: NotRequired[bool]
+    draining_since: NotRequired[float | None]
+    # Why not ready: `draining` first, else the evicting store's policy (strict mode).
+    not_ready_reason: NotRequired[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +263,9 @@ class LLMQueue:
         self._pid: int | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._inherited = False
+        # A drain file older than this (minus 1 s) is a leftover, not a drain (0.2.0 A4).
+        self._created = time.time()
+        self._drain_watcher: DrainWatcher | None = None
         _QUEUES.add(self)
 
     # ---------------------------------------------------------------- construction
@@ -342,6 +352,7 @@ class LLMQueue:
                 status_ttl_secs=settings.status_ttl_secs,
                 caller_ttl_secs=settings.caller_ttl_secs,
                 drain_secs=settings.drain_secs,
+                drain_handback_enabled=settings.drain_handback_enabled,
                 local_limit_cap=settings.local_limit_cap,
                 id_hash_salt=settings.id_hash_salt or "",
                 cfg_reload_secs=settings.cfg_reload_secs,
@@ -490,6 +501,15 @@ class LLMQueue:
             set_default_queue(self)
         self._pid = os.getpid()
         self._loop = asyncio.get_running_loop()
+        drain_file = getattr(self.settings, "drain_file", "")
+        if drain_file:  # every role: a caller-only process fails readiness too (0.2.0 A4)
+            self._drain_watcher = DrainWatcher(
+                drain_file,
+                self.pause_receiving,
+                poll_secs=getattr(self.settings, "drain_poll_secs", 1.0),
+                since=self._created,
+            )
+            self._drain_watcher.start()
         self.started = True
 
     async def _wait_for_start(self) -> None:
@@ -552,9 +572,57 @@ class LLMQueue:
             )
 
     def pause_receiving(self) -> None:
-        """Fail readiness and take no new calls or jobs; running work goes on (preStop hook)."""
+        """Fail readiness and take no new calls or jobs; running work goes on (preStop hook).
+
+        Calls held here waiting for budget go back to the queue at once for another pod
+        (`LLMQ_DRAIN_HANDBACK_ENABLED`, default on; nothing to hand back in `mode=caller`).
+        Sync and callable from any thread (a signal handler, the drain file watcher); undo it
+        with `resume_receiving()`, or follow it with `stop()`.
+        """
         self._engine.pause_receiving()
         self._jobs.pause()
+
+    def resume_receiving(self) -> None:
+        """Undo `pause_receiving()`: take calls and jobs again, ready when started (0.2.0 A2).
+
+        `LLMQueueError` once `stop()` began. A drain file that paused this queue pauses it
+        again only when touched anew (a newer mtime).
+        """
+        if self._stopped or self._closing:
+            raise LLMQueueError("this LLMQueue is stopped; build a new one to resume receiving")
+        self._engine.resume_receiving()
+        self._jobs.resume()
+
+    @property
+    def draining(self) -> bool:
+        """True between `pause_receiving()` (or the drain file) and `resume_receiving()`."""
+        return bool(self._engine.draining)
+
+    @property
+    def draining_since(self) -> float | None:
+        """When the pause began (Unix seconds), None when not draining."""
+        return self._engine.draining_since
+
+    def drain_status(self) -> dict[str, Any]:
+        """`draining`, `since`, `held` (calls waiting for budget) and `running` (calls and jobs)."""
+        out = dict(self._engine.drain_status())
+        out["running"] = int(out["running"]) + self._jobs.running
+        return out
+
+    async def drain(self, drain_secs: float | None = None) -> bool:
+        """Pause, then wait up to `drain_secs` (default `LLMQ_DRAIN_SECS`) for running work.
+
+        Does not stop the queue: `resume_receiving()` or `stop()` follows. True when nothing
+        is running any more (calls and jobs), False when the wait ran out.
+        """
+        self._check()
+        self.pause_receiving()
+        loop = asyncio.get_running_loop()
+        wait = self._engine.settings.drain_secs if drain_secs is None else drain_secs
+        until = loop.time() + max(0.0, wait)
+        jobs_idle = await self._jobs.wait_running(until - loop.time())
+        calls_idle = await self._engine.wait_running(max(0.0, until - loop.time()))
+        return jobs_idle and calls_idle
 
     async def stop(self, drain_secs: float | None = None) -> None:
         """Shut down in order (plan §3.18) and close every client; a second call does nothing.
@@ -582,7 +650,9 @@ class LLMQueue:
         # One step that raised skipped every later one, and `_stopped` made a second stop()
         # return at once, so store pools, provider sessions and the S3 client leaked (CO-1).
         cancelled = False
+        watcher, self._drain_watcher = self._drain_watcher, None
         steps: list[tuple[str, Callable[[], Awaitable[Any]]]] = [
+            ("drain_watcher", lambda: watcher.stop() if watcher else asyncio.sleep(0)),
             ("jobs", lambda: self._jobs.stop(drain_secs=0 if cancelled else drain)),
             (
                 "engine",
@@ -901,8 +971,14 @@ class LLMQueue:
         metrics_route: bool = False,
         admin_token: str | Callable[[], str | None] | None = None,
         admin_header: str | None = None,
+        drain_routes: bool = False,
     ) -> Any:
         """A FastAPI router with status, requests, registry and health (extra `http`).
+
+        `drain_routes=True` adds `POST /drain` (`pause_receiving`), `POST /resume` and an open
+        `GET /drain` (status only). The POST routes are guarded like the write routes (a token
+        or `dependencies`, and the `X-LLMQ-Admin` header); they reach this process only: a
+        pod with several processes drains through `LLMQ_DRAIN_FILE`.
 
         Writes need `actor(request) -> str`, the authenticated name recorded in the audit.
         `metrics_route=True` adds `GET /metrics` (Prometheus exposition, open like the health
@@ -929,6 +1005,8 @@ class LLMQueue:
             allow_writes=allow_writes,
             actor=actor,
             metrics_route=metrics_route,
+            drain_routes=drain_routes,
+            drain=self,
         )
 
     def describe(self) -> dict[str, Any]:

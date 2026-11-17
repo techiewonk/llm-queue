@@ -42,6 +42,10 @@ the fields are listed in [Monitor](../how-to/monitor.md) for the ones worth alar
 | `deployment_failing_last_usable` | error | engine/runtime.py |
 | `deployment_recovered` | info | engine/runtime.py |
 | `direct_run_failed` | warning | engine/runtime.py |
+| `drain_callback_failed` | warning | drain.py |
+| `drain_file_seen` | info | drain.py |
+| `drain_requested` | info | engine/http.py |
+| `drain_resumed` | info | engine/http.py |
 | `emf_lines_dropped` | warning | engine/metrics.py |
 | `fallback_shape_skipped` | info | engine/runtime.py |
 | `finish_failed` | warning | engine/requests.py, engine/runtime.py |

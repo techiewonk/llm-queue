@@ -22,10 +22,10 @@ Start one queue per process, after any fork (in each gunicorn / uvicorn worker, 
 
 ## Deploys and restarts
 
-1. A **preStop hook** calls `llmq.pause_receiving()` through a `/drain` endpoint of the app (the
-   library's router has none), as in `samples/09_http_router.py`. It must answer **GET**:
-   `preStop: httpGet` sends a GET, and a POST-only route answers 405 and nothing drains. Readiness fails, and the process takes no new calls or jobs;
-   running work goes on.
+1. A **preStop hook** pauses the pod: it touches `LLMQ_DRAIN_FILE` (every process of the pod
+   sees it), or, in a single-process pod, posts to the router's `POST /drain` (see
+   [Drain a pod](#drain-a-pod)). Readiness fails, the process takes no new calls or jobs, and
+   calls held waiting for budget go back to the queue at once; running work goes on.
 2. **Shutdown** is `await llmq.stop(drain_secs=...)`. Held messages go back to the queue at once;
    running calls and this pod's waiting callers get up to `drain_secs` (default
    `LLMQ_DRAIN_SECS`, **25 s**) to finish. Jobs drain first, then calls get what is left.
@@ -39,39 +39,79 @@ sequenceDiagram
   participant K as Kubernetes
   participant P as Pod (app + llm-queue)
   participant Q as Queue
-  K->>P: preStop: GET /drain
+  K->>P: preStop: touch $LLMQ_DRAIN_FILE
   P->>P: pause_receiving(): not ready, receive nothing
-  K->>P: SIGTERM
   P->>Q: return held (not started) messages
+  K->>P: SIGTERM
   P->>P: running calls finish (up to 25 s)
   P->>Q: still running: refund grants, return message
   Q-->>K: another pod takes them
-  Note over K,P: terminationGracePeriodSeconds 30 > drain 25 s
+  Note over K,P: terminationGracePeriodSeconds 45 > preStop 15 s + drain 25 s
 ```
 
 Kubernetes settings that fit the defaults:
 
 ```yaml
 spec:
-  terminationGracePeriodSeconds: 30     # the default; keep it above LLMQ_DRAIN_SECS (25)
+  terminationGracePeriodSeconds: 45     # above the preStop sleep (15) + LLMQ_DRAIN_SECS (25)
   containers:
     - name: app
+      env:
+        - {name: LLMQ_DRAIN_FILE, value: /llmq-drain/drain}
       lifecycle:
-        preStop:
-          httpGet: {path: /drain, port: 8000}   # calls llmq.pause_receiving()
+        preStop:   # every process pauses within LLMQ_DRAIN_POLL_SECS (1 s)
+          exec: {command: ["sh", "-c", "touch $LLMQ_DRAIN_FILE; sleep 15"]}
+      volumeMounts:
+        - {name: llmq-drain, mountPath: /llmq-drain}
       readinessProbe:
         httpGet: {path: /llmq/health/ready, port: 8000}
       livenessProbe:
         httpGet: {path: /llmq/health/live, port: 8000}
+  volumes:
+    - {name: llmq-drain, emptyDir: {}}
 ```
 
-The preStop hook's time counts against the grace period, so keep the `/drain` handler instant
-(it only flips a flag). If you raise `LLMQ_DRAIN_SECS` for long answers, raise
-`terminationGracePeriodSeconds` with it (drain + 5 s or more); a pod killed before its drain ends
+The `sleep 15` lets the load balancer see the failed readiness and running calls finish before
+SIGTERM. The preStop hook's time counts against the grace period, so the grace period must cover
+the sleep plus `LLMQ_DRAIN_SECS` plus a margin (45 s here; with the default 30 s, drop the sleep
+or lower `LLMQ_DRAIN_SECS`). If you raise `LLMQ_DRAIN_SECS` for long answers, raise
+`terminationGracePeriodSeconds` with it; a pod killed before its drain ends
 loses nothing either, its calls reappear after `queue.visibility_secs` (default 60 s), but
 they then count one failure each.
 
 Measured: 4 rolling restarts, 0 calls lost (gate B33).
+
+## Drain a pod
+
+A pause takes a process out of service without stopping it: readiness answers 503 with
+`not_ready_reason: draining`, no new calls or jobs are received, running ones go on.
+
+| Way | Reaches | Use |
+|---|---|---|
+| `LLMQ_DRAIN_FILE` | every process of the pod that shares the file | Multi-process pods (gunicorn / uvicorn workers): a preStop hook runs `touch $LLMQ_DRAIN_FILE; sleep 15`. Each process checks every `LLMQ_DRAIN_POLL_SECS` (1 s). A file older than the queue's construction (minus 1 s) is a leftover and ignored |
+| `POST /drain` (`http_router(drain_routes=True)`) | the one process that answered | Single-process pods, or an operator pausing one process. Guarded like the write routes: an admin token (`LLMQ_ADMIN_TOKEN`) or `dependencies`, plus the `X-LLMQ-Admin` header; `drain_routes=True` without either is a `ConfigError`. `GET /drain` is open and only reads `draining`, `since`, `held` and `running` |
+| `llmq.pause_receiving()` | this process | Sync, from any thread (a signal handler); `await llmq.drain(drain_secs)` also waits for running calls and jobs and returns True when none is left |
+
+**Hand-back.** With `LLMQ_DRAIN_HANDBACK_ENABLED=true` (the default) a pause returns the calls
+held here waiting for budget to the queue at once, so another pod runs them; a receive in flight
+when the pause lands returns what it took instead of holding it. `stop()` waits for that
+hand-back. Set it to false to keep held calls here until `stop()` (0.1.1 behaviour). A
+`mode=caller` process holds no queued calls, so nothing is handed back there. With one replica,
+handed-back calls wait for the new pod.
+
+**Resume.** `llmq.resume_receiving()` (or `POST /resume`) undoes a pause: the process receives
+again and is ready once started. After `stop()` it raises `LLMQueueError` (the route answers 409).
+A drain file that paused a process does not pause it again after a resume; touching the file
+anew (a newer mtime) does.
+
+An app with its queue switched off can still fail its own readiness from the same file:
+
+```python
+from llm_queue.drain import DrainWatcher
+
+watcher = DrainWatcher(os.environ["LLMQ_DRAIN_FILE"], on_drain=lambda: state.update(ready=False))
+watcher.start()          # in the app's startup, on its event loop; `await watcher.stop()` at shutdown
+```
 
 ## Health and readiness
 
@@ -79,7 +119,7 @@ Measured: 4 rolling restarts, 0 calls lost (gate B33).
 |---|---|
 | `GET /health/live` | 200 while the library's background loops run and the heartbeat makes progress; **503** when a loop died or the heartbeat stalled for a lease. Once `stop()` begins it stays 200, so a draining pod is not restarted. It reads the process's own state only, never the store |
 | `GET /health/ready` | 200 when the registry is loaded and the process is not draining, else 503. In strict mode a store whose eviction policy can evict the library's keys (`allkeys-*`, or `volatile-*` with native key expiry) also answers 503, with the reason |
-| `await llmq.health()` | `live`, `ready`, `stores` (`state`, `queue`), `eviction_policy`, `key_expiry` (`native` or `swept`), `worker`, `version`, `registry_version`, `held`, `heartbeat_age_secs`; plus `live_reason` when not live, `not_ready_reason` when not ready (strict mode and an evicting store) and `queue_eviction_policy` with a separate queue store |
+| `await llmq.health()` | `live`, `ready`, `stores` (`state`, `queue`), `eviction_policy`, `key_expiry` (`native` or `swept`), `worker`, `version`, `registry_version`, `held`, `heartbeat_age_secs`, `draining`, `draining_since`; plus `live_reason` when not live, `not_ready_reason` when not ready (`draining` after a pause, else in strict mode an evicting store's policy) and `queue_eviction_policy` with a separate queue store |
 
 A liveness probe on `/health/live` restarts a pod whose loops died (0.1.0b1 always answered
 200): keep its `failureThreshold` at 3 or more so one slow beat does not restart a healthy pod.
