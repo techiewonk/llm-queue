@@ -11,10 +11,11 @@ from typing import Any
 import orjson
 import pytest
 import redis.asyncio
-from engine_testkit import CHAT, Make
+from engine_testkit import CHAT, GPT, Make
 
 from llm_queue.engine import requests as requests_module
 from llm_queue.engine.envelope import Reply
+from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import QueueSettings, StreamQueues
 from llm_queue.engine.requests import IndexEntry, RequestStore
@@ -234,3 +235,37 @@ async def test_a1_a_direct_run_whose_post_result_step_raises_returns_the_success
     reply = await engine.call("small", CHAT, request_id="a1-direct", force_direct=True)
     assert reply.ok
     assert (await engine.requests.job("a1-direct"))["state"] == "done"
+
+
+# ---------------------------------------------------------------- A-3 (G6)
+
+
+async def test_a3_the_last_deployment_that_takes_calls_is_never_disabled(make: Make) -> None:
+    """A-3: a disabled or blocked deployment counted as usable for the health safeguard.
+
+    r2 is disabled by the registry and r3's region is blocked: r1 is the last deployment that
+    takes calls, so its target errors only log (`last`) and calls keep going to it.
+    """
+    engine, fake = await make(
+        {
+            "big": {
+                "health": {"disable_errors": 1, "probe_after_secs": 600},
+                "max_attempts": 1,
+                "deployments": {
+                    "aws-a": {
+                        "confirmed": ["r1", "r2"],
+                        "fallback": ["r3"],
+                        "overrides": {"r2": {"enabled": False}},
+                    }
+                },
+            }
+        },
+        {"models": {f"{GPT}@r1": {"force_error": "AccessDeniedException"}}},
+    )
+    await engine.registry.block(region="r3", on=True, actor="t")
+    with pytest.raises(CallFailed):
+        await engine.call("big", CHAT)
+    assert await engine.health.disabled("big") == {}  # r1 was disabled before
+    fake.scenario.patch_model(f"{GPT}@r1", {"force_error": None})
+    reply = await engine.call("big", CHAT)
+    assert reply.meta.deployment == "aws-a/r1"

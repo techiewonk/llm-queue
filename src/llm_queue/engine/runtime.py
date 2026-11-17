@@ -214,6 +214,21 @@ def _takes_calls(view: ResolvedRegistry, alias: str) -> bool:
     )
 
 
+def _dep_takes_calls(view: ResolvedRegistry, alias: str, dep: Deployment) -> bool:
+    """True when a deployment may take calls: enabled, account enabled, unblocked, in residency.
+
+    Admission's own filter (PICK_TAKE `evaluate`), less health and breakers.
+    """
+    routing = view.registry.routing
+    return bool(
+        view.value(alias, "enabled", dep.key)
+        and view.registry.accounts[dep.account].enabled
+        and dep.region not in routing.blocked_regions
+        and dep.account not in routing.blocked_accounts
+        and not view.outside_residency(dep)
+    )
+
+
 def shape_ok(
     view: ResolvedRegistry,
     target: str,
@@ -4372,7 +4387,14 @@ class Engine:
         view = self.registry.current
         for alias, dep_key in noted:
             settings = view.value(alias, "health", dep_key)
-            others = [d.key for d in view.deployments(alias) if d.key != dep_key]
+            # Only deployments that take calls count as usable (A-3, owner Q-3): a disabled,
+            # blocked or out-of-residency one let the real last deployment be disabled, and
+            # the model was `model_unavailable` until a probe recovered it.
+            others = [
+                d.key
+                for d in view.deployments(alias)
+                if d.key != dep_key and _dep_takes_calls(view, alias, d)
+            ]
             outcome = await self.health.record_target_error(
                 alias,
                 dep_key,
