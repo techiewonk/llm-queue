@@ -724,6 +724,7 @@ class _Held:
     # An admin extend (0.2.0 T2): the call's new deadline, store ms (0: none seen).
     extended_ms: int = 0
     answered: bool = False  # its success is stored: a later step's error never fails it (A-1)
+    retry_wait: bool = False  # between two attempts (backoff or waiting for a grant), no grant
 
     @property
     def position(self) -> float:
@@ -1390,6 +1391,14 @@ class Engine:
             for h in list(self._held.values())
             if not h.grants and h.run is None and h.message is not None
         ]
+        # A call between two attempts holds no grant either, but its run task is alive: it
+        # kept the drain open until its deadline (G22). Stopped as a drain timeout stops a run:
+        # given back, not failed (any grant its admission got in flight goes back too, A-4).
+        for held in list(self._held.values()):
+            run = held.run
+            if held.retry_wait and held.message is not None and run is not None and not run.done():
+                held.shutdown = True
+                run.cancel()
         for held in handed:
             # Dropped, not cancelled: its hold sees that within a second and ends. A cancel
             # inside its admission lost a grant the store had made (FE-4, RV-N1).
@@ -3935,6 +3944,7 @@ class Engine:
             self.metrics.count("llmq_retries_total", model=alias, reason=str(kind))
             failed.add(dep_key)
             attempt += 1
+            held.retry_wait = True  # a pause hands it back from here (G22)
             if retry_secs:  # never past the deadline: the caller is told in time
                 left = self._deadline(held) - self.clock.now()
                 await asyncio.sleep(max(0.0, min(retry_secs, left)))
@@ -3954,6 +3964,7 @@ class Engine:
                     return
                 if next_decision.kind == "granted":
                     decision, alias = next_decision, home
+                    held.retry_wait = False
                     break
                 if alias != home and next_decision.kind == "wait":
                     waited = self.clock.now() - held.position_ms / 1000.0
@@ -3962,6 +3973,7 @@ class Engine:
                     )
                     if picked is not None:
                         (decision, alias) = picked
+                        held.retry_wait = False
                         self._fallback_status(held, alias)
                         break
                 if next_decision.kind == "busy":

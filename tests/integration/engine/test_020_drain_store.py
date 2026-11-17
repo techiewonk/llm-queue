@@ -30,6 +30,7 @@ from engine_testkit import (
 from engine_testkit import registry as registry_doc
 
 from llm_queue import LLMQueue, LLMQueueError
+from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.runtime import Engine
 
 pytestmark = pytest.mark.integration
@@ -200,6 +201,63 @@ async def test_a8_resume_from_another_thread_wakes_the_loops(make: Make) -> None
     finally:
         loop.set_debug(False)
     assert (await asyncio.wait_for(caller.call("small", CHAT, timeout_secs=20), 15)).ok
+
+
+async def test_g22_a_pause_hands_back_a_call_waiting_between_retries(make: Make) -> None:
+    """G22 (DR-15): a call in retry backoff (run task alive, no grant) was not handed back.
+
+    It kept the drain open until its deadline and retried on the paused pod. It now goes back
+    at once, not failed, and another pod serves it.
+    """
+    first, fake = await make(
+        {"small": {"retry_base_secs": 8, "retry_max_secs": 8, "max_attempts": 3}},
+        {"models": {f"{SMALL}@r1": {"force_error": "InternalServerException"}}},
+    )
+    caller, _ = await make(worker=False)
+    task = asyncio.create_task(caller.call("small", CHAT, request_id="g22-r", timeout_secs=30))
+    await _until(
+        lambda: (h := first._held.get("g22-r")) is not None and h.retry_wait,
+        what="the call in its retry backoff",
+    )
+    first.pause_receiving()
+    await _until(lambda: "g22-r" not in first._held, secs=2, what="the call handed back")
+    second, other = await make()
+    reply = await asyncio.wait_for(task, 20)
+    assert reply.ok
+    assert reply.meta.worker == second.worker_id
+    assert stats(fake, f"{SMALL}@r1")["calls"] == 1  # never retried on the paused pod
+    assert stats(other, f"{SMALL}@r1")["calls"] == 1
+
+
+async def test_g22_a_stream_cut_by_the_drain_timeout_ends_and_is_not_run_again(
+    make: Make,
+) -> None:
+    """G22 (DR-11): a stream that sent chunks when the drain ran out cannot move elsewhere.
+
+    Its caller gets `worker_shutdown` with the partial text, and no other pod runs it again.
+    """
+    first, fake = await make(
+        {"small": {"stream_flush_ms": 0, "timeout_secs": 30, "attempt_timeout_secs": 25}},
+        {"models": {f"{SMALL}@r1": {"output_tokens": 400, "tokens_per_s": 20}}},
+    )
+    caller, _ = await make(worker=False)
+    seen: list[dict[str, Any]] = []
+
+    async def consume() -> None:
+        async for event in caller.stream("small", CHAT, request_id="g22-s", timeout_secs=30):
+            seen.append(event)
+
+    task = asyncio.create_task(consume())
+    await _until(lambda: len(seen) > 2, secs=10, what="chunks reaching the caller")
+    await first.stop(drain_secs=0.2)
+    with pytest.raises(CallFailed) as info:
+        await asyncio.wait_for(task, 10)
+    assert info.value.kind == "worker_shutdown"
+    assert info.value.partial_text
+    _, other = await make()  # another pod: it must not run the cut stream again
+    await asyncio.sleep(1.5)
+    assert stats(fake, f"{SMALL}@r1")["calls"] == 1
+    assert stats(other, f"{SMALL}@r1").get("calls", 0) == 0
 
 
 async def test_draining_is_in_health_with_its_reason(make: Make) -> None:
