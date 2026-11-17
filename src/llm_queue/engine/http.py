@@ -50,6 +50,10 @@ RETRY_AFTER_SECS = 1
 MAX_ID_CHARS = 256
 MAX_EDIT_PATHS = 100
 MAX_ACTOR_CHARS = 128
+TENANT_IN_URL = (
+    "a tenant name stays out of URLs: pass tenant_hash (get it with `llm-queue tenants hash "
+    "NAME` or POST /tenants/hash)"
+)
 Token = str | Callable[[], str | None] | None
 
 
@@ -326,6 +330,8 @@ def status_router(
     def mounts(op: Op) -> bool:
         if op.guard == "read" and not reads:
             return False
+        if op.guard == "write" and not (guarded or writes_by_token):
+            return False  # never open: e.g. `tenants.hash` (B-22) with only a read token
         return {
             "always": True,
             "writes": allow_writes,
@@ -350,6 +356,10 @@ def status_router(
                     fields[name] = _from_query(param, query.getlist(name))
                 except ValueError:
                     return reply((400, {"error": f"bad {name} ({_signature(op)})"}))
+            if "tenant" in fields and "tenant_hash" in params:
+                # A name in a URL reaches proxy and access logs the library cannot redact
+                # (review B-05): GET routes take the hash only.
+                return reply((400, {"error": TENANT_IN_URL}))
         else:
             try:
                 body = await request.json() if await request.body() else {}

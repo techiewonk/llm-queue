@@ -12,6 +12,7 @@ from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from llm_queue.engine.admin.context import AdminContext
+from llm_queue.engine.fairness import hash_tenant_names, hash_tenant_path
 from llm_queue.errors import ConfigError
 from llm_queue.registry.store import SECRET_FIELDS, audit_diff
 
@@ -103,10 +104,28 @@ class RegistryAdmin:
         actor: str,
         dry_run: bool = True,
     ) -> dict[str, Any]:
-        """Live edit of dotted paths (`{"rpm": 400}` with `model=`); None deletes a path."""
+        """Live edit of dotted paths (`{"rpm": 400}` with `model=`); None deletes a path.
+
+        Tenant names in `fairness.weights` / `quotas` paths are hashed here (RQ-5: the raw
+        name was stored and never matched a call); a 16-hex name is refused.
+        """
         if not values:
             raise ConfigError("give at least one path=value")
-        change = self._ctx.registry.set_change(values, model=model)
+        hash_id = self._ctx.hash_id
+        hashed = dict(
+            pair
+            for path, value in values.items()
+            for pair in hash_tenant_path(path, value, hash_id)
+        )
+        edit = self._ctx.registry.set_change(hashed, model=model)
+
+        def change(doc: dict[str, Any]) -> None:
+            edit(doc)
+            # The whole document after the edit: a name set into a hashed block is refused.
+            fixed = hash_tenant_names(doc, hash_id)
+            doc.clear()
+            doc.update(fixed)
+
         return await _edit(self._ctx, change, actor=actor, dry_run=dry_run)
 
     async def publish(self, *, actor: str, dry_run: bool = True) -> dict[str, Any]:
@@ -114,12 +133,19 @@ class RegistryAdmin:
         doc = self._ctx.config_document()
         if doc is None:
             raise ConfigError("LLMQ_REGISTRY (or LLMQ_REGISTRY_FILE) is not set")
+        # Hashed at load already; an exported (marked) document is never hashed twice.
+        doc = hash_tenant_names(doc, self._ctx.hash_id)
         return await self._publish(doc, actor=actor, dry_run=dry_run, rollback=None)
 
     async def rollback(self, version: int, *, actor: str, dry_run: bool = True) -> dict[str, Any]:
         """Publish version `version`'s content as the next version (live blocks are kept)."""
         store = self._ctx.registry
         kept = await store.kept(version)
+        if hash_tenant_names(kept, self._ctx.hash_id) != kept:
+            # Only a version stored before names were hashed on every write holds names.
+            raise ConfigError(
+                f"version {version} holds tenant names, not hashes: publish a corrected document"
+            )
         doc = {**kept, "registry_version": await store.stored_version() + 1}
         return await self._publish(doc, actor=actor, dry_run=dry_run, rollback=version)
 

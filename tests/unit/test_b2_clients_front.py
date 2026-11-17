@@ -73,7 +73,7 @@ def test_bytes_travel_in_the_envelope_and_come_back_as_bytes() -> None:
 
 
 def test_old_message_version_text_has_no_stale_release() -> None:
-    with pytest.raises(ValueError, match="this library reads 2"):
+    with pytest.raises(ValueError, match="this library reads 3"):
         parse(b'{"v": 1}')
 
 
@@ -255,6 +255,7 @@ class _FakeEngine:
         self.registry = SimpleNamespace(current=current)
         self.queues = None
         self.metrics = None
+        self.hash_id = str  # the job runner hashes a job's ids with it
         self.settings = SimpleNamespace(
             queue_prefix="", drain_secs=0, queue_wait_replicas=0, queue_wait_ms=100
         )

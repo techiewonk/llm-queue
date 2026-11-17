@@ -17,6 +17,7 @@ from llm_queue.engine.admin.registry import usable
 from llm_queue.engine.settings import InfraSettings
 from llm_queue.engine.store_guard import STORE_DOWN
 from llm_queue.errors import LLMQueueError
+from llm_queue.ids import keyed_hash
 
 
 class DrainAdmin:
@@ -73,7 +74,7 @@ def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> 
             local_process_count=s.local_process_count,
             local_concurrency=s.local_concurrency,
             metrics_sink=s.metrics_sink,
-            default_tenant=s.default_tenant,
+            **_default_tenant(s),
             admin_writes_enabled=s.admin_writes_enabled,
             registry_version=doc.get("registry_version"),
             models=sorted(doc.get("models") or {}),
@@ -90,11 +91,26 @@ def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> 
         key_expiry=s.key_expiry,
         store_max_connections=s.store_max_connections,
         metrics_sink=s.metrics_sink,
-        default_tenant=s.default_tenant,
+        **_default_tenant(s),
         admin_writes_enabled=s.admin_writes_enabled,
         registry_version=doc.get("registry_version"),
         models=sorted(doc.get("models") or {}),
     )
+    return out
+
+
+def _default_tenant(s: InfraSettings) -> dict[str, Any]:
+    """`LLMQ_DEFAULT_TENANT` as its keyed hash; the name too with `LLMQ_TENANT_NAMES_ENABLED`.
+
+    `describe()` is served on a read route and logged at start: a raw tenant name there broke
+    "tenant names hashed" (review B-04).
+    """
+    name = s.default_tenant
+    out: dict[str, Any] = {
+        "default_tenant_hash": keyed_hash(s.id_hash_salt or "", name) if name else None
+    }
+    if s.tenant_names_enabled:
+        out["default_tenant"] = name
     return out
 
 

@@ -154,6 +154,27 @@ def test_path_and_query_arguments() -> None:
     assert admin.calls[-1][1]["request_ids"] == ["a", "b"]
 
 
+@pytest.mark.parametrize("path", ["/status", "/requests", "/requests/count"])
+def test_b05_get_routes_take_the_tenant_hash_only(path: str) -> None:
+    """B-05: a name in a query string reached proxy and access logs nobody can redact."""
+    admin = FakeAdmin()
+    http = _writes(admin)
+    refused = http.get(path, params={"model": "m", "tenant": "acme"})
+    assert refused.status_code == 400
+    assert "tenant_hash" in refused.json()["error"]
+    assert http.get(path, params={"model": "m", "tenant_hash": "-"}).status_code == 200
+    assert admin.calls[-1][1]["tenant_hash"] == "-"
+
+
+def test_b22_tenant_hash_needs_the_write_guard() -> None:
+    """B-22: with the hashes reads show, a read token could confirm which tenant a hash is."""
+    http = client(FakeAdmin(), admin_token="w", read_token="r")
+    assert http.post("/tenants/hash", json={"tenant": "a"}, headers={TOKEN: "r"}).status_code == 403
+    assert http.post("/tenants/hash", json={"tenant": "a"}, headers={TOKEN: "w"}).status_code == 200
+    reads_only = client(FakeAdmin(), read_token="r")
+    assert reads_only.post("/tenants/hash", json={"tenant": "a"}).status_code == 404  # unmounted
+
+
 def test_fo15_bounds_on_ids_and_edits() -> None:
     """FO-15: ids, models and edit bodies had no size bound before the store read."""
     http = _writes(FakeAdmin())

@@ -7,6 +7,13 @@ public API (see STABILITY.md).
 
 ## [Unreleased]
 
+### Upgrading from 0.1.1: drain 0.1.1 first
+
+The message format is now version 3: `tenant_id` and `user_id` carry keyed hashes, not raw ids,
+and job messages carry the sender's hashes. 0.1.1 and 0.2.0 workers do not share a queue (a
+0.1.1 worker returns a 0.2.0 message; a 0.2.0 worker refuses a 0.1.1 one). Let the 0.1.1
+workers empty the queues, then start 0.2.0 everywhere (see `docs/how-to/upgrade.md`).
+
 ### Removed and renamed (admin API)
 
 Every admin operation is now one service method under `llmq.admin`, and the `llm-queue` CLI and
@@ -254,6 +261,18 @@ index (below).
   `call_cancel` only for the calls it cancelled and answers waiting calls in one round trip per
   batch; a reprioritize stopped by a full target counts every call left in `skipped.full`;
   `requests.get` of a call whose model was removed returns its records, not a `KeyError`.
+- Tenant names in `fairness.weights` / `quotas` are hashed on every registry write path, not
+  only when the boot file is read: `registry set fairness.weights.acme=3` stored the raw name,
+  which never matched a call. A hashed block is marked `tenant_keys: hashed` (new registry
+  field), so an exported document is not hashed twice; a 16-hex name in a block of names is
+  refused. Job messages carry the hashes of the sender's ids (`ctx.user_hash` /
+  `ctx.tenant_hash`), not the ids; the job's calls use them as they are
+  (`llm_queue.ids.HashedId`).
+- No tenant name on a read route: `describe()` shows `default_tenant_hash` (the name only with
+  `LLMQ_TENANT_NAMES_ENABLED`); `GET /status`, `/requests` and `/requests/count` refuse
+  `?tenant=` (400) and take `tenant_hash` (the CLI and Python still take a name and hash it
+  locally); `POST /tenants/hash` needs the write guard, as with the hashes the reads show it
+  would tell a read token which tenant a hash is.
 - Drain API (plan A1-A5). `pause_receiving()` stays sync and callable from any thread;
   `resume_receiving()` undoes it (ready again when started; `LLMQueueError` after `stop()`);
   `await drain(drain_secs=None)` pauses and waits for running calls and jobs (it does not

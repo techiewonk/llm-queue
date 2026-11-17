@@ -336,9 +336,9 @@ _PCT = number(0, 100, integer=True)
 _POS = number(0, lo_open=True)
 _SECS = number(0, DAY_SECS, lo_open=True)  # timeouts and waits: at most one day (Q42)
 
-# Per-tenant fairness (owner Q28, Q29, Q50), off by default. `weights` and `quotas` name raw
-# tenant ids: they stay in the registry document and the worker's memory; the store and the
-# metrics only ever see the keyed hash of a tenant (`Engine.hash_id`).
+# Per-tenant fairness (owner Q28, Q29, Q50), off by default. `weights` and `quotas` name
+# tenants in the file; every registry write path replaces each name by its keyed hash and marks
+# the block `tenant_keys: hashed` (D2, review RQ-5), so the store only holds hashes.
 FAIRNESS_MODES = ("off", "share", "quota", "fair_queue")
 FAIRNESS_DEFAULTS = {"mode": "off", "default_weight": 1, "active_secs": 60}
 MAX_TENANT_ID_CHARS = 256
@@ -375,6 +375,9 @@ _FAIRNESS = obj(
         "tpm": number(1, integer=True),
         "quotas": TenantMap(_TENANT_CAPS),
         "active_secs": number(1, DAY_SECS),
+        # `hashed`: `weights` / `quotas` are keyed by tenant hashes already (every registry
+        # write path hashes names and writes this; an exported document keeps it).
+        "tenant_keys": one_of("names", "hashed"),
     }
 )
 

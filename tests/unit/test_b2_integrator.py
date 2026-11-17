@@ -116,6 +116,7 @@ def test_register_job_takes_a_timeout() -> None:
         queues=None,
         settings=SimpleNamespace(queue_prefix="", queue_wait_replicas=0, queue_wait_ms=100),
         metrics=MagicMock(),
+        hash_id=str,
     )
     queue = LLMQueue(engine)  # type: ignore[arg-type]
 
@@ -144,6 +145,7 @@ async def test_send_job_at_the_limit_is_queue_full(monkeypatch: pytest.MonkeyPat
         queues=None,
         settings=SimpleNamespace(queue_prefix="", queue_wait_replicas=0, queue_wait_ms=100),
         metrics=None,
+        hash_id=str,
     )
     queue = LLMQueue(engine)  # type: ignore[arg-type]
 

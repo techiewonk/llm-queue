@@ -88,7 +88,7 @@ from llm_queue.engine.streaming import (
     text_of,
 )
 from llm_queue.errors import ConfigError, ErrorKind, LLMQueueError, UnsupportedEnvelopeError
-from llm_queue.ids import keyed_hash, new_id
+from llm_queue.ids import HashedId, hash_once, keyed_hash, new_id
 from llm_queue.providers.classify import (
     error_family,
     is_auth_error,
@@ -458,14 +458,15 @@ def build_envelope(
         allowed_regions=tuple(allowed_regions) if allowed_regions else None,
         allowed_accounts=tuple(allowed_accounts) if allowed_accounts else None,
         session_id=session_id,
-        user_id=hash_id(user_id) if user_id else None,
-        tenant_id=hash_id(tenant_id) if tenant_id else None,
+        user_id=hash_once(user_id, hash_id) if user_id else None,
+        tenant_id=hash_once(tenant_id, hash_id) if tenant_id else None,
         app_request_id=request_id is not None,
         stream=stream,
         vectors=vectors,
     )
     envelope.keep_params_json(encoded)
-    envelope.keep_tenant_name(tenant_id)
+    if not isinstance(tenant_id, HashedId):  # a job's tenant is a hash: no name to keep
+        envelope.keep_tenant_name(tenant_id)
     hook_name = view.value(alias, "admission")
     hook = hooks.get("admission", hook_name)
     if hook is not None:
@@ -1829,7 +1830,7 @@ class Engine:
     ) -> bool:
         """True when this call runs direct: kill switch, or outside `queue_pct` (canary)."""
         routing = view.registry.routing
-        if user_id and self.hash_id(user_id) in routing.allow_users:
+        if user_id and hash_once(user_id, self.hash_id) in routing.allow_users:
             return False
         if routing.kill_switch:
             return True
