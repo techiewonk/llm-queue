@@ -1206,14 +1206,25 @@ class Engine:
     def resume_receiving(self) -> None:
         """Undo `pause_receiving`: receive again, and ready when started (0.2.0 A2).
 
-        `LLMQueueError` once `stop()` began: a stopped engine cannot take calls again.
+        Callable from any thread, as the pause is (A-8). `LLMQueueError` once `stop()` began:
+        a stopped engine cannot take calls again.
         """
         if self._stopping or self._closed:
             raise LLMQueueError("this engine is stopped; it cannot resume receiving")
         self._paused = False
         self._draining_since = None
         self.ready = self._started
-        for wake in self._wake.values():  # receive loops waiting out the pause
+        loop = self._own_loop
+        if loop is None:
+            return  # never started: no receive loop waits
+        # The loops' wake-up events belong to the engine's loop: set from another thread, the
+        # wake-up was lost (asyncio debug raised).
+        with contextlib.suppress(RuntimeError):  # the loop is closed
+            loop.call_soon_threadsafe(self._wake_receivers)
+
+    def _wake_receivers(self) -> None:
+        """On the engine's loop: wake the receive loops waiting out a pause."""
+        for wake in self._wake.values():
             wake.set()
 
     @property

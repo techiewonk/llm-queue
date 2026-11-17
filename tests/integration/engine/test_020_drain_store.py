@@ -183,6 +183,25 @@ async def test_resume_makes_the_engine_ready_and_receiving_again(make: Make) -> 
     assert (await asyncio.wait_for(task, 15)).ok
 
 
+async def test_a8_resume_from_another_thread_wakes_the_loops(make: Make) -> None:
+    """A-8: `resume_receiving()` set the loop's events from the calling thread.
+
+    The pause is thread-safe; the resume was not: with asyncio debug on it raised, and the
+    wake-up was not delivered. It now goes through `call_soon_threadsafe`.
+    """
+    worker, _ = await make()
+    caller, _ = await make(worker=False)
+    worker.pause_receiving()
+    await asyncio.sleep(0.3)  # the receive loops wait out the pause on their events
+    loop = asyncio.get_running_loop()
+    loop.set_debug(True)
+    try:
+        await asyncio.to_thread(worker.resume_receiving)
+    finally:
+        loop.set_debug(False)
+    assert (await asyncio.wait_for(caller.call("small", CHAT, timeout_secs=20), 15)).ok
+
+
 async def test_draining_is_in_health_with_its_reason(make: Make) -> None:
     engine, _ = await make()
     health = await engine.health_check()
@@ -316,3 +335,34 @@ async def test_the_drain_file_pauses_every_queue_and_ignores_an_old_file(
     await _until(lambda: one.draining, what="paused again by a newer file")
     await one.stop(drain_secs=0)
     assert one._drain_watcher is None or not one._drain_watcher.running
+
+
+async def test_a2_stop_stops_receiving_before_the_jobs_drain(
+    queues: Callable[..., Awaitable[LLMQueue]],
+) -> None:
+    """A-2 (G4): `stop()` with no pause kept receiving calls while its jobs drained.
+
+    Calls taken then got only the rest of the drain (streams failed `worker_shutdown`, others
+    ran again elsewhere). A call sent after `stop()` began now waits for another pod.
+    """
+    started = asyncio.Event()
+
+    async def job(payload: dict[str, Any]) -> None:
+        started.set()
+        await asyncio.sleep(2.0)
+
+    first = await queues(jobs={"j": job})
+    second = await queues()
+    second.pause_receiving()
+    await first.send_job("j", {"n": 1})
+    await asyncio.wait_for(started.wait(), 10)
+    stopping = asyncio.create_task(first.stop(drain_secs=5))
+    await _until(lambda: first.draining, what="the stop's pause")
+    call = asyncio.create_task(second.call("small", CHAT, request_id="a2-call", timeout_secs=20))
+    await asyncio.sleep(1.0)
+    assert not call.done()  # the first queue took and ran it while its job drained, before
+    await stopping
+    second.resume_receiving()
+    reply = await asyncio.wait_for(call, 15)
+    assert reply.ok
+    assert reply.meta.worker == second._engine.worker_id
