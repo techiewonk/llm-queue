@@ -5,7 +5,7 @@ in the store: budgets, limiter, breaker, health, sticky sessions, queues, tenant
 purge deletes it. One service does every purge, `PurgeService`; the CLI, the built-in HTTP
 routes and your own API routes all call it.
 
-Every purge can run as a **dry run** first (it reports what it would delete and changes
+Every purge is a **dry run** unless `dry_run=False` (0.2.0, owner D3: it reports what it would delete and changes
 nothing). A real purge writes an entry to the registry audit (`llm-queue registry log`), logs
 `llmq_purge` and counts `llmq_purged_keys_total{kind}`. Each returns a `PurgeReport`;
 `report.as_dict()` is JSON-ready:
@@ -23,10 +23,10 @@ nothing). A real purge writes an entry to the registry audit (`llm-queue registr
 
 ```python
 report = await llmq.purge.plan_tenant("acme")                # dry run: what would go
-report = await llmq.purge.tenant("acme", actor="ops@example.com")
-report = await llmq.purge.deployment("gpt20b", "aws-main/us-east-1", actor="ops")
-report = await llmq.purge.model("old-model", actor="ops")
-report = await llmq.purge.removed(actor="ops")               # all the registry no longer has
+report = await llmq.purge.tenant("acme", actor="ops@example.com", dry_run=False)
+report = await llmq.purge.deployment("gpt20b", "aws-main/us-east-1", actor="ops", dry_run=False)
+report = await llmq.purge.model("old-model", actor="ops", dry_run=False)
+report = await llmq.purge.removed(actor="ops", dry_run=False)  # all the registry no longer has
 pending = await llmq.purge.scheduled()                       # auto purges in their grace
 await llmq.purge.cancel_scheduled("gpt20b/aws-main/us-east-1")  # keep that state
 ```

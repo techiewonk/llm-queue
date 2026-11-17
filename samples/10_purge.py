@@ -48,7 +48,7 @@ async def main() -> None:
             assert plan.dry_run
             assert plan.deleted_keys > 0
 
-            done = await llmq.purge.tenant("acme", actor="sample")
+            done = await llmq.purge.tenant("acme", actor="sample", dry_run=False)
             show("purge tenant", done.as_dict())
             assert not done.dry_run
             assert done.deleted_keys == plan.deleted_keys

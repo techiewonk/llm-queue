@@ -71,7 +71,7 @@ async def test_model_purge_dry_run_real_and_again(store: redis.asyncio.Redis, pr
     assert (plan.deleted_keys, plan.queues, plan.dry_run) == (5, ("llm-ghost",), True)
     assert await _exists(store, [*model, dlq, bell]) == [1] * 5
 
-    done = await svc.model("ghost", actor="ops")
+    done = await svc.model("ghost", actor="ops", dry_run=False)
     assert (done.deleted_keys, done.queues, done.actor) == (5, ("llm-ghost",), "ops")
     assert await _exists(store, [*model, dlq, bell, keep]) == [0] * 5 + [1]
     assert await store.zscore(f"{prefix}:ttl", model[0]) is None
@@ -79,22 +79,22 @@ async def test_model_purge_dry_run_real_and_again(store: redis.asyncio.Redis, pr
     assert (audit[b"op"], audit[b"actor"]) == (b"purge_model", b"ops")
     assert done.as_dict()["queues"] == ["llm-ghost"]
 
-    again = await svc.model("ghost", actor="ops")
+    again = await svc.model("ghost", actor="ops", dry_run=False)
     assert (again.deleted_keys, again.queues) == (0, ())
 
 
 async def test_model_purge_refusals_and_busy_queue(store: redis.asyncio.Redis, prefix: str) -> None:
     svc = await _service(store, prefix)
     with pytest.raises(PurgeRefused, match="still in the registry"):
-        await svc.model("big", actor="ops")
+        await svc.model("big", actor="ops", dry_run=False)
     stream = f"{prefix}:{{q:llm-ghost}}:s"
     await store.xadd(stream, {"body": "x"})
-    report = await svc.model("ghost", actor="ops")
+    report = await svc.model("ghost", actor="ops", dry_run=False)
     assert report.queues == ()
     assert report.skipped[0][0] == "llm-ghost"
     assert "force" in report.skipped[0][1]
     assert await store.exists(stream)
-    forced = await svc.model("ghost", actor="ops", force=True)
+    forced = await svc.model("ghost", actor="ops", dry_run=False, force=True)
     assert forced.queues == ("llm-ghost",)
     assert not await store.exists(stream)
 
@@ -120,12 +120,12 @@ async def test_deployment_purge(store: redis.asyncio.Redis, prefix: str) -> None
     svc = await _service(store, prefix, doc)
     gone, kept = await _seed_deployment(store, prefix)
     with pytest.raises(PurgeRefused):
-        await svc.deployment("big", "aws-a/r2", actor="ops")
+        await svc.deployment("big", "aws-a/r2", actor="ops", dry_run=False)
     await svc.registry.publish(_without(doc, 2), actor="test")
 
     plan = await svc.plan_deployment("big", "aws-a/r2")
     assert (plan.deleted_keys, plan.deleted_fields, plan.target) == (7, 2, "big/aws-a/r2")
-    done = await svc.deployment("big", "aws-a/r2", actor="ops")
+    done = await svc.deployment("big", "aws-a/r2", actor="ops", dry_run=False)
     assert (done.deleted_keys, done.deleted_fields) == (7, 2)
     assert await _exists(store, gone) == [0] * 7
     assert await _exists(store, kept) == [1] * 3
@@ -133,7 +133,7 @@ async def test_deployment_purge(store: redis.asyncio.Redis, prefix: str) -> None
     assert await store.hkeys(f"{m}health") == [b"aws-a/r1|until"]
     assert await store.hkeys(f"{m}rot") == [b"cw|aws-a/r1"]
     assert (await _last_audit(store, prefix))[b"op"] == b"purge_deployment"
-    again = await svc.deployment("big", "aws-a/r2", actor="ops")
+    again = await svc.deployment("big", "aws-a/r2", actor="ops", dry_run=False)
     assert (again.deleted_keys, again.deleted_fields) == (0, 0)
 
 
@@ -143,11 +143,13 @@ async def test_deployment_purge_wait_timeout_skips(store: redis.asyncio.Redis, p
     await svc.registry.publish(_without(doc, 2), actor="test")
     gone, _ = await _seed_deployment(store, prefix)
     await store.hset(f"{prefix}:{{m:big}}:inprog:r-1", mapping={"dep": "aws-a/r2"})
-    waited = await svc.deployment("big", "aws-a/r2", actor="ops")  # wait=True by default
+    waited = await svc.deployment(
+        "big", "aws-a/r2", actor="ops", dry_run=False
+    )  # wait=True by default
     assert waited.deleted_keys == 0
     assert "still running" in waited.skipped[0][1]
     assert await _exists(store, gone) == [1] * 7
-    now = await svc.deployment("big", "aws-a/r2", actor="ops", wait=False)
+    now = await svc.deployment("big", "aws-a/r2", actor="ops", dry_run=False, wait=False)
     assert now.deleted_keys == 7
 
 
@@ -162,15 +164,15 @@ async def test_tenant_purge_fixes_the_weight_sum(store: redis.asyncio.Redis, pre
 
     plan = await svc.plan_tenant("acme")
     assert (plan.deleted_keys, plan.deleted_fields, plan.target) == (2, 2, f"tenant:{h}")
-    done = await svc.tenant("acme", actor="ops")
+    done = await svc.tenant("acme", actor="ops", dry_run=False)
     assert (done.deleted_keys, done.deleted_fields) == (2, 2)
     assert await store.hgetall(f"{m}tf:w") == {other.encode(): b"1", b"~sum": b"1"}
     assert await store.zrange(f"{m}tf:act", 0, -1) == [other.encode()]
     assert await _exists(store, [f"{m}tf:t:{h}", f"{m}tf:s:{h}"]) == [0, 0]
     assert b"acme" not in str(await _last_audit(store, prefix)).encode()  # only the hash
-    again = await svc.tenant("acme", actor="ops")
+    again = await svc.tenant("acme", actor="ops", dry_run=False)
     assert (again.deleted_keys, again.deleted_fields) == (0, 0)
-    await svc.tenant("beta", actor="ops", models=["big"])
+    await svc.tenant("beta", actor="ops", dry_run=False, models=["big"])
     assert not await store.exists(f"{m}tf:w")  # the last tenant: the hash goes
 
 
@@ -180,7 +182,7 @@ async def test_tenant_calls_come_from_the_request_index(
     """T3: a tenant purge of queued / running calls reads the T1 index of each model."""
     off = await _service(store, prefix, request_index=False)
     with pytest.raises(PurgeRefused, match="LLMQ_REQUEST_INDEX_ENABLED"):
-        await off.tenant("acme", actor="ops", remove={"keys", "queued"})
+        await off.tenant("acme", actor="ops", dry_run=False, remove={"keys", "queued"})
     indexed = await _service(store, prefix)
     h = keyed_hash(SALT, "acme")
     other = keyed_hash(SALT, "beta")
@@ -194,13 +196,15 @@ async def test_tenant_calls_come_from_the_request_index(
     await store.zadd(f"{prefix}:{{m:big}}:tq:{h}", {"lapsed": 1})  # past its deadline
     plan = await indexed.plan_tenant("acme", remove={"queued"})
     assert plan.cancelled == 1
-    done = await indexed.tenant("acme", actor="ops", remove={"queued"})
+    done = await indexed.tenant("acme", actor="ops", dry_run=False, remove={"queued"})
     assert done.cancelled == 1
     assert await _exists(store, [f"{prefix}:{{r:q1}}:cancel", f"{prefix}:{{r:r1}}:cancel"]) == [
         1,
         0,
     ]
-    everything = await indexed.tenant("acme", actor="ops", remove={"running", "keys"})
+    everything = await indexed.tenant(
+        "acme", actor="ops", dry_run=False, remove={"running", "keys"}
+    )
     assert everything.cancelled == 2  # every indexed call (the cancel API counts a repeat)
     assert not await store.exists(f"{prefix}:{{r:b1}}:cancel")  # another tenant: untouched
     assert not await store.exists(f"{prefix}:{{r:lapsed}}:cancel")
@@ -217,11 +221,11 @@ async def test_removed_purges_models_and_deployments(
     plan = await svc.removed(actor="ops", dry_run=True)
     assert plan.deleted_keys == 8
     assert plan.kind == "removed"
-    done = await svc.removed(actor="ops")
+    done = await svc.removed(actor="ops", dry_run=False)
     assert done.deleted_keys == 8
     assert await _exists(store, [*gone, f"{prefix}:{{m:ghost}}:cfg"]) == [0] * 8
     assert await _exists(store, kept) == [1] * 3
-    assert (await svc.removed(actor="ops")).deleted_keys == 0
+    assert (await svc.removed(actor="ops", dry_run=False)).deleted_keys == 0
 
 
 async def test_auto_purge_grace_rollback_and_due(store: redis.asyncio.Redis, prefix: str) -> None:
@@ -316,7 +320,7 @@ async def test_engine_purges_a_tenants_calls_from_the_index(make: Make) -> None:
         if await engine.state.zcard(key):
             break
         await asyncio.sleep(0.02)
-    report = await engine.purge.tenant("acme", actor="ops", remove={"running"})
+    report = await engine.purge.tenant("acme", actor="ops", dry_run=False, remove={"running"})
     assert report.cancelled == 1
     with pytest.raises(CallFailed, match="cancelled"):
         await task

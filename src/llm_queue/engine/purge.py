@@ -262,7 +262,7 @@ class PurgeService:
 
     @store_op
     async def model(
-        self, alias: str, *, actor: str, force: bool = False, dry_run: bool = False
+        self, alias: str, *, actor: str, force: bool = False, dry_run: bool = True
     ) -> PurgeReport:
         """Delete every key of model `alias`, its queues and doorbells.
 
@@ -288,7 +288,7 @@ class PurgeService:
         force: bool = False,
         wait: bool | None = None,
         wait_secs: float | None = None,
-        dry_run: bool = False,
+        dry_run: bool = True,
     ) -> PurgeReport:
         """Delete the state of deployment `deployment` (`account/name`) of model `alias`.
 
@@ -321,7 +321,7 @@ class PurgeService:
         actor: str,
         remove: Iterable[str] | None = None,
         models: Sequence[str] | None = None,
-        dry_run: bool = False,
+        dry_run: bool = True,
     ) -> PurgeReport:
         """Delete a tenant's fairness state in every model (or `models`); maybe cancel its calls.
 
@@ -355,7 +355,7 @@ class PurgeService:
         force: bool = False,
         wait: bool | None = None,
         wait_secs: float | None = None,
-        dry_run: bool = False,
+        dry_run: bool = True,
     ) -> PurgeReport:
         """Purge every model and deployment the store has state of and the registry has not.
 
