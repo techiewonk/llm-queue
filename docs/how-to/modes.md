@@ -98,6 +98,11 @@ this process. To change a model in local mode, change the registry document and 
 | `/drain`, `POST /drain`, `POST /resume` | As in queue mode (not audited: the audit is in the store) |
 | `/requests*`, `/tenants`, `/purge/*`, `/registry/versions`, `POST /registry*`, `/audit`, `/models*`, `/blocks*`, `/queues`, `/jobs`, `/dlq*` | 503 `{"reason": "local_mode"}` |
 
+A route's guards answer before the local-mode refusal, as in queue mode: a request without a
+valid token is 403; a write route is mounted only with `allow_writes=True` (404 otherwise),
+and with `dependencies` alone a write without the `X-LLMQ-Admin` header is 403. A request that
+passes them gets the 503 above.
+
 ## Drain
 
 Unchanged: `LLMQ_DRAIN_FILE` (or `POST /drain`) fails readiness, so the load balancer stops

@@ -497,6 +497,28 @@ async def test_install_mounts_every_route_with_local_answers(rig: Rig, tmp_path:
         assert drained["running"] == 0
 
 
+async def test_write_guards_answer_before_the_local_mode_refusal(rig: Rig) -> None:
+    """Review L-8: the documented order, guards first (403 / 404), then 503 `local_mode`."""
+    llmq = await rig.started()
+    body = {"model": "small", "dry_run": True}
+    for writes, headers, code in (
+        (False, {"X-LLMQ-Admin": "1"}, 404),  # write routes not mounted
+        (True, {}, 403),  # dependencies alone: the X-LLMQ-Admin header first
+        (True, {"X-LLMQ-Admin": "1"}, 503),
+    ):
+        app = FastAPI()
+        router = llmq.http_router(
+            dependencies=[lambda: None], allow_writes=writes, actor=lambda r: "tester"
+        )
+        app.include_router(router, prefix="/q")
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://app") as client:
+            got = await client.post("/q/purge/model", json=body, headers=headers)
+        assert got.status_code == code, (writes, headers, got.text)
+        if code == 503:
+            assert got.json()["reason"] == "local_mode"
+
+
 async def test_stop_drains_then_fails_calls_still_running(rig: Rig) -> None:
     await _scenario(rig, {f"{SMALL}@r1": {"hang": True}})
     llmq = await rig.started()
