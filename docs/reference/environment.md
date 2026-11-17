@@ -12,14 +12,33 @@ llmq = LLMQueue.from_env()                                    # os.environ
 llmq = LLMQueue.from_env(secrets=lookup)                      # lookup(name) first, then os.environ
 llmq = LLMQueue.from_env(environ={"LLMQ_STORE_URL": "..."},   # no environment variables at all
                          secrets=lookup)
+llmq = LLMQueue.from_env(secrets=lookup,                      # the app's own values, lowest
+                         defaults={"LLMQ_KEY_PREFIX": "myapp-dev"},
+                         secret_names={"LLMQ_STORE_HOST": "valkey_host"})
 ```
+
+Three layers, highest first: **`secrets=`**, then **`environ`**, then **`defaults=`**.
 
 - `environ=` replaces `os.environ` with a mapping you build (from a config file, Secrets
   Manager, a test fixture). Nothing is read from the process environment then.
 - `secrets=` is a function from a name to a value or `None`; each `LLMQ_*` name is looked up
   there first, then in `environ`. `LLMQ_STORE_PASSWORD` and `LLMQ_QUEUE_STORE_PASSWORD` are read
-  through it on every new store connection, so a rotated password needs no restart. Account
-  secrets (`api_key_ref`, `external_id_ref`) are looked up the same way.
+  through the layers on every new store connection, so a rotated password needs no restart (a
+  password in the environment works without `secrets=` too). Account secrets (`api_key_ref`,
+  `external_id_ref`) are looked up the same way.
+- `defaults=` (a mapping of `LLMQ_*` names to values; `True` / `False` read as `true` /
+  `false`) is used for a name neither layer above sets: the app's own defaults, kept in code.
+  A name without the `LLMQ_` prefix is refused.
+- `secret_names=` maps an `LLMQ_*` setting to the secret that holds it under another name
+  (`{"LLMQ_STORE_PASSWORD": "valkey_password"}`): that secret is asked instead of the
+  `LLMQ_*` name. The order of the layers stays the same.
+
+Two groups name one thing two ways: `LLMQ_STORE_URL` or the store parts (`LLMQ_STORE_HOST`,
+`LLMQ_STORE_PORT`, `LLMQ_STORE_DB`, `LLMQ_STORE_TLS_ENABLED`), and `LLMQ_REGISTRY` or
+`LLMQ_REGISTRY_FILE`. The highest layer that sets any name of a group picks the form, and the
+other form is ignored in every layer: a `defaults` `LLMQ_REGISTRY` gives way to an
+environment's `LLMQ_REGISTRY_FILE`, and an environment's `LLMQ_STORE_URL` to a secret
+`LLMQ_STORE_HOST`. One layer that sets both forms is refused.
 
 Every value is checked at `from_env`; all problems are raised together as one `ConfigError`.
 An empty value (`LLMQ_LEASE_SECS=`, as compose's `${VAR:-}` writes) counts as unset.
@@ -65,11 +84,15 @@ flowchart LR
 
 | Variable | Default | Range | Meaning |
 |---|---|---|---|
-| `LLMQ_STORE_URL` | required | a store URL | The state store: `redis://`, `rediss://`, `valkey://` or `valkeys://` |
-| `LLMQ_STORE_PASSWORD` | none | text | Optional; read through `secrets=` on every new connection (rotation); wins over a password in the URL |
+| `LLMQ_STORE_URL` | required (or `LLMQ_STORE_HOST`) | a store URL | The state store: `redis://`, `rediss://`, `valkey://` or `valkeys://` |
+| `LLMQ_STORE_HOST` | none | a host name or address | The state store as parts instead of a URL (not both in one layer): the URL is built from the host, `LLMQ_STORE_PORT`, `LLMQ_STORE_DB`, `LLMQ_STORE_TLS_ENABLED` and `LLMQ_STORE_PASSWORD` (escaped), and checked like a URL |
+| `LLMQ_STORE_PORT` | 6379 | 1 to 65535 (whole) | The store's port, with `LLMQ_STORE_HOST` |
+| `LLMQ_STORE_DB` | 0 | 0 to 2147483647 (whole) | The database number, with `LLMQ_STORE_HOST` |
+| `LLMQ_STORE_TLS_ENABLED` | true | true or false | `rediss://` (TLS) or `redis://`, with `LLMQ_STORE_HOST`; strict mode still requires TLS for a host that is not local |
+| `LLMQ_STORE_PASSWORD` | none | text | Optional; read on every new connection (rotation), from a secret, the environment or `defaults=`; wins over a password in the URL |
 | `LLMQ_QUEUE_STORE_URL` | the state store | a store URL | Optional separate store for queues and doorbells (same TLS rule) |
 | `LLMQ_QUEUE_STORE_PASSWORD` | none | text | As `LLMQ_STORE_PASSWORD`, for the queue store |
-| `LLMQ_STORE_MAX_CONNECTIONS` | 200 | 4 to 100000 (whole) | Store connection pool per engine (worker slots + callers + 3). Sync calls without a started queue use at most 20 |
+| `LLMQ_STORE_MAX_CONNECTIONS` | 200 | 4 to 100000 (whole) | Store connection pool per engine (worker slots + callers + 3). `auto`: the sum of `worker_slots` over the boot registry's models plus 10 (`STORE_POOL_MARGIN`), within 4 to 100000, computed once by `from_env` (a live edit does not resize it; `start()` warns when the pool is below the slots). Sync calls without a started queue use at most 20 |
 | `LLMQ_QUEUE_FAILOVER_SECS` | 5 | 0 to 3600 | With a separate queue store: send errors this long before calls run direct |
 | `LLMQ_QUEUE_WAIT_REPLICAS` | 0 | 0 to 16 (whole) | A write waits for this many replicas to acknowledge it (0: off). With fewer replicas a write is sent anyway, warned about at most once a minute and counted (`llmq_send_not_replicated_total`); a store with no replica connected skips the wait ... |
 | `LLMQ_QUEUE_WAIT_MS` | 100 | above 0 to 60000 (whole) | ... for at most this long (it must stay below the store read timeout, see [Tune](../how-to/tune.md)) |

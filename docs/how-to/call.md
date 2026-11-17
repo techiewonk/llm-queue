@@ -103,7 +103,13 @@ Bedrock models yield ConverseStream events, OpenAI-compatible ones chat completi
 ```python
 result = await llmq.embed("embed-cohere", texts, input_type="search_document")
 result.vectors          # one vector per text, in order
+
+vector = await llmq.embed_one("embed-cohere", query, input_type="search_query")
+vector = llmq.embed_one_sync("embed-cohere", query)   # sync code, direct path
 ```
+
+`embed_one(model, text, **options)` is `embed(model, [text], ...).vectors[0]`: one text, its
+vector, the same options; `embed_one_sync` is the sync form (like `embed_sync`).
 
 Texts are batched by the model's `embed_batch_size` (capped by what the provider accepts: Titan
 1, Cohere 96, OpenAI 2048; the default is 1, so set it, for example 96 for Cohere and 256 to

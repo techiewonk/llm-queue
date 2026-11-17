@@ -11,8 +11,8 @@ from typing import Any
 import pytest
 
 from llm_queue import LLMQueue, request_context
-from llm_queue.core import _default_worker_id, _SecretFirst
-from llm_queue.engine.settings import InfraSettings
+from llm_queue.core import _default_worker_id
+from llm_queue.engine.settings import InfraSettings, Layers
 
 DEV = {
     "LLMQ_STORE_URL": "redis://localhost:6379/0",
@@ -47,11 +47,11 @@ def test_default_worker_id_is_pod_and_pid(monkeypatch: pytest.MonkeyPatch) -> No
     assert _default_worker_id() == f"api-7f9c:{os.getpid()}"
 
 
-def test_secret_first_mapping_reads_secrets_before_env() -> None:
+def test_layers_mapping_reads_secrets_before_env() -> None:
     def secret(name: str) -> str | None:
         return "99" if name == "LLMQ_JOB_DEDUPE_SECS" else None
 
-    merged = _SecretFirst({"LLMQ_JOB_DEDUPE_SECS": "10", "OTHER": "x"}, secret)
+    merged = Layers({"LLMQ_JOB_DEDUPE_SECS": "10", "OTHER": "x"}, secret)
     assert merged.get("LLMQ_JOB_DEDUPE_SECS") == "99"
     assert merged.get("OTHER") == "x"
     assert merged.get("MISSING") is None

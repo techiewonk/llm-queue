@@ -24,7 +24,6 @@ from collections.abc import (
     Awaitable,
     Callable,
     Coroutine,
-    Iterator,
     Mapping,
     Sequence,
 )
@@ -48,7 +47,7 @@ from llm_queue.engine.offload import ResultOffload
 from llm_queue.engine.purge import PurgeService, PurgeSettings
 from llm_queue.engine.queue import QueueFull
 from llm_queue.engine.runtime import Engine, EngineSettings
-from llm_queue.engine.settings import InfraSettings
+from llm_queue.engine.settings import STORE_POOL_MARGIN, InfraSettings, Layers
 from llm_queue.engine.store_client import Secrets, secret_store_client
 from llm_queue.engine.store_guard import store_op
 from llm_queue.errors import ConfigError, LLMQueueError
@@ -59,9 +58,6 @@ logger = get_logger(__name__)
 # Store connections of the private engine that serves sync calls when no queue is started
 # (Celery workers, scripts): a caller-only engine needs few (D1).
 SYNC_STORE_CONNECTIONS = 20
-# Store connections a worker needs beyond its slots: the receive loop, the result subscriber,
-# heartbeats and status reads (R3PF-8). Unverified: an estimate from the loops it runs.
-STORE_POOL_MARGIN = 10
 # A sync call on a started queue's loop checks this often that the loop still runs (CO-26).
 _LOOP_CHECK_SECS = 1.0
 # How long closing the private engine of the sync calls may take before it is logged and left.
@@ -276,6 +272,8 @@ class LLMQueue:
         environ: Mapping[str, str] | None = None,
         *,
         secrets: Secrets | None = None,
+        defaults: Mapping[str, Any] | None = None,
+        secret_names: Mapping[str, str] | None = None,
         metrics: Metrics | None = None,
         worker_id: str | None = None,
         credentials: Callable[[Any], Mapping[str, Any] | None] | None = None,
@@ -283,14 +281,19 @@ class LLMQueue:
         offload_bytes: int | None = None,
         tuning: Tuning | None = None,
     ) -> LLMQueue:
-        """Build from `LLMQ_*` (secret first when `secrets` is given, then the environment).
+        """Build from `LLMQ_*`: `secrets` first when given, then `environ`, then `defaults`.
 
-        `tuning` sets timeouts, pool sizes and loop pacing in code (`Tuning()` is the
-        defaults); a bad value or combination raises `ConfigError` listing every problem.
+        `defaults` (`{"LLMQ_KEY_PREFIX": "myapp", ...}`) is the lowest layer, for the app's
+        own values; `secret_names` reads a setting from a secret under another name
+        (`{"LLMQ_STORE_HOST": "valkey_host"}`). See `engine.settings.Layers`. `tuning` sets
+        timeouts, pool sizes and loop pacing in code (`Tuning()` is the defaults); a bad value
+        or combination raises `ConfigError` listing every problem.
         """
-        settings = InfraSettings.from_env(environ, secrets=secrets)
-        env = os.environ if environ is None else environ
-        jobs = JobSettings.from_env(_SecretFirst(env, secrets))  # secrets too (0.1.1 read env only)
+        layers = Layers(environ, secrets, defaults, secret_names)
+        settings = InfraSettings.from_env(
+            environ, secrets=secrets, defaults=defaults, secret_names=secret_names
+        )
+        jobs = JobSettings.from_env(layers)  # the same layers as every other setting
         # This process's id prefix: the argument, LLMQ_WORKER_ID, else pod (or host) and pid; the
         # engine adds a random tail, so two processes never share one.
         worker_id = worker_id or settings.worker_id or _default_worker_id()
@@ -308,13 +311,15 @@ class LLMQueue:
         )
 
         def build(cap: int = settings.store_max_connections) -> Engine:
+            # The password is read through the layers on every new connection (rotation):
+            # a secret, else the environment (0.1.1 ignored it there without `secrets=`).
             state = secret_store_client(
-                settings.store_url, secrets, "LLMQ_STORE_PASSWORD", cap, tuning.store
+                settings.store_url, layers.get, "LLMQ_STORE_PASSWORD", cap, tuning.store
             )
             queue_store = (
                 secret_store_client(
                     settings.queue_store_url,
-                    secrets,
+                    layers.get,
                     "LLMQ_QUEUE_STORE_PASSWORD",
                     cap,
                     tuning.store,
@@ -343,7 +348,7 @@ class LLMQueue:
             if credentials is not None:
                 pool_kwargs["credentials"] = credentials
             if secrets is not None:
-                pool_kwargs["secrets"] = secrets
+                pool_kwargs["secrets"] = layers.secret  # `secret_names` apply to accounts too
             engine_settings = EngineSettings(
                 queue_prefix=settings.queue_prefix,
                 lease_secs=settings.lease_secs,
@@ -389,7 +394,7 @@ class LLMQueue:
             job_settings=jobs,
             tuning=tuning,
         )
-        queue._admin_token = lambda: _setting_value("LLMQ_ADMIN_TOKEN", env, secrets)
+        queue._admin_token = lambda: layers.get("LLMQ_ADMIN_TOKEN")
         return queue
 
     # ---------------------------------------------------------------- guards (C2)
@@ -792,6 +797,12 @@ class LLMQueue:
             self._call_kwargs(priority, **kw),
         )
 
+    async def embed_one(
+        self, model: str, text: str, *, priority: bool | None = None, **kw: Any
+    ) -> list[float]:
+        """The vector of one text: `embed(model, [text], ...).vectors[0]` (same options)."""
+        return (await self.embed(model, [text], priority=priority, **kw)).vectors[0]
+
     # ---------------------------------------------------------------- sync (direct path)
 
     def _run_sync[T](self, make: Callable[[Engine], Coroutine[Any, Any, T]]) -> T:
@@ -861,6 +872,12 @@ class LLMQueue:
         """`embed` on the direct path from sync code."""
         kwargs = self._call_kwargs(priority, **kw)
         return self._run_sync(lambda e: _embed(e, model, texts, input_type, partial, True, kwargs))
+
+    def embed_one_sync(
+        self, model: str, text: str, *, priority: bool | None = None, **kw: Any
+    ) -> list[float]:
+        """`embed_one` on the direct path from sync code."""
+        return self.embed_sync(model, [text], priority=priority, **kw).vectors[0]
 
     def close_sync(self) -> None:
         """Stop the private engine of the sync calls (sync-only processes; `stop()` does too)."""
@@ -1243,40 +1260,6 @@ def _warn_if_loop_running() -> None:
         "sync_call_on_event_loop",
         hint="converse_sync / embed_sync block this event loop; await converse / embed instead",
     )
-
-
-class _SecretFirst(Mapping[str, str]):
-    """`env` with each name looked up in `secrets` first: what `InfraSettings.from_env` reads."""
-
-    def __init__(self, env: Mapping[str, str], secrets: Secrets | None) -> None:
-        self._env = env
-        self._secrets = secrets
-
-    def __getitem__(self, name: str) -> str:
-        value = self._secrets(name) if self._secrets is not None else None
-        if value is not None and value != "":
-            return value
-        return self._env[name]
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(self._env)
-
-    def __len__(self) -> int:
-        return len(self._env)
-
-    def get(self, name: str, default: Any = None) -> Any:
-        try:
-            return self[name]
-        except KeyError:
-            return default
-
-
-def _setting_value(name: str, env: Mapping[str, str], secrets: Secrets | None) -> str | None:
-    """A setting read now: the secret first, then the environment; None when unset or empty."""
-    value = secrets(name) if secrets is not None else None
-    if value in (None, ""):
-        value = env.get(name)
-    return value or None
 
 
 def _default_worker_id() -> str:
