@@ -390,6 +390,13 @@ index (below).
   and wakes the callers last: cancelling 10,000 took 9.6 s, now 1.3 s; reprioritizing 1,000
   1.9 s, now 0.8 s. Gate G-T2 waits out its callers' first result reads before it measures
   and times with `perf_counter` (Windows' `monotonic` ticks every 15.6 ms).
+- A smooth window whose bucket holds one call (`rpm x rate_burst` below 2: rpm 9 to 19 at the
+  default `rate_burst` 0.1, rpm 900 at 0.001) granted nothing for about half of all limits:
+  the GCRA check summed `tat + cost x per - now - burst x per`, where `now + per` rounds on
+  13-digit milliseconds, and a call that exactly fills the bucket came out a few 1e-5 ms over,
+  so every call ended `rate_limited` at `max_wait_secs`. The check now subtracts `now` first
+  (exact for an idle bucket), in the admission script, the tenant share clock and local mode.
+  Budgets stay exact and a waiting priority call still goes first.
 
 ### Changed
 

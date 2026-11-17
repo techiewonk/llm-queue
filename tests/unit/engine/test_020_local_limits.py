@@ -51,6 +51,28 @@ def test_one_estimate_above_the_share_is_paid_off_over_the_next_minutes() -> Non
     assert bucket.wait(1000, MINUTE + 5 * 60 + 1) == 0
 
 
+@pytest.mark.parametrize("limit", [9.0, 11.0, 14.0, 17.0])
+def test_an_idle_smooth_bucket_of_one_lets_a_call_in(limit: float) -> None:
+    """Bug: `tat + c x per - now - size x per` rounded above 0 for a call filling the bucket.
+
+    A smooth bucket of one (rpm 9 to 19 at the default burst, 900 at 0.001) answered a wait of
+    about 1e-7 s for ever when idle, at most times of day (at these limits: always), so no call
+    got in. Asked every 0.37 interval, it now takes a call as soon as one is due.
+    """
+    per = 60.0 / limit
+    now = 1_763_445_012.345
+    assert all(_Bucket(limit, 0.001, "smooth").wait(1, now + i * 0.01) == 0 for i in range(100))
+    bucket = _Bucket(limit, 0.001, "smooth")
+    taken = 0
+    for step in range(100):
+        at = now + step * 0.37 * per
+        if bucket.wait(1, at) == 0:
+            bucket.take(1, at)
+            taken += 1
+            assert bucket.wait(1, at) == pytest.approx(per)
+    assert taken == 34  # every third ask (1.11 intervals): the bucket's rate, never stuck
+
+
 def test_fixed_window_at_or_above_one_is_unchanged() -> None:
     bucket = _Bucket(2.0, 1.0, "fixed")
     for _ in range(2):

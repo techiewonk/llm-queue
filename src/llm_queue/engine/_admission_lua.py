@@ -64,7 +64,7 @@ local function avail(key, f, L, bf, mode)
   end
   local per = 60000 / L
   local tat = math.max(rnum(key, f .. '_tat', now), now)
-  return (now + burst * per - tat) / per, tat
+  return burst - (tat - now) / per, tat
 end
 
 -- Room for cost c behind R reserved units: returns wait ms (0 = fits) and the new state.
@@ -86,7 +86,9 @@ local function room(key, f, L, c, R, bf, mode)
     if tat <= now then return 0, now + c * per end
     return tat - now, nil
   end
-  local over = tat + (R + c) * per - now - burst * per
+  -- `tat - now` first: `tat + c * per - now - burst * per` rounded `now + per` to 1/4096 ms,
+  -- and a call filling the bucket exactly (a bucket of one) came out above 0 for ever.
+  local over = (tat - now) + (R + c - burst) * per
   if over > 0 then return over, nil end
   return 0, tat + c * per
 end
@@ -250,7 +252,7 @@ local function tf_clock(key, f, L, c, bf)
   local per = 60000 / L
   local burst = math.max(1, math.floor(L * bf))
   local tat = math.max(rnum(key, f .. '_tat', now), now)
-  local over = tat + c * per - now - burst * per
+  local over = (tat - now) + (c - burst) * per  -- as `room`: exact when the clock is idle
   if c > burst and tat <= now then over = 0 end
   return math.max(0, over), math.min(tat + c * per, now + 60000 + burst * per)
 end
