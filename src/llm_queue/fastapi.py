@@ -76,8 +76,8 @@ def mount(
 
     Call it while building the app, not in its lifespan: routes added after startup are
     missing from an OpenAPI schema already served. Without `drain_routes` in the options the
-    drain routes are mounted when they can be guarded (an admin token or `dependencies`);
-    with neither, drain through `LLMQ_DRAIN_FILE`.
+    drain routes are mounted when they can be guarded as writes (the admin token, or
+    `dependencies` with `actor`); otherwise drain through `LLMQ_DRAIN_FILE`.
     """
     options = dict(router_options)
     if "drain_routes" not in options:
@@ -86,8 +86,14 @@ def mount(
 
 
 def _guarded(llmq: LLMQueue, options: Mapping[str, Any]) -> bool:
-    """True when the router's write routes have a guard: dependencies or an admin token."""
-    if options.get("dependencies") or options.get("admin_token") is not None:
+    """True when the router's write routes have a guard and an actor for the audit.
+
+    The admin token is both (`token:<X-LLMQ-Actor>`); the app's `dependencies` need `actor`.
+    The read token never writes.
+    """
+    if options.get("admin_token") is not None:
+        return True
+    if options.get("dependencies") and options.get("actor") is not None:
         return True
     reader: Callable[[], str | None] | None = getattr(llmq, "_admin_token", None)
     return reader is not None and reader() is not None

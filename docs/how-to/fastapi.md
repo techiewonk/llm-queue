@@ -20,8 +20,8 @@ llmq = install(app, admin_token=token)     # LLMQueue.from_env(), or install(app
 |---|---|
 | Lifespan | Wraps the app's lifespan (`app.router.lifespan_context`): the queue starts **before** your startup and stops **after** your shutdown, so your producers stop first and running calls then drain for `drain_secs` (default `LLMQ_DRAIN_SECS`, 25 s). The queue is also `app.state.llm_queue` |
 | Middleware | Adds `RequestContextMiddleware(**context)`: each HTTP and websocket request runs in its own [request context](call.md#request-context) |
-| Routes | Mounts `llmq.http_router(**router_options)` under `prefix` (default `/internal/llm-queue`): `/health/live`, `/health/ready`, `/status`, ... (see [HTTP router](operate.md#http-router)) |
-| Drain | Mounts `POST /drain` and `POST /resume` when they can be guarded (an admin token or `dependencies`). The `LLMQ_DRAIN_FILE` watcher is started by `LLMQueue.start()` itself (see [Drain a pod](operate.md#drain-a-pod)) |
+| Routes | Mounts `llmq.http_router(**router_options)` under `prefix` (default `/internal/llm-queue`): `/health/live`, `/health/ready`, `GET /` and every admin operation ([Admin API](../reference/admin-api.md)); with no token and no `dependencies` only the probes |
+| Drain | Mounts `GET /drain`, `POST /drain` and `POST /resume` when they can be guarded as writes (the admin token, or `dependencies` with `actor`). The `LLMQ_DRAIN_FILE` watcher is started by `LLMQueue.start()` itself (see [Drain a pod](operate.md#drain-a-pod)) |
 
 Its parameters, all optional:
 
@@ -34,7 +34,7 @@ Its parameters, all optional:
 | `mount_admin` | True | False mounts no routes |
 | `context_middleware` | True | False adds no middleware |
 | `context` | None | Keyword arguments of `RequestContextMiddleware` (`tenant_id`, `user_id`, `session_id`, `priority`) |
-| `**router_options` | | Passed to `llmq.http_router()`: `admin_token`, `admin_header`, `dependencies`, `allow_writes`, `actor`, `metrics_route`, `drain_routes` (an explicit value wins over the rule above) |
+| `**router_options` | | Passed to `llmq.http_router()`: `admin_token`, `admin_read_token`, `admin_header`, `dependencies`, `allow_writes`, `actor`, `metrics_route`, `drain_routes` (an explicit value wins over the rule above), `insecure_reads` |
 
 A second `install()` on one app raises `ConfigError`. Point the Kubernetes probes at
 `/internal/llm-queue/health/ready` and `/health/live`.

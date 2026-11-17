@@ -167,7 +167,9 @@ def test_routes_mount_under_the_prefix_and_options_pass_through() -> None:
         (None, {}, False),
         ("s3cret", {}, True),  # LLMQ_ADMIN_TOKEN set
         (None, {"admin_token": "t"}, True),
-        (None, {"dependencies": [object()]}, True),
+        (None, {"dependencies": [object()]}, False),  # no actor for the audit
+        (None, {"dependencies": [object()], "actor": lambda r: "ann"}, True),
+        (None, {"admin_read_token": "r"}, False),  # the read token never writes
         ("s3cret", {"drain_routes": False}, False),  # an explicit choice wins
     ],
 )
