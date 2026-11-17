@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from llm_queue.engine.settings import InfraSettings, _read_document
+from llm_queue.engine.settings import InfraSettings, read_document
 from llm_queue.errors import ConfigError, MissingExtra
 from llm_queue.registry import check, load_registry
 from llm_queue.registry.resolve import budget_from_quota
@@ -28,7 +28,7 @@ def _small() -> dict[str, Any]:
 
 
 def _expand(document: str, **env: str) -> Any:
-    return json.loads(_read_document(document, None, env.get))
+    return json.loads(read_document(document, None, env.get))
 
 
 # H3: placeholders -------------------------------------------------------------------------
@@ -82,7 +82,7 @@ def test_default_applies_when_unset_or_empty_and_holds_braces() -> None:
 def test_unset_without_default_names_the_variable_and_path() -> None:
     doc = json.dumps({"models": {"m": {"deployments": {"aws": {"confirmed": ["${R1}", "${R2}"]}}}}})
     with pytest.raises(ConfigError) as caught:
-        _read_document(doc, None, NO_ENV.get)
+        read_document(doc, None, NO_ENV.get)
     text = str(caught.value)
     assert "`R1` is not set (at models.m.deployments.aws.confirmed[0])" in text
     assert "`R2` is not set (at models.m.deployments.aws.confirmed[1])" in text
@@ -99,30 +99,30 @@ def test_escape_and_lone_dollar_are_literal() -> None:
 )
 def test_malformed_placeholder_is_refused(value: str, reason: str) -> None:
     with pytest.raises(ConfigError, match=reason):
-        _read_document(json.dumps({"a": value}), None, NO_ENV.get)
+        read_document(json.dumps({"a": value}), None, NO_ENV.get)
 
 
 def test_repeated_keys_are_refused_before_and_after_expansion() -> None:
     with pytest.raises(ConfigError, match="repeats keys"):
-        _read_document('{"rpm": "${A:-1}", "rpm": 2}', None, NO_ENV.get)
+        read_document('{"rpm": "${A:-1}", "rpm": 2}', None, NO_ENV.get)
     with pytest.raises(ConfigError, match="repeats keys"):
-        _read_document('{"x": "${OBJ}"}', None, {"OBJ": '{"a": 1, "a": 2}'}.get)
+        read_document('{"x": "${OBJ}"}', None, {"OBJ": '{"a": 1, "a": 2}'}.get)
 
 
 def test_bad_json_value_is_refused_without_showing_it() -> None:
     with pytest.raises(ConfigError, match="`SECRET` \\(at x\\) reads as JSON") as caught:
-        _read_document('{"x": "${SECRET}"}', None, {"SECRET": "[hunter2"}.get)
+        read_document('{"x": "${SECRET}"}', None, {"SECRET": "[hunter2"}.get)
     assert "hunter2" not in str(caught.value)
 
 
 def test_keys_are_not_expanded() -> None:
     with pytest.raises(ConfigError, match="values only"):
-        _read_document('{"${K}": 1}', None, {"K": "a"}.get)
+        read_document('{"${K}": 1}', None, {"K": "a"}.get)
 
 
 def test_text_without_placeholders_is_returned_as_written() -> None:
     text = '{"registry_version": 1,  "a": "$x"}'
-    assert _read_document(text, None, NO_ENV.get) == text
+    assert read_document(text, None, NO_ENV.get) == text
 
 
 def test_expanded_values_are_not_expanded_again() -> None:
@@ -166,7 +166,7 @@ def test_yaml_file_is_read_and_expanded(tmp_path: Path) -> None:
     pytest.importorskip("yaml")
     path = tmp_path / "registry.yaml"
     path.write_text(YAML_DOC, encoding="utf-8")
-    loaded = json.loads(_read_document(None, str(path), {"CHAT_RPM": "70"}.get))
+    loaded = json.loads(read_document(None, str(path), {"CHAT_RPM": "70"}.get))
     model = loaded["models"]["gpt20b"]
     assert model["rpm"] == 70
     assert model["deployments"]["aws-main"]["confirmed"] == ["ap-south-1"]
@@ -181,11 +181,11 @@ def test_how_to_yaml_example_loads(tmp_path: Path) -> None:
     assert found, "docs/how-to/configure.md lost its registry.yaml example"
     path = tmp_path / "registry.yaml"
     path.write_text(found.group(1), encoding="utf-8")
-    view = load_registry(json.loads(_read_document(None, str(path), NO_ENV.get)))
+    view = load_registry(json.loads(read_document(None, str(path), NO_ENV.get)))
     assert view.value("gpt120b", "rpm") == 450
     assert view.registry.residency == ("ap-south-1",)
     env = {"EMBED_REGIONS": '["ap-south-1", "ap-south-2"]', "REGISTRY_VERSION": "7"}
-    view = load_registry(json.loads(_read_document(None, str(path), env.get)))
+    view = load_registry(json.loads(read_document(None, str(path), env.get)))
     assert view.registry.version == 7
     assert view.registry.residency == ("ap-south-1", "ap-south-2")
 
@@ -195,7 +195,7 @@ def test_yaml_repeated_key_is_refused(tmp_path: Path) -> None:
     path = tmp_path / "registry.yml"
     path.write_text("registry_version: 1\nmodels: {}\nregistry_version: 2\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="`registry_version` is repeated"):
-        _read_document(None, str(path), NO_ENV.get)
+        read_document(None, str(path), NO_ENV.get)
 
 
 def test_yaml_non_json_values_are_refused(tmp_path: Path) -> None:
@@ -203,10 +203,10 @@ def test_yaml_non_json_values_are_refused(tmp_path: Path) -> None:
     path = tmp_path / "registry.yaml"
     path.write_text("a: .nan\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="nan"):
-        _read_document(None, str(path), NO_ENV.get)
+        read_document(None, str(path), NO_ENV.get)
     path.write_text("1: x\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="keys must be text"):
-        _read_document(None, str(path), NO_ENV.get)
+        read_document(None, str(path), NO_ENV.get)
 
 
 def test_yaml_without_the_extra_names_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -221,7 +221,7 @@ def test_yaml_without_the_extra_names_it(tmp_path: Path, monkeypatch: pytest.Mon
     path = tmp_path / "registry.yaml"
     path.write_text(YAML_DOC, encoding="utf-8")
     with pytest.raises(MissingExtra, match=r"llm-queue\[yaml\]"):
-        _read_document(None, str(path), NO_ENV.get)
+        read_document(None, str(path), NO_ENV.get)
 
 
 # H4: residency "auto" ---------------------------------------------------------------------

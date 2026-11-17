@@ -256,9 +256,9 @@ def test_drain_routes_are_writes_and_audited_with_the_actor() -> None:
 
 def test_fo16_redaction_shares_the_store_set_and_walks_lists() -> None:
     """FO-16: two copies of the secret-field set; a new field had to be added in both."""
-    from llm_queue.registry.store import _SECRET_FIELDS, audit_diff
+    from llm_queue.registry.store import SECRET_FIELDS, audit_diff
 
-    doc = {"accounts": [dict.fromkeys(_SECRET_FIELDS, "secret")]}
+    doc = {"accounts": [dict.fromkeys(SECRET_FIELDS, "secret")]}
     assert all(v == "[redacted]" for v in redacted(doc)["accounts"][0].values())
     (entry,) = audit_diff({"a": []}, {"a": [{"api_key_ref": "LLMQ_ACCOUNT_K"}]})
     assert entry["after"] == [{"api_key_ref": "[redacted]"}]

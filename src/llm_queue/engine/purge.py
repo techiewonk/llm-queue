@@ -11,8 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
-import hmac
 import os
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -30,6 +28,7 @@ from llm_queue.engine.requests import RequestStore
 from llm_queue.engine.settings import TENANT_PURGE_PARTS, InfraSettings, Layers
 from llm_queue.engine.store_guard import store_op
 from llm_queue.errors import AdminRefused, ConfigError
+from llm_queue.ids import keyed_hash
 from llm_queue.registry._lua import AUDIT_MAX_ENTRIES
 
 if TYPE_CHECKING:
@@ -90,11 +89,6 @@ return 0
 def _glob_escape(text: str) -> str:
     """`text` matched literally in a SCAN pattern (glob characters and backslash escaped)."""
     return "".join(f"\\{c}" if c in "*?[]\\" else c for c in text)
-
-
-def keyed_hash(salt: str, value: str) -> str:
-    """`Engine.hash_id` without an engine: HMAC-SHA256 of `value` keyed by `salt`, 16 hex."""
-    return hmac.new(salt.encode(), value.encode(), hashlib.sha256).hexdigest()[:16]
 
 
 @dataclass(frozen=True, slots=True)

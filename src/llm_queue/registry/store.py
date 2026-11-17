@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 AUDIT_RETENTION_DAYS = 90
-_SECRET_FIELDS = frozenset({"role_arn", "external_id_ref", "api_key_ref"})
+SECRET_FIELDS = frozenset({"role_arn", "external_id_ref", "api_key_ref"})
 _ACTOR_MAX = 200
 # First retry of a lost publish / edit waits up to 40 ms, doubling per try (jittered, CO-10).
 _CONFLICT_BACKOFF_SECS = 0.02
@@ -139,7 +139,7 @@ def diff(before: Any, after: Any, path: Path = ()) -> list[tuple[Path, Any, Any]
 
 
 def _redact(path: Path, value: Any) -> Any:
-    if value is not None and path and path[-1] in _SECRET_FIELDS:
+    if value is not None and path and path[-1] in SECRET_FIELDS:
         return "[redacted]"
     if isinstance(value, dict):
         return {k: _redact((*path, k), v) for k, v in value.items()}
@@ -213,7 +213,7 @@ def _protected(path: Path) -> str | None:
     if path[:1] == ("accounts",):
         if len(path) == 2:
             return "adding or removing an account changes only with a deploy"
-        if len(path) >= 3 and path[2] in ("kind", "base_url", *_SECRET_FIELDS):
+        if len(path) >= 3 and path[2] in ("kind", "base_url", *SECRET_FIELDS):
             return f"account `{path[2]}` changes only with a deploy"
     in_deployments = path[:1] == ("models",) and len(path) >= 4 and path[2] == "deployments"
     if in_deployments and (len(path) == 4 or path[4] in ("confirmed", "fallback")):

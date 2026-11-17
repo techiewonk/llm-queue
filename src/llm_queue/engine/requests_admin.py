@@ -306,9 +306,9 @@ class RequestsAdmin:
 
         Settings and store passwords are read as `LLMQueue.from_env` reads them.
         """
-        from llm_queue.engine.purge import keyed_hash
         from llm_queue.engine.settings import InfraSettings, Layers
         from llm_queue.engine.store_client import secret_store_client
+        from llm_queue.ids import keyed_hash
         from llm_queue.registry.store import RegistryStore
         from llm_queue.tuning import Tuning
 

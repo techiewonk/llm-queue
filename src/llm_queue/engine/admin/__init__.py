@@ -41,11 +41,12 @@ from llm_queue.engine.admin.registry import (
 from llm_queue.engine.admin.requests import RequestsAdapter
 from llm_queue.engine.audit import Audit
 from llm_queue.engine.keys import Keys
-from llm_queue.engine.purge import PurgeService, PurgeSettings, keyed_hash
+from llm_queue.engine.purge import PurgeService, PurgeSettings
 from llm_queue.engine.queue import StreamQueues
 from llm_queue.engine.requests_admin import AdminSettings, RequestsAdmin
 from llm_queue.engine.settings import InfraSettings, Layers
 from llm_queue.engine.status import StatusReader
+from llm_queue.ids import keyed_hash
 
 if TYPE_CHECKING:
     from llm_queue.engine.local import LocalEngine

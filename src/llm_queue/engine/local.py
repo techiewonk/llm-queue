@@ -49,7 +49,7 @@ from llm_queue.engine.runtime import (
 )
 from llm_queue.engine.streaming import text_of
 from llm_queue.errors import ConfigError, ErrorKind, LocalModeRefused
-from llm_queue.ids import new_id
+from llm_queue.ids import keyed_hash, new_id
 from llm_queue.providers.classify import (
     error_family,
     is_auth_error,
@@ -1387,9 +1387,6 @@ class LocalEngine:
         limits: LocalLimits | None = None,
     ) -> None:
         """Nothing runs until `start`; `limits` shares one process budget between engines."""
-        import hashlib
-        import hmac
-
         self.settings = settings or EngineSettings()
         self.registry = registry
         self.providers = providers
@@ -1397,10 +1394,8 @@ class LocalEngine:
         registry.metrics = self.metrics
         tail = new_id()[-14:]
         self.worker_id = f"{worker_id}-{tail[-6:]}" if worker_id else tail
-        salt = self.settings.id_hash_salt.encode()
-        self.hash_id: Callable[[str], str] = lambda value: hmac.new(
-            salt, value.encode(), hashlib.sha256
-        ).hexdigest()[:16]
+        salt = self.settings.id_hash_salt
+        self.hash_id: Callable[[str], str] = lambda value: keyed_hash(salt, value)
         self.limits = limits or LocalLimits(
             process_count=self.settings.local_process_count, timings=self.settings.timings
         )

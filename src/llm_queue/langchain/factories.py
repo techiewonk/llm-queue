@@ -45,24 +45,24 @@ def boot_registry(registry: Any = None) -> Registry:
     document), or None: `LLMQ_REGISTRY` / `LLMQ_REGISTRY_FILE` from the environment.
     `RegistryError` (a `ConfigError`) when it does not read or check.
     """
-    from llm_queue.engine.settings import _read_document
+    from llm_queue.engine.settings import read_document
     from llm_queue.registry.validate import load_registry
 
     document: Any
     if isinstance(registry, Mapping):
         document = registry
     elif isinstance(registry, (str, bytes)) and registry.lstrip()[:1] in ("{", b"{"):
-        document = _read_document(
+        document = read_document(
             registry.decode() if isinstance(registry, bytes) else registry, None
         )
     elif isinstance(registry, (str, os.PathLike)):
-        document = _read_document(None, os.fspath(registry))
+        document = read_document(None, os.fspath(registry))
     elif registry is None:
         text = os.environ.get("LLMQ_REGISTRY") or None
         path = os.environ.get("LLMQ_REGISTRY_FILE") or None
         if text and path:
             raise ConfigError("set one of LLMQ_REGISTRY and LLMQ_REGISTRY_FILE, not both")
-        document = _read_document(text, path)
+        document = read_document(text, path)
     else:  # an LLMQueue: the document it booted with, else its current registry
         settings = getattr(registry, "settings", None)
         if settings is not None and (settings.registry or settings.registry_file):

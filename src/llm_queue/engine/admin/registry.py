@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from llm_queue.engine.admin.context import AdminContext
 from llm_queue.errors import ConfigError
-from llm_queue.registry.store import _SECRET_FIELDS, audit_diff
+from llm_queue.registry.store import SECRET_FIELDS, audit_diff
 
 if TYPE_CHECKING:
     from llm_queue.registry.resolve import ResolvedRegistry
@@ -26,7 +26,7 @@ _BLOCK_HISTORY = 200
 def redacted(doc: Any) -> Any:
     """The registry with role ARNs and secret references hidden (lists walked too)."""
     if isinstance(doc, Mapping):
-        return {k: "[redacted]" if k in _SECRET_FIELDS else redacted(v) for k, v in doc.items()}
+        return {k: "[redacted]" if k in SECRET_FIELDS else redacted(v) for k, v in doc.items()}
     if isinstance(doc, list):
         return [redacted(v) for v in doc]
     return doc

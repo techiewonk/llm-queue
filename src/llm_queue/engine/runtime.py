@@ -13,7 +13,6 @@ import asyncio
 import contextlib
 import functools
 import hashlib
-import hmac
 import inspect
 import math
 import random
@@ -89,7 +88,7 @@ from llm_queue.engine.streaming import (
     text_of,
 )
 from llm_queue.errors import ConfigError, ErrorKind, LLMQueueError, UnsupportedEnvelopeError
-from llm_queue.ids import new_id
+from llm_queue.ids import keyed_hash, new_id
 from llm_queue.providers.classify import (
     error_family,
     is_auth_error,
@@ -1823,8 +1822,7 @@ class Engine:
         status records, sticky keys, logs and `routing.allow_users`. Unkeyed, a low-entropy id
         (a client code, a phone number) is brute-forced back from the hash.
         """
-        key = self.settings.id_hash_salt.encode()
-        return hmac.new(key, value.encode(), hashlib.sha256).hexdigest()[:16]
+        return keyed_hash(self.settings.id_hash_salt, value)
 
     def _direct_route(
         self, view: ResolvedRegistry, alias: str, rid: str, user_id: str | None
