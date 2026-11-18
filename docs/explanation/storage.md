@@ -55,7 +55,7 @@ same in both [key expiry modes](#key-expiry-modes); only how they are kept diffe
 | `P:{m:A}:rate:DEP` | hash | `rpm_tat`, `tpm_tat`, class clocks `p_/n_rpm_tat`, `p_/n_tpm_tat` (or `*_win` / `*_n` when fixed); `seen_win`, `seen_calls`, `seen_tokens`, `seen_n` | 180 s (`budget_key_ms`), sliding |
 | `P:{a:ACCT}:rate` | hash | Account budget clocks / counters | 180 s, sliding |
 | `P:reset_minute` | string | After a store reset: the minute fixed windows hold until | 120 s |
-| `P:{m:A}:wait:p`, `:wait:n`, `:waitinfo` | zset, zset, hash | Waiters by queue position; each waiter's cost, usable deployments and `exp` | keys: held (180 s), sliding. A waiter counts only while its `exp` (now + 2 s, refreshed on each ask) is ahead |
+| `P:{m:A}:wait:p`, `:wait:n`, `:waitinfo` | zset, zset, hash | Waiters by queue position; each waiter's cost, usable deployments and `exp` (with [backfill](admission.md#backfill) on, also `at`: its predicted grant per deployment) | keys: held (180 s), sliding. A waiter counts only while its `exp` (now + 2 s, refreshed on each ask) is ahead |
 | `P:{m:A}:waitexp` | zset | Waiters by `exp`, so `PICK_TAKE` touches only expired ones | 180 s from the last refusal |
 | `P:{m:A}:lease:DEP:p`, `:lease:DEP:n` | zsets | Slots in use (owner to lease end) | key: held (180 s), sliding; members end at their score (lease 60 s, renewed every lease / 3) |
 | `P:{m:A}:inprog` | zset | Calls in progress (owner to lease end) | held (180 s), sliding |

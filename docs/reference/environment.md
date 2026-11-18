@@ -231,6 +231,7 @@ count, cancel, reprioritize and extend one tenant's calls on one model.
 | `LLMQ_DRAIN_HANDBACK_ENABLED` | true | true or false | `pause_receiving()` returns the calls held here waiting for budget to the queue at once, for another pod; false keeps them here until `stop()` (0.1.1 behaviour). See [Drain](../how-to/operate.md#drain-a-pod) |
 | `LLMQ_DRAIN_FILE` | empty | a path | A file whose appearance (an mtime newer than the queue's construction, minus 1 s) pauses every process of the pod; a resumed process pauses again only when it is touched anew. Empty: off. For a preStop hook in a pod with several processes |
 | `LLMQ_DRAIN_POLL_SECS` | 1 | 0.1 to 60 | How often each process checks `LLMQ_DRAIN_FILE` |
+| `LLMQ_QUEUE_BACKFILL_ENABLED` | false | true or false (`on` / `off`) | Size-aware backfill for every model whose registry leaves `queue.backfill` unset (the registry setting wins, per model and live-editable): a call may pass older waiters of its class that would still be granted at their predicted time. See [Backfill](../explanation/admission.md#backfill) |
 
 ## Purge
 

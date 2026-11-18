@@ -234,6 +234,7 @@ A field left out takes the default below (the *merged* objects merge it across l
 | `queue.max_receives` | 10 | 1 to 1000 (whole) | Deliveries before a message goes to the dead letters |
 | `queue.retention_secs` | 86400 | 60 to 1209600 (whole) | How long a message (which holds the prompt) is kept: one day by default, applied on every send; at most two weeks |
 | `queue.dlq_retention_secs` | 86400 | 60 to 1209600 (whole) | How long a dead letter is kept |
+| `queue.backfill` | `LLMQ_QUEUE_BACKFILL_ENABLED` (false) | true or false | Size-aware backfill: a call may pass older waiters of its class when they would still be granted at their predicted time (in practice the rest of a `fixed` minute that a large waiting call cannot use). Never past a waiting priority call, never over a budget. See [Backfill](../explanation/admission.md#backfill) |
 | `inference.max_tokens` | none | 1 to 10000000 (whole) | Output tokens when the call sets none |
 | `inference.temperature` | none | 0 to 2 | Sampling temperature |
 | `inference.top_p` | none | 0 to 1 | Nucleus sampling |

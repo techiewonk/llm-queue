@@ -43,7 +43,7 @@ stream call's chunk-stream length, so none of these is a separate round trip.
 | Settled? | A stored result or a final job state: `done`; a cancel flag: `cancelled`; running under another worker with a fresh heartbeat: `duplicate` (message returned after half a lease). A dead owner's entry and slot are dropped |
 | Waiters | Expired waiter entries are cleaned. A foreign (model-fallback) ask is refused `busy` while the model has waiters of its own |
 | Tenant | Only with `fairness` on ([Tenant fairness](fairness.md)): `quota` refuses a tenant past its own rpm / tpm (`tenant_limited`: the call fails `rate_limited`); `share` makes a tenant over its weighted share wait (`tenant`) while a tenant within its share waits; `fair_queue` ranks the call among the waiters by its tenant round instead of its queue position |
-| Reservation | Older waiters of the same class set aside their cost (1 request, their tokens, 1 slot) on every deployment they may use. A normal call also sets aside what waiting priority calls need, on a deployment whose normal use this minute reached `normal_min_share` x rpm |
+| Reservation | Older waiters of the same class set aside their cost (1 request, their tokens, 1 slot) on every deployment they may use. A normal call also sets aside what waiting priority calls need, on a deployment whose normal use this minute reached `normal_min_share` x rpm. With [backfill](#backfill) on, a call may pass older waiters of its class that would still be granted at their predicted time |
 | Candidates | Each passed candidate is usable unless disabled, its account disabled, blocked, outside residency, auto-disabled (`health`), or its breaker open (after the cooldown one trial call at a time) |
 | Budgets | Per candidate: the deployment's `rpm` / `tpm`, the class share (normal at most `1 - priority_reserve`, priority at most `1 - normal_min_share`), and the account's `shared_rpm` / `shared_tpm` (with the account's own `priority_reserve` for normal calls). `smooth` (default): a GCRA clock per budget, cost `60 / limit` s per unit, burst `max(1, floor(limit x rate_burst))`. `fixed`: counters per calendar minute. A call larger than the whole bucket is admitted when the clock is idle |
 | Slots | Concurrency per class: `limit` from `P:{m:A}:ac:DEP` (starts at `max_concurrency`, 200 when unset; x0.7 on a throttle at most once a second, +1/limit per success up to the cap); normal slots at most `(1 - priority_reserve)` of it, priority at most `(1 - normal_min_share)` |
@@ -67,3 +67,36 @@ only while it has no waiters. The `fallback_policy` hook can override both. Past
 (counted from the queue position) or the deadline the call ends `expired`, and the caller gets
 `rate_limited` with `retry_after_secs`. A call that already waited out `max_wait_secs` unreceived is
 refused on arrival rather than started with no time left. When the hold ends the loop is woken.
+
+## Backfill
+
+Off by default. A model's `queue.backfill` (live-editable) turns it on or off; a model that leaves
+it unset follows `LLMQ_QUEUE_BACKFILL_ENABLED`. Off, `PICK_TAKE` sends, runs and stores exactly what
+it did before.
+
+The reservation rule keeps waiting calls in order: a small call behind a large one waiting for
+TPM waits too, even when the budget has room for the small call now. Backfill lets the small
+call pass when that does not delay the large one:
+
+- A refused call records, with its waiter entry, when each deployment would admit it (`at`: the
+  store time of its wait there).
+- A later call of the same class first needs room for itself alone. It then passes the older
+  waiters only if they would still fit at the earliest of their predicted times after it:
+  `fixed`, when they are predicted in a later minute (the rest of this one cannot serve them);
+  `smooth`, when the clock after the call still admits their cost by then.
+- Otherwise the plain rule applies. A grant that passed waiters says so (`bf` in the reply).
+
+What it never does:
+
+| Guarantee | How |
+|---|---|
+| Never over a budget | The call's own cost is checked against the real clock or counter; only the reservation is relaxed |
+| Never past a waiting priority call | A normal call's reservation that includes waiting priority calls is applied as before |
+| Never on the account's budget | The account's shared rpm / tpm keep the plain rule (a waiter may be granted on another deployment of the account first) |
+| Never a later grant than predicted | Each passed waiter still fits at its recorded time; a waiter whose prediction improves later (an older call cancelled) may lose that gain |
+| Tenant fairness unchanged | The tenant step (quota, share, fair_queue rounds) runs first, as before |
+
+Where it helps: on a `smooth` clock any spend moves the grant of a waiter on that clock, so
+backfill passes it only when the waiter waits on something else (another of the deployment's
+budgets, a throttle, slots). On a `fixed` window the rest of a minute that a large call cannot use
+goes to smaller calls instead of idling (gate F1 in `scripts/gates.py`).

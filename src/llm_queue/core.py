@@ -406,6 +406,7 @@ class LLMQueue:
                 caller_ttl_secs=settings.caller_ttl_secs,
                 drain_secs=settings.drain_secs,
                 drain_handback_enabled=settings.drain_handback_enabled,
+                queue_backfill_enabled=settings.queue_backfill_enabled,
                 local_process_count=settings.local_process_count,
                 local_concurrency=settings.local_concurrency,
                 static_cap_wait_secs=settings.static_cap_wait_secs,

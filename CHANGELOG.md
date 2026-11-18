@@ -228,6 +228,12 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   (0.2.0 D2): how the process is set up, with no password, salt, token, tenant name or
   registry body. A `describe()` that fails there logs `llmq_configured_failed` and the start
   goes on.
+- Size-aware backfill (plan F1), off by default: registry `queue.backfill` per model
+  (live-editable), else `LLMQ_QUEUE_BACKFILL_ENABLED`. A call may pass older waiters of its
+  class when they would still be granted at their predicted time, so the rest of a `fixed`
+  minute that a large waiting call cannot use serves smaller calls. Never past a waiting
+  priority call, never over a budget, account budgets unchanged; off, admission is unchanged.
+  Gate F1 in `scripts/gates.py`.
 
 ### Changed
 

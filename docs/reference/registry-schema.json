@@ -583,6 +583,9 @@
               "type": "integer",
               "minimum": 60,
               "maximum": 1209600
+            },
+            "backfill": {
+              "type": "boolean"
             }
           },
           "additionalProperties": false,
@@ -2395,6 +2398,9 @@
               "type": "integer",
               "minimum": 60,
               "maximum": 1209600
+            },
+            "backfill": {
+              "type": "boolean"
             }
           },
           "additionalProperties": false,

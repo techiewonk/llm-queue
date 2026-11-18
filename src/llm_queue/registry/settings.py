@@ -493,6 +493,8 @@ SETTINGS: Mapping[str, Spec] = {
                 "max_receives": number(1, 1000, integer=True),
                 "retention_secs": number(60, MAX_RETENTION_SECS, integer=True),
                 "dlq_retention_secs": number(60, MAX_RETENTION_SECS, integer=True),
+                # Size-aware backfill (plan F1, owner Q3); unset: LLMQ_QUEUE_BACKFILL_ENABLED.
+                "backfill": boolean,
             }
         ),
         QUEUE_DEFAULTS,
