@@ -11,7 +11,7 @@ actor and `allow_writes`.
 from __future__ import annotations
 
 import inspect
-import json
+import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -187,6 +187,8 @@ def parse_arguments(op: Op, path: Mapping[str, str], fields: Mapping[str, Any]) 
             wrong.append(param.name)
         elif isinstance(value, int | float) and not isinstance(value, bool) and value < 0:
             wrong.append(param.name)  # counts, limits, seconds and versions are never negative
+        elif isinstance(value, float) and not math.isfinite(value):
+            wrong.append(param.name)  # `nan` passes `< 0` (`?wait_secs=nan`): FB-5
         else:
             out[param.name] = value
     if op.dry_run_default is not None:
@@ -443,8 +445,10 @@ def status_router(
             if raw is None:
                 return reply((413, {"error": f"the body is above {body_max_bytes} bytes"}))
             try:
-                body = json.loads(raw) if raw else {}
-            except ValueError:
+                # orjson: NaN / Infinity are refused, and deep nesting is a JSONDecodeError (a
+                # ValueError) where `json` raised RecursionError, a 500 (review FB-5).
+                body = orjson.loads(raw) if raw else {}
+            except (ValueError, RecursionError):
                 return reply((400, {"error": "the body must be a JSON object"}))
             if not isinstance(body, dict):
                 return reply((400, {"error": "the body must be a JSON object"}))

@@ -5,18 +5,21 @@ A fake `AdminServices` stands in for the services (`admin_testkit.FakeAdmin`).
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import pytest
 from admin_testkit import FakeAdmin, allow, client
 from redis.exceptions import ResponseError
 
+from llm_queue.engine.admin.ops import OPERATIONS
 from llm_queue.engine.admin.queues import DlqAdmin
-from llm_queue.engine.http import ADMIN_HEADER, MAX_VALUE_BYTES, error_response
+from llm_queue.engine.http import ADMIN_HEADER, MAX_VALUE_BYTES, error_response, parse_arguments
 from llm_queue.engine.settings import InfraSettings
 from llm_queue.errors import ConfigError
 
 ADMIN = {ADMIN_HEADER: "1"}
+OPS = {op.id: op for op in OPERATIONS}
 
 
 def _writes(admin: FakeAdmin, **kw: Any) -> Any:
@@ -65,6 +68,26 @@ def test_b08_a_body_value_above_its_cap_is_400() -> None:
     huge = {"values": {"models.m.tags": {"note": "y" * (MAX_VALUE_BYTES + 1)}}, "model": "m"}
     assert _writes(admin).post("/registry", json=huge, headers=ADMIN).status_code == 400
     assert admin.calls == []
+
+
+def test_fb5_deep_nesting_and_non_json_numbers_are_400() -> None:
+    """FB-5: deep nesting raised RecursionError (a 500); NaN / Infinity passed `value < 0`."""
+    admin = FakeAdmin()
+    http = _writes(admin)
+    headers = {**ADMIN, "content-type": "application/json"}
+    deep = b"[" * 100_000 + b"]" * 100_000  # far below the 1 MiB cap
+    for body in (deep, b'{"wait_secs": NaN}', b'{"wait_secs": Infinity}', b"{bad"):
+        reply = http.post("/models/m/drain", content=body, headers=headers)
+        assert reply.status_code == 400, body[:20]
+        assert reply.json()["error"] == "the body must be a JSON object"
+    assert admin.calls == []
+    drain = OPS["models.drain"]
+    for value in (math.nan, math.inf, -math.inf):  # a query's float("nan") reaches here
+        with pytest.raises(ConfigError, match="wait_secs"):
+            parse_arguments(drain, {"model": "m"}, {"wait_secs": value})
+    ok = http.post("/models/m/drain", json={"wait_secs": 1.5, "dry_run": False}, headers=ADMIN)
+    assert ok.status_code == 200
+    assert admin.calls[-1][1]["wait_secs"] == 1.5
 
 
 def test_b08_the_cap_is_a_setting() -> None:

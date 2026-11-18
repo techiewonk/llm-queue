@@ -420,6 +420,10 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   model fallback (C3): the served alias never equals the model id, so each reply paid a
   registry lookup to fill `model_name`. A fallback is now read from the engine's
   `Meta.fallback == "model"`.
+- Admin HTTP bodies are parsed with orjson: a deeply nested body is a 400 (it was a 500 from
+  `RecursionError`), and `NaN` / `Infinity` are refused. A non-finite number from a query
+  (`float("nan")`) is a bad field too: `{"wait_secs": NaN}` disabled a model and returned at
+  once.
 - `requests.extend` reaches every place a deadline lives: a worker that takes the call after
   the extend gets its deadline from `PICK_TAKE` and no longer ends it at `max_wait_secs`; a
   running attempt's timer moves (it was cut at the old deadline and run again); `stream()`
