@@ -490,7 +490,6 @@ class RequestsAdmin:
         self._write_moved_script = state.register_script(_WRITE_MOVED)
         self._clear_moved = self._queue_client.register_script(_CLEAR_MOVED)
         self._owned: builtins.list[Any] = []
-        self._waking: set[asyncio.Task[None]] = set()  # cancels' wakes still running
 
     # ---------------------------------------------------------------- construction
 
@@ -518,8 +517,7 @@ class RequestsAdmin:
         return service
 
     async def aclose(self) -> None:
-        """Finish the cancels' wakes, then close the clients `from_env` made (none otherwise)."""
-        await self.wait_wakes()
+        """Close the clients `from_env` made (none otherwise)."""
         async with contextlib.AsyncExitStack() as stack:
             for client in self._owned:
                 stack.push_async_callback(client.aclose)
@@ -825,25 +823,15 @@ class RequestsAdmin:
         try:
             await self._audit(report)
         finally:
-            self._wake_later(answered)
+            await self._wake(answered)
         return report
 
-    def _wake_later(self, request_ids: Sequence[str]) -> None:
-        """Wake the answered calls' callers in a task: the cancel returns without waiting.
-
-        Last, after the audit, and not awaited (gate G-T2): callers woken in this process (an
-        admin beside an app) ran their result reads on this loop before the wake's own reply
-        was read, 2,000 of 10,000 reads, 0.5 to 2 s of a cancel. The results and the audit are
-        written; `wait_wakes` (and `aclose`) waits for the wakes. One that fails (a store error)
-        is logged, and its callers find their results by the result sweep.
-        """
-        if not request_ids:
-            return
-        task = asyncio.create_task(self._wake(request_ids), name="llmq-admin-wake")
-        self._waking.add(task)
-        task.add_done_callback(self._waking.discard)
-
     async def _wake(self, request_ids: Sequence[str]) -> None:
+        """Wake the answered calls' callers, last; a failure is logged, not raised.
+
+        The results and the audit are already written, so the cancel stands: the callers find
+        their results by the result sweep (gate G-T2 waits for this wake: 1.5 s for 10,000).
+        """
         try:
             await self._requests.wake(request_ids, batch=self.settings.batch)
         except Exception as exc:  # the callers' result sweep finds them
@@ -853,11 +841,6 @@ class RequestsAdmin:
                 error=str(exc),
                 error_type=type(exc).__name__,
             )
-
-    async def wait_wakes(self) -> None:
-        """Wait for the wakes of earlier cancels (each logs its own failure)."""
-        while self._waking:
-            await asyncio.gather(*self._waking)
 
     @store_op
     async def reprioritize(

@@ -1340,10 +1340,6 @@ class Engine:
                     error_type=type(result).__name__,
                 )
         await self._reclaim_lost()
-        # An admin cancel's wakes, before the clients close (each bounded by its store calls).
-        with contextlib.suppress(TimeoutError):
-            async with asyncio.timeout(5.0):
-                await self.requests_admin.wait_wakes()
         self._flush_metrics()
         closes: list[tuple[str, Callable[[], Awaitable[object]]]] = [
             ("chunk_reader", self.chunks.aclose)
