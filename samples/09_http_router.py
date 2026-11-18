@@ -60,7 +60,7 @@ async def main() -> None:
         app.router.lifespan_context(app),
         httpx.AsyncClient(transport=transport, base_url="http://app") as client,
     ):
-        ready = await client.get("/llm-queue/health/ready")
+        ready = await client.get("/internal/llm-queue/health/ready")
         print(f"GET /health/ready -> {ready.status_code} {ready.json()}")
         # Strict mode keeps a pod not ready on a store that can evict its keys (owner decision
         # Q10). On a `volatile-*` store (ElastiCache's default `volatile-lru`) the default
@@ -75,7 +75,7 @@ async def main() -> None:
         else:
             assert ready.status_code == 200
 
-        denied = await client.get("/llm-queue/status")
+        denied = await client.get("/internal/llm-queue/status")
         print(f"GET /status without the admin header -> {denied.status_code}")
         assert denied.status_code == 401
 
@@ -84,57 +84,67 @@ async def main() -> None:
             {"messages": [{"role": "user", "content": [{"text": "Say hi."}]}],
              "inferenceConfig": {"maxTokens": 200}},
         )  # fmt: skip
-        found = await client.get(f"/llm-queue/requests/{reply.request_id}", headers=admin)
+        found = await client.get(f"/internal/llm-queue/requests/{reply.request_id}", headers=admin)
         print(f"GET /requests/{{id}} -> {found.json()['status']['state']}")
         assert found.json()["status"]["state"] == "done"
 
-        index = (await client.get("/llm-queue/", headers=admin)).json()
+        index = (await client.get("/internal/llm-queue/", headers=admin)).json()
         print(f"GET / -> {len(index['routes'])} routes, registry v{index['registry']['version']}")
 
-        metrics = await client.get("/llm-queue/metrics")  # no admin header: a scraper's GET
+        metrics = await client.get(
+            "/internal/llm-queue/metrics"
+        )  # no admin header: a scraper's GET
         series = [line for line in metrics.text.splitlines() if line.startswith("llmq_")]
         print(f"GET /metrics -> {metrics.status_code}, {len(series)} llmq_ series")
         assert metrics.status_code == 200
         assert series
 
-        status = (await client.get("/llm-queue/status?model=gpt20b", headers=admin)).json()
+        status = (await client.get("/internal/llm-queue/status?model=gpt20b", headers=admin)).json()
         for dep in status["deployments"]:
             print(f"  {dep['name']}: rpm {dep['rpm']['used']}/{dep['rpm']['limit']}")
 
         edit = {"values": {"rpm": 50}, "model": "gpt20b"}
-        no_header = await client.post("/llm-queue/registry", json=edit, headers=admin)
+        no_header = await client.post("/internal/llm-queue/registry", json=edit, headers=admin)
         print(f"POST /registry without X-LLMQ-Admin -> {no_header.status_code}")
         assert no_header.status_code == 403
 
-        plan = await client.post("/llm-queue/registry", json=edit, headers=writer)
+        plan = await client.post("/internal/llm-queue/registry", json=edit, headers=writer)
         print(f"POST /registry rpm=50 (dry run) -> {plan.json()['diff']}")
         assert plan.json()["dry_run"] is True
         done = await client.post(
-            "/llm-queue/registry", json={**edit, "dry_run": False}, headers=writer
+            "/internal/llm-queue/registry", json={**edit, "dry_run": False}, headers=writer
         )
         print(f"POST /registry rpm=50 -> {done.json()['diff']}")
         assert done.status_code == 200
         back = {"values": {"rpm": 60}, "model": "gpt20b", "dry_run": False}
-        await client.post("/llm-queue/registry", json=back, headers=writer)  # the sample value
+        await client.post(
+            "/internal/llm-queue/registry", json=back, headers=writer
+        )  # the sample value
 
         region = status["deployments"][0]["name"].split("/")[-1]
         for path in ("/blocks", "/blocks/remove"):  # an emergency block of a region, lifted
             block = await client.post(
-                f"/llm-queue{path}", json={"region": region, "dry_run": False}, headers=writer
+                f"/internal/llm-queue{path}",
+                json={"region": region, "dry_run": False},
+                headers=writer,
             )
             print(f"POST {path} {region} -> {block.json()['blocked_regions']}")
             assert block.status_code == 200
 
-        drained = await client.post("/llm-queue/drain", json={"dry_run": False}, headers=writer)
+        drained = await client.post(
+            "/internal/llm-queue/drain", json={"dry_run": False}, headers=writer
+        )
         print(f"POST /drain -> {drained.status_code}")
         assert drained.status_code == 200
-        after = await client.get("/llm-queue/health/ready")
+        after = await client.get("/internal/llm-queue/health/ready")
         print(f"after POST /drain: GET /health/ready -> {after.status_code}")
         assert after.status_code == 503
-        state = await client.get("/llm-queue/drain", headers=admin)
+        state = await client.get("/internal/llm-queue/drain", headers=admin)
         print(f"GET /drain -> {state.status_code}")
         assert state.status_code == 200
-        resumed = await client.post("/llm-queue/resume", json={"dry_run": False}, headers=writer)
+        resumed = await client.post(
+            "/internal/llm-queue/resume", json={"dry_run": False}, headers=writer
+        )
         print(f"POST /resume -> {resumed.status_code}")
         assert resumed.status_code == 200
 

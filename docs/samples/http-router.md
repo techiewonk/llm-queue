@@ -5,11 +5,11 @@ and drain routes. Use it for the admin API, Kubernetes probes and the preStop ho
 
 ```mermaid
 flowchart LR
-  k8s["Kubernetes probes"] -- "no auth" --> h["/llm-queue/health/live<br/>/llm-queue/health/ready"]
-  admin["Admin user"] -- "app's admin dependency" --> r["/llm-queue/status<br/>/llm-queue/requests/{id}<br/>/llm-queue/registry"]
-  prom["Prometheus"] -- "no auth" --> m["/llm-queue/metrics"]
+  k8s["Kubernetes probes"] -- "no auth" --> h["/internal/llm-queue/health/live<br/>/internal/llm-queue/health/ready"]
+  admin["Admin user"] -- "app's admin dependency" --> r["/internal/llm-queue/status<br/>/internal/llm-queue/requests/{id}<br/>/internal/llm-queue/registry"]
+  prom["Prometheus"] -- "no auth" --> m["/internal/llm-queue/metrics"]
   pre["preStop hook"] -- "touch" --> f["LLMQ_DRAIN_FILE → every process drains"]
-  admin -- "X-LLMQ-Admin" --> d["POST /llm-queue/drain<br/>POST /llm-queue/resume"]
+  admin -- "X-LLMQ-Admin" --> d["POST /internal/llm-queue/drain<br/>POST /internal/llm-queue/resume"]
   f -. "ready → 503" .-> h
   d -. "ready → 503" .-> h
 ```
@@ -17,7 +17,7 @@ flowchart LR
 ## Key points
 
 - `install(app, llmq, ...)` starts and stops the queue with the app and mounts
-  `llmq.http_router()` under `/llm-queue` (install the `http` extra).
+  `llmq.http_router()` under `/internal/llm-queue` (install the `http` extra).
 - The app's admin check compares its secret with `hmac.compare_digest` (constant time), never
   with `!=`.
 - `/health/live` and `/health/ready` take no auth, so the Kubernetes probes can reach them.
