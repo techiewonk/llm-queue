@@ -9,8 +9,9 @@ backslashes or newlines cannot break the document's quoting. Forms, inside any s
 * `$${`: a literal `${`.
 
 A placeholder may not read a credential (`CREDENTIAL_NAMES`: the store passwords, the admin
-tokens, the id salt, the secrets settings and the AWS keys): the expanded document is stored
-and served by `GET /registry`, so one would leak in clear (review B-09, owner Q11).
+tokens, the id salt, the secrets settings, the `LLMQ_ACCOUNT_*` account keys and the AWS
+keys): the expanded document is stored and served by `GET /registry`, so one would leak in
+clear (review B-09, owner Q11).
 
 A string that is exactly one placeholder becomes a typed value when the text it expands to is
 a JSON list, object, number, `true` / `false` or a quoted JSON string (the escape that keeps
@@ -37,9 +38,10 @@ _NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _SCALAR_RE = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?\Z|true\Z|false\Z")
 YAML_SUFFIXES = (".yaml", ".yml")
 # Names a placeholder may never read (any case): `LLMQ_*_PASSWORD`, `LLMQ_*_TOKEN`, the id
-# salt, `LLMQ_SECRET*` / `LLMQ_SECRETS_*` and the AWS credential variables.
+# salt, `LLMQ_SECRET*` / `LLMQ_SECRETS_*`, `LLMQ_ACCOUNT_*` (the account API keys, reached only
+# through `*_ref`) and the AWS credential variables.
 CREDENTIAL_NAMES = re.compile(
-    r"LLMQ_\w+_(?:PASSWORD|TOKEN)|LLMQ_ID_HASH_SALT|LLMQ_SECRETS?(?:_\w+)?"
+    r"LLMQ_\w+_(?:PASSWORD|TOKEN)|LLMQ_ID_HASH_SALT|LLMQ_SECRETS?(?:_\w+)?|LLMQ_ACCOUNT_\w+"
     r"|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN",
     re.IGNORECASE,
 )
@@ -198,8 +200,10 @@ def load_yaml(text: str) -> Any:
 
     problems: list[str] = []
     # A SafeLoader of its own (built per call, so the constructor below never touches PyYAML's
-    # shared SafeLoader) that records a repeated key instead of keeping the last one.
-    loader_class: Any = type("RegistryLoader", (yaml.SafeLoader,), {})
+    # shared SafeLoader) that records a repeated key instead of keeping the last one. The
+    # libyaml parser when PyYAML was built with it (several times faster), else pure Python.
+    base = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+    loader_class: Any = type("RegistryLoader", (base,), {})
 
     def mapping(loader: Any, node: Any, deep: bool = False) -> dict[Any, Any]:
         loader.flatten_mapping(node)

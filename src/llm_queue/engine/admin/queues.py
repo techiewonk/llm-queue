@@ -12,6 +12,7 @@ import orjson
 from llm_queue.engine._codec import text as _text
 from llm_queue.engine.admin.context import AdminContext
 from llm_queue.engine.admin.requests import RequestsAdapter
+from llm_queue.engine.jobs import JOB_NAME_RE
 from llm_queue.engine.queue import RETENTION_SECS
 from llm_queue.engine.status import health_report
 from llm_queue.errors import ConfigError
@@ -129,6 +130,8 @@ class DlqAdmin:
         if job is not None:
             if priority:
                 raise ConfigError("priority is for a model's queue, not a job's")
+            if not JOB_NAME_RE.fullmatch(job):  # it goes into a key
+                raise ConfigError("job: use 1-64 letters, digits, '_' or '-'")
             return self._ctx.job_queue(job), RETENTION_SECS
         view = await self._ctx.view()
         alias = view.registry.alias_of(model or "")

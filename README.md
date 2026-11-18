@@ -139,6 +139,34 @@ runs this against a local Valkey and a fake Bedrock, and
 [the samples](https://github.com/techiewonk/llm-queue/tree/main/samples) cover streaming,
 embeddings, sync code, errors and fallback, jobs, status, LangChain and the HTTP router.
 
+## The short form: a FastAPI app
+
+```python
+from fastapi import FastAPI
+from langchain_aws import ChatBedrockConverse
+from llm_queue import request_context
+from llm_queue.fastapi import install
+from llm_queue.langchain import chat_model
+
+app = FastAPI()
+install(app)  # LLMQueue.from_env(); starts and stops with the app; probes, context middleware
+
+
+@app.post("/answer")
+async def answer(question: str) -> str:
+    # The queued model when the registry has it, else your own direct model (also with
+    # LLMQ_ENABLED=false): the factory follows the queue install() started.
+    model_id = "openai.gpt-oss-120b-1:0"
+    llm = chat_model(model_id, temperature=0) or ChatBedrockConverse(model_id=model_id)
+    with request_context(priority=True, user_id="u-1"):
+        return (await llm.ainvoke(question)).text
+```
+
+`install(app, llmq)` takes a queue you built yourself; `embeddings(model_id)` is the same for
+embedding models. See [Use with FastAPI](https://techiewonk.github.io/llm-queue/how-to/fastapi/),
+[Use LangChain models](https://techiewonk.github.io/llm-queue/how-to/langchain/) and
+[Queue and local modes](https://techiewonk.github.io/llm-queue/how-to/modes/) (`LLMQ_ENABLED`).
+
 ## When to use it
 
 Use llm-queue when several processes or services call the same models and must share their

@@ -135,9 +135,9 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   stops the start, naming the variable and its JSON path. Expansion runs on the parsed
   document, so a value cannot break the JSON, and repeated keys are still refused. Stored
   documents and live edits are never expanded. A placeholder may not read a credential
-  (`LLMQ_*_PASSWORD`, `LLMQ_*_TOKEN`, `LLMQ_ID_HASH_SALT`, `LLMQ_SECRET*`, the AWS key
-  variables): the expanded document is stored and served by `GET /registry`. The names read
-  are logged at start (`registry_placeholders`), never the values.
+  (`LLMQ_*_PASSWORD`, `LLMQ_*_TOKEN`, `LLMQ_ID_HASH_SALT`, `LLMQ_SECRET*`, `LLMQ_ACCOUNT_*`,
+  the AWS key variables): the expanded document is stored and served by `GET /registry`. The
+  names read are logged at start (`registry_placeholders`), never the values.
 - YAML registry files: a `LLMQ_REGISTRY_FILE` ending `.yaml` / `.yml` is read as YAML (new
   extra `llm-queue[yaml]`), with repeated keys refused like in JSON.
 - `residency.allowed_regions: "auto"`: every region the document's deployments use (and their
@@ -166,7 +166,7 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   thread in a copy of the context; logs `background_thread_failed`). Each keeps the ids and
   drops the priority.
 - `LLMQueue.ready`: sync readiness (started, registry loaded, not draining, and in strict mode
-  no evicting store); `llm_queue.queue_ready(enabled, llmq=None)` for an app's own probe.
+  no evicting store); `llm_queue.queue_ready(llmq=None)` for an app's own probe.
 - `LLMQueue.from_env(defaults=...)` (D1): a third layer below `secrets=` and the environment,
   for the app's own `LLMQ_*` values (`True` / `False` read as switches; a name without
   `LLMQ_` is refused). The secret-then-environment order is unchanged. Conflict groups: the
@@ -188,11 +188,17 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   boot registry knows (by alias or model id; Bedrock or OpenAI-compatible adapter by the
   model's provider, `**kw` passed through), else None, so `chat_model(...) or <direct model>`
   keeps the app's direct path for a model outside the registry. `registry=` is a document,
-  JSON text, a path, an `LLMQueue` or None (`LLMQ_REGISTRY` / `LLMQ_REGISTRY_FILE`, read
-  without a store, placeholders expanded). No langchain module is imported for an unknown
-  model.
+  JSON text, a path, an `LLMQueue` or None: the started queue (its off switch and the boot
+  registry its settings read from secrets, the environment and `defaults=`), else, before any
+  queue has started, `LLMQ_ENABLED` and `LLMQ_REGISTRY` / `LLMQ_REGISTRY_FILE` from the
+  environment. The registry is parsed once per queue, and before start once per file version
+  (path, mtime, size): a call costs the adapter's construction only. No langchain module is
+  imported for an unknown model.
   `aliases(registry)` maps model ids to aliases; `boot_registry(registry)` returns the parsed
   registry. See [Use LangChain models](docs/how-to/langchain.md).
+- The boot registry is read once per process: `InfraSettings.registry_document()` returns the
+  document `from_env` read, so a ConfigMap updated in place does not change what
+  `describe()`, the admin services or the engines see until a restart.
 - `LLMQueue.embed_one(model, text, **kw)` and `embed_one_sync(...)` (H8): one text's vector.
 - Requests by model and tenant (T): every call in flight is indexed under its model and tenant
   hash (`P:{m:ALIAS}:tq:H`, `P:{m:ALIAS}:tq`) by the scripts that send and end it (no extra
@@ -220,7 +226,7 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   (also `llm_queue.DrainWatcher`) is the same watcher, standalone (no heavy imports) for apps
   without a queue.
 - `http_router(drain_routes=True)`: `POST /drain`, `POST /resume` (guarded like the write
-  routes: a token or `dependencies`, plus `X-LLMQ-Admin`) and `GET /drain` (the state, behind
+  routes: the admin token, or `dependencies` plus `X-LLMQ-Admin`) and `GET /drain` (the state, behind
   the read guard like every read route). They reach one process; multi-process pods use the
   drain file.
 - `JobRunner.resume()`.
@@ -421,6 +427,14 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   model fallback (C3): the served alias never equals the model id, so each reply paid a
   registry lookup to fill `model_name`. A fallback is now read from the engine's
   `Meta.fallback == "model"`.
+- Admin HTTP bodies are parsed with orjson: a deeply nested body is a 400 (it was a 500 from
+  `RecursionError`), and `NaN` / `Infinity` are refused. A non-finite number from a query
+  (`float("nan")`) is a bad field too: `{"wait_secs": NaN}` disabled a model and returned at
+  once.
+- The `job` of `dlq.list` / `dlq.show` / `dlq.redrive` / `dlq.purge` is checked against the
+  job-name rule (1-64 letters, digits, `_`, `-`) before it goes into a key: braces and colons
+  reached the stream key (`ConfigError`, HTTP 400). A job name with a trailing newline is
+  refused at registration too (the rule was matched with `$`).
 - `requests.extend` reaches every place a deadline lives: a worker that takes the call after
   the extend gets its deadline from `PICK_TAKE` and no longer ends it at `max_wait_secs`; a
   running attempt's timer moves (it was cut at the old deadline and run again); `stream()`

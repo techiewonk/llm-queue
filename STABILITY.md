@@ -1,10 +1,10 @@
 # Stability policy
 
 - **Public API** is exactly this; anything else may change without notice:
-  - the names in `llm_queue.__all__` (`DrainWatcher` among them);
+  - the names in `llm_queue.__all__` (listed under [Public names](#public-names));
   - the public submodules: `llm_queue.fastapi` (`install`, `serve`, `mount`),
-    `llm_queue.langchain` (its `__all__`: `chat_model`, `embeddings`, `aliases`, the `Queued*`
-    adapters, `set_default_queue` / `get_default_queue`), `llm_queue.secrets`
+    `llm_queue.langchain` (its `__all__`, listed under [Public names](#public-names)),
+    `llm_queue.secrets`
     (`secrets_from_config`, `SecretReader`, `SecretSource`) and `llm_queue.drain`
     (`DrainWatcher`);
   - the `llmq.admin` methods: one per row of the operations table in
@@ -41,3 +41,31 @@
 - **Settings:** the `LLMQ_*` names and the registry setting names are public API; removing or
   renaming one, or changing a default that changes behaviour, is a breaking change listed in
   CHANGELOG.md (under "Changed (behaviour)").
+
+## Public names
+
+Kept equal to the modules' `__all__` by `tests/unit/test_stability_names.py`.
+
+### `llm_queue`
+
+`__version__`, `AdminRefused`, `AdminServices`, `background`, `background_priority`,
+`BedrockOptions`, `CallContext`, `CallFailed`, `CATEGORIES`, `Category`, `ConcurrencyStatus`,
+`ConfigError`, `create_background_task`, `current_context`, `current_job`, `DeploymentStatus`,
+`DeploymentView`, `DrainWatcher`, `EmbeddingCodec`, `EmbedResult`, `EmfSink`, `EngineTimings`,
+`error_category`, `error_retryable`, `Health`, `JobContext`, `JobFn`, `JobSettings`, `Kind`,
+`KIND_CATEGORIES`, `KINDS`, `LiveEditRefused`, `LLMQueue`, `LLMQueueError`, `LocalModeRefused`,
+`Meta`, `Metrics`, `MissingExtra`, `ModelHealth`, `ModelStatus`, `NullSink`, `OpenAIOptions`,
+`PrometheusSink`, `Provider`, `PublishResult`, `PurgeReport`, `queue_ready`, `QueueDisabled`,
+`RateStatus`, `register_account_kind`, `register_admission`, `register_balancer`,
+`register_embedding_family`, `register_fallback_policy`, `register_probe`, `register_provider`,
+`register_sticky_key`, `register_token_estimator`, `RegistryConflict`, `RegistryError`,
+`RegistryOptions`, `Reject`, `Reply`, `request_context`, `RequestContext`,
+`RequestContextMiddleware`, `RequestStatus`, `ResultOffload`, `Route`, `run`, `run_in_thread`,
+`S3Offload`, `Secrets`, `StatusReport`, `StoreOptions`, `StoreUnavailable`, `Tuning`,
+`UnknownModel`, `WarmOptions`
+
+### `llm_queue.langchain`
+
+`aliases`, `boot_registry`, `chat_model`, `embeddings`, `EmbedResultLike`, `get_default_queue`,
+`QueueClient`, `QueuedBedrockEmbeddings`, `QueuedChatBedrockConverse`, `QueuedChatOpenAI`,
+`QueuedOpenAIEmbeddings`, `ReplyLike`, `set_default_queue`

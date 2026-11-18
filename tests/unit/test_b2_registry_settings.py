@@ -114,8 +114,8 @@ def test_registry_source_problems_are_config_errors(tmp_path: Path) -> None:
     path.write_text('{"registry_version": 1}', encoding="utf-8")
     settings = _settings(LLMQ_REGISTRY_FILE=str(path))
     path.unlink()
-    with pytest.raises(ConfigError, match="cannot be read"):
-        settings.registry_document()
+    # FB-1: the boot document is the one `from_env` read; the file is not read again.
+    assert settings.registry_document() == '{"registry_version": 1}'
 
 
 @pytest.mark.parametrize("part", ["store", "bedrock", "engine", "registry"])
