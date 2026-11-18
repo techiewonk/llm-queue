@@ -104,6 +104,13 @@ local function create()
 end
 if #job == 0 then
   redis.call('DEL', cancel_key)  -- a cancel left by an earlier run of this id
+  -- An earlier run's final status, result and chunks outlived its record (FA-2: expired after
+  -- an extend, or the record was lost): the status refused every write of this run, which
+  -- admin reads then took for finished, and the old result would answer it.
+  local prior = redis.call('HGET', KEYS[3], 'state')
+  if prior == 'done' or prior == 'failed' or prior == 'expired' or prior == 'cancelled' then
+    redis.call('DEL', KEYS[3], KEYS[4], string.sub(KEYS[1], 1, -4) .. 'chunks')
+  end
   return create()
 end
 local fields = {}
@@ -300,6 +307,12 @@ local function set_status(key, state, ttl, from)
   if X.pttl(key) < ttl * 1000 then X.expire(key, ttl * 1000) end
   return 1
 end
+-- A final write's TTL of a call's job record: `keep_ms`, or as long as its status lives when
+-- that is longer (FA-2: after an extend the status outlived its job by the extension, and a
+-- re-registered id kept the old final status).
+local function keep_final(job, keep_ms)
+  X.expire(job, math.max(keep_ms, X.pttl(string.sub(job, 1, -4) .. 'status')))
+end
 """
 
 # The final write of a call (A-1, owner Q-1): a `done` claim is never replaced (a late reply
@@ -316,7 +329,7 @@ local function final_write(res, job, body, ttl_ms, state, keep_ms)
     local final = current == 'done' or current == 'failed' or current == 'expired'
       or current == 'cancelled'
     if written or not final then redis.call('HSET', job, 'state', state) end
-    X.expire(job, keep_ms)
+    keep_final(job, keep_ms)
   end
   if written then return 1 end
   if redis.call('GET', res) == body then return 2 end
@@ -489,7 +502,7 @@ for i = 1, n do
         if rec[2] then redis.call('ZREM', rec[2], rid) end
         X.set(KEYS[b + 5], ARGV[6 + n + i], res_ttl, true)
         redis.call('HSET', job, 'state', 'cancelled')
-        X.expire(job, keep * 1000)
+        keep_final(job, keep * 1000)
         X.expire(KEYS[b + 3], keep * 1000)
         set_status(KEYS[b + 4], 'cancelled', keep, 7 + 2 * n)
         table.insert(answered, rid)

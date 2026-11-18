@@ -499,6 +499,13 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   only entries up to the page's last deadline so far), and the tenant index is read 1,000
   hashes at a time; each run now takes about 5 ms (12 ms at most). Order and cursors are
   unchanged.
+- An app request id sent again after an extended call ended runs with its own status (FA-2):
+  the end of a call set its job record's TTL to the status TTL alone, below the status's TTL
+  the extend had grown, so the job expired first and the next registration kept the old
+  final status (the new run's status writes refused; `list`, `count`, cancel and
+  reprioritize took the call for finished). The final write now keeps the job as long as its
+  status, and a registration that finds no job record clears an earlier run's final status,
+  result and stream chunks.
 
 ## [0.1.1] - 2026-11-17
 

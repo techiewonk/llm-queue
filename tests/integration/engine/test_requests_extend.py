@@ -8,11 +8,13 @@ see it. Without the extend each call below would end `deadline_exceeded` / `expi
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 
 import pytest
 from engine_testkit import CHAT, SMALL, Make, stats
 
+from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.requests import extend_notice
 from llm_queue.engine.runtime import Engine
 from llm_queue.errors import AdminRefused, ConfigError
@@ -204,3 +206,42 @@ async def test_extend_needs_the_request_index(make: Make) -> None:
     admin.settings = dataclasses.replace(admin.settings, request_index=False)
     with pytest.raises(AdminRefused, match="request index"):
         await admin.extend("any", timeout_secs=9, actor="ops")
+
+
+async def test_a_re_registered_id_after_an_extend_runs_with_its_own_status(make: Make) -> None:
+    """FA-2: extend an app id, end it, lose its job record, send it again: a new run shows.
+
+    The final write set the job's TTL to the status TTL alone, shorter than the status the
+    extend grew, so the job expired first. The re-registered id then kept the old final
+    status: its own status writes were refused and admin reads took it for finished. Now the
+    job lives as long as its status, and a registration with no job clears a final status.
+    """
+    engine, _ = await make(worker=False)
+    admin = engine.requests_admin
+    first = asyncio.create_task(
+        engine.call("small", CHAT, tenant_id="acme", request_id="fa2", timeout_secs=5)
+    )
+    assert await _rid(engine) == "fa2"
+    done = await admin.extend("fa2", timeout_secs=300, actor="ops", dry_run=False)
+    assert done.changed == 1
+    cancelled = await admin.cancel("small", actor="ops", dry_run=False)
+    assert cancelled.changed == 1
+    with pytest.raises(CallFailed, match="cancelled"):
+        await asyncio.wait_for(first, 5)
+    job_key, status_key = engine.keys.request("fa2", "job"), engine.keys.status("fa2")
+    job_ttl, status_ttl = await engine.state.pttl(job_key), await engine.state.pttl(status_key)
+    if job_ttl > 0 and status_ttl > 0:  # native expiry (swept keeps them in its index)
+        assert job_ttl >= status_ttl - 1000
+    await engine.state.delete(job_key)  # its expiry, or a lost record
+    again = asyncio.create_task(
+        engine.call("small", CHAT, tenant_id="acme", request_id="fa2", timeout_secs=30)
+    )
+    try:
+        assert await _rid(engine) == "fa2"
+        assert (await engine.requests.status("fa2"))["state"] == "waiting"
+        page = await admin.list("small", tenant="acme")
+        assert [i.request_id for i in page.items] == ["fa2"]
+    finally:
+        again.cancel()
+        with contextlib.suppress(BaseException):
+            await again
