@@ -682,7 +682,9 @@ async def kill_switch(ctx: Ctx) -> None:
     try:
         await ctx.edit({"routing.kill_switch": True}, model=None)
         seen = await _all_see_kill_switch(ctx)
-        on = ctx.now()
+        # A tick later: on Python 3.12 / Windows the clock ticks every 15.6 ms, so a call that
+        # began just before the last caller had the switch was stamped with this same time.
+        on = ctx.now() + time.get_clock_info("monotonic").resolution
         await _hold(ctx)
         off = ctx.now()
     finally:
@@ -695,6 +697,11 @@ async def kill_switch(ctx: Ctx) -> None:
         bool(switched) and not queued
     )
     ctx.notes.append(f"kill switch: {len(switched)} calls served, {len(queued)} by a worker")
+    ctx.notes += [
+        f"by a worker: sent {r.sent - on:+.2f}s after the switch, worker {r.worker}, "
+        f"seen after {r.seen_secs:.2f}s, model {r.model}, {r.deployment}"
+        for r in queued[:3]
+    ]
 
 
 async def bad_edit(ctx: Ctx) -> None:

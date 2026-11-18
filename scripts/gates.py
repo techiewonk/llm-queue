@@ -1226,39 +1226,59 @@ async def _index_cost(index: bool, calls: int) -> tuple[float, dict[str, float],
     return scripts / max(1, len(run.results)), usec, failed
 
 
+G_T1_ROUNDS = 3  # G-T1 judges the median added time of this many off/on pairs
+
+
 async def gt1() -> bool:
     """Request index cost (0.2.0 design G-T1): B19's burst with the index off, then on.
 
     Pass: store scripts per call unchanged (the index rides in existing scripts) and the store
     time of REGISTER_SEND + SETTLE_DONE (median usec per script call) within +50 us of the
-    index-off run. `--short`: 400 calls a side instead of 2,000.
+    index-off run, both as the median of G_T1_ROUNDS off/on pairs: one pair's index-off time
+    alone moved 125-184 us run to run, more than the margin. `--short`: one pair, 400 calls a
+    side.
     """
     calls = 400 if SHORT else 2000
-    off_scripts, off_usec, off_failed = await _index_cost(False, calls)
-    on_scripts, on_usec, on_failed = await _index_cost(True, calls)
     pair = ("REGISTER_SEND", "SETTLE_DONE")
-    off_sum = sum(off_usec.get(n, math.nan) for n in pair)
-    on_sum = sum(on_usec.get(n, math.nan) for n in pair)
-    return verdict(
-        "G-T1",
-        {
-            "every call served (both runs)": not off_failed and not on_failed,
-            "both scripts seen in the slow log (both runs)": all(
-                n in u for n in pair for u in (off_usec, on_usec)
-            ),
-            # B19 prints one decimal (11.6): a tenth of a script of noise from idle polling.
-            "store scripts per call unchanged (+0.1)": on_scripts <= off_scripts + 0.1,
-            "REGISTER_SEND + SETTLE_DONE within +50 us of the index off": on_sum <= off_sum + 50,
-        },
-        [
-            f"{calls} calls a run; failures off {off_failed[:3] or 0}, on {on_failed[:3] or 0}",
+    added: list[float] = []
+    notes: list[str] = []
+    more_scripts: list[float] = []
+    served = seen = True
+    for _ in range(1 if SHORT else G_T1_ROUNDS):
+        off_scripts, off_usec, off_failed = await _index_cost(False, calls)
+        on_scripts, on_usec, on_failed = await _index_cost(True, calls)
+        off_sum = sum(off_usec.get(n, math.nan) for n in pair)
+        on_sum = sum(on_usec.get(n, math.nan) for n in pair)
+        added.append(on_sum - off_sum)
+        served = served and not off_failed and not on_failed
+        seen = seen and all(n in u for n in pair for u in (off_usec, on_usec))
+        more_scripts.append(on_scripts - off_scripts)
+        notes += [
+            f"{calls} calls a run; failures off {off_failed[:3] or 0}, on {on_failed[:3] or 0}; "
             f"store scripts per call: off {off_scripts:.2f}, on {on_scripts:.2f}",
             "median usec per script call: off "
             + ", ".join(f"{k} {v:.0f}" for k, v in sorted(off_usec.items()))
             + "; on "
             + ", ".join(f"{k} {v:.0f}" for k, v in sorted(on_usec.items()))
             + f"; sum off {off_sum:.0f}, on {on_sum:.0f} (+{on_sum - off_sum:.0f})",
-        ],
+        ]
+    median = statistics.median(added)
+    extra = statistics.median(more_scripts)
+    pairs = ", ".join(f"{a:+.0f}" for a in added)
+    notes.append(f"added us per pair: {pairs}; median {median:+.0f}")
+    pairs = ", ".join(f"{a:+.2f}" for a in more_scripts)
+    notes.append(f"added scripts per call per pair: {pairs}; median {extra:+.2f}")
+    return verdict(
+        "G-T1",
+        {
+            "every call served (all runs)": served,
+            "both scripts seen in the slow log (all runs)": seen,
+            # B19 prints one decimal (11.6): a tenth of a script. The difference moved -0.74 to
+            # +0.95 pair to pair (the idle polling subtracted varies); the index adds no script.
+            "store scripts per call unchanged (+0.1, median)": extra <= 0.1,
+            "REGISTER_SEND + SETTLE_DONE within +50 us of the index off (median)": median <= 50,
+        },
+        notes,
     )
 
 

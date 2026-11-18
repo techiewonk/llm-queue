@@ -116,7 +116,7 @@ python scripts/gates.py BL1 G-T1 G-T2 --short   # the 0.2.0 gates scaled down (a
 | Gate | What it proves | Pass mark |
 |---|---|---|
 | BL1 | local mode against a provider quota: 4 processes, `LLMQ_EXECUTION_MODE=local`, `LLMQ_LOCAL_PROCESS_COUNT=4`, 150 % of the rpm offered for 3 min (`--short` 40 s) | fakellm never over its rpm in a wall-clock minute (+2); every call answered or `rate_limited` on time |
-| G-T1 | the request index's cost: B19's burst with the index off, then on (`--short` 400 calls a side) | store scripts per call unchanged; REGISTER_SEND + SETTLE_DONE median store time within +50 us |
+| G-T1 | the request index's cost: B19's burst with the index off, then on (`--short` 400 calls a side) | store scripts per call unchanged; REGISTER_SEND + SETTLE_DONE median store time within +50 us (median of 3 off/on pairs) |
 | G-T2 | admin at scale: 10,000 waiting calls of 20 tenants, no worker (`--short` 1,000) | `list` 100 rows <= 20 ms, `count` one tenant <= 100 ms, reprioritize 1,000 <= 2 s, cancel 10,000 <= 3 s |
 
 `--quick` leaves out B17, B91, B92, BL1 and G-T2.
