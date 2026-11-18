@@ -257,7 +257,8 @@ message. A value expanded into the document is published to the store with it an
 `GET /registry`, so keep credentials in the `*_ref` fields, not in placeholders: a placeholder
 that names a credential is refused (the load fails naming it and its path, with or without a
 default, and it is never looked up). Refused, in any case: `LLMQ_*_PASSWORD`, `LLMQ_*_TOKEN`,
-`LLMQ_ID_HASH_SALT`, `LLMQ_SECRET*` / `LLMQ_SECRETS_*`, `AWS_ACCESS_KEY_ID`,
+`LLMQ_ID_HASH_SALT`, `LLMQ_SECRET*` / `LLMQ_SECRETS_*`, `LLMQ_ACCOUNT_*` (account keys: use
+`api_key_ref` / `external_id_ref`), `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`. At start `registry_placeholders` logs the
 names the document read, never their values.
 

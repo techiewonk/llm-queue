@@ -25,6 +25,9 @@ REFUSED = [
     "LLMQ_SECRETS_NAMES",
     "LLMQ_SECRETS_SOURCE",
     "LLMQ_SECRETS_REGION",
+    "LLMQ_ACCOUNT_VLLM_KEY",  # FB-2: account API keys are reached only through `*_ref`
+    "LLMQ_ACCOUNT_OPENAI_KEY",
+    "llmq_account_x",
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
