@@ -27,6 +27,16 @@ DEV = {
 }
 
 
+def _draining(llmq: LLMQueue) -> bool:
+    """`llmq.draining` read afresh: mypy keeps an asserted property narrowed across calls."""
+    return llmq.draining
+
+
+def _draining_since(llmq: LLMQueue) -> float | None:
+    """`llmq.draining_since` read afresh (as `_draining`)."""
+    return llmq.draining_since
+
+
 def _touch(path: Path, mtime: float) -> None:
     path.write_text("drain", encoding="utf-8")
     os.utime(path, (mtime, mtime))
@@ -167,19 +177,19 @@ def test_the_engine_gets_the_hand_back_setting() -> None:
 
 def test_pause_and_resume_on_an_unstarted_queue() -> None:
     llmq = LLMQueue.from_env(DEV)
-    assert llmq.draining is False
-    assert llmq.draining_since is None
+    assert _draining(llmq) is False
+    assert _draining_since(llmq) is None
     before = time.time()
     llmq.pause_receiving()
-    assert llmq.draining is True
+    assert _draining(llmq) is True
     assert llmq.draining_since is not None
     assert llmq.draining_since >= before
     first = llmq.draining_since
     llmq.pause_receiving()  # a second pause keeps the first time
     assert llmq.draining_since == first
     llmq.resume_receiving()
-    assert llmq.draining is False
-    assert llmq.draining_since is None
+    assert _draining(llmq) is False
+    assert _draining_since(llmq) is None
     assert llmq._engine.ready is False  # never started: not ready after a resume
 
 
@@ -221,28 +231,28 @@ def test_drain_routes_are_post_guarded_and_get_is_status_only() -> None:
     assert status.status_code == 200
     assert status.json() == {"draining": False, "since": None, "held": 0, "running": 0}
     assert client.post("/drain").status_code == 403  # no token
-    assert llmq.draining is False
+    assert _draining(llmq) is False
     planned = client.post("/drain", headers=both)  # a dry run by default: changes nothing
     assert planned.status_code == 200
     assert planned.json() == {
         "draining": False, "since": None, "held": 0, "running": 0, "dry_run": True,
         "would_change": True,
     }  # fmt: skip
-    assert llmq.draining is False
+    assert _draining(llmq) is False
     paused = client.post("/drain", headers=both, json={"dry_run": False})
     assert paused.status_code == 200
     assert paused.json()["draining"] is True
     assert paused.json()["dry_run"] is False
-    assert llmq.draining is True
+    assert _draining(llmq) is True
     assert client.get("/drain", headers=token).json()["since"] == llmq.draining_since
     planned = client.post("/resume", headers=both)
     assert planned.json()["dry_run"] is True
     assert planned.json()["would_change"] is True
-    assert llmq.draining is True
+    assert _draining(llmq) is True
     resumed = client.post("/resume", headers=both, json={"dry_run": False})
     assert resumed.status_code == 200
     assert resumed.json()["draining"] is False
-    assert llmq.draining is False
+    assert _draining(llmq) is False
 
 
 # ---------------------------------------------------------------- admin: dry run by default

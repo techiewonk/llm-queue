@@ -195,6 +195,7 @@ async def test_cancel_by_ids_is_dry_by_default_filters_and_is_audited() -> None:
     assert (done["matched"], done["changed"]) == (2, 2)
     assert done["by_state"] == {"waiting": 1, "running": 1}
     cancel.assert_awaited_once()
+    assert cancel.await_args is not None
     assert cancel.await_args.args[1][2] == ""  # only state: any call not final
     (key, fields), _ = client.xadd.await_args
     assert (key, fields["actor"], fields["op"]) == ("llmq:cfg:audit", "ann", "requests_cancel")

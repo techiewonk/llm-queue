@@ -14,7 +14,7 @@ import logging
 import os
 from collections.abc import Iterator
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -329,7 +329,7 @@ async def test_sync_calls_run_on_the_started_queue_loop(no_default: None) -> Non
         main = asyncio.get_running_loop()
         reply = await asyncio.to_thread(queue.converse_sync, "m", {"messages": []})
         assert reply.ok
-        assert queue._engine.loops[-1] is main  # type: ignore[attr-defined]
+        assert cast(_FakeEngine, queue._engine).loops[-1] is main  # `_queue()` runs a fake
         assert queue._sync is None  # no private engine was built
         # Refused, naming the fix (owner Q1): await it there, or `ainvoke` in LangChain.
         with pytest.raises(LLMQueueError, match=r"deadlock.*ainvoke"):

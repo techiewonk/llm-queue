@@ -44,7 +44,9 @@ async def _rid(engine: Engine, tenant: str = "acme") -> str:
     for _ in range(300):
         found = await engine.state.zrange(key, 0, 0)
         if found:
-            return found[0].decode()
+            rid = found[0]
+            assert isinstance(rid, bytes)  # the state client does not decode
+            return rid.decode()
         await asyncio.sleep(0.02)
     raise AssertionError("call not indexed")
 

@@ -10,8 +10,9 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from fastapi import FastAPI
@@ -27,6 +28,11 @@ from llm_queue.fastapi import install
 from llm_queue.langchain import chat_model, embeddings, set_default_queue
 
 OFF = {"LLMQ_ENABLED": "false"}
+
+
+def _ready(queue: DisabledQueue) -> bool:
+    """`queue.ready` read afresh: mypy keeps an asserted property narrowed across awaits."""
+    return queue.ready
 
 
 def _off(**extra: str) -> DisabledQueue:
@@ -107,13 +113,14 @@ async def test_calls_are_refused_as_config_error() -> None:
 async def test_admin_refuses_store_operations_and_serves_the_process() -> None:
     queue = _off()
     admin = queue.admin
-    for call in (
+    calls: tuple[Callable[[], Awaitable[Any]], ...] = (
         lambda: admin.status.get(),
         lambda: admin.requests.list("m"),
         lambda: admin.purge.model("m", actor="a", dry_run=True),
         lambda: admin.registry.get(),
         lambda: admin.models.list(),
-    ):
+    )
+    for call in calls:
         with pytest.raises(QueueDisabled):
             await call()
     assert admin.registry.schema()["type"] == "object"
@@ -145,7 +152,8 @@ async def test_start_stop_health_ready_and_describe() -> None:
     await queue.start()
     try:
         health = await queue.health()
-        assert health["enabled"] is False
+        # `enabled` is not a `Health` key; a disabled queue adds it.
+        assert cast(dict[str, Any], health)["enabled"] is False
         assert health["live"]
         assert health["ready"]
         assert queue_ready() is True  # the default queue, switched off: the direct path serves
@@ -164,7 +172,7 @@ async def test_drain_file_still_fails_readiness(tmp_path: Path) -> None:
     queue = _off(LLMQ_DRAIN_FILE=str(path), LLMQ_DRAIN_POLL_SECS="0.1")
     await queue.start()
     try:
-        assert queue.ready
+        assert _ready(queue)
         path.touch()
         os.utime(path, (time.time() + 2, time.time() + 2))
         for _ in range(50):

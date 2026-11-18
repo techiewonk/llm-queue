@@ -16,6 +16,7 @@ from llm_queue import ConfigError, LLMQueue
 from llm_queue.core import EmbedResult
 from llm_queue.engine.envelope import Meta
 from llm_queue.engine.settings import STORE_POOL_MARGIN, InfraSettings, Layers
+from llm_queue.engine.store_client import secret_store_client
 
 GPT = "openai.gpt-oss-120b-1:0"
 TITAN = "amazon.titan-embed-text-v2:0"
@@ -164,7 +165,7 @@ def test_secret_names_apply_to_the_queue_settings_password_and_admin_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clients: list[tuple[str, str | None]] = []
-    real = core.secret_store_client
+    real = secret_store_client  # the function `core` imported, before the patch
 
     def spy(url: str, lookup: Any, name: str, *args: Any) -> Any:
         clients.append((name, lookup(name)))
@@ -235,7 +236,7 @@ def test_store_password_from_the_environment_reaches_the_client(
 ) -> None:
     """0.1.1 ignored LLMQ_STORE_PASSWORD from plain env when `secrets` was None (D3)."""
     lookups: list[Any] = []
-    real = core.secret_store_client
+    real = secret_store_client  # the function `core` imported, before the patch
 
     def spy(url: str, lookup: Any, name: str, *args: Any) -> Any:
         lookups.append(lookup)
@@ -293,11 +294,11 @@ class _Embedder(LLMQueue):
     def __init__(self) -> None:
         self.seen: list[tuple[Any, ...]] = []
 
-    async def embed(self, model: str, texts: Any, **kw: Any) -> EmbedResult:  # type: ignore[override]
+    async def embed(self, model: str, texts: Any, **kw: Any) -> EmbedResult:
         self.seen.append((model, list(texts), kw))
         return EmbedResult([[0.5, 0.25]], Meta())
 
-    def embed_sync(self, model: str, texts: Any, **kw: Any) -> EmbedResult:  # type: ignore[override]
+    def embed_sync(self, model: str, texts: Any, **kw: Any) -> EmbedResult:
         self.seen.append((model, list(texts), kw))
         return EmbedResult([[1.0]], Meta())
 

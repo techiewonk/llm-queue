@@ -24,6 +24,7 @@ from engine_testkit import registry as registry_doc
 from fastapi import FastAPI
 
 from llm_queue import CallFailed, LLMQueue, LocalModeRefused, request_context
+from llm_queue.engine.local import LocalEngine
 from llm_queue.fastapi import install
 
 pytestmark = pytest.mark.integration
@@ -642,7 +643,12 @@ async def test_async_and_sync_engines_share_one_concurrency_cap(slow_rig: Rig) -
     llmq = slow_rig.queue(LLMQ_LOCAL_CONCURRENCY="1")
     sync_call = asyncio.create_task(asyncio.to_thread(llmq.converse_sync, "small", CHAT))
     for _ in range(100):  # the private engine is built, then its call takes the slot
-        if llmq._sync is not None and llmq._sync._engine.limits.slots("small").in_use:
+        sync = llmq._sync
+        if (
+            sync is not None
+            and isinstance(sync._engine, LocalEngine)
+            and sync._engine.limits.slots("small").in_use
+        ):
             break
         await asyncio.sleep(0.02)
     await llmq.start()

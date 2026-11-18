@@ -20,7 +20,7 @@ from fakellm.state import ENGINE
 async def _mapping(request: web.Request) -> Any:
     text = await request.text()
     if "yaml" in request.content_type:
-        import yaml  # type: ignore[import-untyped]  # no types-PyYAML in the venv
+        import yaml
 
         return yaml.safe_load(text)
     return json.loads(text or "null")

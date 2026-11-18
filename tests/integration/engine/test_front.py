@@ -20,6 +20,7 @@ from engine_testkit import FakeEngine, Scenario, create_app, registry
 from fakellm import REQUEST_IDS
 
 from llm_queue import CallFailed, LLMQueue, OpenAIOptions, Tuning, request_context
+from llm_queue.engine.runtime import Engine
 from llm_queue.http_transport import _error_response
 
 pytestmark = pytest.mark.integration
@@ -195,6 +196,7 @@ async def test_sync_calls_run_direct(llmq: LLMQueue, store: redis.asyncio.Redis)
 async def _messages_sent(llmq: LLMQueue, store: redis.asyncio.Redis, alias: str) -> int:
     """Messages ever added to a model's normal and priority streams (XINFO entries-added)."""
     engine = llmq._engine
+    assert isinstance(engine, Engine)  # queue mode
     total = 0
     for priority in (False, True):
         name = engine._queue_name(engine.registry.current, alias, priority)

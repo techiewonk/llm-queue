@@ -273,7 +273,7 @@ def load_scenario(path: str | Path) -> Scenario:
     if str(path).endswith(".json"):
         return Scenario.from_mapping(json.loads(text))
     try:
-        import yaml  # type: ignore[import-untyped]  # no types-PyYAML in the venv
+        import yaml
     except ImportError as exc:  # pragma: no cover - the image and venv both ship PyYAML
         raise ScenarioError("YAML scenarios need PyYAML: pip install pyyaml") from exc
     return Scenario.from_mapping(yaml.safe_load(text))

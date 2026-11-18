@@ -94,7 +94,9 @@ async def _dump(store: redis.asyncio.Redis, prefix: str) -> dict[str, Any]:
     async for key in store.scan_iter(match=f"{prefix}*", count=500):
         if not any(part in key for part in (b"{r:", b":tq", b"{q:", b"audit")):
             continue  # the engine's own beats and sweeps write elsewhere meanwhile
-        kind = (await store.type(key)).decode()
+        raw_kind = await store.type(key)
+        assert isinstance(raw_kind, bytes)  # the fixture client does not decode
+        kind = raw_kind.decode()
         if kind == "hash":
             out[key] = sorted((await store.hgetall(key)).items())
         elif kind == "zset":
@@ -366,6 +368,7 @@ async def test_reprioritize_moves_only_that_tenants_queued_calls(
         old = before[rid].message_id
         assert old is not None
         new = after[rid].message_id
+        assert new is not None
         assert new != old
         # The copy keeps its original place: `pos` is the id it was sent with (Q9).
         entry: Any = await engine.state.xrange(

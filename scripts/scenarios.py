@@ -769,7 +769,7 @@ async def tenant_isolation(ctx: Ctx) -> None:
     a_cancelled = [done[i.request_id] for i in waiting.items if i.request_id in done]
     ctx.checks["tenant B: every call served"] = all(kind == "ok" for _, kind in b.values())
     ctx.checks["tenant B: none moved"] = not b_moved
-    ctx.checks["tenant B: none cancelled"] = cancelled.tenant != admin._hash("B")
+    ctx.checks["tenant B: none cancelled"] = cancelled.tenant != admin.hash_id("B")
     ctx.checks["tenant A: calls moved"] = moved.changed > 0
     ctx.checks["tenant A: cancelled calls end cancelled within 2 s"] = all(
         kind == "cancelled" and at - cancel_at <= 2.0 + 1.0  # + the run's clock slack
@@ -970,9 +970,9 @@ async def tenant_isolation_full(ctx: Ctx) -> None:
         r.ok for t, r in [*base.calls.values(), *wave.calls.values()] if t == "B"
     )
     ctx.checks["tenant B: none moved"] = wave.b_moved == 0
-    ctx.checks["tenant B: none cancelled"] = wave.cancelled_tenant != admin._hash("B") and not any(
-        r.kind == "cancelled" for r, _ in b
-    )
+    ctx.checks["tenant B: none cancelled"] = wave.cancelled_tenant != admin.hash_id(
+        "B"
+    ) and not any(r.kind == "cancelled" for r, _ in b)
     ctx.checks["tenant A: calls moved"] = wave.changed > 0
     ctx.checks["tenant B: p95 wait within 10 % of the baseline wave"] = (
         p95_now <= base_p95 * (1 + T1_P95_SLACK) + T1_P95_FLOOR_SECS

@@ -261,6 +261,7 @@ async def test_health_calls_and_drain_file(tmp_path: Path) -> None:
 
 def test_a_bad_drain_poll_still_disables() -> None:
     queue = _config_failed(LLMQ_DRAIN_POLL_SECS="0")
+    assert queue.settings is not None
     assert queue.settings.drain_poll_secs == 1.0
 
 

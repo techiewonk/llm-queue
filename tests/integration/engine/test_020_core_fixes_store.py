@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import os
 from typing import Any
 
 import orjson
@@ -15,7 +16,6 @@ import pytest
 import redis.asyncio
 from engine_testkit import CHAT, GPT, SMALL, Make, away_from_minute_end, stats
 
-from llm_queue.engine import requests as requests_module
 from llm_queue.engine.envelope import Reply
 from llm_queue.engine.errors import CallFailed
 from llm_queue.engine.keys import Keys
@@ -137,7 +137,7 @@ async def test_a5_a_replayed_register_answers_the_first_outcome(
     now answers the first outcome; another registration still attaches.
     """
     requests = _store(store, prefix)
-    monkeypatch.setattr(requests_module.os, "urandom", lambda n: b"\x01" * n)
+    monkeypatch.setattr(os, "urandom", lambda n: b"\x01" * n)
     assert await _register(requests) == "new"
     assert await _register(requests) == "new"  # the replay: `attached` before
     monkeypatch.undo()
@@ -154,7 +154,7 @@ async def test_a5_a_replayed_register_send_sends_once(
     keys = Keys(prefix)
     requests = _store(store, prefix)
     queues = StreamQueues(store, keys)
-    monkeypatch.setattr(requests_module.os, "urandom", lambda n: b"\x02" * n)
+    monkeypatch.setattr(os, "urandom", lambda n: b"\x02" * n)
 
     async def send() -> Any:
         return await requests.register_send(

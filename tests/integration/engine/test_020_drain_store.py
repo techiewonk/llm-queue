@@ -48,6 +48,11 @@ async def _until(check: Callable[[], Any], secs: float = 5.0, what: str = "condi
         await asyncio.sleep(0.02)
 
 
+def _draining(llmq: LLMQueue) -> bool:
+    """`llmq.draining` read afresh: mypy keeps an asserted property narrowed across awaits."""
+    return llmq.draining
+
+
 def _holding(engine: Engine) -> bool:
     return any(h.hold is not None and h.run is None for h in engine._held.values())
 
@@ -156,7 +161,8 @@ async def test_a_batch_received_at_pause_goes_back_unadmitted(
 
     async def admit(alias: str, message: Any) -> bool:
         admitted.append(message.id)
-        return await real_admit(alias, message)
+        ok: bool = await real_admit(alias, message)
+        return ok
 
     monkeypatch.setattr(worker.queues, "receive_first", receive_first)
     monkeypatch.setattr(worker, "_admit_new", admit)
@@ -273,7 +279,7 @@ async def test_draining_is_in_health_with_its_reason(make: Make) -> None:
     assert health["draining_since"] >= before
     assert health["not_ready_reason"] == "draining"
     # Draining wins over an evicting store: the operator's action is the first reason.
-    engine._evicting = lambda: "store_eviction_policy"  # type: ignore[method-assign]
+    engine._evicting = lambda: "store_eviction_policy"
     assert (await engine.health_check())["not_ready_reason"] == "draining"
     engine.resume_receiving()
     health = await engine.health_check()
@@ -382,18 +388,18 @@ async def test_admin_drain_is_a_dry_run_by_default_and_audits_only_real_runs(
 
     planned = await admin.drain.start(actor="ann")
     assert (planned["draining"], planned["dry_run"], planned["would_change"]) == (False, True, True)
-    assert llmq.draining is False
+    assert _draining(llmq) is False
     assert (await llmq.health())["ready"] is True
     assert await entries("drain") == []
 
     done = await admin.drain.start(actor="ann", dry_run=False)
     assert (done["draining"], done["dry_run"]) == (True, False)
-    assert llmq.draining is True
+    assert _draining(llmq) is True
     assert [e["actor"] for e in await entries("drain")] == ["ann"]
 
     planned = await admin.drain.resume(actor="ann")
     assert (planned["draining"], planned["would_change"]) == (True, True)
-    assert llmq.draining is True
+    assert _draining(llmq) is True
     assert await entries("resume") == []
 
     done = await admin.drain.resume(actor="ann", dry_run=False)

@@ -33,6 +33,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from llm_queue import CallFailed, LLMQueue  # noqa: E402  # needs the sys.path entry
+from llm_queue.engine.runtime import Engine  # noqa: E402
 
 STORE_URL = "redis://:localdev@127.0.0.1:6379/0"
 REQUEST = {
@@ -88,14 +89,21 @@ async def stop_all(queues: list[LLMQueue]) -> None:
         raise errors[0]
 
 
+def _held(queue: LLMQueue) -> int:
+    """Calls one queue-mode queue holds (a local engine holds none: the run needs queue mode)."""
+    engine = queue._engine
+    assert isinstance(engine, Engine), "the load run needs queue mode"
+    return len(engine._held)
+
+
 async def still_held(queues: list[LLMQueue], secs: float = 3.0) -> int:
     """Held calls left once the last replies are acknowledged (a reply is published first)."""
     for _ in range(int(secs / 0.1)):
-        held = sum(len(q._engine._held) for q in queues)
+        held = sum(_held(q) for q in queues)
         if not held:
             return 0
         await asyncio.sleep(0.1)
-    return sum(len(q._engine._held) for q in queues)
+    return sum(_held(q) for q in queues)
 
 
 async def cleanup(prefix: str) -> None:

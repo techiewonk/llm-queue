@@ -7,7 +7,7 @@ itself runs against real stores in `tests/integration/engine/test_requests_admin
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -162,7 +162,8 @@ async def test_status_of_one_tenant_on_a_model() -> None:
     status = MagicMock()
     status.model = AsyncMock(return_value={"model": "m", "tenant": {"tenant": H}})
     admin = _admin(_Service(), status)
-    admin.context.registry.current.registry.alias_of.return_value = "m"
+    registry = cast(MagicMock, admin.context.registry)  # `_admin` builds it as a MagicMock
+    registry.current.registry.alias_of.return_value = "m"
     admin.context.engine = MagicMock()  # view() reads the loaded registry
     report = await admin.status.get("m", tenant="acme")
     assert report["tenant"] == {"tenant": H}

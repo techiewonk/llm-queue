@@ -90,7 +90,7 @@ def test_body_has_only_the_hash() -> None:
 
 def test_registry_tenant_names_are_hashed_at_load() -> None:
     """D2: the boot document names tenants; only their hashes go on."""
-    doc = {
+    doc: dict[str, Any] = {
         "defaults": {"fairness": {"mode": "share", "weights": {"acme": 2}}},
         "models": {
             "m": {"fairness": {"mode": "quota", "quotas": {"acme": {"rpm": 5}}}},

@@ -187,6 +187,7 @@ async def test_start_twice_and_restart(make: Make, store: Any, prefix: str) -> N
     }
     queue = LLMQueue.from_env(env)
     await queue.start()
+    assert isinstance(queue._engine, Engine)  # queue mode
     tasks = len(queue._engine._tasks)
     await queue.start()
     assert len(queue._engine._tasks) == tasks

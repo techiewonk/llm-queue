@@ -190,7 +190,7 @@ def test_http_waits_are_always_capped() -> None:
     """Rescan B3-R3: an omitted wait waited LLMQ_PURGE_WAIT_SECS (300 s) per deployment."""
     admin = FakeAdmin()
     http = _writes(admin, wait_cap_secs=60)
-    dep = {"model": "m", "deployment": "a/r"}
+    dep: dict[str, Any] = {"model": "m", "deployment": "a/r"}
     for body, want in (({}, 60.0), ({"wait_secs": 500}, 60.0), ({"wait_secs": 5}, 5.0)):
         assert http.post("/purge/deployment", json={**dep, **body}, headers=ADMIN).is_success
         assert admin.calls[-1][1]["wait_secs"] == want

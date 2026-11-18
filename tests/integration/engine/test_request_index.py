@@ -141,7 +141,7 @@ async def test_confirm_indexes_and_a_takeover_moves_the_score(
 ) -> None:
     keys = Keys(prefix)
     requests = RequestStore(store, keys, takeover_grace_secs=0)
-    record = {
+    record: dict[str, Any] = {
         "caller": "pod-a",
         "user_hash": "u",
         "params_hash": "p",
@@ -176,7 +176,7 @@ async def test_lapsed_entries_are_pruned_and_ttl_only_grows(
     requests = engine.requests
     await engine.state.zadd(keys.request_index("m", "h1"), {"old": 1})
     await engine.state.zadd(keys.tenant_index("m"), {"gone": 1})
-    record = {
+    record: dict[str, Any] = {
         "caller": "pod-a",
         "user_hash": "u",
         "params_hash": "p",
@@ -196,7 +196,8 @@ async def test_lapsed_entries_are_pruned_and_ttl_only_grows(
 
 @pytest.fixture
 async def engine_store(make: Make) -> tuple[Engine, Any]:
-    return await make(worker=False)
+    engine, fake = await make(worker=False)
+    return engine, fake
 
 
 # ------------------------------------------------------------------ the engine paths

@@ -7,7 +7,7 @@ OpenAI do) and keeps the ids it sent; each path must report the id of its own re
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from aiohttp.test_utils import TestServer
@@ -33,7 +33,10 @@ async def fake() -> AsyncIterator[TestServer]:
     await server.close()
 
 
-def _providers(server: TestServer, transport: str, http: str = "httpx") -> Providers:
+Http = Literal["httpx", "aiohttp"]  # `OpenAIOptions.http`
+
+
+def _providers(server: TestServer, transport: str, http: Http = "httpx") -> Providers:
     url = str(server.make_url("")).rstrip("/")
     return Providers(
         ClientPool(
@@ -84,7 +87,7 @@ async def test_bedrock_result_has_the_request_id(
 
 
 @pytest.mark.parametrize("http", ["httpx", "aiohttp"])
-async def test_openai_chat_result_has_the_request_id(fake: TestServer, http: str) -> None:
+async def test_openai_chat_result_has_the_request_id(fake: TestServer, http: Http) -> None:
     providers = _providers(fake, "botocore", http)
     try:
         result = await providers.get("openai").call(
