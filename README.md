@@ -56,15 +56,21 @@ with Amazon Bedrock and OpenAI-compatible servers (such as vLLM), and with LangC
 
 ## How it works
 
-```mermaid
-flowchart LR
-  APP["App code<br/>or LangChain adapter"] -->|"converse / embed"| Q[("Valkey / Redis<br/>queues, budgets, results")]
-  Q -->|"one atomic admission:<br/>deployment, RPM, TPM, slot"| W["Workers<br/>(in the app's own pods)"]
-  W --> D1["Bedrock<br/>account A / region 1"]
-  W --> D2["Bedrock<br/>account B / region 2"]
-  W --> D3["OpenAI-compatible<br/>(vLLM)"]
-  W -->|"result"| Q
-  Q -->|"reply"| APP
+```text
+  App code / LangChain adapter
+        |  converse / embed                         ^  reply
+        v                                           |
+  +-----------------------------------------------------------+
+  |  Valkey / Redis: queues, budgets, results                 |
+  |  one atomic admission: deployment + RPM + TPM + slot      |
+  +-----------------------------------------------------------+
+        |  call                                     ^  result
+        v                                           |
+  Workers (in the app's own pods) ------------------+
+        |
+        +--> Bedrock, account A / region 1
+        +--> Bedrock, account B / region 2
+        +--> OpenAI-compatible server (vLLM)
 ```
 
 Each process is a caller, a worker or both. A caller registers the call and sends it to the
@@ -78,7 +84,7 @@ result; the caller wakes up and reads it. There is no separate service to run: o
 pip install "llm-queue[langchain-aws]"            # Bedrock (+ LangChain)
 pip install "llm-queue[openai,langchain-openai]"  # OpenAI-compatible servers (+ LangChain)
 pip install "llm-queue[http,metrics]"             # FastAPI routes, Prometheus metrics
-pip install "llm-queue[langchain-aws]==0.1.1"     # pinned (no --pre since 0.1.1)
+pip install "llm-queue[langchain-aws]==0.2.0"     # pinned
 ```
 
 Python 3.12 or newer, and Valkey 8 or Redis 7.2+ (one primary, replicas allowed; cluster mode is

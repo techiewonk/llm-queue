@@ -88,3 +88,13 @@ def test_repo_links_point_at_files() -> None:
     assert paths
     missing = [p for p in paths if not (ROOT / p).exists()]
     assert missing == [], f"not in the repo: {missing}"
+
+
+def test_readme_renders_on_pypi() -> None:
+    """PyPI renders no mermaid: a flow in the README is a `text` block (the docs keep mermaid).
+
+    A relative link breaks on PyPI too; every link is absolute.
+    """
+    assert not blocks("mermaid")
+    assert "](docs/" not in README
+    assert "](./" not in README
