@@ -516,7 +516,8 @@ return {moved, dropped, redis.call('XLEN', KEYS[6])}
 )
 
 # Reprioritize (0.2.0 T2): move waiting messages from one queue to another (a model's normal and
-# priority queues). KEYS: the 7 keys of the source, then the 7 of the target. ARGV: retention ms,
+# priority queues). KEYS: the 7 keys of the source, the 7 of the target, then the target's move
+# marks (`moved`, see `StreamQueues.moved_key`). ARGV: retention ms,
 # the target's max waiting (0: no limit), the target's doorbell, byte cap, the key prefix (the
 # job records live in this store) or '' (they live elsewhere: checked and updated by the
 # caller), the target class (`p` / `n`), then request id / message id pairs. A message held by
@@ -527,6 +528,9 @@ return {moved, dropped, redis.call('XLEN', KEYS[6])}
 # call was first sent with, so its deadline, `max_wait_secs` and place among waiting calls stay
 # (owner Q9); `fails` goes along; the source entry and its records go. The run stops when the
 # target is full (`full`, the rest too) or past the byte cap (the rest is left for the next run).
+# With the records elsewhere (prefix ''), each moved call is marked in `moved` (request id -> new
+# message id, kept for the retention): the caller writes the records from the marks and clears
+# them, and a caller that died first leaves them for the next admin read of the model (RQ-8).
 # Reply: {moved {rid, new id, ...}, skipped {rid, reason, ...}, pairs looked at}.
 MOVE = (
     _NOW
@@ -596,13 +600,18 @@ for a = 7, #ARGV, 2 do
       if redis.call('EXISTS', status) == 1 then
         redis.call('HSET', status, 'priority', cls == 'p' and '1' or '0')
       end
+    else
+      redis.call('HSET', KEYS[15], rid, new)
     end
     table.insert(moved, rid)
     table.insert(moved, new)
   end
   looked = (a - 5) / 2
 end
-if #moved > 0 then ring(bell) end
+if #moved > 0 then
+  ring(bell)
+  if prefix == '' then X.expire(KEYS[15], retention) end
+end
 return {moved, skipped, looked}
 """
 )
@@ -762,6 +771,14 @@ class StreamQueues:
     def queue_keys(self, queue: str) -> list[str]:
         """The keys of one queue, in `_PARTS` order (stream first)."""
         return [self.keys.queue(queue, part) for part in _PARTS]
+
+    def moved_key(self, queue: str) -> str:
+        """Calls `move` sent to `queue` whose records (in another store) are still to write.
+
+        A hash, request id -> the call's new message id, in the queue's hash slot; it expires
+        with the queue's retention (the moved messages are trimmed by then).
+        """
+        return self.keys.queue(queue, "moved")
 
     async def send(
         self,
@@ -984,8 +1001,9 @@ class StreamQueues:
         """Move waiting messages (request id, message id) from `source` to `target` (`MOVE`).
 
         `prefix`: the key prefix when the calls' job records live in this store (they are
-        checked and updated in the same script), else '' (the caller does both). Pairs past
-        the byte cap are not looked at: `looked` says how many were.
+        checked and updated in the same script), else '' (the caller does both, from the marks
+        `MOVE` leaves in `moved_key(target)`). Pairs past the byte cap are not looked at:
+        `looked` says how many were.
         """
         if not pairs:
             return MoveResult((), (), 0)
@@ -1000,7 +1018,7 @@ class StreamQueues:
         for rid, mid in pairs:
             args += [rid, mid]
         moved, skipped, looked = await self._move(
-            [*self.queue_keys(source), *self.queue_keys(target)], args
+            [*self.queue_keys(source), *self.queue_keys(target), self.moved_key(target)], args
         )
         return MoveResult(
             tuple((_text(moved[i]), _text(moved[i + 1])) for i in range(0, len(moved), 2)),
@@ -1043,7 +1061,9 @@ class StreamQueues:
 
     async def delete(self, names: Sequence[str]) -> None:
         """Delete queues and everything in them (model removal)."""
-        await self._client.delete(*[k for name in names for k in self.queue_keys(name)])
+        await self._client.delete(
+            *[k for name in names for k in (*self.queue_keys(name), self.moved_key(name))]
+        )
 
 
 def _receive_args(count: int, settings: QueueSettings) -> list[int | str]:
