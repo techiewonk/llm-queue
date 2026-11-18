@@ -50,7 +50,7 @@ from llm_queue.engine.purge import PurgeSettings
 from llm_queue.engine.queue import QueueFull
 from llm_queue.engine.requests_admin import AdminSettings
 from llm_queue.engine.runtime import Engine, EngineSettings
-from llm_queue.engine.settings import STORE_POOL_MARGIN, InfraSettings, Layers
+from llm_queue.engine.settings import STORE_POOL_MARGIN, InfraSettings, Layers, env_or_default
 from llm_queue.engine.store_client import Secrets, secret_store_client
 from llm_queue.engine.store_guard import store_op
 from llm_queue.errors import ConfigError, LLMQueueError, LocalModeRefused
@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     from llm_queue.engine.admin import AdminServices
 
 logger = get_logger(__name__)
+CONFIG_ERROR_MODES = ("raise", "disable")  # LLMQ_CONFIG_ERROR_MODE, the first is the default
 # A sync call on a started queue's loop checks this often that the loop still runs (CO-26).
 _LOOP_CHECK_SECS = 1.0
 # How long closing the private engine of the sync calls may take before it is logged and left.
@@ -217,6 +218,9 @@ class Health(TypedDict):
     # `queue` or `local` (LLMQ_EXECUTION_MODE); local mode has no stores (`stores` is empty).
     mode: NotRequired[str]
     running: NotRequired[int]  # local mode: calls in flight in this process
+    # A disabled queue (`enabled: false`): `switch` (LLMQ_ENABLED=false) or `config_error`
+    # (LLMQ_CONFIG_ERROR_MODE=disable after a ConfigError at `from_env`).
+    disabled_reason: NotRequired[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,9 +323,62 @@ class LLMQueue:
 
         The secrets are `secrets`, else the sources `LLMQ_SECRETS_SOURCE` names; `secrets_names`
         reads a setting under another key, `tuning` sets timeouts and pools in code (see
-        docs/reference/environment.md). `LLMQ_ENABLED=false` returns a `DisabledQueue` (probes
-        and the drain file only, every call refused); `ConfigError` lists every problem.
+        docs/reference/environment.md). `LLMQ_ENABLED=false` (`environ`, then `defaults`: never
+        a secret) returns a `DisabledQueue` (probes and the drain file only, every call refused)
+        without reading any secrets source. `ConfigError` lists every problem; with
+        `LLMQ_CONFIG_ERROR_MODE=disable` it is logged (`llmq_config_failed`) instead and a
+        `DisabledQueue` with `disabled_reason: config_error` is returned.
         """
+        mode, mode_problem = _config_error_mode(environ, defaults)
+        if mode_problem:  # an invalid mode reads as `raise`
+            raise ConfigError(f"invalid LLMQ settings:\n  {mode_problem}")
+        try:
+            return cls._from_env(
+                environ,
+                secrets=secrets,
+                defaults=defaults,
+                secrets_names=secrets_names,
+                metrics=metrics,
+                instance_id=instance_id,
+                credentials=credentials,
+                offload=offload,
+                offload_bytes=offload_bytes,
+                tuning=tuning,
+            )
+        except ConfigError as exc:
+            if mode != "disable":
+                raise
+            from llm_queue.disabled import DisabledQueue
+
+            # Every library message is free of values (secrets, passwords, tokens, the salt):
+            # the problems are logged as raised, one line each.
+            problems = [line.strip() for line in str(exc).splitlines() if line.strip()]
+            logger.error(
+                "llmq_config_failed",
+                problems=problems,
+                error_type=type(exc).__name__,
+                config_error_mode=mode,
+                disabled_reason="config_error",
+            )
+            settings = InfraSettings.after_config_error(environ, defaults)
+            return DisabledQueue(settings, reason="config_error")
+
+    @classmethod
+    def _from_env(
+        cls,
+        environ: Mapping[str, str] | None,
+        *,
+        secrets: Secrets | None,
+        defaults: Mapping[str, Any] | None,
+        secrets_names: Mapping[str, str] | None,
+        metrics: Metrics | None,
+        instance_id: str | None,
+        credentials: Callable[[Any], Mapping[str, Any] | None] | None,
+        offload: ResultOffload | None,
+        offload_bytes: int | None,
+        tuning: Tuning | None,
+    ) -> LLMQueue:
+        """`from_env` before `LLMQ_CONFIG_ERROR_MODE`: any problem raises `ConfigError`."""
         layers = Layers(environ, secrets, defaults, secrets_names)  # reads a source once
         settings = InfraSettings.from_layers(layers)
         if not settings.enabled:  # LLMQ_ENABLED=false: the off switch (0.2.0 H1)
@@ -1220,6 +1277,19 @@ class LLMQueue:
     def describe(self) -> dict[str, Any]:
         """This queue's settings for a log line: no password, salt, token or registry body."""
         return self.admin.describe()
+
+
+def _config_error_mode(
+    environ: Mapping[str, str] | None, defaults: Mapping[str, Any] | None
+) -> tuple[str, str | None]:
+    """`LLMQ_CONFIG_ERROR_MODE` (`raise` or `disable`) and its problem; invalid reads `raise`.
+
+    From `environ` then `defaults` only, never a secret: reading the secret may be what fails.
+    """
+    raw = (env_or_default(environ, defaults, "LLMQ_CONFIG_ERROR_MODE") or "raise").strip().lower()
+    if raw in CONFIG_ERROR_MODES:
+        return raw, None
+    return "raise", "LLMQ_CONFIG_ERROR_MODE must be raise or disable"
 
 
 def _transport_problems(settings: InfraSettings, tuning: Tuning) -> list[str]:

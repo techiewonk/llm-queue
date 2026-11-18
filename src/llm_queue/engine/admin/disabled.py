@@ -122,6 +122,7 @@ class DisabledOpsAdmin:
                 "mode": None,
                 "execution_mode": "disabled",
                 "environment": settings.environment if settings else None,
+                "disabled_reason": getattr(process, "disabled_reason", "switch"),
             },
             "process": None,
             "stores": None,

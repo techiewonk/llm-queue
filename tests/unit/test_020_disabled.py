@@ -57,12 +57,16 @@ def test_bad_drain_poll_is_refused_when_off() -> None:
         InfraSettings.from_env({**OFF, "LLMQ_DRAIN_POLL_SECS": "0"})
 
 
-def test_switch_reads_secrets_and_defaults_like_every_setting() -> None:
+def test_switch_reads_the_environment_and_defaults_never_a_secret() -> None:
     def secrets(name: str) -> str | None:
         return "false" if name == "LLMQ_ENABLED" else None
 
-    assert isinstance(LLMQueue.from_env({}, secrets=secrets), DisabledQueue)
+    # A secret holding LLMQ_ENABLED is ignored: the switch is read before any secret.
+    with pytest.raises(ConfigError, match="LLMQ_STORE_URL"):
+        LLMQueue.from_env({"LLMQ_ENVIRONMENT": "dev"}, secrets=secrets)
     assert isinstance(LLMQueue.from_env({}, defaults={"LLMQ_ENABLED": False}), DisabledQueue)
+    off = LLMQueue.from_env({"LLMQ_ENABLED": "false"}, defaults={"LLMQ_ENABLED": True})
+    assert isinstance(off, DisabledQueue)
 
 
 # ---------------------------------------------------------------- Python
@@ -130,6 +134,7 @@ async def test_start_stop_health_ready_and_describe() -> None:
         "enabled": False,
         "environment": "prod",
         "drain_file": False,
+        "disabled_reason": "switch",
     }
     set_default_queue(None)
     await queue.start()
@@ -191,6 +196,7 @@ def test_install_mounts_the_probes_only() -> None:
         assert client.get("/internal/llm-queue/health/live").json() == {
             "live": True,
             "enabled": False,
+            "disabled_reason": "switch",
         }
         ready = client.get("/internal/llm-queue/health/ready")
         assert ready.status_code == 200

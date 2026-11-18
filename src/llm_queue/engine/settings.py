@@ -86,6 +86,7 @@ SETTING_NAMES = frozenset(
         "LLMQ_HTTP_ALLOWED_HOSTS",
         "LLMQ_BEDROCK_ENDPOINT_URL",
         "LLMQ_CALLER_TTL_SECS",
+        "LLMQ_CONFIG_ERROR_MODE",
         "LLMQ_REGISTRY_RELOAD_SECS",
         "LLMQ_DEBUG_CAPTURE_ENABLED",
         "LLMQ_TENANT_DEFAULT",
@@ -160,6 +161,19 @@ _SECRETS_SETTINGS = frozenset(
         "SECRETS_TIMEOUT_SECS",
     )
 )
+# Read from the environment and `defaults=` only, never from a secret: the secrets settings,
+# the off switch (read before any secret, so `LLMQ_ENABLED=false` never touches a source) and
+# `LLMQ_CONFIG_ERROR_MODE` (reading the secret may be what fails). A secret holding one of these
+# names is ignored, and `LLMQ_SECRETS_NAMES` may not map one.
+ENV_ONLY_SETTINGS = _SECRETS_SETTINGS | {PREFIX + "ENABLED", PREFIX + "CONFIG_ERROR_MODE"}
+
+
+def env_or_default(
+    environ: Mapping[str, str] | None, defaults: Mapping[str, Any] | None, name: str
+) -> str | None:
+    """`name` from `environ` (default `os.environ`), else `defaults`; never from a secret."""
+    value = _set((os.environ if environ is None else environ).get(name))
+    return value if value is not None else _set((defaults or {}).get(name))
 
 
 def _set(value: Any) -> str | None:
@@ -194,6 +208,8 @@ class Layers(Mapping[str, str]):
         """Read `environ` (default `os.environ`, copied now) and the other layers.
 
         A configured secrets source is read once here: `ConfigError` names one that cannot be.
+        `LLMQ_ENABLED` is read first, from `environ` then `defaults` only: when it is false no
+        source is built or read and `secrets` is not used (the off switch touches no secret).
         """
         from llm_queue import secrets as sources
 
@@ -209,6 +225,21 @@ class Layers(Mapping[str, str]):
             value = _set(self._env.get(name))
             return value if value is not None else raw_defaults.get(name)
 
+        self._defaults = {name: _set(value) for name, value in raw_defaults.items()}
+        self._secrets: Callable[[str], str | None] | None = None
+        self._names: dict[str, str] = {}
+        self.secrets_source = str(_set(setting(sources.SOURCE_VAR)) or "none").strip()
+        self.secrets_region: str | None = None
+        self.secrets_cache_secs = sources.CACHE_SECS
+        self.secrets_timeout_secs = sources.TIMEOUT_SECS
+        # The off switch before any secret: false here builds and reads no secrets source and
+        # checks no secrets setting (a bad `LLMQ_ENABLED` is reported by `from_layers`).
+        switch = _set(setting(PREFIX + "ENABLED"))
+        self.switched_off = switch is not None and switch.strip().lower() in _FALSE
+        if self.switched_off:
+            if problems:
+                raise ConfigError("invalid LLMQ settings:\n  " + "\n  ".join(problems))
+            return
         names, found = sources.parse_secret_names(setting(sources.NAMES_VAR))
         problems += found
         for name, secret in (secrets_names or {}).items():
@@ -219,7 +250,7 @@ class Layers(Mapping[str, str]):
         for name in names:
             if not name.startswith(PREFIX):
                 problems.append(f"secret names: {name!r} is not an LLMQ_* setting")
-            elif name in sources.SETTINGS:
+            elif name in ENV_ONLY_SETTINGS:
                 problems.append(f"secret names: {name} is read from the environment, not a secret")
         cache = sources.read_number(
             setting(sources.CACHE_VAR),
@@ -237,11 +268,10 @@ class Layers(Mapping[str, str]):
             sources.MAX_TIMEOUT_SECS,
             problems,
         )
-        spec = str(_set(setting(sources.SOURCE_VAR)) or "none").strip()
+        spec = self.secrets_source
         region = _set(setting(sources.REGION_VAR))
         if problems:
             raise ConfigError("invalid LLMQ settings:\n  " + "\n  ".join(problems))
-        self.secrets_source = spec
         self.secrets_region = region.strip() if region else None
         self.secrets_cache_secs = cache
         self.secrets_timeout_secs = timeout
@@ -258,7 +288,6 @@ class Layers(Mapping[str, str]):
             except ConfigError as exc:
                 raise ConfigError(f"invalid LLMQ settings:\n  {exc}") from None
         self._secrets = secrets
-        self._defaults = {name: _set(value) for name, value in raw_defaults.items()}
         self._names = names
 
     @property
@@ -297,7 +326,7 @@ class Layers(Mapping[str, str]):
 
     def secret(self, name: str) -> str | None:
         """Secret `name` (under its mapped key), None when unset or empty."""
-        if self._secrets is None or name in _SECRETS_SETTINGS:
+        if self._secrets is None or name in ENV_ONLY_SETTINGS:
             return None
         return _set(self._secrets(self._names.get(name, name)))
 
@@ -582,6 +611,10 @@ class InfraSettings:
     # LLMQ_ENABLED (0.2.0 H1, FU1): false switches the library off (a disabled queue: probes,
     # the drain file and `describe()` only; every other setting is then not read or checked).
     enabled: bool = True
+    # LLMQ_CONFIG_ERROR_MODE: `raise` (a ConfigError stops `from_env`) or `disable` (logged as
+    # `llmq_config_failed`, a disabled queue returned). Environment and defaults only; core.py
+    # reads it before these settings, as building them may be what fails.
+    config_error_mode: str = "raise"
     queue_store_url: str | None = field(default=None, repr=False)
     store_max_connections: int = 200
     # LLMQ_STORE_MAX_CONNECTIONS=auto (0.2.0 D7): the size above is the boot registry's worker
@@ -726,6 +759,9 @@ class InfraSettings:
             return cls._disabled(layers)
         store = get("STORE_URL")
         execution_mode = str(get("EXECUTION_MODE", "queue")).strip().lower()
+        config_error_mode = str(get("CONFIG_ERROR_MODE", "raise")).strip().lower()
+        if config_error_mode not in ("raise", "disable"):
+            problems.append("LLMQ_CONFIG_ERROR_MODE must be raise or disable")
         if execution_mode not in EXECUTION_MODES:
             problems.append("LLMQ_EXECUTION_MODE must be queue or local")
         local = execution_mode == "local"
@@ -961,6 +997,7 @@ class InfraSettings:
             drain_poll_secs=number("DRAIN_POLL_SECS", 1.0, lo=0.1, hi=60),
             queue_backfill_enabled=backfill,
             execution_mode=execution_mode,
+            config_error_mode=config_error_mode,
             local_process_count=number("LOCAL_PROCESS_COUNT", 1, int, hi=100_000),
             local_concurrency=number("LOCAL_CONCURRENCY", 10, int, hi=100_000),
             static_cap_wait_secs=number("STATIC_CAP_WAIT_SECS", 5.0, zero=True, hi=3600),
@@ -1030,6 +1067,37 @@ class InfraSettings:
             drain_file=str(layers.get(PREFIX + "DRAIN_FILE", "") or "").strip(),
             drain_poll_secs=poll,
             secrets_source=layers.secrets_source,
+        )
+
+    @classmethod
+    def after_config_error(
+        cls, environ: Mapping[str, str] | None, defaults: Mapping[str, Any] | None
+    ) -> InfraSettings:
+        """The disabled settings `LLMQ_CONFIG_ERROR_MODE=disable` falls back to; never raises.
+
+        Read from `environ` (default `os.environ`) and `defaults` only, as the secrets may be
+        what failed: the environment and the drain file (a bad poll interval reads as 1s).
+        """
+
+        def get(name: str) -> str:
+            return (env_or_default(environ, defaults, PREFIX + name) or "").strip()
+
+        environment = get("ENVIRONMENT").lower()
+        environment = {"": "unset", "production": "prod"}.get(environment, environment)
+        try:
+            poll = float(get("DRAIN_POLL_SECS") or 1.0)
+        except ValueError:
+            poll = 1.0
+        if not (math.isfinite(poll) and 0.1 <= poll <= 60):
+            poll = 1.0
+        return cls(
+            store_url="",
+            enabled=False,
+            config_error_mode="disable",
+            environment=environment,
+            drain_file=get("DRAIN_FILE"),
+            drain_poll_secs=poll,
+            secrets_source=get("SECRETS_SOURCE") or "none",
         )
 
     def registry_document(self) -> str:

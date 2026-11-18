@@ -1,4 +1,8 @@
-"""The queue `LLMQueue.from_env()` returns with `LLMQ_ENABLED=false` (0.2.0 H1, FU1).
+"""The queue `LLMQueue.from_env()` returns switched off (0.2.0 H1, FU1).
+
+With `LLMQ_ENABLED=false` (`disabled_reason: switch`), or after a `ConfigError` with
+`LLMQ_CONFIG_ERROR_MODE=disable` (`disabled_reason: config_error`, logged as
+`llmq_config_failed`): the same queue either way.
 
 The off switch, the last step of the switch ladder (docs/how-to/modes.md): no store client,
 no engine, no provider client. The app runs its own direct path, because the factories
@@ -30,7 +34,9 @@ logger = get_logger(__name__)
 class DisabledQueue(LLMQueue):
     """An `LLMQueue` switched off: probes, drain and `describe()`; calls raise `QueueDisabled`."""
 
-    def __init__(self, settings: InfraSettings) -> None:  # noqa: D107 - see the class
+    def __init__(self, settings: InfraSettings, *, reason: str = "switch") -> None:
+        """Over disabled `settings`; `reason` is `switch` or `config_error` (see the module)."""
+        self.disabled_reason = reason
         # No engine: nothing of LLMQueue.__init__ applies. The attributes below are what the
         # fork hook and `queue_ready()` read.
         self.settings = settings
@@ -46,7 +52,7 @@ class DisabledQueue(LLMQueue):
 
     @property
     def enabled(self) -> bool:
-        """False: `LLMQ_ENABLED=false` switched the library off."""
+        """False: the library is switched off (`disabled_reason` says why)."""
         return False
 
     @property
@@ -133,7 +139,7 @@ class DisabledQueue(LLMQueue):
         return True
 
     async def health(self) -> Health:
-        """`enabled: false`, live, ready unless draining; no stores."""
+        """`enabled: false` and `disabled_reason`, live, ready unless draining; no stores."""
         out: dict[str, Any] = {
             "enabled": False,
             "live": True,
@@ -144,16 +150,17 @@ class DisabledQueue(LLMQueue):
             "stores": {},
             "eviction_policy": "none",
             "key_expiry_mode": "none",
+            "disabled_reason": self.disabled_reason,
         }
         if self.draining:
             out["not_ready_reason"] = "draining"
         return cast("Health", out)
 
     def describe(self) -> dict[str, Any]:
-        """`enabled: false`, the version, environment and whether a drain file is watched."""
+        """`enabled: false`, `disabled_reason`, the version, environment and drain file use."""
         from llm_queue.engine.admin.process import describe_settings
 
-        return describe_settings(self.settings, None)
+        return {**describe_settings(self.settings, None), "disabled_reason": self.disabled_reason}
 
     # ---------------------------------------------------------------- refused
 
@@ -251,7 +258,9 @@ class DisabledQueue(LLMQueue):
         router = APIRouter()
 
         async def live() -> Any:
-            return JSONResponse({"live": True, "enabled": False})
+            return JSONResponse(
+                {"live": True, "enabled": False, "disabled_reason": self.disabled_reason}
+            )
 
         async def ready() -> Any:
             health = dict(await self.health())
