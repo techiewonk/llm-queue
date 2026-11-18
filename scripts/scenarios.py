@@ -99,6 +99,7 @@ SLOW_ID = "openai.slow-1:0"  # C1's calls: their own fakellm keys, apart from th
 ORPHAN_ID = "openai.orphan-1:0"  # C2's calls
 RECOVERY_SECS = 30.0  # a faulted region must serve again within this after the fault
 LOADS = {"under": 0.5, "at": 1.0, "burst": 3.0}
+KILL_SWITCH_SEEN_CAP_SECS = 10.0  # R3: every caller has the switch by then (reload 1 s)
 SETTLE_PROBE_SECS = 30.0  # after the fixed settle: until a probe call succeeds per caller (FT-9)
 # `--matrix default`: every scenario `at`, and `burst` only where load changes the code path
 # (refusals on time, held calls, store recovery under pressure). `under` takes the same paths
@@ -653,11 +654,34 @@ async def deployment_off(ctx: Ctx) -> None:
         await ctx.edit({path: True})
 
 
+async def _all_see_kill_switch(ctx: Ctx, cap_secs: float = KILL_SWITCH_SEEN_CAP_SECS) -> bool:
+    """Until every caller runs on a registry with the kill switch on (False at the cap).
+
+    A caller picks direct or queued once, at the call's start, from the registry it runs on
+    (`admin.registry.current`). The edit reaches the other caller on its next reload: the
+    reload loop sleeps LLMQ_REGISTRY_RELOAD_SECS after each reload ends, so the switch can
+    arrive later than that interval under load (1.66 s once at 300 %).
+    """
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < cap_secs:
+        if all(q.admin.registry.current.registry.routing.kill_switch for q in ctx.queues):
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
 async def kill_switch(ctx: Ctx) -> None:
-    """The kill switch: every call runs direct (no queue), same budgets."""
+    """The kill switch: every call runs direct (no queue), same budgets.
+
+    Judged from when every caller has the switch (`_all_see_kill_switch`), not a fixed wait
+    after the edit: 1.5 s missed a caller whose reload came late, and the calls it queued
+    just before its reload were counted as calls a worker took while the switch was on.
+    """
+    seen = False
+    on = off = 0.0
     try:
         await ctx.edit({"routing.kill_switch": True}, model=None)
-        await asyncio.sleep(1.5)  # LLMQ_REGISTRY_RELOAD_SECS 1: both callers see the switch
+        seen = await _all_see_kill_switch(ctx)
         on = ctx.now()
         await _hold(ctx)
         off = ctx.now()
@@ -666,6 +690,7 @@ async def kill_switch(ctx: Ctx) -> None:
     callers = {q._engine.worker_id for q in ctx.queues}
     switched = [r for r in ctx.run.results if on <= r.sent <= off and r.ok]
     queued = [r for r in switched if r.worker not in callers]
+    ctx.checks["every caller saw the switch"] = seen
     ctx.checks["calls ran direct (in the caller) while the switch was on"] = (
         bool(switched) and not queued
     )
