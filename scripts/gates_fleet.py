@@ -310,13 +310,13 @@ class Worker:
         """
         if self.proc.poll() is not None:
             return
-        if sys.platform != "win32":
+        if sys.platform == "win32":
+            if self.proc.stdin is not None:
+                with contextlib.suppress(OSError):
+                    self.proc.stdin.write(b"stop\n")
+                    self.proc.stdin.flush()
+        else:
             self.proc.send_signal(signal.SIGTERM)
-            return
-        if self.proc.stdin is not None:
-            with contextlib.suppress(OSError):
-                self.proc.stdin.write(b"stop\n")
-                self.proc.stdin.flush()
 
     async def stop(self) -> None:
         """Graceful: pause, drain, stop; killed if it has not stopped within 60 s.
