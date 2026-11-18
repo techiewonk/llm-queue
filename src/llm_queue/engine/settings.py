@@ -719,6 +719,9 @@ class InfraSettings:
     placeholder_lookup: Callable[[str], str | None] | None = field(
         default=None, repr=False, compare=False
     )
+    # The boot registry JSON `from_layers` read (placeholders expanded): one read per process,
+    # so a ConfigMap edited in place does not change the boot registry. None: read on use.
+    registry_text: str | None = field(default=None, repr=False, compare=False)
 
     @property
     def strict(self) -> bool:
@@ -790,6 +793,7 @@ class InfraSettings:
                     "(no scheme, port or path), e.g. api.openai.com"
                 )
         boot: Any = None  # the boot registry document, when it reads
+        boot_text: str | None = None
         if registry and registry_file:
             problems.append("set one of LLMQ_REGISTRY and LLMQ_REGISTRY_FILE, not both")
         elif registry or registry_file:
@@ -797,6 +801,7 @@ class InfraSettings:
             try:
                 text = read_document(registry, registry_file, placeholder, used)
                 document = boot = orjson.loads(text)
+                boot_text = text
             except ConfigError as exc:
                 problems.append(str(exc))
             except ValueError as exc:  # orjson refuses what `json` took (NaN): R3CF-1
@@ -1035,6 +1040,7 @@ class InfraSettings:
             secrets_cache_secs=layers.secrets_cache_secs,
             secrets_timeout_secs=layers.secrets_timeout_secs,
             placeholder_lookup=placeholder,
+            registry_text=boot_text,
         )
         if problems:
             raise ConfigError("invalid LLMQ settings:\n  " + "\n  ".join(problems))
@@ -1101,14 +1107,17 @@ class InfraSettings:
         )
 
     def registry_document(self) -> str:
-        """The registry JSON from `LLMQ_REGISTRY` or the file `LLMQ_REGISTRY_FILE`.
+        """The boot registry JSON from `LLMQ_REGISTRY` or the file `LLMQ_REGISTRY_FILE`.
 
-        Placeholders expanded; tenant names in `fairness` replaced by their keyed hashes (D2),
-        so only hashes reach the store. `ConfigError` when it cannot be read or parsed.
+        The text `from_env` read (the file is not read again), else read now. Placeholders
+        expanded; tenant names in `fairness` replaced by their keyed hashes (D2), so only
+        hashes reach the store. `ConfigError` when it cannot be read or parsed.
         """
         from llm_queue.engine.fairness import hash_tenant_names
 
-        text = read_document(self.registry, self.registry_file, self.placeholder_lookup)
+        text = self.registry_text or read_document(
+            self.registry, self.registry_file, self.placeholder_lookup
+        )
         document = parse_document(text)
         salt = self.id_hash_salt or ""
         hashed = hash_tenant_names(document, lambda value: keyed_hash(salt, value))

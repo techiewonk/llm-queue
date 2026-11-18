@@ -6,13 +6,21 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from llm_queue import ConfigError, LLMQueue
-from llm_queue.langchain import aliases, boot_registry, chat_model, embeddings
+from llm_queue.langchain import (
+    aliases,
+    boot_registry,
+    chat_model,
+    embeddings,
+    set_default_queue,
+)
+from llm_queue.registry import validate
 
 GPT = "openai.gpt-oss-120b-1:0"
 TITAN = "amazon.titan-embed-text-v2:0"
@@ -128,3 +136,120 @@ def test_factories_pick_the_openai_adapters_for_openai_models() -> None:
     emb = embeddings("local-emb", registry=doc)
     assert isinstance(emb, QueuedOpenAIEmbeddings)
     assert (emb.model_alias, emb.model) == ("local-emb", "e5")
+
+
+# FB-1: the started queue decides; one parse per queue or per file version --------------------
+
+
+@pytest.fixture
+def no_default_queue(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """No started queue, no registry or off switch in the environment; cleared after."""
+    for name in ("LLMQ_REGISTRY", "LLMQ_REGISTRY_FILE", "LLMQ_ENABLED"):
+        monkeypatch.delenv(name, raising=False)
+    set_default_queue(None)
+    yield
+    set_default_queue(None)
+
+
+def _count_parses(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    calls = [0]
+    real = validate.load_registry
+
+    def counted(*args: Any, **kw: Any) -> Any:
+        calls[0] += 1
+        return real(*args, **kw)
+
+    monkeypatch.setattr(validate, "load_registry", counted)
+    return calls
+
+
+@pytest.mark.usefixtures("no_default_queue")
+async def test_factories_follow_a_started_queue_switched_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The environment alone would build adapters: the started queue wins.
+    monkeypatch.setenv("LLMQ_REGISTRY", json.dumps(DOC))
+    assert chat_model(GPT) is not None
+    off_by_default = LLMQueue.from_env({"LLMQ_STORE_URL": URL}, defaults={"LLMQ_ENABLED": False})
+    # A secrets source that cannot be read, with LLMQ_CONFIG_ERROR_MODE=disable.
+    missing = f"file:{tmp_path / 'missing.json'}"
+    off_by_secret = LLMQueue.from_env(
+        {**DEV, "LLMQ_STORE_URL": URL, "LLMQ_SECRETS_SOURCE": missing},
+        defaults={"LLMQ_CONFIG_ERROR_MODE": "disable"},
+    )
+    for queue in (off_by_default, off_by_secret):
+        assert not queue.enabled
+        await queue.start()
+        try:
+            assert chat_model(GPT) is None
+            assert embeddings(TITAN) is None
+        finally:
+            await queue.stop()
+        assert chat_model(GPT) is not None  # stopped: the environment again
+
+
+@pytest.mark.usefixtures("no_default_queue")
+def test_factories_use_the_queues_registry_from_defaults_and_secrets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    doc = json.loads(json.dumps(DOC))
+    doc["models"]["titan"].update(model_id="${EMBED_ID}", family="titan")
+    path = tmp_path / "registry.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    secret = tmp_path / "secret.json"
+    secret.write_text(json.dumps({"EMBED_ID": "secret-embed-id"}), encoding="utf-8")
+    env = {"LLMQ_STORE_URL": URL, "LLMQ_ENVIRONMENT": "dev"}
+    env["LLMQ_SECRETS_SOURCE"] = f"file:{secret}"
+    llmq = LLMQueue.from_env(env, defaults={"LLMQ_REGISTRY_FILE": str(path)})
+    with pytest.raises(ConfigError, match="no registry"):  # not in the environment
+        chat_model(GPT)
+    set_default_queue(llmq)  # as LLMQueue.start() does
+    parses = _count_parses(monkeypatch)
+    reads = [0]
+    real_read = Path.read_text
+
+    def counted_read(self: Path, *args: Any, **kw: Any) -> str:
+        reads[0] += 1
+        return real_read(self, *args, **kw)
+
+    monkeypatch.setattr(Path, "read_text", counted_read)
+    # A ConfigMap edited after boot: the started queue keeps its boot models.
+    path.write_text(json.dumps({**doc, "models": {}}), encoding="utf-8")
+    for _ in range(20):
+        emb = embeddings("secret-embed-id")
+        assert emb.model_alias == "titan"
+        assert chat_model(GPT).model_alias == "gpt120b"
+    assert emb.llmq is None  # the default queue is looked up per call
+    assert parses[0] == 1  # one parse per queue
+    assert reads[0] == 0  # the boot document from_env read; the file is not read again
+
+
+@pytest.mark.usefixtures("no_default_queue")
+def test_factories_before_start_cache_the_file_and_see_a_change(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "registry.yaml"
+    path.write_text(json.dumps(DOC), encoding="utf-8")  # JSON is YAML
+    monkeypatch.setenv("LLMQ_REGISTRY_FILE", str(path))
+    parses = _count_parses(monkeypatch)
+    for _ in range(20):
+        assert chat_model(GPT).model_alias == "gpt120b"
+    assert parses[0] == 1
+    # A ConfigMap update before start: a new mtime and size, read again.
+    smaller = {**DOC, "models": {"titan": DOC["models"]["titan"]}}
+    path.write_text(json.dumps(smaller), encoding="utf-8")
+    later = path.stat().st_mtime_ns + 10**9
+    os.utime(path, ns=(later, later))
+    assert chat_model(GPT) is None
+    assert embeddings(TITAN).model_alias == "titan"
+    assert parses[0] == 2
+    # A placeholder variable that changes is read again too.
+    doc = json.loads(json.dumps(DOC))
+    doc["models"]["titan"].update(model_id="${EMBED_ID}", family="titan")
+    monkeypatch.delenv("LLMQ_REGISTRY_FILE")
+    monkeypatch.setenv("LLMQ_REGISTRY", json.dumps(doc))
+    monkeypatch.setenv("EMBED_ID", "one")
+    assert embeddings("one").model_alias == "titan"
+    monkeypatch.setenv("EMBED_ID", "two")
+    assert embeddings("one") is None
+    assert embeddings("two").model_alias == "titan"

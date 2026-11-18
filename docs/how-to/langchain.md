@@ -48,10 +48,19 @@ The factories read the registry the process **starts** with, without a store:
 
 | `registry=` | Read from |
 |---|---|
-| None (default) | `LLMQ_REGISTRY` or `LLMQ_REGISTRY_FILE` in the environment, as `from_env` reads them: placeholders expanded, `.yaml` files as YAML |
+| None (default) | The started queue (`LLMQueue.start()` or `install()` registers it), as for `registry=llmq`. Before any queue has started: `LLMQ_REGISTRY` or `LLMQ_REGISTRY_FILE` in the environment, placeholders expanded from the environment, `.yaml` files as YAML |
 | a mapping, or JSON text | That document |
 | a path (`str` or `Path`) | That file |
-| an `LLMQueue` | Its boot document (and the queue is passed to the adapter as `llmq`) |
+| an `LLMQueue` | The boot document its settings read: secrets, the environment and `defaults=`, placeholders expanded (and the queue is passed to the adapter as `llmq`) |
+
+The started queue also decides the off switch: a `DisabledQueue` (`LLMQ_ENABLED=false`, or
+`LLMQ_CONFIG_ERROR_MODE=disable` after a configuration error) makes every factory return None,
+so the app takes its direct path. Before any queue has started, `LLMQ_ENABLED` is read from
+the environment.
+
+The registry is parsed once: once per queue, and before start once per file version (the
+file's path, modification time and size, and the placeholder values read). A ConfigMap updated
+in place does not change the registry of a started queue.
 
 What that means for live edits:
 
@@ -60,5 +69,6 @@ What that means for live edits:
 - a model **removed** by a live edit is still built as a queued class: its calls raise
   `UnknownModel` until the next restart (or until it is added back).
 
-Pass `registry=llmq` when the app builds its queue with `defaults=` or `secrets=`: the
-environment alone may not hold the registry's location then.
+Pass `registry=llmq` when a factory runs before the queue starts (at import time, for example)
+and the app builds its queue with `defaults=`, `secrets=` or `LLMQ_SECRETS_SOURCE`: the
+environment alone may not hold the registry's location or the off switch then.

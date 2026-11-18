@@ -188,11 +188,17 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   boot registry knows (by alias or model id; Bedrock or OpenAI-compatible adapter by the
   model's provider, `**kw` passed through), else None, so `chat_model(...) or <direct model>`
   keeps the app's direct path for a model outside the registry. `registry=` is a document,
-  JSON text, a path, an `LLMQueue` or None (`LLMQ_REGISTRY` / `LLMQ_REGISTRY_FILE`, read
-  without a store, placeholders expanded). No langchain module is imported for an unknown
-  model.
+  JSON text, a path, an `LLMQueue` or None: the started queue (its off switch and the boot
+  registry its settings read from secrets, the environment and `defaults=`), else, before any
+  queue has started, `LLMQ_ENABLED` and `LLMQ_REGISTRY` / `LLMQ_REGISTRY_FILE` from the
+  environment. The registry is parsed once per queue, and before start once per file version
+  (path, mtime, size): a call costs the adapter's construction only. No langchain module is
+  imported for an unknown model.
   `aliases(registry)` maps model ids to aliases; `boot_registry(registry)` returns the parsed
   registry. See [Use LangChain models](docs/how-to/langchain.md).
+- The boot registry is read once per process: `InfraSettings.registry_document()` returns the
+  document `from_env` read, so a ConfigMap updated in place does not change what
+  `describe()`, the admin services or the engines see until a restart.
 - `LLMQueue.embed_one(model, text, **kw)` and `embed_one_sync(...)` (H8): one text's vector.
 - Requests by model and tenant (T): every call in flight is indexed under its model and tenant
   hash (`P:{m:ALIAS}:tq:H`, `P:{m:ALIAS}:tq`) by the scripts that send and end it (no extra
