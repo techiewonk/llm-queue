@@ -984,11 +984,10 @@ class RequestStore:
     async def take_result(self, request_id: str) -> Reply | None:
         """A stored result; a library id's then expires in seconds (or `result_dedupe_secs`).
 
-        An offloaded result is deleted only after its offload read worked (RESCAN S4): it was
-        deleted first, and a blip in that read lost it. A gone object raises
-        `CallFailed("result_expired")`; a read that keeps failing (access denied, throttling,
-        a timeout) raises `queue_unavailable` and leaves the result to read again (R3JE-28).
-        A process without the offload never deletes an offloaded result (R3JE-26).
+        An offloaded result is deleted only after its read worked: deleting first lost it to a
+        blip (RESCAN S4). A gone object raises `result_expired`; a read that keeps failing raises
+        `queue_unavailable` and leaves the result (R3JE-28). A process without the offload never
+        deletes an offloaded result (R3JE-26).
         """
         job, _, _, result = self._req(request_id)
         # The marker always: without it the script took the marker for a result and dropped
@@ -1118,11 +1117,9 @@ class RequestStore:
     ) -> tuple[list[str], int, list[str]]:
         """`cancel_ids`, and each marked call still `queued` answered with `reply` (an admin).
 
-        `reply` with each call's request id is stored as its result and its status set to
-        `cancelled`, as `put_result` would (`CANCEL_SETTLE`). One script per `batch` ids, all
-        sent in one pipelined round trip (a round trip per batch: 10,000 ids took 4 s in gate
-        G-T2). Returns (marked, started, answered); the answered calls' callers are woken by
-        `wake`, which the caller sends once it is done.
+        Stores `reply` as each call's result with status `cancelled`, as `put_result` would. One
+        script per `batch` ids in one pipelined round trip (one per batch took 4 s for 10,000
+        ids, gate G-T2). Returns (marked, started, answered); call `wake` for the answered ones.
         """
         if not request_ids:
             return [], 0, []
@@ -1160,12 +1157,10 @@ class RequestStore:
     async def wake(self, request_ids: Sequence[str], *, batch: int) -> None:
         """Wake every caller waiting on these ids (their results are stored): one round trip.
 
-        One script per `batch` ids. Kept apart from `cancel_settle` so a cancel can finish
-        its own writes first: woken callers in the cancel's process (an admin beside an app,
-        gate G-T2) ran 10,000 result reads between its last round trips. One transaction, so
-        every reply comes back after the last publish, not one per script with the woken
-        callers' reads run between them (10,000 ids in gate G-T2: 0.9 s, 0.5 s in one; the
-        store is held for one SMEMBERS and the publishes per id).
+        Apart from `cancel_settle` so a cancel finishes its writes first: woken callers in its
+        process ran 10,000 result reads between its round trips (gate G-T2). One transaction of
+        a script per `batch` ids, so no reads interleave (10,000 ids: 0.9 s to 0.5 s); the store
+        is held for one SMEMBERS and the publishes per id.
         """
         if not request_ids:
             return

@@ -1,10 +1,9 @@
 """The engine of one process: caller and worker over the registry, queues and admission.
 
-`Engine.call` registers a call (duplicate ids attach to the first run), sends it to its model's
-queue and waits for the result. The worker side reads each model's priority queue first, admits
-calls with one store call each, holds a refused call (and stops reading its class) until it is
-granted or expires, runs granted calls with the attempt timers, retries by the refund rules and
-falls back to fallback regions and other models by the registry's rules (plan §3.3 to §3.18).
+`Engine.call` registers a call (duplicate ids attach to the first run), queues it and waits.
+Workers read priority first, admit with one store call each, hold a refused call (and its class)
+until granted or expired, run with attempt timers, retry by the refund rules and fall back to
+other regions and models by the registry's rules (plan §3.3 to §3.18).
 """
 
 from __future__ import annotations
@@ -416,11 +415,10 @@ def build_envelope(
 ) -> tuple[str, Envelope]:
     """A call's model (a disabled one's fallback) and envelope, checked as every path needs.
 
-    One copy for the queue engine and the local executor (`LLMQ_EXECUTION_MODE=local`): a
-    disabled model's fallback, `max_message_bytes`, the call's timeout and the `admission`
-    hook. Raises `CallFailed` for a call that cannot run. The envelope carries only keyed
-    hashes (`hash_id`) of `user_id` and `tenant_id` (owner D1, 0.2.0): the message, its dead
-    letter and the worker never hold a raw id; the admission hook still sees the raw ones.
+    Shared by the queue engine and local mode: fallback, `max_message_bytes`, timeout and the
+    `admission` hook; raises `CallFailed` for a call that cannot run. The envelope holds only
+    keyed hashes of `user_id` and `tenant_id` (owner D1), so no message, dead letter or worker
+    holds a raw id; the admission hook still sees the raw ones.
     """
     alias = view.registry.alias_of(model)
     rid = request_id or stream_id or new_id()
@@ -1212,11 +1210,10 @@ class Engine:
     def pause_receiving(self) -> None:
         """Not ready, and take no new calls from the queues; running calls go on.
 
-        The first step of a shutdown, for a preStop hook: the load balancer stops sending
-        requests while this pod finishes its work. With `drain_handback_enabled` (default on,
-        `LLMQ_DRAIN_HANDBACK_ENABLED`) calls held here waiting for budget go back to the queue
-        at once, for another pod (0.2.0 A1). Sync and callable from any thread: the hand-back
-        is scheduled on the engine's loop, and `stop()` waits for it.
+        First shutdown step (preStop): the load balancer stops sending while the pod finishes.
+        With `drain_handback_enabled` (default on) calls held for budget go back to the queue
+        at once for another pod (0.2.0 A1). Sync and thread-safe: the hand-back is scheduled on
+        the engine's loop, and `stop()` waits for it.
         """
         self.ready = False
         if self._draining_since is None:
@@ -1696,11 +1693,10 @@ class Engine:
     ) -> AsyncIterator[dict[str, Any]]:
         """Run a chat call and yield the provider's events as they arrive (plan §3.13, F6).
 
-        Takes `call`'s options. The events are ConverseStream events (Bedrock) or chat
-        completion chunks (OpenAI-compatible). A failure after events were yielded raises
-        `CallFailed` with `partial_text`; no switch to another deployment happens then.
-        `meta_event=True` ends a complete stream with one library event, `{"llmq": {"usage":
-        ..., "meta": ...}}`: tokens, served model, deployment, fallback, attempts (R3ST-9).
+        Takes `call`'s options; yields ConverseStream events or chat completion chunks. A failure
+        after the first event raises `CallFailed` with `partial_text` and never switches
+        deployment. `meta_event=True` ends a complete stream with `{"llmq": {"usage": ...,
+        "meta": ...}}`: tokens, served model, deployment, fallback, attempts (R3ST-9).
         """
         view = self.registry.current
         alias = view.registry.alias_of(model)
@@ -2090,11 +2086,10 @@ class Engine:
     ) -> None:
         """Put the message on its queue and confirm the record; undo the record on failure.
 
-        A separate queue store that keeps failing for `queue_failover_secs` sends the call
-        down the direct path; shorter blips are retried. With `queue_wait_replicas`, a send
-        that too few replicas acknowledged in time stays sent (owner Q9): warned at most once
-        a minute and counted. It ran direct in the caller before, its copy bouncing on the
-        queue as a duplicate every 30 s.
+        A queue store failing for `queue_failover_secs` sends the call direct; shorter blips are
+        retried. A send too few replicas acknowledged (`queue_wait_replicas`) stays sent, warned
+        once a minute and counted (owner Q9): running it direct as well left its queued copy
+        bouncing as a duplicate every 30 s.
         """
         settings = self._queue_settings(view, alias)  # its own retention_secs (Q27)
         loop = asyncio.get_running_loop()
@@ -2417,12 +2412,10 @@ class Engine:
     async def _store_back(self, secs: float) -> bool:
         """True once the state store answers again; False when `secs` pass first.
 
-        Every call paused on the `store_down` path waits on one probe of this process (a ping
-        a second). A ping per paused call made N pings a second, each a new connection while
-        the store refused them: at 300 % load (scenario X1) about 600 connects a second through
-        the store proxy, half of them these pings, and the pool's connections went to them.
-        `asyncio.wait`: a probe stopped with the engine is "not back", never a cancel raised in
-        a caller's task.
+        Paused `store_down` calls share one probe per process (a ping a second): a ping per call
+        at 300 % load (scenario X1) made ~600 connects a second, half of them pings, starving
+        the pool. `asyncio.wait`: a probe stopped with the engine is "not back", never a cancel
+        raised in a caller's task.
         """
         probe = self._store_ping
         if probe is None or probe.done():
@@ -2747,12 +2740,10 @@ class Engine:
     async def _warm_clients(self) -> None:
         """Create every Bedrock deployment's client now, not on its first call.
 
-        A client takes about a second to build (measured: the first call of a fresh worker took
-        1,032 ms against ~140 ms after; B92 asks for <= 500 ms of first-call overhead).
-        All at once, each pool sized by the worker slots of the models routed to its account
-        and region (E3, E5). Failures are logged by the pool; a call meets them again. The
-        OpenAI-compatible routes go too (nothing is built for them): their missing secrets are
-        warned about at start, not first met by a call (CL-6).
+        A client takes ~1 s to build (measured first call 1,032 ms vs ~140 ms; B92 allows 500
+        ms). All at once, each pool sized by its account and region's worker slots (E3, E5);
+        failures are logged and a call meets them again. OpenAI-compatible routes go too, so
+        their missing secrets are warned about at start, not first met by a call (CL-6).
         """
         view = self.registry.current
         routes = [
@@ -2892,11 +2883,10 @@ class Engine:
     async def _model_loop(self, alias: str) -> None:
         """Receive this model's calls (priority first) and admit them in order.
 
-        Idle, it blocks on its queues' doorbell (a send wakes one worker at once) for 50 ms at a
-        time, then 1 s after a second with nothing: polling idle loops made ~96 receive
-        scripts/s per pod with 4 models (measured); a busy loop never waits. With no free worker
-        slot it waits for one (`_run` wakes it), not on the doorbell; a token it took but cannot
-        serve (no slot, or that class held) goes back, so another pod's worker wakes for it.
+        Idle, it blocks on the doorbell 50 ms at a time, then 1 s after a quiet second (polling
+        made ~96 receive scripts/s per pod with 4 models, measured); a busy loop never waits.
+        With no free slot it waits on `_run`, not the doorbell; a token it cannot serve (no
+        slot, or class held) goes back so another pod's worker wakes for it.
         """
         empty = 0
         wake = self._wake.setdefault(alias, asyncio.Event())
@@ -3139,14 +3129,10 @@ class Engine:
     def _callers_judgeable(self) -> bool:
         """False while lapsed caller keys prove nothing: the store was out of reach lately.
 
-        After a store outage the callers' liveness keys may have expired only because nobody
-        could renew them: for a caller TTL and a heartbeat after this process last saw the
-        store fail, callers count as alive (B95: a 45 s block dropped 429 of 500 calls).
-
-        Judged from this process's own heartbeat too: a half-open store hung every command for
-        the read timeout, the doorbell wait swallowed its error, and calls were dropped the
-        moment the store came back (scenario S5). A heartbeat that is late or just recovered
-        from a gap means the store was out of reach here as well.
+        Caller keys may lapse only because nobody could renew them, so callers count as alive
+        for a caller TTL and a heartbeat after a store failure (B95: a 45 s block dropped 429 of
+        500 calls). A late or just-recovered own heartbeat counts too: a half-open store's
+        swallowed errors dropped calls the moment it came back (scenario S5).
         """
         beat = self.settings.lease_secs / 3
         grace = self.caller_ttl_secs + beat + 5
@@ -5288,11 +5274,9 @@ class Engine:
     ) -> None:
         """Run a store write that must land, again while the store is out of reach or refuses.
 
-        Gives up (raises) once the outage outlasts a lease, or with `held` the call's deadline
-        when that is later (owner Q7: an answer in hand is kept while its caller still waits;
-        it was dropped after one lease and the call ran again). A refusal (NOREPLICAS, OOM,
-        MISCONF, BUSY) counts as the store down (Q12, R3FM-7). Only for writes that are safe
-        to run twice (each checks its own receipt or key).
+        Raises once the outage outlasts a lease, or `held`'s later deadline (owner Q7: an answer
+        dropped after one lease made the call run again). A refusal (NOREPLICAS, OOM, MISCONF,
+        BUSY) counts as down (Q12, R3FM-7). Only for writes safe to run twice.
         """
         wait_secs = self.settings.lease_secs
         if held is not None:

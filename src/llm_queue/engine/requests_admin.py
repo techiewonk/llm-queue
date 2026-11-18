@@ -1,13 +1,9 @@
 """The admin side of requests (0.2.0 T): the request index settings and the `RequestsAdmin` service.
 
-Calls are indexed per model and tenant (`P:{m:ALIAS}:tq:H`, see `requests.py` `_INDEX_FN`), so an
-operator can list, count, cancel, reprioritize and extend one tenant's calls on one model
-without touching another tenant's. Tenants are named by their keyed hash only
-(`LLMQ_ID_HASH_SALT`); a raw name given here is hashed and never stored or logged. Every change
-is a dry run unless `dry_run=False` (owner D3), takes an `actor` and writes one audit entry.
-
-`RequestsAdmin` is built from the stores alone (like `PurgeService`), so the CLI, the HTTP
-routes and an admin worker share it without an engine (`RequestsAdmin.from_env`).
+The per-model, per-tenant index (`P:{m:ALIAS}:tq:H`) lets an operator list, count, cancel,
+reprioritize and extend one tenant's calls; tenants are keyed hashes, a raw name is never stored
+or logged. Every change is a dry run unless `dry_run=False` (owner D3), names an `actor` and is
+audited. Built from the stores alone (`from_env`), so CLI, HTTP and admin workers share it.
 """
 
 from __future__ import annotations
@@ -185,13 +181,15 @@ return out
 class AdminSettings:
     """The request index and admin operation settings (`LLMQ_*`, design 0.2.0 section 7).
 
-    `request_index`: calls are indexed per model and tenant (`LLMQ_REQUEST_INDEX_ENABLED`).
-    `tenant_names`: tenant names are stored beside their hashes (`LLMQ_TENANT_NAMES_ENABLED`).
-    `batch`: ids per pipeline or cancel script (`LLMQ_ADMIN_BATCH`); `scan_max`: index entries
-    or messages one operation reads (`LLMQ_ADMIN_SCAN_MAX`); `list_max`: the largest list page
-    (`LLMQ_REQUESTS_LIST_MAX`); `move_batch` / `move_bytes`: messages and bytes per reprioritize
-    script run (`LLMQ_REQUESTS_MOVE_BATCH` / `_BYTES`); `metrics_tenants`: (tenant name, label)
-    pairs that get a `tenant` metric label of their own (`LLMQ_METRICS_TENANTS`).
+    Attributes:
+        request_index: Index calls per model and tenant (`LLMQ_REQUEST_INDEX_ENABLED`).
+        tenant_names: Store tenant names beside their hashes (`LLMQ_TENANT_NAMES_ENABLED`).
+        batch: Ids per pipeline or cancel script (`LLMQ_ADMIN_BATCH`).
+        scan_max: Index entries or messages one operation reads (`LLMQ_ADMIN_SCAN_MAX`).
+        list_max: The largest list page (`LLMQ_REQUESTS_LIST_MAX`).
+        move_batch: Messages per reprioritize script run (`LLMQ_REQUESTS_MOVE_BATCH`).
+        move_bytes: Bytes per reprioritize script run (`LLMQ_REQUESTS_MOVE_BYTES`).
+        metrics_tenants: (name, label) pairs with their own `tenant` label (`LLMQ_METRICS_TENANTS`).
     """
 
     request_index: bool = True
@@ -225,11 +223,10 @@ class AdminSettings:
 class RequestSummary:
     """One call in flight, as the index and its records show it (never its prompt).
 
-    `tenant` and `user` are keyed hashes (`-`: no tenant); `tenant_name` only with
-    `LLMQ_TENANT_NAMES_ENABLED`. `stage`: `queued` (in its queue, visible), `delayed` (returned
-    with a delay still to run), `held` (taken by a worker, waiting for budget), `direct` (runs
-    in its caller's process), `running` (granted). `cancelling`: a cancel is pending.
-    `deadline_in_secs`: seconds to the call's deadline (None when not indexed).
+    `tenant` and `user` are keyed hashes (`-`: no tenant); `tenant_name` needs
+    `LLMQ_TENANT_NAMES_ENABLED`. `stage` is `queued`, `delayed` (returned with a delay), `held`
+    (worker waits for budget), `direct` (runs in its caller) or `running`; `cancelling` means a
+    cancel is pending; `deadline_in_secs` is None when not indexed.
     """
 
     request_id: str
@@ -653,11 +650,10 @@ class RequestsAdmin:
     ) -> ChangeReport:
         """Cancel calls by id, or by model, tenant and state (default `waiting`, owner D9).
 
-        Cancel wins for every caller of an id. With `state="waiting"` a call granted between
-        the read and the write is left running (`skipped.started`); a call already being
-        cancelled is skipped (`already_cancelling`), so a second run changes nothing. A dry run
-        (the default) writes nothing; a real one writes one audit entry with counts, named
-        `op` (`purge_queue` when `llmq.admin.purge.queue` asks).
+        Cancel wins for every caller of an id. With `state="waiting"` a call granted meanwhile
+        keeps running (`skipped.started`) and one already cancelling is skipped, so a rerun
+        changes nothing. Dry run by default; a real run writes one audit entry named `op`
+        (`purge_queue` from `llmq.admin.purge.queue`).
         """
         check_actor(actor)
         self._check_state(state)
@@ -767,11 +763,9 @@ class RequestsAdmin:
     ) -> ChangeReport:
         """Move waiting calls of `model` (and a tenant) to the priority (or normal) queue.
 
-        Only calls still in their queue move: a call held by a worker waiting for budget is
-        skipped (`held`, owner D7), as are `delayed`, `direct`, `cancelling` ones and those
-        already in the target class (`already`). A moved call keeps its deadline,
-        `max_wait_secs` and its place among waiting calls by arrival (`pos`, owner Q9).
-        `limit`: at most this many (oldest first). Dry run by default.
+        Only queued calls move; `held` (owner D7), `delayed`, `direct`, `cancelling` and
+        `already` ones are skipped. A moved call keeps its deadline, `max_wait_secs` and arrival
+        order (`pos`, owner Q9). `limit` caps the count, oldest first. Dry run by default.
         """
         check_actor(actor)
         view = await self._view()
@@ -851,12 +845,10 @@ class RequestsAdmin:
     ) -> ChangeReport:
         """Give a call in flight a longer timeout: `timeout_secs` from when it was sent.
 
-        The new deadline (send time + `timeout_secs`) reaches all three places a deadline lives
-        (owner D6): the records and the index, every worker holding the call, and every caller
-        waiting on it. `timeout_secs` above the model's `timeout_max_secs` or its queue's
-        `retention_secs` (the message would be trimmed) is a `ConfigError`. It only grows: a
-        deadline not later than the current one (the call's own timeout included) is
-        `skipped.already`. Needs the request index (`AdminRefused` when off). Dry run by default.
+        The deadline reaches records and index, holding workers and waiting callers (owner D6).
+        Above `timeout_max_secs` or the queue's `retention_secs` (message trimmed) is a
+        `ConfigError`; a deadline not later than the current one is `skipped.already`. Needs the
+        request index (`AdminRefused` when off). Dry run by default.
         """
         check_actor(actor)
         if not timeout_secs > 0:
