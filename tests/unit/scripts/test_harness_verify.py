@@ -109,6 +109,67 @@ async def test_rpm_cut_restores_the_budget_when_the_sampler_raised(
     assert edits == [{"rpm": scenarios.RPM // 4}, {"rpm": scenarios.RPM}]
 
 
+def _caller(worker_id: str) -> Any:
+    """A caller as `kill_switch` reads it: its id and the registry it runs on."""
+    routing = types.SimpleNamespace(kill_switch=False)
+    current = types.SimpleNamespace(registry=types.SimpleNamespace(routing=routing))
+    return types.SimpleNamespace(
+        _engine=types.SimpleNamespace(worker_id=worker_id),
+        admin=types.SimpleNamespace(registry=types.SimpleNamespace(current=current)),
+        routing=routing,
+    )
+
+
+async def test_kill_switch_is_judged_from_when_every_caller_has_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 burst: the second caller reloaded the switch 1.66 s after the edit, past the fixed
+    1.5 s wait, and the calls it queued just before that reload failed the run as calls a
+    worker took while the switch was on. The window now opens once every caller has it.
+    """
+    t0 = time.monotonic()
+    first, late = _caller("caller-a"), _caller("caller-b")
+    results: list[Any] = []
+    tasks: list[asyncio.Task[None]] = []
+
+    def now() -> float:
+        return time.monotonic() - t0
+
+    async def late_reload() -> None:
+        await asyncio.sleep(1.7)
+        results.append(types.SimpleNamespace(sent=now(), ok=True, worker="worker-1"))
+        late.routing.kill_switch = True
+
+    async def edit(change: dict[str, Any], **_: Any) -> None:
+        first.routing.kill_switch = change["routing.kill_switch"]
+        if change["routing.kill_switch"]:
+            tasks.append(asyncio.create_task(late_reload()))
+        else:
+            late.routing.kill_switch = False
+
+    async def hold_with_a_direct_call() -> None:
+        await asyncio.sleep(0.5)  # the old fixed wait (1.5 s) opened the window before 1.7 s
+        results.append(types.SimpleNamespace(sent=now(), ok=True, worker="caller-b"))
+
+    ctx = types.SimpleNamespace(
+        edit=edit,
+        now=now,
+        queues=[first, late],
+        run=types.SimpleNamespace(results=results),
+        profile=QUICK,
+        checks={},
+        notes=[],
+    )
+    monkeypatch.setattr(scenarios, "_hold", lambda _ctx: hold_with_a_direct_call())
+    await scenarios.kill_switch(ctx)
+    await asyncio.gather(*tasks)
+    assert ctx.checks == {
+        "every caller saw the switch": True,
+        "calls ran direct (in the caller) while the switch was on": True,
+    }
+    assert ctx.notes == ["kill switch: 1 calls served, 0 by a worker"]
+
+
 async def test_provider_both_down_resets_every_region_when_one_reset_fails() -> None:
     """CO-16: the first region whose reset raised left the other regions failing."""
     resets: list[str] = []

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from llm_queue.engine.admin.context import AdminContext
 from llm_queue.engine.fairness import hash_tenant_names, hash_tenant_path
+from llm_queue.engine.store_guard import store_op
 from llm_queue.errors import ConfigError
 from llm_queue.registry.store import SECRET_FIELDS, audit_diff, check_actor
 
@@ -36,8 +37,14 @@ def redacted(doc: Any) -> Any:
 Change = Callable[[dict[str, Any]], None]
 
 
+@store_op
 async def _edit(ctx: AdminContext, change: Change, *, actor: str, dry_run: bool) -> dict[str, Any]:
-    """Apply (or plan) one registry edit: `{diff, version, dry_run}`."""
+    """Apply (or plan) one registry edit: `{diff, version, dry_run}`.
+
+    `store_op`: the read of the document before the edit (`RegistryStore._read`) is not an
+    admin method, so a store outage there reached the app as redis-py's `ConnectionError`
+    instead of `StoreUnavailable` (scenario X2: an edit during a store block).
+    """
     store = ctx.registry
     if dry_run:
         diff = await store.plan_edit(change, actor=actor)

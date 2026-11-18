@@ -561,6 +561,10 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   local-mode processes of 150 sent 640 calls in one wall-clock minute against an rpm of 600
   (gate BL1). A throttled attempt now keeps its request charged and gets its tokens back, in
   both modes; a call that never reached the provider still gets everything back.
+- A live registry edit (`admin.registry.set` and the other registry writes) during a store
+  outage raised redis-py's `ConnectionError` instead of `StoreUnavailable` (scenario X2): the
+  read of the document before the edit was not guarded. It raises `StoreUnavailable` like
+  every other admin operation.
 
 ## [0.1.1] - 2026-11-17
 

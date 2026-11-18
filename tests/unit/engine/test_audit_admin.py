@@ -135,3 +135,26 @@ async def test_en31_fresh_password_does_not_block_the_loop() -> None:
     finally:
         task.cancel()
     assert ticks >= 5
+
+
+async def test_a_live_edit_in_a_store_outage_raises_store_unavailable() -> None:
+    """Scenario X2: the read of the document before a live edit is not an admin method, so
+    a store outage there raised redis-py's ConnectionError to the app (and past the
+    harness's StoreUnavailable retry) instead of `StoreUnavailable`.
+    """
+    from types import SimpleNamespace
+
+    from llm_queue import StoreUnavailable
+    from llm_queue.engine.admin.registry import RegistryAdmin
+
+    class DownStore:
+        def set_change(self, _values: Any, *, model: str | None) -> Any:
+            return lambda doc: None
+
+        async def _read(self) -> Any:
+            raise StoreConnectionError("Connection closed by server.")
+
+    ctx = SimpleNamespace(registry=DownStore(), hash_id=lambda name: name)
+    admin = RegistryAdmin(ctx)  # type: ignore[arg-type]  # fake
+    with pytest.raises(StoreUnavailable, match="unreachable"):
+        await admin.set({"rpm": 1}, model="chat", actor="t", dry_run=False)
