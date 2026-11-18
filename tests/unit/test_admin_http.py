@@ -268,11 +268,15 @@ def test_drain_routes_are_writes_and_audited_with_the_actor() -> None:
     http = _writes(admin, drain_routes=True)
     assert http.post("/drain").status_code == 403  # no admin header
     assert http.post("/drain", headers=ADMIN).status_code == 200
+    assert http.post("/drain", headers=ADMIN, json={"dry_run": False}).status_code == 200
     assert http.post("/resume", headers=ADMIN).status_code == 200
+    assert http.post("/resume", headers=ADMIN, json={"dry_run": False}).status_code == 200
     assert http.get("/drain").status_code == 200
     assert admin.calls == [
-        ("drain.start", {"actor": "http:ann"}),
-        ("drain.resume", {"actor": "http:ann"}),
+        ("drain.start", {"actor": "http:ann", "dry_run": True}),  # a dry run by default
+        ("drain.start", {"actor": "http:ann", "dry_run": False}),
+        ("drain.resume", {"actor": "http:ann", "dry_run": True}),
+        ("drain.resume", {"actor": "http:ann", "dry_run": False}),
         ("drain.get", {}),
     ]
 

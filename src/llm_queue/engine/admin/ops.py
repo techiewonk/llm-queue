@@ -145,10 +145,12 @@ OPERATIONS: tuple[Op, ...] = (
        http=("GET", "/drain"), mount="drain", missing={"cli": _PROCESS}),
     Op("drain.start", "drain", "update", "drain.start",
        "Stop taking work here (readiness fails); held calls go back to the queue",
-       http=("POST", "/drain"), writes=True, audit_op="drain", mount="drain",
+       http=("POST", "/drain"), writes=True, audit_op="drain", dry_run_default=True,
+       mount="drain",
        missing={"cli": _PROCESS + "; pods use LLMQ_DRAIN_FILE"}),
     Op("drain.resume", "drain", "update", "drain.resume", "Take work again after a drain",
-       http=("POST", "/resume"), writes=True, audit_op="resume", mount="drain",
+       http=("POST", "/resume"), writes=True, audit_op="resume", dry_run_default=True,
+       mount="drain",
        missing={"cli": _PROCESS}),
     # -- status ---------------------------------------------------------------------------
     _r("status.get", "status",
@@ -326,3 +328,13 @@ def op_row(op: Op) -> dict[str, Any]:
         "audit_op": op.audit_op,
         "summary": op.summary,
     }
+
+
+def drain_plan(process: Any, *, draining: bool) -> dict[str, Any]:
+    """A dry run of `drain.start` (`draining=True`) or `drain.resume`: changes nothing.
+
+    `process.drain_status()` now, `dry_run: true`, and `would_change` (False when the process
+    is already in that state). Shared by the queue, local and disabled drain admins.
+    """
+    status = dict(process.drain_status())
+    return {**status, "dry_run": True, "would_change": bool(status["draining"]) != draining}

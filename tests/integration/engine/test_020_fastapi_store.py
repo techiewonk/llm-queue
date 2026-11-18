@@ -93,7 +93,9 @@ async def test_install_runs_the_queue_around_the_app(env: dict[str, str], tmp_pa
         assert status.status_code == 403  # the token guards everything but the probes
         assert (await client.post("/ask")).json() == {"ok": True, "tenant": "acme"}
         drain = await client.post(
-            "/internal/llm-queue/drain", headers={"X-LLMQ-Token": "s3cret", "X-LLMQ-Admin": "1"}
+            "/internal/llm-queue/drain",
+            headers={"X-LLMQ-Token": "s3cret", "X-LLMQ-Admin": "1"},
+            json={"dry_run": False},  # a dry run otherwise
         )
         assert drain.status_code == 200  # drain routes mounted: a token guards them
         assert _ready(llmq) is False

@@ -29,8 +29,8 @@ To run without the store (outage, migration, a service without one), see the swi
 ## Deploys and restarts
 
 1. A **preStop hook** pauses the pod: it touches `LLMQ_DRAIN_FILE` (every process of the pod
-   sees it), or, in a single-process pod, posts to the router's `POST /drain` (see
-   [Drain a pod](#drain-a-pod)). Readiness fails, the process takes no new calls or jobs, and
+   sees it), or, in a single-process pod, posts `{"dry_run": false}` to the router's
+   `POST /drain` (see [Drain a pod](#drain-a-pod)). Readiness fails, the process takes no new calls or jobs, and
    calls held waiting for budget go back to the queue at once; running work goes on.
 2. **Shutdown** is `await llmq.stop(drain_secs=...)`. Held messages go back to the queue at once;
    running calls and this pod's waiting callers get up to `drain_secs` (default
@@ -95,7 +95,7 @@ A pause takes a process out of service without stopping it: readiness answers 50
 | Way | Reaches | Use |
 |---|---|---|
 | `LLMQ_DRAIN_FILE` | every process of the pod that shares the file | Multi-process pods (gunicorn / uvicorn workers): a preStop hook runs `touch $LLMQ_DRAIN_FILE; sleep 15`. Each process checks every `LLMQ_DRAIN_POLL_SECS` (1 s). A file older than the queue's construction (minus 1 s) is a leftover and ignored |
-| `POST /drain` (`http_router(drain_routes=True)`) | the one process that answered | Single-process pods, or an operator pausing one process. Guarded like the write routes: an admin token (`LLMQ_ADMIN_TOKEN`) or `dependencies`, plus the `X-LLMQ-Admin` header; `drain_routes=True` without either is a `ConfigError`. `GET /drain` is open and only reads `draining`, `since`, `held` and `running` |
+| `POST /drain` (`http_router(drain_routes=True)`) | the one process that answered | Single-process pods, or an operator pausing one process. Guarded like the write routes: an admin token (`LLMQ_ADMIN_TOKEN`) or `dependencies`, plus the `X-LLMQ-Admin` header; `drain_routes=True` without either is a `ConfigError`. A write like every admin write: a dry run unless the body is `{"dry_run": false}`, and audited only when it acts. `GET /drain` only reads `draining`, `since`, `held` and `running` |
 | `llmq.pause_receiving()` | this process | Sync, from any thread (a signal handler); `await llmq.drain(drain_secs)` also waits for running calls and jobs and returns True when none is left |
 
 **Hand-back.** With `LLMQ_DRAIN_HANDBACK_ENABLED=true` (the default) a pause returns the calls
@@ -105,8 +105,17 @@ hand-back. Set it to false to keep held calls here until `stop()` (0.1.1 behavio
 `mode=caller` process holds no queued calls, so nothing is handed back there. With one replica,
 handed-back calls wait for the new pod.
 
-**Resume.** `llmq.resume_receiving()` (or `POST /resume`) undoes a pause: the process receives
-again and is ready once started. After `stop()` it raises `LLMQueueError` (the route answers 409).
+**Resume.** `llmq.resume_receiving()` (or `POST /resume` with `{"dry_run": false}`) undoes a
+pause: the process receives again and is ready once started. After `stop()` it raises
+`LLMQueueError` (the route answers 409).
+
+**Admin drain is a dry run by default.** `llmq.admin.drain.start(actor=...)` and
+`resume(actor=...)` (and their routes) are admin writes: without `dry_run=False` (HTTP
+`"dry_run": false`) they change nothing, write no audit entry and return the current status
+with `dry_run: true` and `would_change` (False when the process is already in that state). With
+`dry_run=False` they act, are audited (`op` `drain` / `resume`) and return the status after,
+with `dry_run: false`. The drain file and `LLMQueue.pause_receiving()` / `resume_receiving()` /
+`drain()` are the process API, not admin writes: they act at once and have no dry run.
 A drain file that paused a process does not pause it again after a resume; touching the file
 anew (a newer mtime) does.
 

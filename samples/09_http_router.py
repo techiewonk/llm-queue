@@ -125,7 +125,7 @@ async def main() -> None:
             print(f"POST {path} {region} -> {block.json()['blocked_regions']}")
             assert block.status_code == 200
 
-        drained = await client.post("/llm-queue/drain", json={}, headers=writer)
+        drained = await client.post("/llm-queue/drain", json={"dry_run": False}, headers=writer)
         print(f"POST /drain -> {drained.status_code}")
         assert drained.status_code == 200
         after = await client.get("/llm-queue/health/ready")
@@ -134,7 +134,7 @@ async def main() -> None:
         state = await client.get("/llm-queue/drain", headers=admin)
         print(f"GET /drain -> {state.status_code}")
         assert state.status_code == 200
-        resumed = await client.post("/llm-queue/resume", json={}, headers=writer)
+        resumed = await client.post("/llm-queue/resume", json={"dry_run": False}, headers=writer)
         print(f"POST /resume -> {resumed.status_code}")
         assert resumed.status_code == 200
 

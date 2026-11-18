@@ -63,8 +63,8 @@ mistyped fields are a 400.
 | `metrics.get` | read | the metrics sink (`LLMQ_METRICS_SINK`) | process-local | `GET /metrics` | open |  |  |
 | `process.describe` | read | `llmq.admin.describe()` | `llm-queue describe` | `GET /describe` | read |  |  |
 | `drain.get` | read | `llmq.admin.drain.get()` | process-local | `GET /drain` | read |  |  |
-| `drain.start` | update | `await llmq.admin.drain.start(actor="ann")` | process-local (pods use `LLMQ_DRAIN_FILE`) | `POST /drain` | write | `drain` | no |
-| `drain.resume` | update | `await llmq.admin.drain.resume(actor="ann")` | process-local | `POST /resume` | write | `resume` | no |
+| `drain.start` | update | `await llmq.admin.drain.start(actor="ann", dry_run=False)` | process-local (pods use `LLMQ_DRAIN_FILE`) | `POST /drain` | write | `drain` | yes |
+| `drain.resume` | update | `await llmq.admin.drain.resume(actor="ann", dry_run=False)` | process-local | `POST /resume` | write | `resume` | yes |
 | `status.get` | read | `await llmq.admin.status.get("sonnet", tenant="acme")` | `llm-queue status [--model M] [--tenant T]` | `GET /status?model=M&tenant_hash=H` | read |  |  |
 | `status.health` | read | `await llmq.admin.status.health()` | `llm-queue health [--model M]` | `GET /status/health?model=M` | read |  |  |
 | `registry.get` | read | `await llmq.admin.registry.get()` | `llm-queue registry get [--model M]` | `GET /registry` | read |  |  |
@@ -152,7 +152,8 @@ settings (`registry.set`); jobs are sent by the app (`llmq.send_job`), their dea
 | `jobs.list` | | `{jobs: [{job, waiting, held, dead_letters, consumer}]}` |
 | `purge.*` | see [Purge store state](../how-to/purge.md) | the purge report (`PurgeReport.as_dict()`) |
 | `purge.unschedule` | `target` (`alias` or `alias/account/name`) | `{target, cancelled, dry_run}` |
-| `drain.get` / `start` / `resume` | | `{draining, since, held, running}` |
+| `drain.get` | | `{draining, since, held, running}` |
+| `drain.start` / `resume` | | `{draining, since, held, running, dry_run}`; a dry run (the default) changes nothing, is not audited, and adds `would_change` (False when the process is already draining / not draining). Not `LLMQ_DRAIN_FILE` or `LLMQueue.pause_receiving()` / `resume_receiving()` / `drain()`: those are the process API and act at once |
 
 ### Requests by model and tenant
 

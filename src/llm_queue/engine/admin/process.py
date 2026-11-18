@@ -12,7 +12,7 @@ import orjson
 
 from llm_queue._version import __version__
 from llm_queue.engine.admin.context import AdminContext
-from llm_queue.engine.admin.ops import OPERATIONS, op_row
+from llm_queue.engine.admin.ops import OPERATIONS, drain_plan, op_row
 from llm_queue.engine.admin.registry import usable
 from llm_queue.engine.settings import InfraSettings
 from llm_queue.engine.store_guard import STORE_DOWN
@@ -32,21 +32,33 @@ class DrainAdmin:
         """`draining`, `since`, `held` (calls waiting for budget), `running` (calls and jobs)."""
         return dict(self._ctx.needs_process("drain").drain_status())
 
-    async def start(self, *, actor: str) -> dict[str, Any]:
-        """Stop taking calls and jobs here (readiness fails); held calls go back at once."""
+    async def start(self, *, actor: str, dry_run: bool = True) -> dict[str, Any]:
+        """Stop taking calls and jobs here (readiness fails); held calls go back at once.
+
+        A dry run (the default) changes nothing and writes no audit entry: the current status
+        with `dry_run` and `would_change` (False when this process drains already).
+        """
         check_actor(actor)
         process = self._ctx.needs_process("drain")
+        if dry_run:
+            return drain_plan(process, draining=True)
         process.pause_receiving()
         await self._audit(actor, "drain")
-        return dict(process.drain_status())
+        return {**process.drain_status(), "dry_run": False}
 
-    async def resume(self, *, actor: str) -> dict[str, Any]:
-        """Take calls and jobs again; `LLMQueueError` once the queue is stopping."""
+    async def resume(self, *, actor: str, dry_run: bool = True) -> dict[str, Any]:
+        """Take calls and jobs again; `LLMQueueError` once the queue is stopping.
+
+        A dry run (the default) changes nothing and writes no audit entry: the current status
+        with `dry_run` and `would_change` (False when this process is not draining).
+        """
         check_actor(actor)
         process = self._ctx.needs_process("resume")
+        if dry_run:
+            return drain_plan(process, draining=False)
         process.resume_receiving()
         await self._audit(actor, "resume")
-        return dict(process.drain_status())
+        return {**process.drain_status(), "dry_run": False}
 
     async def _audit(self, actor: str, op: str) -> None:
         worker = self._ctx.engine.worker_id if self._ctx.engine is not None else "?"

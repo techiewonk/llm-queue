@@ -120,7 +120,7 @@ but `LLMQ_ENVIRONMENT`, `LLMQ_DRAIN_FILE` and `LLMQ_DRAIN_POLL_SECS`. On each su
 | `/` | The admin index: `library.execution_mode` is `local`, `process` from this process, per model its slots and usable deployments; `stores`, `jobs` and `purges` are null |
 | `/describe` | `execution_mode: local`, the local settings; no store fields |
 | `/registry`, `/registry/diff`, `/registry/schema`, `POST /tenants/hash` | The document (secrets hidden); `live_edits` is empty |
-| `/drain`, `POST /drain`, `POST /resume` | As in queue mode (not audited: the audit is in the store) |
+| `/drain`, `POST /drain`, `POST /resume` | As in queue mode: a dry run unless `{"dry_run": false}` (not audited: the audit is in the store) |
 | `/requests*`, `/tenants`, `/purge/*`, `/registry/versions`, `POST /registry*`, `/audit`, `/models*`, `/blocks*`, `/queues`, `/jobs`, `/dlq*` | 503 `{"reason": "local_mode"}` |
 
 A route's guards answer before the local-mode refusal, as in queue mode: a request without a

@@ -31,8 +31,8 @@ flowchart LR
   (`LLMQ_METRICS_SINK=prometheus`, or `metrics=PrometheusSink()` as in the sample; install the
   `metrics` extra). It is open like the probes, so a scraper needs no admin credentials.
 - Draining: with `dependencies` and `actor`, `install()` mounts the guarded drain routes.
-  `POST /drain` fails readiness and hands held calls back while running calls finish;
-  `POST /resume` undoes it; `GET /drain` shows the state. A route reaches one process, so a pod
+  `POST /drain` with `{"dry_run": false}` fails readiness and hands held calls back while
+  running calls finish (without it, a dry run); `POST /resume` undoes it; `GET /drain` shows the state. A route reaches one process, so a pod
   with several processes drains through `LLMQ_DRAIN_FILE`: the preStop hook runs
   `touch $LLMQ_DRAIN_FILE` and every process sees it (see
   [Drain a pod](../how-to/operate.md#drain-a-pod)). Never add an open GET that drains: anyone

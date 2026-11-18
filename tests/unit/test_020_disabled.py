@@ -121,9 +121,12 @@ async def test_admin_refuses_store_operations_and_serves_the_process() -> None:
     index = await admin.ops.index(routes=[])
     assert index["library"]["enabled"] is False
     assert index["process"]["ready"] is True
-    assert (await admin.drain.start(actor="a"))["draining"] is True
+    planned = await admin.drain.start(actor="a")  # a dry run by default
+    assert (planned["dry_run"], planned["would_change"], queue.ready) == (True, True, True)
+    assert (await admin.drain.start(actor="a", dry_run=False))["draining"] is True
     assert queue.ready is False
-    assert (await admin.drain.resume(actor="a"))["draining"] is False
+    assert (await admin.drain.resume(actor="a"))["draining"] is True  # dry run: still draining
+    assert (await admin.drain.resume(actor="a", dry_run=False))["draining"] is False
 
 
 async def test_start_stop_health_ready_and_describe() -> None:
