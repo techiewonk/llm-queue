@@ -1,10 +1,12 @@
-"""`LLMQ_CONFIG_ERROR_MODE` and the off switch that never touches a secret.
+"""`LLMQ_CONFIG_ERROR_MODE` and the off switch, both layered: the secret wins.
 
-`LLMQ_ENABLED=false` (environment, then `defaults=`) returns a `DisabledQueue` without building
-or reading a secrets source. With `LLMQ_CONFIG_ERROR_MODE=disable`, a `ConfigError` at
+`LLMQ_ENABLED=false` returns a `DisabledQueue`; with no secrets source it reads nothing else,
+with one the secret's value wins (one secret switches every pod). A secrets source that cannot
+be read is handled by the environment / defaults mode. With `LLMQ_CONFIG_ERROR_MODE=disable`
+(the default), a `ConfigError` at
 `from_env` (a bad setting, a secrets source that cannot be read) is logged once as
 `llmq_config_failed`, without values, and a `DisabledQueue` with `disabled_reason:
-config_error` is returned: probes, drain file, factories None. `raise` (the default) raises.
+config_error` is returned: probes, drain file, factories None. `raise` raises.
 """
 
 from __future__ import annotations
@@ -93,34 +95,78 @@ def _assert_no_values(text: str) -> None:
 # ---------------------------------------------------------------- the off switch
 
 
-def test_off_switch_never_builds_or_reads_a_secrets_source(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_off_switch_without_secrets_reads_nothing_else(monkeypatch: pytest.MonkeyPatch) -> None:
     _never_touched(monkeypatch)
-
-    def code_secrets(name: str) -> str | None:
-        raise AssertionError(f"secrets= was asked for {name}")
-
-    env = {"LLMQ_ENABLED": "false", "LLMQ_SECRETS_SOURCE": AWS, "LLMQ_ENVIRONMENT": "prod"}
+    env = {"LLMQ_ENABLED": "false", "LLMQ_ENVIRONMENT": "prod", "LLMQ_SECRETS_NAMES": "not json"}
     queue = LLMQueue.from_env(env)
     assert isinstance(queue, DisabledQueue)
     assert queue.disabled_reason == "switch"
     assert queue.describe()["environment"] == "prod"
-    assert isinstance(LLMQueue.from_env(env, secrets=code_secrets), DisabledQueue)
-    # The app's own default (`defaults={"LLMQ_ENABLED": False}`) is read before a secret too.
-    off = LLMQueue.from_env({"LLMQ_SECRETS_SOURCE": AWS}, defaults={"LLMQ_ENABLED": False})
+    # The app's own default (`defaults={"LLMQ_ENABLED": False}`) switches it off too.
+    off = LLMQueue.from_env({}, defaults={"LLMQ_ENABLED": False})
     assert isinstance(off, DisabledQueue)
+    assert off.disabled_reason == "switch"
 
 
-def test_a_secret_cannot_switch_the_library(monkeypatch: pytest.MonkeyPatch) -> None:
-    secret = {"LLMQ_ENABLED": "false", "LLMQ_CONFIG_ERROR_MODE": "disable"}
-    _aws(monkeypatch, {"SecretString": json.dumps(secret)})
-    env = {"LLMQ_SECRETS_SOURCE": AWS, "LLMQ_ENVIRONMENT": "dev", "LLMQ_CONFIG_ERROR_MODE": "raise"}
-    with pytest.raises(ConfigError, match="LLMQ_STORE_URL"):  # neither key was taken
+def test_a_secret_switches_the_library_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    _aws(monkeypatch, {"SecretString": json.dumps({"LLMQ_ENABLED": "false"})})
+    env = {"LLMQ_SECRETS_SOURCE": AWS, "LLMQ_ENVIRONMENT": "prod", "LLMQ_ENABLED": "true"}
+    queue = LLMQueue.from_env(env)
+    assert isinstance(queue, DisabledQueue)
+    assert queue.disabled_reason == "switch"
+
+
+def test_a_secret_switches_the_library_on_over_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = {"LLMQ_ENABLED": "true", "LLMQ_CONFIG_ERROR_MODE": "raise"}
+    made = _aws(monkeypatch, {"SecretString": json.dumps(secret)})
+    env = {"LLMQ_SECRETS_SOURCE": AWS, "LLMQ_ENVIRONMENT": "dev", "LLMQ_ENABLED": "false"}
+    # Enabled by the secret: the start goes on, and stops at the missing store (raise).
+    with pytest.raises(ConfigError, match="LLMQ_STORE_URL"):
         LLMQueue.from_env(env)
-    for name in ("LLMQ_ENABLED", "LLMQ_CONFIG_ERROR_MODE"):
-        with pytest.raises(ConfigError, match=f"{name} is read from the environment"):
-            LLMQueue.from_env({**env, "LLMQ_SECRETS_NAMES": json.dumps({name: "k"})})
+    assert made  # the source was read although the environment said false
+
+
+def test_a_secret_mode_raise_makes_a_later_bad_setting_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _aws(monkeypatch, {"SecretString": json.dumps({"LLMQ_CONFIG_ERROR_MODE": "raise"})})
+    env = {**DISABLE, "LLMQ_SECRETS_SOURCE": AWS, "LLMQ_ENVIRONMENT": "dev"}
+    with pytest.raises(ConfigError, match="LLMQ_LEASE_SECS"):
+        LLMQueue.from_env({**env, "LLMQ_LEASE_SECS": "x"})
+
+
+def test_a_secret_mode_disable_disables_a_later_bad_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _aws(monkeypatch, {"SecretString": json.dumps({"LLMQ_CONFIG_ERROR_MODE": "disable"})})
+    env = {"LLMQ_SECRETS_SOURCE": AWS, "LLMQ_CONFIG_ERROR_MODE": "raise", "LLMQ_LEASE_SECS": "x"}
+    queue = LLMQueue.from_env({**env, "LLMQ_ENVIRONMENT": "dev"})
+    assert isinstance(queue, DisabledQueue)
+    assert queue.disabled_reason == "config_error"
+
+
+def test_an_unreadable_secret_is_handled_by_the_environment_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _aws(monkeypatch, _ClientError("AccessDeniedException"))
+    env = {**DISABLE, "LLMQ_SECRETS_SOURCE": AWS, "LLMQ_ENABLED": "false"}
+    queue = LLMQueue.from_env(env)  # the secret is read even with the environment off
+    assert isinstance(queue, DisabledQueue)
+    assert queue.disabled_reason == "config_error"
+
+
+def test_only_the_secrets_settings_cannot_be_mapped(monkeypatch: pytest.MonkeyPatch) -> None:
+    _aws(monkeypatch, {"SecretString": json.dumps({"k": "false"})})
+    env = {"LLMQ_SECRETS_SOURCE": AWS, "LLMQ_ENVIRONMENT": "dev"}
+    off = LLMQueue.from_env({**env, "LLMQ_SECRETS_NAMES": json.dumps({"LLMQ_ENABLED": "k"})})
+    assert isinstance(off, DisabledQueue)
+    assert off.disabled_reason == "switch"
+    names = {**env, "LLMQ_CONFIG_ERROR_MODE": "raise"}
+    names["LLMQ_SECRETS_NAMES"] = json.dumps({"LLMQ_SECRETS_REGION": "k"})
+    with pytest.raises(ConfigError, match="LLMQ_SECRETS_REGION is read from the environment"):
+        LLMQueue.from_env(names)
 
 
 # ---------------------------------------------------------------- disable (the default), raise

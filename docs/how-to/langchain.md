@@ -56,7 +56,8 @@ The factories read the registry the process **starts** with, without a store:
 The started queue also decides the off switch: a `DisabledQueue` (`LLMQ_ENABLED=false`, or
 `LLMQ_CONFIG_ERROR_MODE=disable` after a configuration error) makes every factory return None,
 so the app takes its direct path. Before any queue has started, `LLMQ_ENABLED` is read from
-the environment.
+the environment only (no secret is read without a queue), while `from_env` lets a secret win:
+when a secret holds the switch, pass `registry=llmq`.
 
 The registry is parsed once: once per queue, and before start once per file version (the
 file's path, modification time and size, and the placeholder values read). A ConfigMap updated
