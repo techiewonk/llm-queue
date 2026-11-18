@@ -102,7 +102,10 @@ class LocalModeRefused(ConfigError):
 
 
 class QueueDisabled(ConfigError):
-    """A call or store operation asked of a queue switched off with `LLMQ_ENABLED=false`.
+    """A call or store operation asked of a switched-off queue.
+
+    Off with `LLMQ_ENABLED=false`, or after a configuration error with
+    `LLMQ_CONFIG_ERROR_MODE=disable` (`health()["disabled_reason"]` says which).
 
     The off switch keeps the app on its own direct path: the factories return None, so only
     code that calls the queue directly gets this. Category `config_error`, not retryable;
@@ -111,7 +114,10 @@ class QueueDisabled(ConfigError):
 
     def __init__(self, operation: str) -> None:
         """`operation` names what was asked (`converse`, `status`, `purge.model`...)."""
-        super().__init__(f"llm-queue is disabled (LLMQ_ENABLED=false): {operation} refused")
+        super().__init__(
+            f"llm-queue is disabled (LLMQ_ENABLED=false, or a configuration error with "
+            f"LLMQ_CONFIG_ERROR_MODE=disable): {operation} refused"
+        )
         self.operation = operation
 
 

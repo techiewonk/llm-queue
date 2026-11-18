@@ -85,7 +85,8 @@ counts, never a tenant name), purges included (which also write `llmq_purge`); `
 | `llmq_call_finished` | info | engine/runtime.py |
 | `llmq_configured` | info | core.py (once per `start()`, every mode: the `describe()` summary: version, worker id, roles, environment, store `scheme://host:port` (no password), prefixes, key expiry, pool, metrics sink, registry version and models, `tenant_default_hash`; never a salt, token, tenant name or registry body) |
 | `llmq_configured_failed` | warning | core.py (`describe()` raised at start, e.g. a registry file changed since `from_env`; the start goes on) |
-| `llmq_disabled` | info | disabled.py (`LLMQ_ENABLED=false`: once at `start()`, with `describe()`: version, `enabled: false`, environment, whether a drain file is watched) |
+| `llmq_config_failed` | error | core.py (`LLMQ_CONFIG_ERROR_MODE=disable`: `from_env` met a `ConfigError` (a bad setting, a secrets source that cannot be read) and returned a disabled queue; once, with `problems` (one line each, never a value, password, token or salt), `error_type`, `config_error_mode` and `disabled_reason: config_error`) |
+| `llmq_disabled` | info | disabled.py (`LLMQ_ENABLED=false`, or `LLMQ_CONFIG_ERROR_MODE=disable` after a configuration error: once at `start()`, with `describe()`: version, `enabled: false`, `disabled_reason` (`switch` or `config_error`), environment, whether a drain file is watched) |
 | `llmq_purge` | info | engine/purge.py |
 | `llmq_registry_audit` | info | registry/store.py |
 | `llmq_start_failed` | error | fastapi.py (`on_start_error="log"`: the app stays up, not ready) |

@@ -235,6 +235,12 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   (`enabled: false`), `health()` / `describe()` say so, `llmq_disabled` is logged once at start,
   and the drain file still fails readiness. The fifth step of the switch ladder
   (docs/how-to/modes.md).
+- `LLMQ_CONFIG_ERROR_MODE` (`raise` by default, or `disable`): with `disable`, a `ConfigError`
+  at `from_env()` (a bad setting, a secrets source that cannot be read) is logged once as
+  `llmq_config_failed` (the problems, never a value) and a disabled queue is returned instead
+  of raising: `health()` / `describe()` say `enabled: false`, `disabled_reason: config_error`
+  (`switch` for `LLMQ_ENABLED=false`), the factories return None, `install()` mounts the probes
+  only and the drain file still works. Read from the environment and `defaults=` only.
 - Health summary (0.2.0 F2): each model in `status()` has `health` (`state` `healthy` /
   `warning` / `critical`, `reasons`, budget use this minute, waiting calls, oldest wait,
   usable deployments) and the report has the worst state as `health`; the new operation
@@ -273,6 +279,10 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   `secrets=` (D3; 0.1.1 ignored them there and logged in with the URL's password, or none). They
   are still read on every new connection and win over a password in the URL.
 - A missing store now reads `LLMQ_STORE_URL (or LLMQ_STORE_HOST) is required`.
+- `LLMQ_ENABLED` is read from the environment and `defaults=` only, never from a secret, and
+  before any secret: `LLMQ_ENABLED=false` builds and reads no secrets source (it was read once
+  at `from_env` even with the queue off, so an unreadable secret stopped a switched-off pod). A
+  secret holding `LLMQ_ENABLED` is ignored and `LLMQ_SECRETS_NAMES` may not map it.
 - `LLMQ_REGISTRY` in a secret and `LLMQ_REGISTRY_FILE` in the environment (or the other way)
   were refused as "both set"; the conflict group now lets the secret's form win.
 - `STORE_POOL_MARGIN` moved from `llm_queue.core` to `llm_queue.engine.settings`; the internal

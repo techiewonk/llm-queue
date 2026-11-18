@@ -92,7 +92,12 @@ class AdminServices:
         """This process's settings, safe to log (no password, salt, token or registry body)."""
         engine = self.context.engine
         worker = engine.worker_id if engine is not None else None
-        return describe_settings(self.context.settings, worker)
+        out = describe_settings(self.context.settings, worker)
+        # A `DisabledQueue` says why it is off (`switch` or `config_error`).
+        reason = getattr(getattr(self.context, "process", None), "disabled_reason", None)
+        if reason is not None:
+            out["disabled_reason"] = reason
+        return out
 
     # ---------------------------------------------------------------- construction
 

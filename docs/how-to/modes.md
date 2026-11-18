@@ -19,6 +19,14 @@ it:
 | 4. Local | `LLMQ_EXECUTION_MODE=local` and a restart | Every call runs in its own process against the provider; the store is never contacted (no client is built) | Set `queue` (or remove it) and restart |
 | 5. Off | `LLMQ_ENABLED=false` and a restart | The library does nothing: the factories return None, so the app runs its own direct path (`chat_model(...) or ChatBedrockConverse(...)`); a direct `llmq.converse()` raises `QueueDisabled`; `install()` mounts the two probes only (`enabled: false`); the drain file still fails readiness | Remove it (or set `true`) and restart |
 
+`LLMQ_ENABLED` is read from the environment, then `defaults=`, never from a secret and before
+any secret: step 5 builds and reads no secrets source, so it works when Secrets Manager is the
+problem. `LLMQ_CONFIG_ERROR_MODE=disable` takes step 5 on its own when `from_env()` meets a
+`ConfigError` (a bad setting, a secret that cannot be read): it logs `llmq_config_failed` once
+and returns the same disabled queue, with `disabled_reason: config_error` (step 5 by hand says
+`switch`) in `health()` and `describe()`. The pod starts and serves the app's direct path instead
+of crashing; fix the setting and restart. The default, `raise`, stops the start.
+
 Steps 2 and 3 need the store: they move where a call runs, not where its budget lives. Step 4
 is for when the store itself is the problem (lost, being migrated, not yet provisioned) or for
 a service that does not want one (a small tool, a test environment, a single-process job).
@@ -97,7 +105,7 @@ but `LLMQ_ENVIRONMENT`, `LLMQ_DRAIN_FILE` and `LLMQ_DRAIN_POLL_SECS`. On each su
 |---|---|
 | Python | `start()` / `stop()` run the drain file watcher only and log `llmq_disabled` once; `converse`, `chat`, `call`, the streams, `embed`, the `*_sync` calls, jobs, `status()` and `request_status()` raise `QueueDisabled`; `health()` and `describe()` say `enabled: false`; `ready` and `queue_ready()` are true unless draining; `llmq.admin` serves `describe`, `ops`, `registry.schema` and `drain.*`, every other operation raises `QueueDisabled` |
 | LangChain | `chat_model()` / `embeddings()` return None (with no queue given they read `LLMQ_ENABLED` from the environment) |
-| HTTP | `install()` / `mount()` mount `GET /health/live` (`{"live": true, "enabled": false}`) and `GET /health/ready` (200, or 503 while draining) only, whatever the router options; the context middleware is still added |
+| HTTP | `install()` / `mount()` mount `GET /health/live` (`{"live": true, "enabled": false, "disabled_reason": "switch"}`, or `"config_error"`) and `GET /health/ready` (200, or 503 while draining) only, whatever the router options; the context middleware is still added |
 | CLI | `llm-queue describe` answers `enabled: false`; every store command exits 1 with the `QueueDisabled` message |
 
 ## HTTP routes and probes
