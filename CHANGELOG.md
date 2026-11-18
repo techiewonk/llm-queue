@@ -424,6 +424,10 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   `RecursionError`), and `NaN` / `Infinity` are refused. A non-finite number from a query
   (`float("nan")`) is a bad field too: `{"wait_secs": NaN}` disabled a model and returned at
   once.
+- The `job` of `dlq.list` / `dlq.show` / `dlq.redrive` / `dlq.purge` is checked against the
+  job-name rule (1-64 letters, digits, `_`, `-`) before it goes into a key: braces and colons
+  reached the stream key (`ConfigError`, HTTP 400). A job name with a trailing newline is
+  refused at registration too (the rule was matched with `$`).
 - `requests.extend` reaches every place a deadline lives: a worker that takes the call after
   the extend gets its deadline from `PICK_TAKE` and no longer ends it at `max_wait_secs`; a
   running attempt's timer moves (it was cut at the old deadline and run again); `stream()`

@@ -35,6 +35,18 @@ async def test_b07_a_dead_letter_id_that_is_not_a_stream_id_is_refused() -> None
         await dlq.purge(model="m", entry_ids=["1-0", "1-x"], actor="ann")
 
 
+@pytest.mark.parametrize("job", ["a}:x", "{h}", "a b", "x" * 65, "", "ok\n", "a:b"])
+async def test_fb6_a_dead_letter_job_name_that_could_not_be_a_job_is_refused(job: str) -> None:
+    """FB-6: `job` went into a stream key unchecked (braces, colons, any length)."""
+    dlq = object.__new__(DlqAdmin)  # the check comes before any store read
+    with pytest.raises(ConfigError, match="job: use 1-64"):
+        await dlq.list(job=job)
+    with pytest.raises(ConfigError, match="job: use 1-64"):
+        await dlq.show("1-0", job=job)
+    with pytest.raises(ConfigError, match="job: use 1-64"):
+        await dlq.purge(job=job, actor="ann")
+
+
 @pytest.mark.parametrize(
     ("error", "code"),
     [

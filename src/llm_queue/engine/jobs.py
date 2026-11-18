@@ -47,7 +47,7 @@ CONSUMER_TTL_SECS = 30  # a consuming process marks its job queues every third o
 _BELL_WAIT_SECS = 0.5
 # A job name goes into store keys: no spaces, `:` or `{}` (hash tags), and a bounded length
 # (R3JE-12). Within the model queues' own rule, so `jobs-<name>` is a valid queue name.
-_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+JOB_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _JOB_ID_MAX = 200  # characters of an app job id (it is part of the dedupe key)
 _CLAIM_SECS = 60  # a dedupe claim lives this long until its send is confirmed
 _MAX_STORE_SECS = 1_209_600  # the longest a dead letter may be kept (two weeks, as models)
@@ -229,7 +229,7 @@ class JobRunner:
         `concurrency` (default `LLMQ_JOB_CONCURRENCY`, 4) caps its runs in this process.
         `ConfigError` for a bad name, a function that is not async, or a call after `start`.
         """
-        if not _NAME_RE.match(name):
+        if not JOB_NAME_RE.fullmatch(name):
             raise ConfigError(
                 f"job name {name!r}: use 1-64 letters, digits, '_' or '-' (it is part of a key)"
             )
