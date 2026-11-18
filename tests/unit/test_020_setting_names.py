@@ -67,7 +67,7 @@ def test_the_rename_table_is_consistent() -> None:
     old, new = set(st.PENDING_RENAMES), set(st.PENDING_RENAMES.values())
     assert old <= st.SETTING_NAMES
     assert not new & st.SETTING_NAMES
-    assert not (old | new) & (set(st.RENAMED) | set(st.RENAMED.values()) | set(st.REMOVED))
+    assert not (old | new) & (set(st.RENAMED) | set(st.RENAMED.values()))
     assert all(n.startswith("LLMQ_") and n.isupper() for n in old | new)
 
 

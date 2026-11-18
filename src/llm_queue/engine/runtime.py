@@ -12,7 +12,6 @@ import asyncio
 import contextlib
 import functools
 import hashlib
-import inspect
 import math
 import random
 import time
@@ -580,28 +579,9 @@ async def _close_all(steps: Sequence[tuple[str, Callable[[], Awaitable[object]]]
         raise first
 
 
-_ACCEPTS_API: dict[type, bool] = {}
-
-
-def _api_kwargs(provider: Any, view: ResolvedRegistry, alias: str) -> dict[str, Any]:
-    """`converse_api` for a provider whose `call` accepts it; nothing for one that does not.
-
-    Owner Q33: a custom provider written for 0.1.0b1 has no such parameter, and passing it
-    raised `TypeError` on every call. Checked once per provider class.
-    """
-    kind = type(provider)
-    accepts = _ACCEPTS_API.get(kind)
-    if accepts is None:
-        try:
-            params = inspect.signature(provider.call).parameters.values()
-        except (TypeError, ValueError):
-            accepts = True
-        else:
-            accepts = any(
-                p.name == "converse_api" or p.kind is inspect.Parameter.VAR_KEYWORD for p in params
-            )
-        _ACCEPTS_API[kind] = accepts
-    return {"converse_api": str(view.value(alias, "converse_api"))} if accepts else {}
+def _api_kwargs(view: ResolvedRegistry, alias: str) -> dict[str, Any]:
+    """The model's `converse_api` for `Provider.call` (part of its contract)."""
+    return {"converse_api": str(view.value(alias, "converse_api"))}
 
 
 # The marker `stream()` puts on its chunk queue when the call task ends (R3PF-11).
@@ -4194,7 +4174,7 @@ class Engine:
                     route,
                     timing,
                     sink=sink,
-                    **_api_kwargs(provider, view, alias),
+                    **_api_kwargs(view, alias),
                 )
             if writer is not None:
                 # Usage and how the call was served, for `stream(meta_event=True)`: a stream
@@ -4619,7 +4599,7 @@ class Engine:
                 params,
                 route_for(view, deployment),
                 Timing(PROBE_TIMEOUT_SECS, PROBE_TIMEOUT_SECS, PROBE_TIMEOUT_SECS),
-                **_api_kwargs(provider, view, alias),  # the calls' own API (IAM)
+                **_api_kwargs(view, alias),  # the calls' own API (IAM)
             )
         except Exception as exc:
             return provider.classify(exc).kind is ErrorKind.THROTTLE

@@ -215,15 +215,12 @@ local function ring(bell)
 end
 """
 
-# Read a receive's claim (see RECEIVE_FIRST): nil when there is none, or an older library's list
-# (WRONGTYPE), or anything that is not the JSON this library writes.
+# Read a receive's claim (see RECEIVE_FIRST): nil when there is none.
 _CLAIM_FN = """
 local function read_claim(key)
-  local raw = redis.pcall('GET', key)
-  if type(raw) ~= 'string' then return nil end
-  local ok, prior = pcall(cjson.decode, raw)
-  if ok and type(prior) == 'table' then return prior end
-  return nil
+  local raw = redis.call('GET', key)
+  if not raw then return nil end
+  return cjson.decode(raw)
 end
 """
 

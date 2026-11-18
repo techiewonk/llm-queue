@@ -90,7 +90,7 @@ async def test_expired_waiters_are_found_by_their_expiry(
 async def test_sweep_drops_expired_waiters_without_an_expiry_entry(
     store: redis.asyncio.Redis, prefix: str
 ) -> None:
-    """B5 (109): a waiter with no `waitexp` member (older library) is still cleaned up."""
+    """B5 (109): a waiter with no `waitexp` member (evicted) is still cleaned up."""
     r = await rig(store, prefix)
     await store.zadd(_m(prefix, "wait:p"), {"old": 1})
     await store.hset(_m(prefix, "waitinfo"), "old", '{"exp": 0, "deps": ["aws-a/r1"]}')
