@@ -17,7 +17,7 @@ from typing import Any, NamedTuple
 import pytest
 
 from llm_queue.engine.jobs import JobSettings
-from llm_queue.engine.settings import PENDING_RENAMES, RENAMED, InfraSettings
+from llm_queue.engine.settings import InfraSettings
 from llm_queue.errors import ConfigError
 from llm_queue.registry import load_registry
 from llm_queue.registry import settings as st
@@ -227,18 +227,14 @@ JOB_ROWS = _rows(_section(CONFIG, "## Job settings (`LLMQ_JOB_*`)"))
 
 
 def _variables_read() -> set[str]:
-    """Every `LLMQ_*` variable the library reads (settings.py names, literals, job fields).
-
-    The old names of `RENAMED` are never read; the new names of `PENDING_RENAMES` are only
-    listed until `scripts/rename_settings.py` runs.
-    """
+    """Every `LLMQ_*` variable the library reads (settings.py names, literals, job fields)."""
     settings = (SRC / "engine" / "settings.py").read_text(encoding="utf-8")
     found = re.findall(r'"([A-Z][A-Z0-9_]*[A-Z0-9])"', settings)
     names = {f"LLMQ_{n}" for n in found if not n.startswith("LLMQ_")}
     for path in SRC.rglob("*.py"):
         names |= set(re.findall(r'"(LLMQ_[A-Z0-9_]*[A-Z0-9])"', path.read_text(encoding="utf-8")))
     names |= {f"LLMQ_JOB_{f.name.upper()}" for f in dataclasses.fields(JobSettings)}
-    return names - set(RENAMED) - set(PENDING_RENAMES.values())
+    return names
 
 
 def _problems(read: Callable[[], object]) -> list[str]:
@@ -263,7 +259,7 @@ def test_process_variable_default_and_range(variable: str) -> None:
     field = variable.removeprefix("LLMQ_").lower()
     defaults = InfraSettings.from_env(DEV)
     value = getattr(defaults, field, None)
-    if field == "queue_wait_scopes":
+    if field == "replica_wait_scopes":
         assert _first(default) == "all"
     elif field == "environment":
         assert _first(default) == "unset"  # what `from_env({})` reads; DEV sets it

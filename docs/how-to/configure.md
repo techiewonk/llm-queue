@@ -31,7 +31,7 @@ another secret store changes two variables. In a Kubernetes manifest:
 
 ```yaml
 - {name: LLMQ_SECRETS_SOURCE, value: "aws-secretsmanager:${ENV}/researchassistant/secret"}
-- {name: LLMQ_SECRET_NAMES, value: '{"LLMQ_STORE_HOST":"valkey_host","LLMQ_STORE_PORT":"valkey_port","LLMQ_STORE_PASSWORD":"valkey_key","LLMQ_ID_HASH_SALT":"llmq_id_hash_salt"}'}
+- {name: LLMQ_SECRETS_NAMES, value: '{"LLMQ_STORE_HOST":"valkey_host","LLMQ_STORE_PORT":"valkey_port","LLMQ_STORE_PASSWORD":"valkey_key","LLMQ_ID_HASH_SALT":"llmq_id_hash_salt"}'}
 ```
 
 - `LLMQ_SECRETS_SOURCE` lists sources tried in order for each name:
@@ -44,8 +44,8 @@ another secret store changes two variables. In a Kubernetes manifest:
   (`KEY=a#b`). Quote a value that holds ` #`: `KEY="a # b"` is the text between the quotes,
   and only a comment may follow the closing quote. A line that breaks these rules is refused,
   naming the line, never its text.
-- `LLMQ_SECRET_NAMES` gives each setting's key in the secret; a setting named twice is
-  refused. `secret_names=` in code is merged over it (the argument wins per setting). Names
+- `LLMQ_SECRETS_NAMES` gives each setting's key in the secret; a setting named twice is
+  refused. `secrets_names=` in code is merged over it (the argument wins per setting). Names
   and keys are stripped of spaces in both.
 - Values are cached for `LLMQ_SECRETS_CACHE_SECS` (300) and read again after, so a rotated
   store password reaches the next new connection within that time. A source that cannot be read
@@ -53,7 +53,7 @@ another secret store changes two variables. In a Kubernetes manifest:
   hold is unset, and the environment and `defaults=` are asked next.
 - The same source serves the store passwords, `LLMQ_ADMIN_TOKEN`, `LLMQ_JOB_*`, the account
   secrets (`api_key_ref`, `external_id_ref`), registry placeholders, the `llm-queue` CLI,
-  and `AdminServices.from_env` (it takes `secrets=`, `defaults=` and `secret_names=` as
+  and `AdminServices.from_env` (it takes `secrets=`, `defaults=` and `secrets_names=` as
   `LLMQueue.from_env` does).
 - `describe()` shows the sources (kind and secret id) and the mapped setting names, never a
   value.
@@ -65,7 +65,7 @@ the environment; then `defaults=`. To build the same lookup in code:
 from llm_queue.secrets import secrets_from_config
 
 lookup = secrets_from_config("file:/etc/llmq,aws-secretsmanager:prod/app", cache_secs=60)
-llmq = LLMQueue.from_env(secrets=lookup, secret_names={"LLMQ_STORE_PASSWORD": "valkey_key"})
+llmq = LLMQueue.from_env(secrets=lookup, secrets_names={"LLMQ_STORE_PASSWORD": "valkey_key"})
 ```
 
 An app's own store is a class with `kind`, `label` and `load() -> Mapping[str, str]` (the
@@ -86,7 +86,7 @@ a later refresh the last values are kept and `secrets_refresh_failed` is logged.
 ```python
 llmq = LLMQueue.from_env(
     secrets=my_secret_lookup,
-    secret_names={                       # the secrets' own names
+    secrets_names={                       # the secrets' own names
         "LLMQ_STORE_HOST": "valkey_host",
         "LLMQ_STORE_PASSWORD": "valkey_password",
         "LLMQ_ADMIN_TOKEN": "llmq_admin_token",
@@ -100,7 +100,7 @@ llmq = LLMQueue.from_env(
 )
 ```
 
-- `secret_names` (merged over `LLMQ_SECRET_NAMES`) asks the secret under its own name instead
+- `secrets_names` (merged over `LLMQ_SECRETS_NAMES`) asks the secret under its own name instead
   of the `LLMQ_*` name; the order of the layers does not change. It covers every setting read through the layers: the store
   passwords, `LLMQ_ADMIN_TOKEN`, `LLMQ_JOB_*` and the account secrets.
 - A secret wins over the environment, as in 0.1. For the environment to win over a secret,
@@ -145,7 +145,7 @@ The settings you set in most deployments:
 | `LLMQ_ID_HASH_SALT` | Key of the user / session id hash (HMAC); required when strict |
 | `LLMQ_KEY_PREFIX`, `LLMQ_QUEUE_PREFIX` | Names of this environment's keys and queues. The key prefix defaults to `llmq` in dev and is **required** in strict mode (name it per app and environment); the queue prefix defaults to empty |
 | `LLMQ_REGISTRY` or `LLMQ_REGISTRY_FILE` | The registry document, inline or as a file (set one, not both) |
-| `LLMQ_MODE` | `both` (default), `caller`, `worker` |
+| `LLMQ_ROLE` | `both` (default), `caller`, `worker` |
 | `LLMQ_METRICS_SINK` | `emf` (CloudWatch, default), `prometheus`, `none` |
 
 !!! warning "Unset `LLMQ_ENVIRONMENT` is strict"
@@ -190,7 +190,7 @@ Every variable with its default is in [Environment variables](../reference/envir
 | `accounts` | One entry per account, with account-level settings. `kind` is `aws` (serves `bedrock` models), `openai` (serves `openai` models: an OpenAI-compatible server such as vLLM), or a kind added with `register_account_kind` |
 | `models` | One entry per alias: `type` (`chat` or `embedding`), `provider`, `model_id`, settings, and `deployments` |
 | `models.*.deployments` | Per account: `confirmed` regions (used first) and `fallback` regions (used by the `fallback` rule), plus deployment-level settings |
-| `live_edit` | Optional: `safe`, `all` or `off`; the live-edit mode of this document (deploy-only). Unset, each process's `LLMQ_REGISTRY_LIVE_EDIT` applies |
+| `live_edit` | Optional: `safe`, `all` or `off`; the live-edit mode of this document (deploy-only). Unset, each process's `LLMQ_REGISTRY_LIVE_EDIT_MODE` applies |
 | `min_lib_version` | Optional: the oldest llm-queue that may use this document (for example `0.1.0b2`) |
 
 Invalid documents are refused with every problem listed at once.
@@ -250,7 +250,7 @@ written. Details: [Placeholders and YAML](../reference/registry.md#placeholders-
 | Kind | Fields | Notes |
 |---|---|---|
 | `aws` | `role_arn`, `external_id_ref` (both optional) | Without `role_arn` the pod's own identity is used (EKS pod identity, IRSA, instance role); with it the role is assumed per account. Takes no `base_url` / `api_key_ref` |
-| `openai` | `base_url` (required), `api_key_ref` | `https` unless the host is local; no user, password or key in the URL; link-local and metadata addresses refused; the host must be in `LLMQ_BASE_URL_ALLOWED_HOSTS` when strict |
+| `openai` | `base_url` (required), `api_key_ref` | `https` unless the host is local; no user, password or key in the URL; link-local and metadata addresses refused; the host must be in `LLMQ_HTTP_ALLOWED_HOSTS` when strict |
 
 `api_key_ref` and `external_id_ref` name a secret, not hold it: an upper-case name that starts
 with `LLMQ_ACCOUNT_`, looked up in `from_env(secrets=)` and then the environment. Any other name
@@ -278,7 +278,7 @@ llm-queue deployments get gpt120b aws-main/us-east-1  # one deployment's setting
 ## Live edits
 
 The registry can be changed while the system runs, without a deploy. The document's `live_edit`
-field (else `LLMQ_REGISTRY_LIVE_EDIT`, default `safe`) decides what may change live. Keeping the
+field (else `LLMQ_REGISTRY_LIVE_EDIT_MODE`, default `safe`) decides what may change live. Keeping the
 mode in the document makes it one rule for the whole environment rather than per process.
 
 | Value | Live edits allowed |

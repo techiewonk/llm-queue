@@ -257,7 +257,7 @@ class _FakeEngine:
         self.metrics = None
         self.hash_id = str  # the job runner hashes a job's ids with it
         self.settings = SimpleNamespace(
-            queue_prefix="", drain_secs=0, queue_wait_replicas=0, queue_wait_ms=100
+            queue_prefix="", drain_secs=0, replica_wait_count=0, replica_wait_ms=100
         )
         self.loops: list[asyncio.AbstractEventLoop] = []
 
@@ -279,7 +279,7 @@ class _FakeEngine:
 
 
 def _queue() -> LLMQueue:
-    return LLMQueue(_FakeEngine(), settings=SimpleNamespace(mode="caller"))  # type: ignore[arg-type]
+    return LLMQueue(_FakeEngine(), settings=SimpleNamespace(role="caller"))  # type: ignore[arg-type]
 
 
 @pytest.fixture

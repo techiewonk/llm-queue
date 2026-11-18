@@ -313,11 +313,11 @@ def test_r3je6_register_job_in_caller_mode_is_refused() -> None:
     """R3JE-6: a caller-mode process starts no job loops; its registered jobs never ran."""
     engine = SimpleNamespace(
         queues=None,
-        settings=SimpleNamespace(queue_prefix="", queue_wait_replicas=0, queue_wait_ms=100),
+        settings=SimpleNamespace(queue_prefix="", replica_wait_count=0, replica_wait_ms=100),
         metrics=None,
         hash_id=_hash,
     )
-    queue = LLMQueue(engine, settings=SimpleNamespace(mode="caller"))  # type: ignore[arg-type]
+    queue = LLMQueue(engine, settings=SimpleNamespace(role="caller"))  # type: ignore[arg-type]
     with pytest.raises(ConfigError, match="caller mode"):
         queue.register_job("j", _noop)
 

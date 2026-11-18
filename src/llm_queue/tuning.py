@@ -129,10 +129,12 @@ class Tuning:
     openai: OpenAIOptions = field(default_factory=OpenAIOptions)
     warm: WarmOptions = field(default_factory=WarmOptions)
 
-    def problems(self, *, queue_wait_ms: int = 0, result_ttl_secs: int | None = None) -> list[str]:
+    def problems(
+        self, *, replica_wait_ms: int = 0, result_ttl_secs: int | None = None
+    ) -> list[str]:
         """Every bad value and bad combination, one line each (empty when all is well).
 
-        `queue_wait_ms` is `LLMQ_QUEUE_WAIT_MS`: WAIT blocks a connection that long, so the
+        `replica_wait_ms` is `LLMQ_REPLICA_WAIT_MS`: WAIT blocks a connection that long, so the
         store read timeout must be above it. `result_ttl_secs` is `LLMQ_RESULT_TTL_SECS`: a
         result must outlive a waiting caller's last-resort read (R3CF-10).
         """
@@ -160,7 +162,7 @@ class Tuning:
         store, engine = self.store, self.engine
         blocking = {
             "engine.idle_slow_secs": ("BLPOP", engine.idle_slow_secs),
-            "LLMQ_QUEUE_WAIT_MS": ("WAIT", queue_wait_ms / 1000),
+            "LLMQ_REPLICA_WAIT_MS": ("WAIT", replica_wait_ms / 1000),
             "engine.stream_read_block_ms": ("XREAD BLOCK", engine.stream_read_block_ms / 1000),
         }
         for name, (command, secs) in blocking.items():

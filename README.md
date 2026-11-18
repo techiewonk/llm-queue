@@ -39,7 +39,7 @@ with Amazon Bedrock and OpenAI-compatible servers (such as vLLM), and with LangC
   optional token streaming (`queue_streaming=True`).
 - **Observability.** CloudWatch EMF or Prometheus metrics (`GET /metrics`), alerts, a status
   API, health and readiness routes, a CLI, and a documented list of every log event.
-- **Runs on a shared cache store.** With `LLMQ_KEY_EXPIRY=auto` (the default) llm-queue keeps
+- **Runs on a shared cache store.** With `LLMQ_KEY_EXPIRY_MODE=auto` (the default) llm-queue keeps
   no TTL on the keys it needs when the store's policy is `volatile-*` (ElastiCache's default
   `volatile-lru`), so it can share one Valkey with your app's cache and none of its keys is
   evicted. See [Run on a shared cache store](https://techiewonk.github.io/llm-queue/how-to/shared-cache-store/).

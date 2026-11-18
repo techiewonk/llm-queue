@@ -60,7 +60,7 @@ The Valkey / Redis client of every process. The pool size is `LLMQ_STORE_MAX_CON
 |---|---|---|---|
 | `store.retries` | 3 | 0 to 100 (whole) | Retries of a failed store command, with jittered backoff (about 1.5 s in all) |
 | `store.connect_timeout_secs` | 5 | above 0 to 86400 | A store node that does not answer in a failover fails fast |
-| `store.read_timeout_secs` | 15 | above 0 to 86400 | A reply that never comes fails the command instead of hanging its call; at least 1 s above every blocking command (`engine.idle_slow_secs`, `LLMQ_QUEUE_WAIT_MS`, `engine.stream_read_block_ms`) |
+| `store.read_timeout_secs` | 15 | above 0 to 86400 | A reply that never comes fails the command instead of hanging its call; at least 1 s above every blocking command (`engine.idle_slow_secs`, `LLMQ_REPLICA_WAIT_MS`, `engine.stream_read_block_ms`) |
 | `store.health_check_secs` | 30 | above 0 to 86400 | A connection idle this long is pinged before use |
 | `store.pool_wait_secs` | 10 | above 0 to 86400 | A burst waits this long for a free connection |
 
@@ -211,7 +211,7 @@ of every setting and the level it came from.
 | `fallback_policy` | defaults, model | none | a hook name | Name of a registered fallback policy hook |
 | `token_estimator` | defaults, model | none | a hook name | Name of a registered token estimator |
 | `probe` | defaults, model | none | a hook name | Name of a registered health probe |
-| `debug_capture` | model | false | true or false | Store prompt and answer for an hour (dev only, with `LLMQ_DEBUG_CAPTURE_FROM_CONFIG`; protected) |
+| `debug_capture` | model | false | true or false | Store prompt and answer for an hour (dev only, with `LLMQ_DEBUG_CAPTURE_ENABLED`; protected) |
 | `fairness` | defaults, model | see fields | object, fields below | *merged*: per-tenant fairness, off by default. See [Tenant fairness](../explanation/fairness.md) |
 
 ### Fields of the object settings

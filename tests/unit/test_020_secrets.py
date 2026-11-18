@@ -1,4 +1,4 @@
-"""0.2.0 secrets: `LLMQ_SECRETS_SOURCE`, `LLMQ_SECRET_NAMES` and `llm_queue.secrets`.
+"""0.2.0 secrets: `LLMQ_SECRETS_SOURCE`, `LLMQ_SECRETS_NAMES` and `llm_queue.secrets`.
 
 No AWS call is made: the Secrets Manager client is a real botocore client under a `Stubber`,
 handed in through the client factory hook.
@@ -336,7 +336,7 @@ def test_aws_rotation_is_seen_after_the_cache_and_a_failed_refresh_keeps_values(
     stub.assert_no_pending_responses()
 
 
-# Layers: LLMQ_SECRETS_SOURCE, LLMQ_SECRET_NAMES ------------------------------------------------
+# Layers: LLMQ_SECRETS_SOURCE, LLMQ_SECRETS_NAMES ------------------------------------------------
 
 
 def _volume(tmp_path: Path, **values: str) -> Path:
@@ -364,7 +364,7 @@ def test_settings_from_a_source_under_mapped_names(tmp_path: Path) -> None:
             **DEV,
             "LLMQ_STORE_TLS_ENABLED": "false",
             "LLMQ_SECRETS_SOURCE": f"file:{volume}",
-            "LLMQ_SECRET_NAMES": json.dumps(names),
+            "LLMQ_SECRETS_NAMES": json.dumps(names),
         }
     )
     assert settings.store_url.startswith("redis://:")
@@ -372,7 +372,7 @@ def test_settings_from_a_source_under_mapped_names(tmp_path: Path) -> None:
     assert settings.id_hash_salt == SALT
     assert settings.secrets_source == f"file:{volume}"
     assert settings.secret_sources == (f"file:{volume}",)
-    assert settings.secret_names == tuple(sorted(names))
+    assert settings.secrets_names == tuple(sorted(names))
     _no_secret_in(repr(settings))
 
 
@@ -381,15 +381,15 @@ def test_secret_names_argument_wins_per_setting(tmp_path: Path) -> None:
     layers = Layers(
         {
             "LLMQ_SECRETS_SOURCE": f"file:{volume}",
-            "LLMQ_SECRET_NAMES": json.dumps(
-                {"LLMQ_ADMIN_TOKEN": "env_key", "LLMQ_DEFAULT_TENANT": "other"}
+            "LLMQ_SECRETS_NAMES": json.dumps(
+                {"LLMQ_ADMIN_TOKEN": "env_key", "LLMQ_TENANT_DEFAULT": "other"}
             ),
         },
-        secret_names={"LLMQ_ADMIN_TOKEN": "arg_key"},
+        secrets_names={"LLMQ_ADMIN_TOKEN": "arg_key"},
     )
     assert layers.get("LLMQ_ADMIN_TOKEN") == "from-arg"
-    assert layers.get("LLMQ_DEFAULT_TENANT") == "o"
-    assert layers.secret_names == {"LLMQ_ADMIN_TOKEN": "arg_key", "LLMQ_DEFAULT_TENANT": "other"}
+    assert layers.get("LLMQ_TENANT_DEFAULT") == "o"
+    assert layers.secrets_names == {"LLMQ_ADMIN_TOKEN": "arg_key", "LLMQ_TENANT_DEFAULT": "other"}
 
 
 def test_secret_names_from_defaults_as_a_mapping(tmp_path: Path) -> None:
@@ -398,17 +398,17 @@ def test_secret_names_from_defaults_as_a_mapping(tmp_path: Path) -> None:
         {},
         defaults={
             "LLMQ_SECRETS_SOURCE": f"file:{volume}",
-            "LLMQ_SECRET_NAMES": {"LLMQ_DEFAULT_TENANT": "tenant"},
+            "LLMQ_SECRETS_NAMES": {"LLMQ_TENANT_DEFAULT": "tenant"},
         },
     )
-    assert layers.get("LLMQ_DEFAULT_TENANT") == "acme"
+    assert layers.get("LLMQ_TENANT_DEFAULT") == "acme"
 
 
 def test_secret_names_are_validated_all_at_once() -> None:
     with pytest.raises(ConfigError) as info:
         Layers(
             {
-                "LLMQ_SECRET_NAMES": json.dumps(
+                "LLMQ_SECRETS_NAMES": json.dumps(
                     {
                         "STORE_HOST": "h",
                         "LLMQ_STORE_PORT": "",
@@ -418,18 +418,18 @@ def test_secret_names_are_validated_all_at_once() -> None:
                 ),
                 "LLMQ_SECRETS_CACHE_SECS": "-1",
             },
-            secret_names={"LLMQ_ADMIN_TOKEN": " "},
+            secrets_names={"LLMQ_ADMIN_TOKEN": " "},
         )
     text = str(info.value)
     assert "'STORE_HOST' is not an LLMQ_* setting" in text
-    assert "LLMQ_SECRET_NAMES: LLMQ_STORE_PORT must name a secret key" in text
+    assert "LLMQ_SECRETS_NAMES: LLMQ_STORE_PORT must name a secret key" in text
     assert "LLMQ_SECRETS_SOURCE is read from the environment, not a secret" in text
-    assert "LLMQ_SECRET_NAMES: LLMQ_KEY_PREFIX must name a secret key" in text
-    assert "secret_names: LLMQ_ADMIN_TOKEN must name a secret" in text
+    assert "LLMQ_SECRETS_NAMES: LLMQ_KEY_PREFIX must name a secret key" in text
+    assert "secrets_names: LLMQ_ADMIN_TOKEN must name a secret" in text
     assert "LLMQ_SECRETS_CACHE_SECS must be 0 or more" in text
     for bad in ("not json", "[1]"):
-        with pytest.raises(ConfigError, match="LLMQ_SECRET_NAMES must be a JSON object"):
-            Layers({"LLMQ_SECRET_NAMES": bad})
+        with pytest.raises(ConfigError, match="LLMQ_SECRETS_NAMES must be a JSON object"):
+            Layers({"LLMQ_SECRETS_NAMES": bad})
 
 
 def test_the_secrets_settings_are_never_read_from_a_secret(tmp_path: Path) -> None:
@@ -461,10 +461,10 @@ def test_code_secrets_win_over_the_source_which_is_not_read(tmp_path: Path) -> N
     layers = Layers(
         {"LLMQ_SECRETS_SOURCE": f"file:{tmp_path / 'absent'}", "LLMQ_KEY_PREFIX": "env"},
         {"LLMQ_KEY_PREFIX": "code"}.get,
-        {"LLMQ_KEY_PREFIX": "default", "LLMQ_DEFAULT_TENANT": "d"},
+        {"LLMQ_KEY_PREFIX": "default", "LLMQ_TENANT_DEFAULT": "d"},
     )
     assert layers.get("LLMQ_KEY_PREFIX") == "code"
-    assert layers.get("LLMQ_DEFAULT_TENANT") == "d"  # environment, then defaults, as before
+    assert layers.get("LLMQ_TENANT_DEFAULT") == "d"  # environment, then defaults, as before
     assert layers.describe_secrets() == {"sources": ["code"], "names": []}
 
 
@@ -472,7 +472,7 @@ def test_env_source_maps_other_variable_names(tmp_path: Path) -> None:
     layers = Layers(
         {
             "LLMQ_SECRETS_SOURCE": "env",
-            "LLMQ_SECRET_NAMES": '{"LLMQ_ADMIN_TOKEN": "APP_ADMIN_TOKEN"}',
+            "LLMQ_SECRETS_NAMES": '{"LLMQ_ADMIN_TOKEN": "APP_ADMIN_TOKEN"}',
             "APP_ADMIN_TOKEN": "tok",
         }
     )
@@ -513,7 +513,7 @@ def test_queue_password_jobs_admin_token_and_account_refs_through_the_source(
                 "LLMQ_STORE_URL": "redis://localhost:6379/0",
                 **DEV,
                 "LLMQ_SECRETS_SOURCE": f"file:{volume}",
-                "LLMQ_SECRET_NAMES": json.dumps(
+                "LLMQ_SECRETS_NAMES": json.dumps(
                     {"LLMQ_STORE_PASSWORD": "valkey_key", "LLMQ_ADMIN_TOKEN": "admin"}
                 ),
             }
@@ -743,8 +743,8 @@ def test_the_admin_token_guard_reads_a_secret_off_the_event_loop() -> None:
 
 def test_a_setting_named_twice_in_secret_names_is_refused() -> None:
     names = '{"LLMQ_STORE_PASSWORD": "a", "LLMQ_STORE_PASSWORD": "b"}'
-    with pytest.raises(ConfigError, match="LLMQ_SECRET_NAMES: LLMQ_STORE_PASSWORD is set twice"):
-        Layers({**DEV, "LLMQ_SECRET_NAMES": names})
+    with pytest.raises(ConfigError, match="LLMQ_SECRETS_NAMES: LLMQ_STORE_PASSWORD is set twice"):
+        Layers({**DEV, "LLMQ_SECRETS_NAMES": names})
 
 
 def test_secret_names_argument_values_are_stripped(tmp_path: Path) -> None:
@@ -753,10 +753,10 @@ def test_secret_names_argument_values_are_stripped(tmp_path: Path) -> None:
     (volume / "valkey_key").write_text(PASSWORD, encoding="utf-8")
     layers = Layers(
         {**DEV, "LLMQ_SECRETS_SOURCE": f"file:{volume}"},
-        secret_names={" LLMQ_STORE_PASSWORD ": " valkey_key\n"},
+        secrets_names={" LLMQ_STORE_PASSWORD ": " valkey_key\n"},
     )
     assert layers.get("LLMQ_STORE_PASSWORD") == PASSWORD
-    assert layers.secret_names == {"LLMQ_STORE_PASSWORD": "valkey_key"}
+    assert layers.secrets_names == {"LLMQ_STORE_PASSWORD": "valkey_key"}
 
 
 def test_dotenv_inline_comments_and_quotes_follow_the_documented_rule(tmp_path: Path) -> None:

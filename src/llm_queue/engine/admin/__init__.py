@@ -140,7 +140,7 @@ class AdminServices:
             registry = LocalRegistry(
                 orjson.loads(settings.registry_document()),
                 prefix=settings.key_prefix,
-                allowed_hosts=settings.base_url_allowed_hosts,
+                allowed_hosts=settings.http_allowed_hosts,
             )
             salt = settings.id_hash_salt or ""
 
@@ -190,14 +190,14 @@ class AdminServices:
         *,
         secrets: Callable[[str], str | None] | None = None,
         defaults: Mapping[str, Any] | None = None,
-        secret_names: Mapping[str, str] | None = None,
+        secrets_names: Mapping[str, str] | None = None,
     ) -> AdminServices:
         """Standalone services from `LLMQ_*` (CLI, admin workers); close with `aclose()`.
 
         Read as `LLMQueue.from_env` reads its settings (same arguments): `secrets` when given,
         else the sources `LLMQ_SECRETS_SOURCE` names, then `environ`, then `defaults`.
         """
-        layers = Layers(environ, secrets, defaults, secret_names)
+        layers = Layers(environ, secrets, defaults, secrets_names)
         settings = InfraSettings.from_layers(layers)
         if not settings.enabled:  # LLMQ_ENABLED=false: nothing to talk to
             return cls.for_disabled(settings=settings)

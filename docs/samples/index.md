@@ -42,7 +42,7 @@ flowchart LR
 ```
 
 The runner only sets the environment and starts each sample as its own process. Inside, the
-sample starts the queue; the same process acts as caller and worker (`LLMQ_MODE=both`), just as
+sample starts the queue; the same process acts as caller and worker (`LLMQ_ROLE=both`), just as
 an app pod does. At the end the runner deletes every key under the run's prefix.
 
 ## The samples

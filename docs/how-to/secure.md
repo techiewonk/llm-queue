@@ -57,7 +57,7 @@ The registry names secrets; it never holds them:
 ### Read secrets from a secret store, not the manifest
 
 Set `LLMQ_SECRETS_SOURCE` (`aws-secretsmanager:<id>` on the pod role, or `file:<path>` on a
-mounted Kubernetes secret) and `LLMQ_SECRET_NAMES`, so the store password, the id salt and the
+mounted Kubernetes secret) and `LLMQ_SECRETS_NAMES`, so the store password, the id salt and the
 admin token never sit in a manifest or the environment (see
 [Configure: Secrets](configure.md#secrets)):
 
@@ -81,7 +81,7 @@ An `openai` account's `base_url`:
 - must not point at a link-local, metadata (`169.254.169.254`, `fd00:ec2::/32`), unspecified or
   multicast address, in any spelling (`0x7f.1`, `2130706433` and `::ffff:a.b.c.d` are read as
   the address they name);
-- must name a host in `LLMQ_BASE_URL_ALLOWED_HOSTS`. When strict, the variable is required as
+- must name a host in `LLMQ_HTTP_ALLOWED_HOSTS`. When strict, the variable is required as
   soon as the registry has an `openai` account.
 
 ## 4. Protect the HTTP write routes
@@ -127,7 +127,7 @@ app.include_router(
   the header). A shared token has no identity: the `X-LLMQ-Actor`
   value is a claimed name, labelled as such; apps with real auth pass `actor=`.
 - `GET /dlq/{entry_id}?unsafe=true` returns message bodies (prompts) only with
-  `LLMQ_ADMIN_DLQ_BODIES_ENABLED=true`.
+  `LLMQ_ADMIN_DEAD_LETTER_BODIES_ENABLED=true`.
 - Bodies and ids are bounded before any store read: at most 100 paths per edit, ids and names
   of at most 256 characters.
 
@@ -163,7 +163,7 @@ also match each pod's own deploy config: a stored document that differs is refus
 
 - No prompt text is logged; ids are hashed (user, session, and tenant in logs).
 - `debug_capture` (prompt text in the store for an hour) needs
-  `LLMQ_DEBUG_CAPTURE_FROM_CONFIG=true`, which is refused in every strict environment.
+  `LLMQ_DEBUG_CAPTURE_ENABLED=true`, which is refused in every strict environment.
 - Dead letters hold the prompt: `queue.dlq_retention_secs` is capped at two weeks and dead
   letters are trimmed on a timer.
 

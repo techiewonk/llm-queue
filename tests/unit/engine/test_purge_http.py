@@ -22,9 +22,9 @@ def test_purge_settings_defaults_and_validation() -> None:
     custom = InfraSettings.from_env(
         {
             **DEV,
-            "LLMQ_AUTO_PURGE": "off",
+            "LLMQ_PURGE_AUTO_ENABLED": "off",
             "LLMQ_REQUEST_INDEX_ENABLED": "off",
-            "LLMQ_TENANT_PURGE_DEFAULT": "running, keys",
+            "LLMQ_PURGE_TENANT_REMOVE": "running, keys",
             "LLMQ_ADMIN_BATCH": "50",
         }
     )
@@ -32,8 +32,8 @@ def test_purge_settings_defaults_and_validation() -> None:
     assert (got.auto, got.request_index, got.batch) == (False, False, 50)
     assert got.tenant_default == frozenset({"keys", "running"})
     for name, value in (
-        ("LLMQ_AUTO_PURGE", "maybe"),
-        ("LLMQ_TENANT_PURGE_DEFAULT", "keys,everything"),
+        ("LLMQ_PURGE_AUTO_ENABLED", "maybe"),
+        ("LLMQ_PURGE_TENANT_REMOVE", "keys,everything"),
         ("LLMQ_ADMIN_BATCH", "0"),
     ):
         with pytest.raises(ConfigError, match=name):
@@ -59,14 +59,14 @@ def test_report_as_dict() -> None:
 def test_key_expiry_and_purge_switches_are_validated() -> None:
     """Each new setting has a default and refuses a bad value (owner: default + configurable)."""
     settings = InfraSettings.from_env(DEV)
-    assert (settings.key_expiry, settings.http_purge_wait_secs) == ("auto", 60.0)
-    assert (settings.ttl_sweep_batch, settings.ttl_sweep_rounds) == (500, 100)
+    assert (settings.key_expiry_mode, settings.admin_http_wait_secs) == ("auto", 60.0)
+    assert (settings.key_expiry_sweep_batch, settings.key_expiry_sweep_rounds) == (500, 100)
     for name, value in (
-        ("LLMQ_KEY_EXPIRY", "sometimes"),
-        ("LLMQ_HTTP_PURGE_WAIT_SECS", "4000"),
-        ("LLMQ_PURGE_WAIT", "maybe"),
+        ("LLMQ_KEY_EXPIRY_MODE", "sometimes"),
+        ("LLMQ_ADMIN_HTTP_WAIT_SECS", "4000"),
+        ("LLMQ_PURGE_WAIT_ENABLED", "maybe"),
         ("LLMQ_REQUEST_INDEX_ENABLED", "maybe"),
-        ("LLMQ_TTL_SWEEP_BATCH", "6000"),
+        ("LLMQ_KEY_EXPIRY_SWEEP_BATCH", "6000"),
     ):
         with pytest.raises(ConfigError, match=name):
             InfraSettings.from_env({**DEV, name: value})

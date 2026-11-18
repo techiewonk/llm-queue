@@ -206,8 +206,8 @@ class LocalOpsAdmin:
         out: dict[str, Any] = {
             "library": {
                 "version": __version__,
-                "worker": engine.worker_id if engine is not None else None,
-                "mode": settings.mode if settings else None,
+                "instance": engine.worker_id if engine is not None else None,
+                "role": settings.role if settings else None,
                 "execution_mode": "local",
                 "environment": settings.environment if settings else None,
             },

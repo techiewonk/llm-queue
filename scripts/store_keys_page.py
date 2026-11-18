@@ -110,7 +110,7 @@ details.key > summary::-webkit-details-marker { display: none }
     <div class="modes">
       <div class="mode"><h3>native</h3><p>Valkey TTLs, as in 0.1.0b2. Safe only on <code>noeviction</code>.</p><p><span class="pill plain">PEXPIRE key 180000</span></p></div>
       <div class="mode"><h3>swept</h3><p>No TTL; the index holds the expiry. Safe on <code>noeviction</code> and every <code>volatile-*</code> policy.</p><p><span class="pill ok">ZADD P:ttl now+180000 key</span></p></div>
-      <div class="mode"><h3>auto (default)</h3><p><code>LLMQ_KEY_EXPIRY=auto</code> reads the store's policy at start and each minute: <code>noeviction</code> &rarr; native, anything else &rarr; swept. The choice is stored in <code>P:expiry</code>.</p></div>
+      <div class="mode"><h3>auto (default)</h3><p><code>LLMQ_KEY_EXPIRY_MODE=auto</code> reads the store's policy at start and each minute: <code>noeviction</code> &rarr; native, anything else &rarr; swept. The choice is stored in <code>P:expiry</code>.</p></div>
     </div>
   </section>
 
@@ -122,7 +122,7 @@ details.key > summary::-webkit-details-marker { display: none }
       <tbody>
         <tr><td><code>noeviction</code></td><td>native</td><td><span class="pill ok">no</span></td><td>Writes refused (OOM): calls fail <code>queue_unavailable</code> or wait per <code>store_down</code>, loudly</td><td><span class="pill ok">ready</span></td></tr>
         <tr><td><code>volatile-lru / lfu / ttl / random</code></td><td>swept</td><td><span class="pill ok">no</span> (only the locks, health probe and debug keys, on purpose)</td><td>Your app's TTL keys are evicted; if only TTL-free keys remain, writes are refused as with noeviction</td><td><span class="pill ok">ready</span></td></tr>
-        <tr><td><code>volatile-*</code> with <code>LLMQ_KEY_EXPIRY=native</code></td><td>(forced)</td><td><span class="pill bad">yes</span>: budgets, records, results</td><td>Silent loss</td><td><span class="pill bad">not ready</span></td></tr>
+        <tr><td><code>volatile-*</code> with <code>LLMQ_KEY_EXPIRY_MODE=native</code></td><td>(forced)</td><td><span class="pill bad">yes</span>: budgets, records, results</td><td>Silent loss</td><td><span class="pill bad">not ready</span></td></tr>
         <tr><td><code>allkeys-*</code></td><td>swept</td><td><span class="pill bad">yes</span>: everything, queues too</td><td>Silent loss</td><td><span class="pill bad">not ready</span></td></tr>
       </tbody>
     </table></div>
@@ -152,17 +152,17 @@ Reply returned to the app</pre></div>
     <div class="scroll"><table>
       <thead><tr><th>Setting</th><th>Default</th><th>Controls</th></tr></thead>
       <tbody>
-        <tr><td><code>LLMQ_KEY_EXPIRY</code></td><td>auto</td><td>native TTLs or the swept index</td></tr>
-        <tr><td><code>LLMQ_TTL_SWEEP_BATCH</code> / <code>_ROUNDS</code></td><td>500 / 20</td><td>Keys deleted per sweep run / full batches per sweep</td></tr>
+        <tr><td><code>LLMQ_KEY_EXPIRY_MODE</code></td><td>auto</td><td>native TTLs or the swept index</td></tr>
+        <tr><td><code>LLMQ_KEY_EXPIRY_SWEEP_BATCH</code> / <code>_ROUNDS</code></td><td>500 / 20</td><td>Keys deleted per sweep run / full batches per sweep</td></tr>
         <tr><td><code>LLMQ_RESULT_TTL_SECS</code></td><td>300</td><td>How long a result waits to be read</td></tr>
         <tr><td><code>LLMQ_RESULT_DEDUPE_SECS</code></td><td>0</td><td>Keep a result after its first read (else 2 s)</td></tr>
         <tr><td><code>LLMQ_STATUS_TTL_SECS</code></td><td>1800</td><td>Request status, cancel flags, finished records</td></tr>
         <tr><td><code>LLMQ_CALLER_TTL_SECS</code></td><td>30 (45 effective)</td><td>Caller process liveness</td></tr>
         <tr><td><code>LLMQ_LEASE_SECS</code></td><td>60</td><td>Running-call leases; renewed every 20 s</td></tr>
         <tr><td><code>LLMQ_AUDIT_RETENTION_DAYS</code></td><td>90</td><td>Registry audit stream (also capped near 10,000)</td></tr>
-        <tr><td><code>LLMQ_AUTO_PURGE</code> / <code>LLMQ_PURGE_GRACE_SECS</code></td><td>on / 900</td><td>Delete a removed model's or deployment's keys after the grace</td></tr>
-        <tr><td><code>LLMQ_PURGE_WAIT</code> / <code>_WAIT_SECS</code></td><td>true / 300</td><td>A deployment purge waits for its running calls</td></tr>
-        <tr><td><code>LLMQ_REQUEST_INDEX_ENABLED</code> / <code>LLMQ_TENANT_PURGE_DEFAULT</code></td><td>true / keys</td><td>Request index per model and tenant (needed to find a tenant's calls) / what a tenant purge removes</td></tr>
+        <tr><td><code>LLMQ_PURGE_AUTO_ENABLED</code> / <code>LLMQ_PURGE_GRACE_SECS</code></td><td>on / 900</td><td>Delete a removed model's or deployment's keys after the grace</td></tr>
+        <tr><td><code>LLMQ_PURGE_WAIT_ENABLED</code> / <code>_WAIT_SECS</code></td><td>true / 300</td><td>A deployment purge waits for its running calls</td></tr>
+        <tr><td><code>LLMQ_REQUEST_INDEX_ENABLED</code> / <code>LLMQ_PURGE_TENANT_REMOVE</code></td><td>true / keys</td><td>Request index per model and tenant (needed to find a tenant's calls) / what a tenant purge removes</td></tr>
         <tr><td>Registry <code>queue.retention_secs</code>, <code>dlq_retention_secs</code></td><td>86400</td><td>Queue stream and dead-letter trimming</td></tr>
         <tr><td>Registry <code>sticky.idle_ttl_secs</code></td><td>1800</td><td>Session-to-deployment stickiness</td></tr>
       </tbody>

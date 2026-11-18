@@ -83,14 +83,14 @@ counts, never a tenant name), purges included (which also write `llmq_purge`); `
 | `key_expiry_publish_failed` | warning | engine/runtime.py |
 | `llmq_admin` | info | engine/audit.py |
 | `llmq_call_finished` | info | engine/runtime.py |
-| `llmq_configured` | info | core.py (once per `start()`, every mode: the `describe()` summary: version, worker id, roles, environment, store `scheme://host:port` (no password), prefixes, key expiry, pool, metrics sink, registry version and models, `default_tenant_hash`; never a salt, token, tenant name or registry body) |
+| `llmq_configured` | info | core.py (once per `start()`, every mode: the `describe()` summary: version, worker id, roles, environment, store `scheme://host:port` (no password), prefixes, key expiry, pool, metrics sink, registry version and models, `tenant_default_hash`; never a salt, token, tenant name or registry body) |
 | `llmq_configured_failed` | warning | core.py (`describe()` raised at start, e.g. a registry file changed since `from_env`; the start goes on) |
 | `llmq_disabled` | info | disabled.py (`LLMQ_ENABLED=false`: once at `start()`, with `describe()`: version, `enabled: false`, environment, whether a drain file is watched) |
 | `llmq_purge` | info | engine/purge.py |
 | `llmq_registry_audit` | info | registry/store.py |
 | `llmq_start_failed` | error | fastapi.py (`on_start_error="log"`: the app stays up, not ready) |
 | `local_attempt_failed` | warning | engine/local.py (one provider attempt on the local executor: `local` mode or `store_down: static_cap`, field `path`) |
-| `local_mode_started` | info | core.py (`LLMQ_EXECUTION_MODE=local`: process count, concurrency, `budgets` (per model the rpm / tpm this process may use), an `LLMQ_MODE` that does not apply) |
+| `local_mode_started` | info | core.py (`LLMQ_EXECUTION_MODE=local`: process count, concurrency, `budgets` (per model the rpm / tpm this process may use), an `LLMQ_ROLE` that does not apply) |
 | `message_needs_newer_library` | warning | engine/runtime.py |
 | `metric_dropped` | warning | engine/metrics.py |
 | `model_loop_died` | error | engine/runtime.py |

@@ -119,7 +119,7 @@ settings (`registry.set`); jobs are sent by the app (`llmq.send_job`), their dea
 
 | Op | Parameters (default) | Answer |
 |---|---|---|
-| `process.describe` | | `{version, worker_id, enabled, execution_mode, secrets, mode, environment, store, separate_queue_store, key_prefix, queue_prefix, key_expiry, store_max_connections, metrics_sink, default_tenant_hash, admin_writes_enabled, registry_version, models}` (no password, salt, token or registry body; `default_tenant` too only with `LLMQ_TENANT_NAMES_ENABLED`); logged once at start as `llmq_configured`. Off: `{version, enabled: false, environment, drain_file}` |
+| `process.describe` | | `{version, worker_id, enabled, execution_mode, secrets, mode, environment, store, separate_queue_store, key_prefix, queue_prefix, key_expiry_mode, store_max_connections, metrics_sink, tenant_default_hash, admin_writes_enabled, registry_version, models}` (no password, salt, token or registry body; `tenant_default` too only with `LLMQ_TENANT_NAMES_ENABLED`); logged once at start as `llmq_configured`. Off: `{version, enabled: false, environment, drain_file}` |
 | `status.get` | `model` (all), `tenant` / `tenant_hash` (with a model) | `StatusReport`, or `ModelStatus` of one model (with `tenants` and `request_index`); with a tenant also `tenant: {tenant, waiting, running, by_stage, oldest_wait_secs, fairness}` |
 | `status.health` | `model` (all) | `{health, registry_version, models: [{model, state, reasons, budget_used_pct, waiting, oldest_waiting_secs, usable_deployments, deployments}]}`; `state` is `healthy`, `warning` or `critical` (`health` the worst), against the model's `health_summary` thresholds. Critical: `no_usable_deployment` (an enabled model), `budget_used`, `waiting`, `oldest_wait` at their critical mark; warning: those at their warning mark, `breaker_open`, `deployment_disabled`, `dead_letters` (`alerts.dlq_messages`), `kill_switch`, `model_disabled`. Local mode: this process's view and budget shares. The same summary is each model's `health` in `status.get` and `GET /` |
 | `registry.get` | `model` (whole document) | `{registry, changes, live_edits}`, secrets shown as `[redacted]` |
@@ -146,7 +146,7 @@ settings (`registry.set`); jobs are sent by the app (`llmq.send_job`), their dea
 | `tenants.hash` | `tenant` | `{tenant_hash}`: the keyed hash (`LLMQ_ID_HASH_SALT`) admin views show. Write-guarded over HTTP: it confirms which tenant a hash is |
 | `queues.list` | | `{queues: [{queue, model, job, class, messages, waiting, held, dead_letters, oldest_wait_secs, consumer}]}` |
 | `dlq.list` | `model` or `job`, `priority` (false), `count` (10) | `{queue, letters: [{id, src, fails, request_id, tenant}]}`; `tenant` is a hash, bodies never listed |
-| `dlq.show` | `entry_id`, `model` or `job`, `priority`, `unsafe` (false) | one letter; `body` only with `unsafe`, and over HTTP only with `LLMQ_ADMIN_DLQ_BODIES_ENABLED=true` |
+| `dlq.show` | `entry_id`, `model` or `job`, `priority`, `unsafe` (false) | one letter; `body` only with `unsafe`, and over HTTP only with `LLMQ_ADMIN_DEAD_LETTER_BODIES_ENABLED=true` |
 | `dlq.redrive` | `model` or `job`, `priority`, `count` (1,000) | `{queue, moved, dead_letters, dry_run}` |
 | `dlq.purge` | `model` or `job`, `priority`, `entry_ids` (all) | `{queue, deleted, dry_run}` |
 | `jobs.list` | | `{jobs: [{job, waiting, held, dead_letters, consumer}]}` |
@@ -163,7 +163,7 @@ under `AdminServices.from_env()` and the CLI. A tenant is given by name (`tenant
 `LLMQ_ID_HASH_SALT`, never stored) or by hash (`tenant_hash`, 16 hex, or `-` for calls with no
 tenant). `GET` routes take `tenant_hash` only (`?tenant=` is a 400: a name in a URL reaches
 access logs); run `llm-queue tenants hash NAME` first. `describe()` shows
-`default_tenant_hash`, and the name of `LLMQ_DEFAULT_TENANT` only with
+`tenant_default_hash`, and the name of `LLMQ_TENANT_DEFAULT` only with
 `LLMQ_TENANT_NAMES_ENABLED`. With `LLMQ_REQUEST_INDEX_ENABLED=false`, looking calls up by model and tenant answers
 `AdminRefused` (HTTP 409, CLI exit 1), `requests.count` and `requests.extend` included (a count
 of zeros would read as "nothing waiting"); `requests.get` and `requests.cancel` by request ids

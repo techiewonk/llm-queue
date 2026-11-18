@@ -38,7 +38,7 @@ gpt20b rpm 60 -> 45 (live)
   audit: {'id': '1794929827054-0', 'actor': 'sample', 'op': 'edit', 'version': '1', 'diff': [{'path': 'models.gpt20b.deployments.aws-main.overrides.us-east-1.enabled', 'before': False, 'after': None}], 'ts': '1794929827.055'}
 fairness on: {'mode': 'quota', 'active_tenants': 1, 'waiting_within_share': 0}
 fairness off: in status: False
-health: {'live': True, 'ready': True, 'draining': False, 'draining_since': None, 'worker': 'api-7f9c:12-9bb228', 'version': '0.1.1', 'registry_version': 1, 'held': 0, 'heartbeat_age_secs': 2.4, 'stores': {'state': 'ok', 'queue': 'ok'}, 'eviction_policy': 'noeviction', 'key_expiry': 'native'}
+health: {'live': True, 'ready': True, 'draining': False, 'draining_since': None, 'worker': 'api-7f9c:12-9bb228', 'version': '0.1.1', 'registry_version': 1, 'held': 0, 'heartbeat_age_secs': 2.4, 'stores': {'state': 'ok', 'queue': 'ok'}, 'eviction_policy': 'noeviction', 'key_expiry_mode': 'native'}
 ```
 
 The second and third audit entries come from [sample 05](errors-and-fallback.md) turning its

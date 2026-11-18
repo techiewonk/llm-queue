@@ -75,11 +75,11 @@ def test_defaults_fill_settings_below_environ_and_secrets() -> None:
         defaults={
             "LLMQ_LEASE_SECS": 90,
             "LLMQ_KEY_PREFIX": "from-default",
-            "LLMQ_DEFAULT_TENANT": "acme",
+            "LLMQ_TENANT_DEFAULT": "acme",
         },
     )
     assert (settings.lease_secs, settings.key_prefix) == (30, "from-secret")
-    assert settings.default_tenant == "acme"
+    assert settings.tenant_default == "acme"
 
 
 def test_defaults_and_secret_names_must_name_llmq_settings() -> None:
@@ -87,7 +87,7 @@ def test_defaults_and_secret_names_must_name_llmq_settings() -> None:
         environ={"LLMQ_STORE_URL": URL, **DEV}, defaults={"KEY_PREFIX": "x"}
     )
     text = _problems(
-        environ={"LLMQ_STORE_URL": URL, **DEV}, secret_names={"STORE_HOST": "h", "LLMQ_X": ""}
+        environ={"LLMQ_STORE_URL": URL, **DEV}, secrets_names={"STORE_HOST": "h", "LLMQ_X": ""}
     )
     assert "'STORE_HOST' is not an LLMQ_* setting" in text
     assert "LLMQ_X must name a secret" in text
@@ -140,7 +140,7 @@ def test_store_url_and_store_parts_are_one_conflict_group() -> None:
     assert "set LLMQ_STORE_URL or the store parts (LLMQ_STORE_HOST" in text
 
 
-# H7: secret_names ------------------------------------------------------------------------------
+# H7: secrets_names ------------------------------------------------------------------------------
 
 
 def test_secret_names_read_settings_from_secrets_under_other_names() -> None:
@@ -154,7 +154,7 @@ def test_secret_names_read_settings_from_secrets_under_other_names() -> None:
     settings = InfraSettings.from_env(
         {**DEV, "LLMQ_STORE_TLS_ENABLED": "false", "LLMQ_STORE_PORT": "1"},
         secrets=secrets,
-        secret_names={"LLMQ_STORE_HOST": "valkey_host", "LLMQ_STORE_PORT": "valkey_port"},
+        secrets_names={"LLMQ_STORE_HOST": "valkey_host", "LLMQ_STORE_PORT": "valkey_port"},
     )
     assert settings.store_url == "redis://cache.internal:6380/0"  # the secret beats the env
     assert "LLMQ_STORE_HOST" not in asked  # the mapped name only
@@ -175,7 +175,7 @@ def test_secret_names_apply_to_the_queue_settings_password_and_admin_token(
     llmq = LLMQueue.from_env(
         {"LLMQ_STORE_URL": URL, **DEV},
         secrets=vault.get,
-        secret_names={
+        secrets_names={
             "LLMQ_STORE_PASSWORD": "vk_pass",
             "LLMQ_ADMIN_TOKEN": "admin",
             "LLMQ_JOB_CONCURRENCY": "jobs",

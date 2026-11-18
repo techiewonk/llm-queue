@@ -45,7 +45,7 @@ adds the request context middleware, and mounts the admin, probe and drain route
 | **Must** | `LLMQ_DRAIN_FILE` touched by the preStop hook (several processes per pod) or `POST /drain` (one process) | Without it a rolling deploy cuts calls off instead of handing them to other pods |
 | **Must** | Queued model classes: `chat_model(...)` / `embeddings(...)` (or `QueuedChatBedrockConverse` / `QueuedBedrockEmbeddings`) | Only queued calls are admitted against the shared budgets |
 | **Must** | `LLMQ_ID_HASH_SALT`, `LLMQ_KEY_PREFIX` per app and environment, a TLS store URL (strict environments) | Refused at start otherwise; keeps environments apart |
-| **Should** | `request_context(user_id=, session_id=, tenant_id=, priority=)` per request (or `RequestContextMiddleware`, `LLMQ_DEFAULT_TENANT`) | Priority for interactive work, sticky sessions, tenant fairness and the per-tenant views |
+| **Should** | `request_context(user_id=, session_id=, tenant_id=, priority=)` per request (or `RequestContextMiddleware`, `LLMQ_TENANT_DEFAULT`) | Priority for interactive work, sticky sessions, tenant fairness and the per-tenant views |
 | **Should** | `llm_queue.background()` / `@background_priority` for background work | Background work never takes budget from waiting users |
 | **Should** | `error.category` / `error.retryable` in your error handling | Do not retry what the queue already retried |
 | **Should** | The admin routes with `LLMQ_ADMIN_TOKEN` (writes) and `LLMQ_ADMIN_READ_TOKEN` (dashboards); `GET /` and `/status` on your dashboard; a metrics sink (`emf` or `prometheus`) | Live status and operations without shell access |
@@ -59,7 +59,7 @@ adds the request context middleware, and mounts the admin, probe and drain route
 
 Set it per request: `request_context(...)` around the work, or `RequestContextMiddleware`
 (added by `install()`), with callables when the values come from the request. A single-tenant
-app sets `LLMQ_DEFAULT_TENANT` once. Background work runs under `llm_queue.background()` or
+app sets `LLMQ_TENANT_DEFAULT` once. Background work runs under `llm_queue.background()` or
 `@background_priority` (normal priority); `create_background_task` and `run_in_thread` carry
 the context into a task or a thread at background priority. See
 [Make calls](call.md#request-context).

@@ -84,7 +84,7 @@ pipelined batches of `LLMQ_ADMIN_BATCH` (500).
 
 ### Running calls on a deployment
 
-A deployment purge waits for its running calls first (`wait`, default `LLMQ_PURGE_WAIT=true`)
+A deployment purge waits for its running calls first (`wait`, default `LLMQ_PURGE_WAIT_ENABLED=true`)
 for at most `wait_secs` (default `LLMQ_PURGE_WAIT_SECS=300`). When calls are still running then,
 nothing is deleted and the report's `skipped` says how many. `wait=False` deletes at once; keys a
 finishing call writes back are cleaned by the next purge or expire on their own.
@@ -97,7 +97,7 @@ the audit name only the hash.
 
 | `remove` | Does |
 |---|---|
-| `keys` (default, `LLMQ_TENANT_PURGE_DEFAULT`) | Deletes the tenant's fairness state. A tenant that calls again starts fresh |
+| `keys` (default, `LLMQ_PURGE_TENANT_REMOVE`) | Deletes the tenant's fairness state. A tenant that calls again starts fresh |
 | `queued` | Cancels the tenant's calls still waiting (not running) |
 | `running` | Cancels every call of the tenant, running ones included |
 
@@ -110,7 +110,7 @@ logged `call_cancel` with `source=purge`.
 
 ## Automatic purge
 
-With `LLMQ_AUTO_PURGE=true` (the default), when a publish or reload drops a model or a
+With `LLMQ_PURGE_AUTO_ENABLED=true` (the default), when a publish or reload drops a model or a
 deployment, one worker (lock `P:lock:purge`) records it in `P:purge` with a due time of now
 plus `LLMQ_PURGE_GRACE_SECS` (900). The worker sweep loop then purges each due target **that is
 still absent** from the registry; a rollback within the grace keeps the state (the entry is
@@ -132,7 +132,7 @@ purges are audited with the actor `auto`.
   the longest call the registry allows (`timeout_max_secs`, 900), and a dropped deployment gets
   no new calls. If you raise `timeout_max_secs`, raise the grace to at least the same.
 
-Set `LLMQ_AUTO_PURGE=false` to purge only by hand (the 0.1.0b2 behaviour).
+Set `LLMQ_PURGE_AUTO_ENABLED=false` to purge only by hand (the 0.1.0b2 behaviour).
 
 ## CLI
 
@@ -168,7 +168,7 @@ curl -X POST https://app/llmq/purge/tenant -H "X-LLMQ-Token: $LLMQ_ADMIN_TOKEN" 
 A refused purge answers 409 (no `Retry-After`), a bad body 400, a store outage 503.
 
 An HTTP request should not hang for minutes, so a purge over HTTP that waits for running calls
-(`/purge/deployment`, `/purge/removed`) waits at most `LLMQ_HTTP_PURGE_WAIT_SECS` (60): a larger
+(`/purge/deployment`, `/purge/removed`) waits at most `LLMQ_ADMIN_HTTP_WAIT_SECS` (60): a larger
 or omitted `wait_secs` is capped to it. Calls still running then are reported in `skipped` and
 nothing of that deployment is deleted; purge again later, or send `"wait": false`.
 
@@ -176,13 +176,13 @@ nothing of that deployment is deleted; purge again later, or send `"wait": false
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LLMQ_AUTO_PURGE` | true | Auto purge after a registry drop |
+| `LLMQ_PURGE_AUTO_ENABLED` | true | Auto purge after a registry drop |
 | `LLMQ_PURGE_GRACE_SECS` | 900 | Grace before an auto purge |
-| `LLMQ_PURGE_WAIT` | true | A deployment purge waits for its running calls |
+| `LLMQ_PURGE_WAIT_ENABLED` | true | A deployment purge waits for its running calls |
 | `LLMQ_PURGE_WAIT_SECS` | 300 | ... at most this long |
-| `LLMQ_HTTP_PURGE_WAIT_SECS` | 60 | The longest an HTTP purge (deployment, removed) or model drain waits |
+| `LLMQ_ADMIN_HTTP_WAIT_SECS` | 60 | The longest an HTTP purge (deployment, removed) or model drain waits |
 | `LLMQ_ADMIN_BATCH` | 500 | Keys per `UNLINK` batch (and ids per admin pipeline) |
-| `LLMQ_TENANT_PURGE_DEFAULT` | `keys` | What a tenant purge removes |
+| `LLMQ_PURGE_TENANT_REMOVE` | `keys` | What a tenant purge removes |
 | `LLMQ_REQUEST_INDEX_ENABLED` | true | Index each call by model and tenant (needed for `queued` / `running`) |
 
 Ranges are in [Environment variables](../reference/environment.md#purge).

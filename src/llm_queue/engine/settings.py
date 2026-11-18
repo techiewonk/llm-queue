@@ -66,40 +66,6 @@ CONFLICT_GROUPS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("REGISTRY",), ("REGISTRY_FILE",)),
 )
 _TRUE, _FALSE = ("true", "1", "yes", "on"), ("false", "0", "no", "off")
-# `RENAMED` (old name -> new name) and `PENDING_RENAMES` are the input of
-# `scripts/rename_settings.py`, never read by the library: an old name is refused at start like
-# any other unknown `LLMQ_*` name (`unknown_names`). `PENDING_RENAMES` is the names standard
-# (`LLMQ_<AREA>_<THING>[_<UNIT>]`, environment.md "Names") not applied yet: the code still reads
-# its old names. The script rewrites every read, doc, test, sample and manifest from it and
-# moves it into `RENAMED`; it rewrites this block, so keep it plain.
-# rename-table: begin
-RENAMED: dict[str, str] = {
-    "LLMQ_LOCAL_LIMIT_CAP": "LLMQ_LOCAL_CONCURRENCY",
-    "LLMQ_PURGE_BATCH": "LLMQ_ADMIN_BATCH",
-}
-PENDING_RENAMES: dict[str, str] = {
-    "LLMQ_AUTO_PURGE": "LLMQ_PURGE_AUTO_ENABLED",
-    "LLMQ_PURGE_WAIT": "LLMQ_PURGE_WAIT_ENABLED",
-    "LLMQ_HTTP_PURGE_WAIT_SECS": "LLMQ_ADMIN_HTTP_WAIT_SECS",
-    "LLMQ_TENANT_PURGE_DEFAULT": "LLMQ_PURGE_TENANT_REMOVE",
-    "LLMQ_QUEUE_WAIT_REPLICAS": "LLMQ_REPLICA_WAIT_COUNT",
-    "LLMQ_QUEUE_WAIT_MS": "LLMQ_REPLICA_WAIT_MS",
-    "LLMQ_QUEUE_WAIT_SCOPES": "LLMQ_REPLICA_WAIT_SCOPES",
-    "LLMQ_QUEUE_FAILOVER_SECS": "LLMQ_QUEUE_STORE_FAILOVER_SECS",
-    "LLMQ_CFG_RELOAD_SECS": "LLMQ_REGISTRY_RELOAD_SECS",
-    "LLMQ_KEY_EXPIRY": "LLMQ_KEY_EXPIRY_MODE",
-    "LLMQ_TTL_SWEEP_BATCH": "LLMQ_KEY_EXPIRY_SWEEP_BATCH",
-    "LLMQ_TTL_SWEEP_ROUNDS": "LLMQ_KEY_EXPIRY_SWEEP_ROUNDS",
-    "LLMQ_REGISTRY_LIVE_EDIT": "LLMQ_REGISTRY_LIVE_EDIT_MODE",
-    "LLMQ_DEBUG_CAPTURE_FROM_CONFIG": "LLMQ_DEBUG_CAPTURE_ENABLED",
-    "LLMQ_BASE_URL_ALLOWED_HOSTS": "LLMQ_HTTP_ALLOWED_HOSTS",
-    "LLMQ_MODE": "LLMQ_ROLE",
-    "LLMQ_WORKER_ID": "LLMQ_INSTANCE_ID",
-    "LLMQ_DEFAULT_TENANT": "LLMQ_TENANT_DEFAULT",
-    "LLMQ_ADMIN_DLQ_BODIES_ENABLED": "LLMQ_ADMIN_DEAD_LETTER_BODIES_ENABLED",
-    "LLMQ_SECRET_NAMES": "LLMQ_SECRETS_NAMES",
-}
-# rename-table: end
 # Every process setting (`LLMQ_JOB_*` and the `LLMQ_ACCOUNT_*` secrets aside): environment.md
 # documents exactly these, a test checks each is read, and a registry `*_ref` may not name one.
 SETTING_NAMES = frozenset(
@@ -108,7 +74,7 @@ SETTING_NAMES = frozenset(
         "LLMQ_ADMIN_BATCH",
         "LLMQ_ADMIN_BODY_MAX_BYTES",
         "LLMQ_ADMIN_CSRF_HEADER",
-        "LLMQ_ADMIN_DLQ_BODIES_ENABLED",
+        "LLMQ_ADMIN_DEAD_LETTER_BODIES_ENABLED",
         "LLMQ_ADMIN_HEADER",
         "LLMQ_ADMIN_INDEX_CACHE_SECS",
         "LLMQ_ADMIN_READ_TOKEN",
@@ -116,13 +82,13 @@ SETTING_NAMES = frozenset(
         "LLMQ_ADMIN_TOKEN",
         "LLMQ_ADMIN_WRITES_ENABLED",
         "LLMQ_AUDIT_RETENTION_DAYS",
-        "LLMQ_AUTO_PURGE",
-        "LLMQ_BASE_URL_ALLOWED_HOSTS",
+        "LLMQ_PURGE_AUTO_ENABLED",
+        "LLMQ_HTTP_ALLOWED_HOSTS",
         "LLMQ_BEDROCK_ENDPOINT_URL",
         "LLMQ_CALLER_TTL_SECS",
-        "LLMQ_CFG_RELOAD_SECS",
-        "LLMQ_DEBUG_CAPTURE_FROM_CONFIG",
-        "LLMQ_DEFAULT_TENANT",
+        "LLMQ_REGISTRY_RELOAD_SECS",
+        "LLMQ_DEBUG_CAPTURE_ENABLED",
+        "LLMQ_TENANT_DEFAULT",
         "LLMQ_DRAIN_FILE",
         "LLMQ_DRAIN_HANDBACK_ENABLED",
         "LLMQ_DRAIN_POLL_SECS",
@@ -130,30 +96,30 @@ SETTING_NAMES = frozenset(
         "LLMQ_ENABLED",
         "LLMQ_ENVIRONMENT",
         "LLMQ_EXECUTION_MODE",
-        "LLMQ_HTTP_PURGE_WAIT_SECS",
+        "LLMQ_ADMIN_HTTP_WAIT_SECS",
         "LLMQ_ID_HASH_SALT",
-        "LLMQ_KEY_EXPIRY",
+        "LLMQ_KEY_EXPIRY_MODE",
         "LLMQ_KEY_PREFIX",
         "LLMQ_LEASE_SECS",
         "LLMQ_LOCAL_CONCURRENCY",
         "LLMQ_LOCAL_PROCESS_COUNT",
         "LLMQ_METRICS_SINK",
         "LLMQ_METRICS_TENANTS",
-        "LLMQ_MODE",
+        "LLMQ_ROLE",
         "LLMQ_PURGE_GRACE_SECS",
-        "LLMQ_PURGE_WAIT",
+        "LLMQ_PURGE_WAIT_ENABLED",
         "LLMQ_PURGE_WAIT_SECS",
         "LLMQ_QUEUE_BACKFILL_ENABLED",
-        "LLMQ_QUEUE_FAILOVER_SECS",
+        "LLMQ_QUEUE_STORE_FAILOVER_SECS",
         "LLMQ_QUEUE_PREFIX",
         "LLMQ_QUEUE_STORE_PASSWORD",
         "LLMQ_QUEUE_STORE_URL",
-        "LLMQ_QUEUE_WAIT_MS",
-        "LLMQ_QUEUE_WAIT_REPLICAS",
-        "LLMQ_QUEUE_WAIT_SCOPES",
+        "LLMQ_REPLICA_WAIT_MS",
+        "LLMQ_REPLICA_WAIT_COUNT",
+        "LLMQ_REPLICA_WAIT_SCOPES",
         "LLMQ_REGISTRY",
         "LLMQ_REGISTRY_FILE",
-        "LLMQ_REGISTRY_LIVE_EDIT",
+        "LLMQ_REGISTRY_LIVE_EDIT_MODE",
         "LLMQ_REQUESTS_LIST_MAX",
         "LLMQ_REQUESTS_MOVE_BATCH",
         "LLMQ_REQUESTS_MOVE_BYTES",
@@ -164,7 +130,7 @@ SETTING_NAMES = frozenset(
         "LLMQ_SECRETS_REGION",
         "LLMQ_SECRETS_SOURCE",
         "LLMQ_SECRETS_TIMEOUT_SECS",
-        "LLMQ_SECRET_NAMES",
+        "LLMQ_SECRETS_NAMES",
         "LLMQ_STATIC_CAP_WAIT_SECS",
         "LLMQ_STATUS_TTL_SECS",
         "LLMQ_STORE_DB",
@@ -177,10 +143,10 @@ SETTING_NAMES = frozenset(
         "LLMQ_STS_ENDPOINT_URL",
         "LLMQ_SYNC_STORE_MAX_CONNECTIONS",
         "LLMQ_TENANT_NAMES_ENABLED",
-        "LLMQ_TENANT_PURGE_DEFAULT",
-        "LLMQ_TTL_SWEEP_BATCH",
-        "LLMQ_TTL_SWEEP_ROUNDS",
-        "LLMQ_WORKER_ID",
+        "LLMQ_PURGE_TENANT_REMOVE",
+        "LLMQ_KEY_EXPIRY_SWEEP_BATCH",
+        "LLMQ_KEY_EXPIRY_SWEEP_ROUNDS",
+        "LLMQ_INSTANCE_ID",
     }
 )
 # Where secrets come from is never itself read from a secret (llm_queue.secrets.SETTINGS).
@@ -188,7 +154,7 @@ _SECRETS_SETTINGS = frozenset(
     PREFIX + n
     for n in (
         "SECRETS_SOURCE",
-        "SECRET_NAMES",
+        "SECRETS_NAMES",
         "SECRETS_REGION",
         "SECRETS_CACHE_SECS",
         "SECRETS_TIMEOUT_SECS",
@@ -213,7 +179,7 @@ class Layers(Mapping[str, str]):
     rotation needs no restart); docs/reference/environment.md "Where values come from".
     """
 
-    # `secret_names` and `LLMQ_SECRET_NAMES` (merged, the argument wins) map a setting to its
+    # `secrets_names` and `LLMQ_SECRETS_NAMES` (merged, the argument wins) map a setting to its
     # key in the secrets (0.2.0 H7). The secrets settings themselves are read from the
     # environment and the defaults only. Settings that name one thing two ways follow
     # `CONFLICT_GROUPS`. A mapping, so `JobSettings.from_env` reads it.
@@ -223,7 +189,7 @@ class Layers(Mapping[str, str]):
         environ: Mapping[str, str] | None = None,
         secrets: Callable[[str], str | None] | None = None,
         defaults: Mapping[str, Any] | None = None,
-        secret_names: Mapping[str, str] | None = None,
+        secrets_names: Mapping[str, str] | None = None,
     ) -> None:
         """Read `environ` (default `os.environ`, copied now) and the other layers.
 
@@ -245,10 +211,10 @@ class Layers(Mapping[str, str]):
 
         names, found = sources.parse_secret_names(setting(sources.NAMES_VAR))
         problems += found
-        for name, secret in (secret_names or {}).items():
+        for name, secret in (secrets_names or {}).items():
             if not str(secret or "").strip():
-                problems.append(f"secret_names: {name} must name a secret")
-            else:  # stripped as LLMQ_SECRET_NAMES is: `" valkey_host"` names `valkey_host`
+                problems.append(f"secrets_names: {name} must name a secret")
+            else:  # stripped as LLMQ_SECRETS_NAMES is: `" valkey_host"` names `valkey_host`
                 names[str(name).strip()] = str(secret).strip()
         for name in names:
             if not name.startswith(PREFIX):
@@ -306,7 +272,7 @@ class Layers(Mapping[str, str]):
         return self._secrets
 
     @property
-    def secret_names(self) -> dict[str, str]:
+    def secrets_names(self) -> dict[str, str]:
         """Settings read from the secrets under another key (merged names)."""
         return dict(self._names)
 
@@ -492,14 +458,14 @@ TENANT_PURGE_PARTS = ("keys", "queued", "running")
 def _purge_settings(
     get: Callable[..., Any], number: Callable[..., Any], problems: list[str]
 ) -> dict[str, Any]:
-    """The purge settings (`LLMQ_AUTO_PURGE` ... `LLMQ_TENANT_PURGE_DEFAULT`) as fields.
+    """The purge settings (`LLMQ_PURGE_AUTO_ENABLED` ... `LLMQ_PURGE_TENANT_REMOVE`) as fields.
 
     Kept apart from `from_env`'s body so the purge feature reads as one block.
     """
     out: dict[str, Any] = {}
     for name, field_name, default in (
-        ("AUTO_PURGE", "auto_purge", "true"),
-        ("PURGE_WAIT", "purge_wait", "true"),
+        ("PURGE_AUTO_ENABLED", "purge_auto_enabled", "true"),
+        ("PURGE_WAIT_ENABLED", "purge_wait_enabled", "true"),
     ):
         raw = str(get(name, default)).strip().lower()
         if raw not in _TRUE + _FALSE:
@@ -508,15 +474,15 @@ def _purge_settings(
         out[field_name] = raw in _TRUE
     out["purge_grace_secs"] = number("PURGE_GRACE_SECS", 900.0, zero=True, hi=604_800)
     out["purge_wait_secs"] = number("PURGE_WAIT_SECS", 300.0, zero=True, hi=86_400)
-    out["http_purge_wait_secs"] = number("HTTP_PURGE_WAIT_SECS", 60.0, zero=True, hi=3_600)
-    parts = {p.strip().lower() for p in str(get("TENANT_PURGE_DEFAULT", "keys")).split(",")}
+    out["admin_http_wait_secs"] = number("ADMIN_HTTP_WAIT_SECS", 60.0, zero=True, hi=3_600)
+    parts = {p.strip().lower() for p in str(get("PURGE_TENANT_REMOVE", "keys")).split(",")}
     parts.discard("")
     if not parts or parts - set(TENANT_PURGE_PARTS):
         problems.append(
-            "LLMQ_TENANT_PURGE_DEFAULT must be a comma list of " + ", ".join(TENANT_PURGE_PARTS)
+            "LLMQ_PURGE_TENANT_REMOVE must be a comma list of " + ", ".join(TENANT_PURGE_PARTS)
         )
         parts = {"keys"}
-    out["tenant_purge_default"] = ",".join(p for p in TENANT_PURGE_PARTS if p in parts)
+    out["purge_tenant_remove"] = ",".join(p for p in TENANT_PURGE_PARTS if p in parts)
     return out
 
 
@@ -634,9 +600,9 @@ class InfraSettings:
     queue_prefix: str = ""
     registry: str | None = None
     registry_file: str | None = None
-    registry_live_edit: str = "safe"
-    base_url_allowed_hosts: tuple[str, ...] = ()
-    cfg_reload_secs: float = 30.0
+    registry_live_edit_mode: str = "safe"
+    http_allowed_hosts: tuple[str, ...] = ()
+    registry_reload_secs: float = 30.0
     result_ttl_secs: int = 300
     result_dedupe_secs: int = 0
     status_ttl_secs: int = 1800
@@ -660,19 +626,19 @@ class InfraSettings:
     local_concurrency: int = 10  # LLMQ_LOCAL_CONCURRENCY
     static_cap_wait_secs: float = 5.0  # LLMQ_STATIC_CAP_WAIT_SECS: a `static_cap` budget wait
     metrics_sink: str = "emf"
-    mode: str = "both"
+    role: str = "both"
     bedrock_endpoint_url: str | None = None
     sts_endpoint_url: str | None = None
     id_hash_salt: str | None = field(default=None, repr=False)
     environment: str = "unset"
-    queue_failover_secs: float = 5.0
-    queue_wait_replicas: int = 0
-    queue_wait_ms: int = 100
-    # What the replica wait covers (owner Q8 / Q51), LLMQ_QUEUE_WAIT_SCOPES: all by default.
-    queue_wait_scopes: frozenset[str] = frozenset(WAIT_SCOPES)
-    debug_capture_from_config: bool = False
-    worker_id: str = ""  # LLMQ_WORKER_ID: this process's id prefix (default pod:pid)
-    default_tenant: str | None = None  # LLMQ_DEFAULT_TENANT: when a call names none
+    queue_store_failover_secs: float = 5.0
+    replica_wait_count: int = 0
+    replica_wait_ms: int = 100
+    # What the replica wait covers (owner Q8 / Q51), LLMQ_REPLICA_WAIT_SCOPES: all by default.
+    replica_wait_scopes: frozenset[str] = frozenset(WAIT_SCOPES)
+    debug_capture_enabled: bool = False
+    instance_id: str = ""  # LLMQ_INSTANCE_ID: this process's id prefix (default pod:pid)
+    tenant_default: str | None = None  # LLMQ_TENANT_DEFAULT: when a call names none
     admin_header: str = "X-LLMQ-Token"  # LLMQ_ADMIN_HEADER: the admin tokens' header
     # Admin surfaces (0.2.0 R): write routes mounted by default, the claimed-actor header of a
     # token guard (audited `token:<value>`), the `GET /` summary cache, dead-letter bodies.
@@ -680,20 +646,22 @@ class InfraSettings:
     admin_actor_header: str = "X-LLMQ-Actor"  # LLMQ_ADMIN_ACTOR_HEADER
     admin_csrf_header: str = "X-LLMQ-Admin"  # LLMQ_ADMIN_CSRF_HEADER: a write route needs it
     admin_index_cache_secs: float = 2.0  # LLMQ_ADMIN_INDEX_CACHE_SECS
-    admin_dlq_bodies_enabled: bool = False  # LLMQ_ADMIN_DLQ_BODIES_ENABLED
+    admin_dead_letter_bodies_enabled: bool = False  # LLMQ_ADMIN_DEAD_LETTER_BODIES_ENABLED
     admin_body_max_bytes: int = 1_048_576  # LLMQ_ADMIN_BODY_MAX_BYTES: a larger POST is a 413
-    # How keys expire (LLMQ_KEY_EXPIRY): `auto` picks native TTLs on a `noeviction` store and the
+    # Key expiry (LLMQ_KEY_EXPIRY_MODE): `auto` picks native TTLs on a `noeviction` store and the
     # expiry index on a `volatile-*` one (owner decision K4, 0.1.0b3); engine/expiry.py.
-    key_expiry: str = "auto"
-    ttl_sweep_batch: int = 500  # LLMQ_TTL_SWEEP_BATCH: keys per sweep script run
-    ttl_sweep_rounds: int = 100  # LLMQ_TTL_SWEEP_ROUNDS: full batches per sweep, at most
+    key_expiry_mode: str = "auto"
+    key_expiry_sweep_batch: int = 500  # LLMQ_KEY_EXPIRY_SWEEP_BATCH: keys per sweep script run
+    key_expiry_sweep_rounds: int = (
+        100  # LLMQ_KEY_EXPIRY_SWEEP_ROUNDS: full batches per sweep, at most
+    )
     # Purge of removed models / deployments and tenants (0.1.0b3, owner K1-K3): see `PurgeSettings`.
-    auto_purge: bool = True
+    purge_auto_enabled: bool = True
     purge_grace_secs: float = 900.0
-    purge_wait: bool = True
+    purge_wait_enabled: bool = True
     purge_wait_secs: float = 300.0
-    http_purge_wait_secs: float = 60.0  # LLMQ_HTTP_PURGE_WAIT_SECS
-    tenant_purge_default: str = "keys"  # comma list of TENANT_PURGE_PARTS
+    admin_http_wait_secs: float = 60.0  # LLMQ_ADMIN_HTTP_WAIT_SECS
+    purge_tenant_remove: str = "keys"  # comma list of TENANT_PURGE_PARTS
     # The request index and admin operations (0.2.0 T): see `AdminSettings` (requests_admin.py).
     request_index_enabled: bool = True  # LLMQ_REQUEST_INDEX_ENABLED
     tenant_names_enabled: bool = False  # LLMQ_TENANT_NAMES_ENABLED: names stored beside hashes
@@ -709,7 +677,7 @@ class InfraSettings:
     # (names only), the region, the cache time and the AWS timeouts.
     secrets_source: str = "none"
     secret_sources: tuple[str, ...] = ()
-    secret_names: tuple[str, ...] = ()
+    secrets_names: tuple[str, ...] = ()
     secrets_region: str | None = None
     secrets_cache_secs: float = 300.0
     secrets_timeout_secs: float = 10.0
@@ -731,14 +699,14 @@ class InfraSettings:
         *,
         secrets: Callable[[str], str | None] | None = None,
         defaults: Mapping[str, Any] | None = None,
-        secret_names: Mapping[str, str] | None = None,
+        secrets_names: Mapping[str, str] | None = None,
     ) -> InfraSettings:
         """Read `LLMQ_*`: the secrets first, then `environ` (`os.environ`), then `defaults`.
 
         The secrets are `secrets` when given, else the sources `LLMQ_SECRETS_SOURCE` names.
-        See `Layers`; `secret_names` maps a setting to the key of the secret that holds it.
+        See `Layers`; `secrets_names` maps a setting to the key of the secret that holds it.
         """
-        return cls.from_layers(Layers(environ, secrets, defaults, secret_names))
+        return cls.from_layers(Layers(environ, secrets, defaults, secrets_names))
 
     @classmethod
     def from_layers(cls, layers: Layers) -> InfraSettings:
@@ -776,15 +744,13 @@ class InfraSettings:
         elif not store and not host and not local:  # local mode never contacts a store
             problems.append(f"LLMQ_STORE_URL (or LLMQ_STORE_HOST) is required ({_SCHEMES_TEXT})")
         registry, registry_file = get("REGISTRY"), get("REGISTRY_FILE")
-        hosts = tuple(
-            h.strip() for h in str(get("BASE_URL_ALLOWED_HOSTS", "")).split(",") if h.strip()
-        )
+        hosts = tuple(h.strip() for h in str(get("HTTP_ALLOWED_HOSTS", "")).split(",") if h.strip())
         for host in hosts:
             # A scheme, port or path never matched a host, and every `openai` account then
             # failed with a message that did not point at this entry (R3CF-13).
             if any(c in host for c in "/:@?#") and not host.strip("[]").count(":") > 1:
                 problems.append(
-                    f"LLMQ_BASE_URL_ALLOWED_HOSTS entry `{host}` must be a bare host name "
+                    f"LLMQ_HTTP_ALLOWED_HOSTS entry `{host}` must be a bare host name "
                     "(no scheme, port or path), e.g. api.openai.com"
                 )
         boot: Any = None  # the boot registry document, when it reads
@@ -806,7 +772,7 @@ class InfraSettings:
                 kinds = [a.get("kind") for a in (accounts or {}).values() if isinstance(a, dict)]
                 if strict and "openai" in kinds and not hosts:
                     problems.append(
-                        "LLMQ_BASE_URL_ALLOWED_HOSTS is required outside dev when the registry "
+                        "LLMQ_HTTP_ALLOWED_HOSTS is required outside dev when the registry "
                         f"has an `openai` account ({environment})"
                     )
         salt = get("ID_HASH_SALT")
@@ -817,25 +783,25 @@ class InfraSettings:
                 f"LLMQ_ID_HASH_SALT must be at least {MIN_SALT_CHARS} characters outside dev "
                 f"({environment}): a short key does not stop brute-forcing hashed ids"
             )
-        debug_capture = str(get("DEBUG_CAPTURE_FROM_CONFIG", "false")).strip().lower()
+        debug_capture = str(get("DEBUG_CAPTURE_ENABLED", "false")).strip().lower()
         if debug_capture not in ("true", "false", "1", "0", "yes", "no", "on", "off"):
-            problems.append("LLMQ_DEBUG_CAPTURE_FROM_CONFIG must be true or false")
+            problems.append("LLMQ_DEBUG_CAPTURE_ENABLED must be true or false")
         capture = debug_capture in ("true", "1", "yes", "on")
         if capture and strict:
             problems.append(
-                f"LLMQ_DEBUG_CAPTURE_FROM_CONFIG is refused outside dev ({environment}): it "
+                f"LLMQ_DEBUG_CAPTURE_ENABLED is refused outside dev ({environment}): it "
                 "stores prompt text"
             )
         sink = str(get("METRICS_SINK", "emf"))
         if sink not in METRICS_SINKS:
             problems.append("LLMQ_METRICS_SINK must be emf, prometheus or none")
-        live_edit = str(get("REGISTRY_LIVE_EDIT", "safe"))
+        live_edit = str(get("REGISTRY_LIVE_EDIT_MODE", "safe"))
         if live_edit not in ("safe", "all", "off"):
-            problems.append("LLMQ_REGISTRY_LIVE_EDIT must be safe, all or off")
-        worker_id = str(get("WORKER_ID", "") or "").strip()
+            problems.append("LLMQ_REGISTRY_LIVE_EDIT_MODE must be safe, all or off")
+        worker_id = str(get("INSTANCE_ID", "") or "").strip()
         if worker_id and not _PREFIX_RE.match(worker_id.replace(":", "_")):
-            problems.append("LLMQ_WORKER_ID must be letters, digits, `_`, `.`, `:` or `-`")
-        default_tenant = str(get("DEFAULT_TENANT", "") or "").strip() or None
+            problems.append("LLMQ_INSTANCE_ID must be letters, digits, `_`, `.`, `:` or `-`")
+        tenant_default = str(get("TENANT_DEFAULT", "") or "").strip() or None
         admin_header = str(get("ADMIN_HEADER", "X-LLMQ-Token") or "").strip()
         actor_header = str(get("ADMIN_ACTOR_HEADER", "X-LLMQ-Actor") or "").strip()
         csrf_header = str(get("ADMIN_CSRF_HEADER", "X-LLMQ-Admin") or "").strip()
@@ -848,17 +814,17 @@ class InfraSettings:
                 problems.append(f"LLMQ_{name} must be a header name (letters, digits, `-`)")
         switches = {
             name: read_bool(layers, name, False, problems)
-            for name in ("ADMIN_WRITES_ENABLED", "ADMIN_DLQ_BODIES_ENABLED")
+            for name in ("ADMIN_WRITES_ENABLED", "ADMIN_DEAD_LETTER_BODIES_ENABLED")
         }
         hand_back = read_bool(layers, "DRAIN_HANDBACK_ENABLED", True, problems)
         backfill = read_bool(layers, "QUEUE_BACKFILL_ENABLED", False, problems)
         drain_file = str(get("DRAIN_FILE", "") or "").strip()
-        mode = str(get("MODE", "both"))
+        mode = str(get("ROLE", "both"))
         if mode not in ("both", "caller", "worker"):
-            problems.append("LLMQ_MODE must be both, caller or worker")
-        key_expiry = str(get("KEY_EXPIRY", "auto")).strip().lower()
-        if key_expiry not in KEY_EXPIRY_MODES:
-            problems.append("LLMQ_KEY_EXPIRY must be auto, native or swept")
+            problems.append("LLMQ_ROLE must be both, caller or worker")
+        key_expiry_mode = str(get("KEY_EXPIRY_MODE", "auto")).strip().lower()
+        if key_expiry_mode not in KEY_EXPIRY_MODES:
+            problems.append("LLMQ_KEY_EXPIRY_MODE must be auto, native or swept")
         key_prefix = get("KEY_PREFIX")
         if strict and not key_prefix and not local:
             # Owner decision Q26 (R3SE-9): two environments on one store that both left the
@@ -906,7 +872,7 @@ class InfraSettings:
             if not math.isfinite(value):
                 problems.append(f"LLMQ_{name} must be a finite number")
                 return default
-            # A range for every variable, not only a lower bound: `LLMQ_CFG_RELOAD_SECS=1e-9`
+            # A range for every variable, not only a lower bound: `LLMQ_REGISTRY_RELOAD_SECS=1e-9`
             # spun the reload loop, a TTL past int32 failed at the first write (R3CF-14).
             low = lo if lo is not None else 0
             if value < low or (value == 0 and not zero and lo is None):
@@ -919,7 +885,7 @@ class InfraSettings:
                 return default
             return value
 
-        scopes, scope_problems = parse_scopes(str(get("QUEUE_WAIT_SCOPES", "all")))
+        scopes, scope_problems = parse_scopes(str(get("REPLICA_WAIT_SCOPES", "all")))
         problems.extend(scope_problems)
         lease = number("LEASE_SECS", 60.0, hi=3600)
         caller_ttl = number("CALLER_TTL_SECS", 30, int, hi=86_400)
@@ -977,9 +943,9 @@ class InfraSettings:
             queue_prefix=queue_prefix,
             registry=registry,
             registry_file=registry_file,
-            registry_live_edit=live_edit,
-            base_url_allowed_hosts=hosts,
-            cfg_reload_secs=number("CFG_RELOAD_SECS", 30.0, lo=1, hi=3600),
+            registry_live_edit_mode=live_edit,
+            http_allowed_hosts=hosts,
+            registry_reload_secs=number("REGISTRY_RELOAD_SECS", 30.0, lo=1, hi=3600),
             result_ttl_secs=number("RESULT_TTL_SECS", 300, int),
             result_dedupe_secs=number("RESULT_DEDUPE_SECS", 0, int, zero=True),
             # At least 1 s; that it outlives a call is the start cross-check's job (R3CF-10).
@@ -999,35 +965,35 @@ class InfraSettings:
             local_concurrency=number("LOCAL_CONCURRENCY", 10, int, hi=100_000),
             static_cap_wait_secs=number("STATIC_CAP_WAIT_SECS", 5.0, zero=True, hi=3600),
             metrics_sink=sink,
-            mode=mode,
+            role=mode,
             bedrock_endpoint_url=endpoints["BEDROCK_ENDPOINT_URL"],
             sts_endpoint_url=endpoints["STS_ENDPOINT_URL"],
             id_hash_salt=salt,
             environment=environment,
-            queue_failover_secs=number("QUEUE_FAILOVER_SECS", 5.0, zero=True, hi=3600),
-            queue_wait_replicas=number("QUEUE_WAIT_REPLICAS", 0, int, zero=True, hi=16),
-            queue_wait_ms=number("QUEUE_WAIT_MS", 100, int, hi=60_000),
-            queue_wait_scopes=scopes,
-            debug_capture_from_config=capture,
-            worker_id=worker_id,
-            default_tenant=default_tenant,
+            queue_store_failover_secs=number("QUEUE_STORE_FAILOVER_SECS", 5.0, zero=True, hi=3600),
+            replica_wait_count=number("REPLICA_WAIT_COUNT", 0, int, zero=True, hi=16),
+            replica_wait_ms=number("REPLICA_WAIT_MS", 100, int, hi=60_000),
+            replica_wait_scopes=scopes,
+            debug_capture_enabled=capture,
+            instance_id=worker_id,
+            tenant_default=tenant_default,
             admin_header=admin_header,
             admin_writes_enabled=switches["ADMIN_WRITES_ENABLED"],
             admin_actor_header=actor_header,
             admin_csrf_header=csrf_header,
             admin_index_cache_secs=number("ADMIN_INDEX_CACHE_SECS", 2.0, zero=True, hi=60),
-            admin_dlq_bodies_enabled=switches["ADMIN_DLQ_BODIES_ENABLED"],
+            admin_dead_letter_bodies_enabled=switches["ADMIN_DEAD_LETTER_BODIES_ENABLED"],
             admin_body_max_bytes=number(
                 "ADMIN_BODY_MAX_BYTES", 1_048_576, int, lo=1024, hi=67_108_864
             ),
-            key_expiry=key_expiry,
-            ttl_sweep_batch=number("TTL_SWEEP_BATCH", 500, int, lo=1, hi=5_000),
-            ttl_sweep_rounds=number("TTL_SWEEP_ROUNDS", 100, int, lo=1, hi=10_000),
+            key_expiry_mode=key_expiry_mode,
+            key_expiry_sweep_batch=number("KEY_EXPIRY_SWEEP_BATCH", 500, int, lo=1, hi=5_000),
+            key_expiry_sweep_rounds=number("KEY_EXPIRY_SWEEP_ROUNDS", 100, int, lo=1, hi=10_000),
             **purge,
             **admin,
             secrets_source=layers.secrets_source,
             secret_sources=tuple(secrets_shown["sources"]),
-            secret_names=tuple(secrets_shown["names"]),
+            secrets_names=tuple(secrets_shown["names"]),
             secrets_region=layers.secrets_region,
             secrets_cache_secs=layers.secrets_cache_secs,
             secrets_timeout_secs=layers.secrets_timeout_secs,

@@ -322,14 +322,14 @@ async def test_deadline_cuts_do_not_open_the_breaker(make: Make) -> None:
 
 
 async def test_unreplicated_send_runs_the_call_direct(make: Make) -> None:
-    """`queue_wait_replicas` (plan B23): a send no replica acknowledged is a failed send.
+    """`replica_wait_count` (plan B23): a send no replica acknowledged is a failed send.
 
     The call runs direct instead of failing (837 calls failed in B23 before), once.
     """
     import dataclasses
 
     engine, fake = await make()
-    engine.settings = dataclasses.replace(engine.settings, queue_wait_replicas=1, queue_wait_ms=50)
+    engine.settings = dataclasses.replace(engine.settings, replica_wait_count=1, replica_wait_ms=50)
     reply = await engine.call("small", CHAT, request_id="r-unreplicated")
     assert reply.ok
     await asyncio.sleep(1.0)  # the unreplicated copy, if received, finds no caller

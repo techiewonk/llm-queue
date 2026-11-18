@@ -47,7 +47,7 @@ ENV = {
 
 def test_defaults_are_valid() -> None:
     """`Tuning()` (what every app gets by default) has no problem, even with a 100 ms WAIT."""
-    assert Tuning().problems(queue_wait_ms=100) == []
+    assert Tuning().problems(replica_wait_ms=100) == []
 
 
 def test_every_bad_value_is_listed_at_once() -> None:
@@ -69,10 +69,10 @@ def test_every_bad_value_is_listed_at_once() -> None:
 def test_read_timeout_must_be_above_every_blocking_command() -> None:
     """A WAIT, BLPOP or XREAD BLOCK longer than the read timeout would time out every time."""
     tuning = Tuning(store=StoreOptions(read_timeout_secs=4))
-    assert tuning.problems(queue_wait_ms=100) == []
-    problems = tuning.problems(queue_wait_ms=5000)
+    assert tuning.problems(replica_wait_ms=100) == []
+    problems = tuning.problems(replica_wait_ms=5000)
     assert len(problems) == 1
-    assert "LLMQ_QUEUE_WAIT_MS" in problems[0]
+    assert "LLMQ_REPLICA_WAIT_MS" in problems[0]
     slow_idle = Tuning(
         store=StoreOptions(read_timeout_secs=4), engine=EngineTimings(idle_slow_secs=5)
     )

@@ -178,7 +178,7 @@ def test_refused_edits_by_mode(full: dict[str, Any]) -> None:
     after["residency"] = {"allowed_regions": ["us-east-1"]}
     assert any("residency" in r for r in refused_edits(full, after, "safe"))
     assert refused_edits(full, after, "all") == []
-    assert refused_edits(full, after, "off") == ["live edits are off (registry_live_edit=off)"]
+    assert refused_edits(full, after, "off") == ["live edits are off (registry_live_edit_mode=off)"]
     removed = copy.deepcopy(full)
     del removed["models"]["gpt20b"]
     assert refused_edits(full, removed, "all") == [
@@ -188,7 +188,7 @@ def test_refused_edits_by_mode(full: dict[str, Any]) -> None:
 
 def test_refused_edits_unknown_mode_is_a_config_error() -> None:
     """CO-24: an unknown mode raised `ValueError`, outside the one error family."""
-    with pytest.raises(ConfigError, match="registry_live_edit"):
+    with pytest.raises(ConfigError, match="registry_live_edit_mode"):
         refused_edits({}, {}, "bogus")
 
 

@@ -62,7 +62,7 @@ jobs:
 
   swept:
     # The engine integration tests with no native TTLs: every expiry in the index `P:ttl`
-    # (LLMQ_KEY_EXPIRY=swept, as on a shared volatile-* store). Same stack as CI's integration.
+    # (LLMQ_KEY_EXPIRY_MODE=swept, as on a shared volatile-* store). Same stack as CI's integration.
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

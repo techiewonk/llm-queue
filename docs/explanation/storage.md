@@ -131,9 +131,9 @@ sooner with a purge.
   Liveness is false when a background loop died or the heartbeat stopped for a lease.
 - **`NOSCRIPT`**: a pipelined `SEND` + `WAIT` that meets a node without the script cached is run once
   more (pipelines load scripts only when they start); plain script calls rely on redis-py's reload.
-- **Queue store failover**: `LLMQ_QUEUE_FAILOVER_SECS` (5) of send errors (each try bounded by
+- **Queue store failover**: `LLMQ_QUEUE_STORE_FAILOVER_SECS` (5) of send errors (each try bounded by
   it) before a call runs direct; the next calls skip the queue store while the outage is remembered;
-  `LLMQ_QUEUE_WAIT_REPLICAS` / `LLMQ_QUEUE_WAIT_MS` (0 / 100) make a send wait for replicas.
+  `LLMQ_REPLICA_WAIT_COUNT` / `LLMQ_REPLICA_WAIT_MS` (0 / 100) make a send wait for replicas.
 - **Store reset**: a missing or changed `P:epoch` (restart without data, failover to an empty node)
   is detected by every pod's heartbeat (each remembers the epoch it saw): the pod writes the
   key expiry mode (`P:expiry`) again, and each pod puts its own
@@ -149,7 +149,7 @@ sooner with a purge.
 ## Key expiry modes
 
 Every key above with a lifetime needs something to delete it on time. There are two ways, and
-`LLMQ_KEY_EXPIRY` picks one per store.
+`LLMQ_KEY_EXPIRY_MODE` picks one per store.
 
 | | `native` | `swept` |
 |---|---|---|
@@ -167,8 +167,8 @@ About 1800 s later the next sweep finds it due, deletes it with `UNLINK` and rem
 to take the expiry sweep's own lock, `P:lock:ttlsweep`; the one that gets it runs `TTL_SWEEP`.
 It is a separate lock from the worker sweep's `P:lock:sweep` (lapsed leases, dead letters), so
 the index is swept even in a fleet of callers only, and a slow worker sweep never holds it
-back. One run deletes up to `LLMQ_TTL_SWEEP_BATCH` (500) due keys; the sweep runs again while a
-run comes back full, at most `LLMQ_TTL_SWEEP_ROUNDS` (100) times. That is up to 50000 keys per
+back. One run deletes up to `LLMQ_KEY_EXPIRY_SWEEP_BATCH` (500) due keys; the sweep runs again while a
+run comes back full, at most `LLMQ_KEY_EXPIRY_SWEEP_ROUNDS` (100) times. That is up to 50000 keys per
 10 s by default; a bigger backlog waits for the next sweep.
 Each deleted key counts in `llmq_ttl_swept_total`. The sweep runs in both modes, so keys indexed
 while `swept` still go after a switch to `native`. A script that asks for a key's time left
@@ -213,7 +213,7 @@ separate queue store, each store has its own `P:expiry` and `P:ttl`.
 | `allkeys-*` | `swept` (the safer one) | No: `allkeys-*` can evict keys with no TTL (queues, registry), so no mode makes it safe |
 | unknown (unreadable) | `swept` | Yes |
 
-`LLMQ_KEY_EXPIRY=native` or `swept` asks for that mode. `native` on a `volatile-*` store makes a
+`LLMQ_KEY_EXPIRY_MODE=native` or `swept` asks for that mode. `native` on a `volatile-*` store makes a
 strict-mode process unready. Give every process of one prefix the same setting: a process whose
 setting differs from the store's mode follows the store and logs `key_expiry_conflict` (warning,
 with `store`, `setting` and `mode`, once per mode). To move a store from `swept` back to
@@ -231,7 +231,7 @@ sweep, which runs in both modes, deletes it on time. During a rolling upgrade fr
 old pods still set native TTLs and do not read `P:expiry`; finish the rollout (see
 [Upgrade](../how-to/upgrade.md)).
 
-**Seeing it.** `health()["key_expiry"]` is the state store's mode; the gauge
+**Seeing it.** `health()["key_expiry_mode"]` is the state store's mode; the gauge
 `llmq_key_expiry_swept{store}` is 1 in `swept`; `ZCARD P:ttl` is the number of keys waiting to
 expire. See [Shared cache store](../how-to/shared-cache-store.md) for running on a `volatile-lru`
 cache.
@@ -240,7 +240,7 @@ cache.
 
 | Requirement | Why | What the library does |
 |---|---|---|
-| `maxmemory-policy noeviction`, **or** a `volatile-*` policy with key expiry `swept` | Any other set-up lets a full store evict queue messages, budgets and results: lost calls and overspent budgets. `allkeys-*` is never safe | Reads the policy at `start()` and every minute after (`CONFIG GET`, else `INFO memory` where `CONFIG` is disabled, as on ElastiCache) and picks the [key expiry mode](#key-expiry-modes). Logs `store_eviction_policy` (warning) when the policy can evict its keys in that mode (`allkeys-*`, or `volatile-*` with `native`) and, in strict mode, fails readiness with `not_ready_reason`. Reports `eviction_policy` (`unknown` when unreadable) and `key_expiry` in `health()`, and `queue_eviction_policy` when the queue store is a separate one |
+| `maxmemory-policy noeviction`, **or** a `volatile-*` policy with key expiry `swept` | Any other set-up lets a full store evict queue messages, budgets and results: lost calls and overspent budgets. `allkeys-*` is never safe | Reads the policy at `start()` and every minute after (`CONFIG GET`, else `INFO memory` where `CONFIG` is disabled, as on ElastiCache) and picks the [key expiry mode](#key-expiry-modes). Logs `store_eviction_policy` (warning) when the policy can evict its keys in that mode (`allkeys-*`, or `volatile-*` with `native`) and, in strict mode, fails readiness with `not_ready_reason`. Reports `eviction_policy` (`unknown` when unreadable) and `key_expiry_mode` in `health()`, and `queue_eviction_policy` when the queue store is a separate one |
 | One primary (with replicas), **not cluster mode** | One admission script touches keys of several hash tags | `start()` refuses a cluster-mode store with a `ConfigError` (`INFO cluster`) instead of failing at the first call |
 | Lua scripts, pub/sub, blocking list reads (`BLPOP`) | Admission, result wake-ups and the queue doorbell | ElastiCache for Valkey / Redis OSS allows all three |
 | A store that is out of memory | `noeviction` refuses writes when full; so does `volatile-*` once only keys without a TTL are left | Calls fail `queue_unavailable` ("out of memory"), admin operations `StoreUnavailable`; nothing is lost silently |
@@ -248,7 +248,7 @@ cache.
 
 Set `min-replicas-to-write` with `min-replicas-max-lag` (for example 1 and 10 s) on a replicated
 self-managed Valkey or Redis; on a managed service, check whether its parameter group exposes
-them (unverified for ElastiCache). `LLMQ_QUEUE_WAIT_REPLICAS` adds a `WAIT` after each
+them (unverified for ElastiCache). `LLMQ_REPLICA_WAIT_COUNT` adds a `WAIT` after each
 send for the same guarantee per message.
 
 Tested versions: Valkey 8.1 and Redis 7.4 (the `docker/compose.yaml` stack every integration

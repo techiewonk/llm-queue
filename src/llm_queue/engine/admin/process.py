@@ -59,19 +59,19 @@ class DrainAdmin:
 
 
 def _default_tenant(s: InfraSettings) -> dict[str, Any]:
-    """`LLMQ_DEFAULT_TENANT` as its keyed hash; the name too only with tenant names on (B-04)."""
-    name = s.default_tenant
+    """`LLMQ_TENANT_DEFAULT` as its keyed hash; the name too only with tenant names on (B-04)."""
+    name = s.tenant_default
     out: dict[str, Any] = {
-        "default_tenant_hash": keyed_hash(s.id_hash_salt or "", name) if name else None
+        "tenant_default_hash": keyed_hash(s.id_hash_salt or "", name) if name else None
     }
     if s.tenant_names_enabled:
-        out["default_tenant"] = name
+        out["tenant_default"] = name
     return out
 
 
 def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> dict[str, Any]:
     """Settings for a log line: no password, salt, token or registry body; tenant as a hash."""
-    out: dict[str, Any] = {"version": __version__, "worker_id": worker_id}
+    out: dict[str, Any] = {"version": __version__, "instance_id": worker_id}
     s = settings
     if s is None:
         return out
@@ -84,7 +84,7 @@ def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> 
     # Kinds and ids of the secrets sources and the mapped setting names: never a value.
     out["secrets"] = {
         "sources": list(s.secret_sources),
-        "names": list(s.secret_names),
+        "names": list(s.secrets_names),
         "cache_secs": s.secrets_cache_secs,
     }
     if s.execution_mode == "local":  # no store: its settings do not apply
@@ -101,13 +101,13 @@ def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> 
         return out
     store = urlsplit(s.store_url)
     out.update(
-        mode=s.mode,
+        role=s.role,
         environment=s.environment,
         store=f"{store.scheme}://{store.hostname}:{store.port or 6379}",
         separate_queue_store=s.queue_store_url is not None,
         key_prefix=s.key_prefix,
         queue_prefix=s.queue_prefix,
-        key_expiry=s.key_expiry,
+        key_expiry_mode=s.key_expiry_mode,
         store_max_connections=s.store_max_connections,
         metrics_sink=s.metrics_sink,
         **_default_tenant(s),
@@ -144,8 +144,8 @@ class OpsAdmin:
         out: dict[str, Any] = {
             "library": {
                 "version": __version__,
-                "worker": engine.worker_id if engine is not None else None,
-                "mode": settings.mode if settings else None,
+                "instance": engine.worker_id if engine is not None else None,
+                "role": settings.role if settings else None,
                 "execution_mode": "queue",
                 "environment": settings.environment if settings else None,
             },
@@ -166,7 +166,7 @@ class OpsAdmin:
             out["stores"] = {
                 "state": health["stores"].get("state"),
                 "queue": health["stores"].get("queue"),
-                "key_expiry": health.get("key_expiry"),
+                "key_expiry_mode": health.get("key_expiry_mode"),
                 "eviction_policy": health.get("eviction_policy"),
             }
         try:

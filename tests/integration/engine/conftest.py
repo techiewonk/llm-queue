@@ -97,7 +97,7 @@ async def make(store: redis.asyncio.Redis, prefix: str) -> AsyncIterator[Make]:
             reg,
             Providers(pool),
             settings=EngineSettings(
-                lease_secs=3, poll_secs=0.2, sweep_secs=1, key_expiry=KEY_EXPIRY
+                lease_secs=3, poll_secs=0.2, sweep_secs=1, key_expiry_mode=KEY_EXPIRY
             ),
         )
         await engine.start(worker=worker, caller=caller)

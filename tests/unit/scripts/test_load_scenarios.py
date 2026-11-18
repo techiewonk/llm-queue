@@ -35,7 +35,7 @@ def test_t1_runs_under_every_load_with_swept_expiry() -> None:
     """T1 at scale under every load (burst included), with the swept leak check after it."""
     assert scenarios.plan(["T1"], None, "full") == [("T1", load) for load in scenarios.LOADS]
     t1 = scenarios.BY_ID["T1"]
-    assert t1.env["LLMQ_KEY_EXPIRY"] == "swept"
+    assert t1.env["LLMQ_KEY_EXPIRY_MODE"] == "swept"
     assert t1.extra is scenarios.swept_leak_check
 
 

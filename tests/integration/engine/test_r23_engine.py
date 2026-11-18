@@ -885,7 +885,7 @@ async def test_cg1_callers_recover_soon_after_a_store_block_under_load(
 
 
 async def test_cg3_a_failing_queue_store_sends_calls_direct(make: Make) -> None:
-    """CG-3: `LLMQ_QUEUE_FAILOVER_SECS` (a separate queue store that keeps failing sends the
+    """CG-3: `LLMQ_QUEUE_STORE_FAILOVER_SECS` (a separate queue store that keeps failing sends the
     call down the direct path) had no test. A queue store on a refused port, failover 0.5 s.
 
     The refused case; the blackholed one is R3FM-3's test below.
@@ -897,7 +897,7 @@ async def test_cg3_a_failing_queue_store_sends_calls_direct(make: Make) -> None:
         base.registry,
         base.providers,
         queue_store=queue_store,
-        settings=dataclasses.replace(base.settings, queue_failover_secs=0.5),
+        settings=dataclasses.replace(base.settings, queue_store_failover_secs=0.5),
     )
     await engine.start(worker=False)
     try:
@@ -976,7 +976,7 @@ async def test_r3fm3_a_blackholed_queue_store_is_skipped_after_the_first_detecti
     """R3FM-3 (send timeout, AMEND CG-3): a blackholed queue store cost every call the
     client's full retry budget (about 21 s) before the direct path, for the whole outage.
 
-    Each send try is now bounded by `queue_failover_secs`, and the outage is remembered: the
+    Each send try is now bounded by `queue_store_failover_secs`, and the outage is remembered: the
     first call fails over within the failover time plus 1 s, the next ones skip the queue
     store at once. The store accepts connections and never answers (not a refused port).
     """
@@ -989,7 +989,7 @@ async def test_r3fm3_a_blackholed_queue_store_is_skipped_after_the_first_detecti
     server = await asyncio.start_server(blackhole, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     base, _ = await make(worker=False)
-    settings = dataclasses.replace(base.settings, queue_failover_secs=0.5)
+    settings = dataclasses.replace(base.settings, queue_store_failover_secs=0.5)
     engine = Engine(base.state, base.registry, base.providers, queue_store=base.state)
     engine.settings = settings
     await engine.start(worker=False)
@@ -1011,7 +1011,7 @@ async def test_r3fm3_a_blackholed_queue_store_is_skipped_after_the_first_detecti
         reply = await engine.call("small", CHAT, timeout_secs=20)
         assert reply.ok
         first_secs = loop.time() - started - reply.meta.provider_ms / 1000
-        assert first_secs < settings.queue_failover_secs + 1.0, first_secs
+        assert first_secs < settings.queue_store_failover_secs + 1.0, first_secs
         tried = sends
         for _ in range(3):
             started = loop.time()

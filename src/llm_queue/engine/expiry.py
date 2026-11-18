@@ -1,4 +1,4 @@
-"""How llm-queue's store keys expire: native TTLs, or the expiry index (`LLMQ_KEY_EXPIRY`).
+"""How llm-queue's store keys expire: native TTLs, or the expiry index (`LLMQ_KEY_EXPIRY_MODE`).
 
 `volatile-*` eviction policies evict only keys that have a TTL. In `swept` mode no key the
 library needs has one: each expiry is a member of the sorted set `P:ttl` (score = expire-at,
@@ -19,8 +19,8 @@ from typing import Any
 
 KEY_EXPIRY_MODES = ("auto", "native", "swept")
 NATIVE, SWEPT = "native", "swept"
-SWEEP_BATCH = 500  # keys per TTL_SWEEP run (LLMQ_TTL_SWEEP_BATCH)
-SWEEP_ROUNDS = 100  # full batches per sweep, at most (LLMQ_TTL_SWEEP_ROUNDS)
+SWEEP_BATCH = 500  # keys per TTL_SWEEP run (LLMQ_KEY_EXPIRY_SWEEP_BATCH)
+SWEEP_ROUNDS = 100  # full batches per sweep, at most (LLMQ_KEY_EXPIRY_SWEEP_ROUNDS)
 # Policies that evict only keys with a TTL: safe in `swept` mode.
 VOLATILE_POLICIES = ("volatile-lru", "volatile-lfu", "volatile-ttl", "volatile-random")
 

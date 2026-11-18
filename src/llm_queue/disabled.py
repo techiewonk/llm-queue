@@ -143,7 +143,7 @@ class DisabledQueue(LLMQueue):
             "draining_since": self._paused_since,
             "stores": {},
             "eviction_policy": "none",
-            "key_expiry": "none",
+            "key_expiry_mode": "none",
         }
         if self.draining:
             out["not_ready_reason"] = "draining"

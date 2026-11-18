@@ -199,7 +199,7 @@ def _deploy_only(path: Path) -> str | None:
 
 
 def _protected(path: Path) -> str | None:
-    """Why a changed path is protected under `registry_live_edit=safe`, or None.
+    """Why a changed path is protected under `registry_live_edit_mode=safe`, or None.
 
     Settings marked `protected` in `SETTINGS` come from that table (CO-11); the rest are
     structural (residency, accounts, region lists) or part of one setting (`inference.extra`).
@@ -223,12 +223,12 @@ def _protected(path: Path) -> str | None:
 
 
 def refused_edits(before: Mapping[str, Any], after: Mapping[str, Any], mode: str) -> list[str]:
-    """Reasons a live edit from `before` to `after` is refused under `registry_live_edit=mode`."""
+    """Why a live edit from `before` to `after` is refused under `registry_live_edit_mode=mode`."""
     if mode not in LIVE_EDIT_MODES:  # ConfigError: one error family (CO-24)
-        raise ConfigError(f"registry_live_edit must be one of {', '.join(LIVE_EDIT_MODES)}")
+        raise ConfigError(f"registry_live_edit_mode must be one of {', '.join(LIVE_EDIT_MODES)}")
     changes = diff(dict(before), dict(after))
     if mode == "off" and changes:
-        return ["live edits are off (registry_live_edit=off)"]
+        return ["live edits are off (registry_live_edit_mode=off)"]
     reasons = []
     whole = []
     for section, what in (("models", "a model"), ("accounts", "an account")):
@@ -252,7 +252,7 @@ def protected_mismatches(
 ) -> list[tuple[str, str]]:
     """(path, why) of every protected or deploy-only field where `stored` differs from `config`.
 
-    The rules of a live edit under `registry_live_edit=mode`, plus `live_edit` itself; a
+    The rules of a live edit under `registry_live_edit_mode=mode`, plus `live_edit` itself; a
     newer `registry_version` may add or remove whole models. Versions and switches skipped.
     """
     old_version, new_version = config.get("registry_version"), stored.get("registry_version")
@@ -452,7 +452,9 @@ class RegistryStore:
     ) -> None:
         """Keep the client and settings; nothing is read or written until `boot` or `load`."""
         if live_edit not in LIVE_EDIT_MODES:
-            raise ConfigError(f"registry_live_edit must be one of {', '.join(LIVE_EDIT_MODES)}")
+            raise ConfigError(
+                f"registry_live_edit_mode must be one of {', '.join(LIVE_EDIT_MODES)}"
+            )
         self._client = client
         self.prefix = prefix
         self._history_size = history_size  # `Tuning.registry`

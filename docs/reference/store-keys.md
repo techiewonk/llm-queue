@@ -8,7 +8,7 @@ per key, with the same fields as the tables below).
 [Storage](../explanation/storage.md) explains the store rules in prose; this page is the
 complete list.
 
-Keys expire in one of two modes, set by `LLMQ_KEY_EXPIRY` (`auto` by default) and stored per
+Keys expire in one of two modes, set by `LLMQ_KEY_EXPIRY_MODE` (`auto` by default) and stored per
 store in `P:expiry` (see [Key expiry modes](../explanation/storage.md#key-expiry-modes)):
 
 - **native**: Valkey TTLs, as the "Lifetime (native)" column says. Needs `noeviction`.
@@ -242,11 +242,11 @@ What the library checks:
 |---|---|---|
 | Cluster mode (`INFO cluster`) | `start()` | `ConfigError`: refused (`store_checks.py:67-94`, `runtime.py:740-742`) |
 | `maxmemory-policy` (`CONFIG GET`, else `INFO memory`; `unknown` if neither works) | `start()`, then every 12 store probes (about 1 minute) | Logs `store_eviction_policy` when `eviction_warning(policy, mode)` warns (`store_checks.py:51-64,90-94`): `allkeys-*` always; `volatile-*` only with native TTLs. Re-read by `_read_policies` (`runtime.py:4326-4339`, `POLICY_EVERY_ROUNDS` = 12, `HEALTH_PROBE_EVERY_SECS` = 5 s, `runtime.py:110,119`) |
-| Key expiry mode | `start()`, every minute, after a store reset | `_apply_expiry` asks each store's `P:expiry` for `decide(LLMQ_KEY_EXPIRY, policy)` (`Expiry.adopt`: the store's mode wins, only `swept` replaces `native`); a change logs `key_expiry_changed` (warning) and is announced on `P:expiry:changed` (pub/sub, every process follows at once), a differing explicit setting `key_expiry_conflict` (warning), a failed write `key_expiry_publish_failed` (warning, `_publish_expiry_safely` `runtime.py:4342-4347`). Until a process has published its mode it reports the mode its setting asks for (`native` for `auto`) |
+| Key expiry mode | `start()`, every minute, after a store reset | `_apply_expiry` asks each store's `P:expiry` for `decide(LLMQ_KEY_EXPIRY_MODE, policy)` (`Expiry.adopt`: the store's mode wins, only `swept` replaces `native`); a change logs `key_expiry_changed` (warning) and is announced on `P:expiry:changed` (pub/sub, every process follows at once), a differing explicit setting `key_expiry_conflict` (warning), a failed write `key_expiry_publish_failed` (warning, `_publish_expiry_safely` `runtime.py:4342-4347`). Until a process has published its mode it reports the mode its setting asks for (`native` for `auto`) |
 | Readiness, strict (`LLMQ_ENVIRONMENT` not `dev`/`local`/`test`/`ci`; unset is strict) | each `health_check()` | `_evicting()` returns a reason: `ready: false` with `not_ready_reason` (`runtime.py:4252-4257,4301-4309`); gauge `llmq_ready` 0 (`runtime.py:4502-4510`) |
-| Readiness, dev | each `health_check()` | Ready; warning at start only; `eviction_policy` and `key_expiry` in `health()` (`runtime.py:4267-4270`) |
+| Readiness, dev | each `health_check()` | Ready; warning at start only; `eviction_policy` and `key_expiry_mode` in `health()` (`runtime.py:4267-4270`) |
 | Gauges | each metrics tick | `llmq_store_eviction_unsafe{store}` 1 when unsafe in the store's mode; `llmq_key_expiry_swept{store}` 1 in `swept` (`runtime.py:4503-4507`) |
-| Expiry sweep | every `sweep_secs` (10 s), in every process (workers and callers), one at a time under its own lock `P:lock:ttlsweep` (the worker sweep keeps `P:lock:sweep`) | `TTL_SWEEP` deletes due keys, `LLMQ_TTL_SWEEP_BATCH` (500) per run, at most `LLMQ_TTL_SWEEP_ROUNDS` (100) runs per sweep (`runtime.py:4384-4400`); counted in `llmq_ttl_swept_total`. It runs in both modes |
+| Expiry sweep | every `sweep_secs` (10 s), in every process (workers and callers), one at a time under its own lock `P:lock:ttlsweep` (the worker sweep keeps `P:lock:sweep`) | `TTL_SWEEP` deletes due keys, `LLMQ_KEY_EXPIRY_SWEEP_BATCH` (500) per run, at most `LLMQ_KEY_EXPIRY_SWEEP_ROUNDS` (100) runs per sweep (`runtime.py:4384-4400`); counted in `llmq_ttl_swept_total`. It runs in both modes |
 
 An unreadable policy (`unknown`) never fails readiness (`store_checks.py:57`); with `auto` it
 gets `swept`.
@@ -274,8 +274,8 @@ gets `swept`.
 | Model `health.disable_window_secs` | 300 s (`registry/settings.py:298`) | `terr:DEP` |
 | `LLMQ_JOB_DEDUPE_SECS` | 86400 s (`jobs.py:64`) | jobs `id:JOBID` |
 | `LLMQ_JOB_DEAD_RETENTION_SECS` | 604800 s (`jobs.py:68`) | jobs `dlq` trim; `P:jobs:QP` TTL |
-| `LLMQ_KEY_EXPIRY` | `auto` (`settings.py:281`) | how every expiry is kept: native TTLs or the index `P:ttl` (`auto`: native on `noeviction`, else swept). Lifetimes stay the same |
-| `LLMQ_TTL_SWEEP_BATCH` / `LLMQ_TTL_SWEEP_ROUNDS` | 500 / 100 (`settings.py:392-393`; 1-5000 / 1-10000) | how many due keys one sweep deletes (at most 500 x 100 = 50000 per 10 s by default); a bigger backlog waits for the next sweep |
+| `LLMQ_KEY_EXPIRY_MODE` | `auto` (`settings.py:281`) | how every expiry is kept: native TTLs or the index `P:ttl` (`auto`: native on `noeviction`, else swept). Lifetimes stay the same |
+| `LLMQ_KEY_EXPIRY_SWEEP_BATCH` / `LLMQ_KEY_EXPIRY_SWEEP_ROUNDS` | 500 / 100 (`settings.py:392-393`; 1-5000 / 1-10000) | how many due keys one sweep deletes (at most 500 x 100 = 50000 per 10 s by default); a bigger backlog waits for the next sweep |
 | `LLMQ_PURGE_GRACE_SECS` | 900 s | `P:purge` due times |
 | `LLMQ_REQUEST_INDEX_ENABLED` | true | writes `tq:H`, `tq` and the job's `ix` / `ixh` / `mid` / `q` at all |
 | `LLMQ_TENANT_NAMES_ENABLED` | false | writes `tqn` at all |
@@ -873,7 +873,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 |---|---|
 | Type | zset |
 | Store | state |
-| Schema | The calls in flight of tenant `H` on model `ALIAS` (0.2.0 T1): member = request id, score = the call's deadline (store ms: now + call time + `caller_margin_secs`; an extend raises it). `H` = the keyed hash of the call's tenant (`LLMQ_DEFAULT_TENANT` included), `-` for no tenant; the user id is never a fallback here. `ALIAS` = the model whose queue holds the call (after the disabled-model fallback). |
+| Schema | The calls in flight of tenant `H` on model `ALIAS` (0.2.0 T1): member = request id, score = the call's deadline (store ms: now + call time + `caller_margin_secs`; an extend raises it). `H` = the keyed hash of the call's tenant (`LLMQ_TENANT_DEFAULT` included), `-` for no tenant; the user id is never a fallback here. `ALIAS` = the model whose queue holds the call (after the disabled-model fallback). |
 | Written by | `index_add` (`_INDEX_FN`, `requests.py`) in `REGISTER_SEND` (queued, shared store) and `CONFIRM` (separate queue store or replica wait; direct runs; takeovers update the score, and a takeover under another tenant `ZREM`s the call from the old tenant's key): `ZADD`, then entries past their deadline are pruned (`ZREMRANGEBYSCORE`). `EXTEND` (`ZADD XX`). |
 | Read by | `RequestsAdmin` (`requests_admin.py`: list, count, cancel, reprioritize); tenant purge `queued` / `running` (`purge.py`); `status(model, tenant=...)` (`status.py`). Readers count only scores in the future and drop ids whose job is final or gone. |
 | Lifetime (native) | 60 s past the latest deadline in it; a write only lengthens it (`X.pttl` check). |

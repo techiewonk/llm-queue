@@ -106,7 +106,7 @@ class PurgeSettings:
     grace_secs: float = 900.0
     wait: bool = True
     wait_secs: float = 300.0
-    http_wait_secs: float = 60.0  # LLMQ_HTTP_PURGE_WAIT_SECS: the most an HTTP purge waits
+    http_wait_secs: float = 60.0  # LLMQ_ADMIN_HTTP_WAIT_SECS: the most an HTTP purge waits
     batch: int = 500
     tenant_default: frozenset[str] = frozenset({"keys"})
     request_index: bool = True
@@ -115,13 +115,13 @@ class PurgeSettings:
     def from_infra(cls, settings: InfraSettings) -> PurgeSettings:
         """The purge part of the process settings."""
         return cls(
-            auto=settings.auto_purge,
+            auto=settings.purge_auto_enabled,
             grace_secs=float(settings.purge_grace_secs),
-            wait=settings.purge_wait,
+            wait=settings.purge_wait_enabled,
             wait_secs=float(settings.purge_wait_secs),
-            http_wait_secs=float(settings.http_purge_wait_secs),
+            http_wait_secs=float(settings.admin_http_wait_secs),
             batch=int(settings.admin_batch),
-            tenant_default=frozenset(settings.tenant_purge_default.split(",")),
+            tenant_default=frozenset(settings.purge_tenant_remove.split(",")),
             request_index=settings.request_index_enabled,
         )
 
@@ -199,7 +199,7 @@ class PurgeService:
         *,
         secrets: Callable[[str], str | None] | None = None,
         defaults: Mapping[str, Any] | None = None,
-        secret_names: Mapping[str, str] | None = None,
+        secrets_names: Mapping[str, str] | None = None,
     ) -> PurgeService:
         """A standalone service from `LLMQ_*` (an admin worker); close it with `aclose()`.
 
@@ -208,7 +208,7 @@ class PurgeService:
         """
         from llm_queue.engine.admin.context import AdminContext
 
-        ctx = AdminContext.from_layers(Layers(environ, secrets, defaults, secret_names))
+        ctx = AdminContext.from_layers(Layers(environ, secrets, defaults, secrets_names))
         service = ctx.purge
         service._owned = ctx.owned
         return service
@@ -263,7 +263,7 @@ class PurgeService:
     ) -> PurgeReport:
         """Delete the state of deployment `deployment` (`account/name`) of model `alias`.
 
-        `wait` (default `LLMQ_PURGE_WAIT`) waits up to `wait_secs` (`LLMQ_PURGE_WAIT_SECS`)
+        `wait` (default `LLMQ_PURGE_WAIT_ENABLED`) waits up to `wait_secs` (`LLMQ_PURGE_WAIT_SECS`)
         for its running calls to end; still running then, nothing is deleted and the report
         says why. `AdminRefused` while the registry still has it, unless `force`.
         """
@@ -298,7 +298,7 @@ class PurgeService:
         """Delete a tenant's fairness state in every model (or `models`); maybe cancel its calls.
 
         `tenant_id` is the raw id (hashed as admission hashes it). `remove` (default
-        `LLMQ_TENANT_PURGE_DEFAULT`): `keys`, `queued` (cancel calls still waiting), `running`
+        `LLMQ_PURGE_TENANT_REMOVE`): `keys`, `queued` (cancel calls still waiting), `running`
         (cancel every call); the last two read the request index of each model (T3), so they
         need `LLMQ_REQUEST_INDEX_ENABLED` (on by default), else `AdminRefused`.
         """
@@ -333,7 +333,7 @@ class PurgeService:
         """Purge every model and deployment the store has state of and the registry has not.
 
         What `purge removed` runs. Queues of removed models go only when empty unless `force`;
-        `wait` / `wait_secs` as in `deployment` (defaults `LLMQ_PURGE_WAIT[_SECS]`), per
+        `wait` / `wait_secs` as in `deployment` (defaults `LLMQ_PURGE_WAIT_ENABLED[_SECS]`), per
         deployment.
         """
         check_actor(actor)

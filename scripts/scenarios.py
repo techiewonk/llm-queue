@@ -130,7 +130,7 @@ PROFILES = {
             "LLMQ_LEASE_SECS": "3",
             "LLMQ_CALLER_TTL_SECS": "10",  # 5 s: one stray caller_gone at 300 % (busy driver?)
             "LLMQ_STATUS_TTL_SECS": "30",
-            "LLMQ_CFG_RELOAD_SECS": "1",
+            "LLMQ_REGISTRY_RELOAD_SECS": "1",
             "LLMQ_DRAIN_SECS": "5",
         },
         defaults={
@@ -628,7 +628,7 @@ async def rpm_cut(ctx: Ctx) -> None:
     sampler: asyncio.Task[list[tuple[float, list[int]]]] | None = None
     try:
         await ctx.edit({"rpm": RPM // 4})
-        await asyncio.sleep(1.5)  # LLMQ_CFG_RELOAD_SECS 1: every process has the new budget
+        await asyncio.sleep(1.5)  # LLMQ_REGISTRY_RELOAD_SECS 1: every process has the new budget
         sampler = asyncio.create_task(_budget_samples(ctx, stop))
         await _hold(ctx)
     finally:
@@ -657,7 +657,7 @@ async def kill_switch(ctx: Ctx) -> None:
     """The kill switch: every call runs direct (no queue), same budgets."""
     try:
         await ctx.edit({"routing.kill_switch": True}, model=None)
-        await asyncio.sleep(1.5)  # LLMQ_CFG_RELOAD_SECS 1: both callers see the switch
+        await asyncio.sleep(1.5)  # LLMQ_REGISTRY_RELOAD_SECS 1: both callers see the switch
         on = ctx.now()
         await _hold(ctx)
         off = ctx.now()
@@ -1012,7 +1012,7 @@ def swept_leaks(gate: Gate) -> list[str]:
 
 
 async def swept_leak_check(ctx: Ctx) -> None:
-    """After the run: no key of it has a native TTL (`LLMQ_KEY_EXPIRY=swept`)."""
+    """After the run: no key of it has a native TTL (`LLMQ_KEY_EXPIRY_MODE=swept`)."""
     leaked = await asyncio.to_thread(swept_leaks, ctx.gate)
     ctx.checks["swept: no key with a native TTL at the end"] = not leaked
     ctx.notes.append(f"swept leak check: {len(leaked)} keys {sorted(leaked)[:5] or ''}".rstrip())
@@ -1186,7 +1186,7 @@ async def caller_dies(ctx: Ctx) -> None:
     try:
         proc = subprocess.Popen(  # noqa: ASYNC220  # one process, started once
             [PY, str(Path(__file__).parent / "gates_fleet.py"), "caller", "100", "orphan"],
-            env={**ctx.gate.env, "LLMQ_MODE": "caller"},
+            env={**ctx.gate.env, "LLMQ_ROLE": "caller"},
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=log,
@@ -1283,12 +1283,12 @@ class Client:
     """A client pod: its own process (`gates_fleet.py client`), its own engine and calls."""
 
     def __init__(self, ctx: Ctx, spec: dict[str, Any], **env: str) -> None:
-        """Start it (`LLMQ_MODE=caller` unless `env` says otherwise)."""
+        """Start it (`LLMQ_ROLE=caller` unless `env` says otherwise)."""
         log = log_file("client")
         self.spec = spec
         self.proc = subprocess.Popen(
             [PY, str(Path(__file__).parent / "gates_fleet.py"), "client", json.dumps(spec)],
-            env={**ctx.gate.env, "LLMQ_MODE": "caller", **env},
+            env={**ctx.gate.env, "LLMQ_ROLE": "caller", **env},
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=log,
@@ -1483,7 +1483,7 @@ async def registry_versions(ctx: Ctx) -> None:
     ctx.checks["older service logged registry_older_ignored"] = (
         "registry_older_ignored" in old_pod.report["events"]
     )
-    await asyncio.sleep(2)  # LLMQ_CFG_RELOAD_SECS 1: the driver's callers reload
+    await asyncio.sleep(2)  # LLMQ_REGISTRY_RELOAD_SECS 1: the driver's callers reload
     seen = int(ctx.queues[0].admin.registry.current.registry.version)
     ctx.checks["the other callers moved to the newer version"] = seen == want
     ctx.notes.append(
@@ -1789,7 +1789,7 @@ SCENARIOS = [
         "index empty; no swept leak (--quick: 30 calls a tenant)",
         tenant_isolation_t1,
         extra=swept_leak_check,
-        env={"LLMQ_KEY_EXPIRY": "swept"},
+        env={"LLMQ_KEY_EXPIRY_MODE": "swept"},
         # 2 deployments x 60 rpm: 2 calls a second, so the quick run's 60 calls wait (the
         # design-scale run edits the budget to T1_RPM live).
         models={
@@ -1930,9 +1930,9 @@ SCENARIOS = [
         "L3",
         "store",
         "separate queue store blocked",
-        "calls run direct after LLMQ_QUEUE_FAILOVER_SECS; all served on time",
+        "calls run direct after LLMQ_QUEUE_STORE_FAILOVER_SECS; all served on time",
         queue_store_block,
-        env={"LLMQ_QUEUE_FAILOVER_SECS": "2"},
+        env={"LLMQ_QUEUE_STORE_FAILOVER_SECS": "2"},
         queue_proxy=True,
     ),
     _s(

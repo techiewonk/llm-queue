@@ -1,7 +1,7 @@
 """One admin builder from `Layers`, with `from_env`'s full signature (0.2.0 review B-23).
 
 `AdminServices`, `RequestsAdmin` and `PurgeService` each wired the stores and the registry from
-`LLMQ_*` on their own and took neither `defaults=` nor `secret_names=`: the CLI and admin
+`LLMQ_*` on their own and took neither `defaults=` nor `secrets_names=`: the CLI and admin
 workers could not reproduce an app that configures through `defaults=`. All three now build
 on `AdminContext.from_layers` and take `LLMQueue.from_env`'s arguments.
 """
@@ -45,7 +45,7 @@ async def test_builders_take_defaults_and_secret_names(name: str) -> None:
     finally:
         await built.aclose()
     names = {"LLMQ_KEY_PREFIX": "app_prefix", "LLMQ_ID_HASH_SALT": "app_salt"}
-    built = BUILDERS[name](DEV, secrets=SECRETS, secret_names=names)
+    built = BUILDERS[name](DEV, secrets=SECRETS, secrets_names=names)
     try:
         assert _prefix(built) == "from-a-secret"
         if isinstance(built, RequestsAdmin):

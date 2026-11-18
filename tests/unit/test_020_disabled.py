@@ -126,7 +126,7 @@ async def test_start_stop_health_ready_and_describe() -> None:
     assert queue.execution_mode == "disabled"
     assert queue.describe() == {
         "version": queue.describe()["version"],
-        "worker_id": None,
+        "instance_id": None,
         "enabled": False,
         "environment": "prod",
         "drain_file": False,

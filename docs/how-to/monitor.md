@@ -172,7 +172,7 @@ from 0.1 s to 600 s. Alert gauges are named `llmq_alert_<name>`, labels `model` 
 | `llmq_bad_messages_total` | counter | model | Count | worker | Messages that could not be read (dead-lettered) |
 | `llmq_newer_messages_total` | counter | model | Count | worker | Messages from a newer library, given back |
 | `llmq_swept_total` | counter | model | Count | worker | Lapsed leases and in-progress entries the sweep removed |
-| `llmq_ttl_swept_total` | counter | - | Count | worker or caller | Keys deleted by the expiry index sweep (`LLMQ_KEY_EXPIRY` swept: the expiries Valkey would have run); counted by whichever process held `P:lock:ttlsweep` |
+| `llmq_ttl_swept_total` | counter | - | Count | worker or caller | Keys deleted by the expiry index sweep (`LLMQ_KEY_EXPIRY_MODE` swept: the expiries Valkey would have run); counted by whichever process held `P:lock:ttlsweep` |
 | `llmq_reclaimed_total` | counter | model | Count | worker | Messages taken over from a worker that went quiet |
 | `llmq_stuck_calls_total` | counter | model | Count | worker | Held calls freed because nothing worked on them |
 | `llmq_store_resets_total` | counter | - | Count | worker | State store resets (lost keys) this pod detected |

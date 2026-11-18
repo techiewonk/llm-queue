@@ -49,21 +49,21 @@ deployment health, and reports status.
 
 ## Topology
 
-Every process runs the same code. By default (`LLMQ_MODE=both`) the worker side runs inside the
+Every process runs the same code. By default (`LLMQ_ROLE=both`) the worker side runs inside the
 app's own pods, so there is no separate worker fleet. A fleet may also split: web pods as
 callers only, worker pods that only serve.
 
 ```mermaid
 flowchart TB
-  subgraph app["App pods: LLMQ_MODE=both (default)"]
+  subgraph app["App pods: LLMQ_ROLE=both (default)"]
     direction LR
     p1["Pod 1<br/>caller + worker"]
     p2["Pod 2<br/>caller + worker"]
   end
   subgraph split["Optional split fleet"]
     direction LR
-    c1["Web pod<br/>LLMQ_MODE=caller"]
-    w1["Worker pod<br/>LLMQ_MODE=worker"]
+    c1["Web pod<br/>LLMQ_ROLE=caller"]
+    w1["Worker pod<br/>LLMQ_ROLE=worker"]
   end
   subgraph ss["State store: LLMQ_STORE_URL, one primary + replicas"]
     direction LR
@@ -124,7 +124,7 @@ model fallback, `max_message_bytes`, timeout, `admission` hook), `request_params
 shares the process's `LocalLimits`, so a process has one budget. Store-only operations of a
 `LocalEngine` (and its `LocalRegistry`) raise `LocalModeRefused`; the HTTP handlers answer 503.
 
-## Roles: `LLMQ_MODE`
+## Roles: `LLMQ_ROLE`
 
 `LLMQueue.start()` starts the engine with `worker = mode in (both, worker)` and
 `caller = mode in (both, caller)` (`core.py`). The role decides which background loops run.
@@ -222,7 +222,7 @@ effective value, taken from the most specific level that sets it (deployment, mo
 |---|---|
 | `boot()` at start | Publishes the process's own document by the version rule (see [Many services, one model](../how-to/share-models.md#the-registry-version-rule)), then loads what is live. Store unreachable, or the stored document refused (invalid, or `min_lib_version` above this library): the pod runs on its own document |
 | `PUBLISH` / `EDIT` (Lua, `registry/_lua.py`) | One script stores the document, `P:{reg}:meta` (version, hash, change counter), an audit entry and each model's resolved admission numbers in `P:{m:A}:cfg`. Compare-and-set on the change counter. Routing blocks and the kill switch set live survive a publish |
-| `run()`: the reload loop | Every `LLMQ_CFG_RELOAD_SECS` (30 s): reload; republish its own document when the stored one was lost (store reset) or is invalid and not newer. After failures the wait doubles up to 30 s |
+| `run()`: the reload loop | Every `LLMQ_REGISTRY_RELOAD_SECS` (30 s): reload; republish its own document when the stored one was lost (store reset) or is invalid and not newer. After failures the wait doubles up to 30 s |
 | `stale_config` | `PICK_TAKE` compares the change counter in `cfg` with the worker's; a mismatch makes the worker reload once (one reload in flight per process) and ask again |
 
 Admission scripts never parse the document: they read `P:{m:A}:cfg`.
@@ -375,7 +375,7 @@ visible, retries a failure after 5 s doubling to 300 s for about an hour, then d
 
 `PurgeService` deletes the store state of a removed model or deployment, or of one tenant, with
 a dry run by default, an audit entry and a `PurgeReport`. `llmq.admin.purge`, the CLI and the
-HTTP routes all call it. **Auto purge** (`LLMQ_AUTO_PURGE`, on by default) runs in the worker
+HTTP routes all call it. **Auto purge** (`LLMQ_PURGE_AUTO_ENABLED`, on by default) runs in the worker
 sweeper's loop: when a reload drops a model or deployment, one worker (lock `P:lock:purge`)
 schedules it in `P:purge` with a grace (`LLMQ_PURGE_GRACE_SECS`, 900 s) and purges it when due if
 it is still absent. See [Purge store state](../how-to/purge.md) and the
@@ -391,7 +391,7 @@ Every key with a lifetime goes through one `Expiry` helper (Python) or `X.expire
   keys, up to one sweep (10 s) late. A `volatile-*` store cannot evict them.
 
 The mode belongs to the store: `P:expiry` holds it (missing means `native`) and every script
-reads it. With `LLMQ_KEY_EXPIRY=auto` the engine reads each store's eviction policy at start and
+reads it. With `LLMQ_KEY_EXPIRY_MODE=auto` the engine reads each store's eviction policy at start and
 every minute, and picks `native` for `noeviction`, `swept` otherwise. A state store and a separate
 queue store each have their own `P:expiry` and `P:ttl`. See
 [Key expiry modes](storage.md#key-expiry-modes) and the
@@ -408,7 +408,7 @@ are defaults. [Background tasks](background.md) has more on each.
 | `_heartbeat` | all | `LLMQ_LEASE_SECS` / 3 (20 s), shorter for short `visibility_secs`, 1 s after a store error | - | `RENEW` grants, held claims and the caller key (one script); `EXTEND_MANY` held messages; clock sync; epoch and `master_replid` checks (store reset or promotion); safety-net cancel check; loops for models a reload added; free stuck holds |
 | `_ttl_sweeper` | all | `sweep_secs` (10 s) | `P:lock:ttlsweep` | `TTL_SWEEP` on each store's `P:ttl`: up to 500 keys a run, up to 100 runs a sweep |
 | `_store_prober` | all | 5 s; eviction policy read again every 12th round (1 min) | - | Write probe per store for readiness (`ok`, `read_only`, `down`); ends the outage memos; publishes the key expiry mode again |
-| `registry_reload` (`RegistryStore.run`) | all | `LLMQ_CFG_RELOAD_SECS` (30 s), back-off on failure | - | Reload; republish its own document when the stored one is lost or invalid |
+| `registry_reload` (`RegistryStore.run`) | all | `LLMQ_REGISTRY_RELOAD_SECS` (30 s), back-off on failure | - | Reload; republish its own document when the stored one is lost or invalid |
 | `offload_lifecycle` | all | once at start | - | Warn when the S3 bucket has no expiry rule for the offload prefix |
 | `_result_reader` | every role | pub/sub on `P:done:WORKER` | - | Wake waiting callers; a re-subscribe wakes all; a ping every 5 s, reset after two silent pings |
 | `_result_sweep` | every role | 5 s | - | One `_RESULTS_EXIST` script per 500 waiting ids finds results pub/sub missed; three such sweeps in a row reset the reader |
@@ -438,7 +438,7 @@ Two URLs, one store by default. `LLMQ_QUEUE_STORE_URL` moves the queue traffic t
 
 With one store, a call's send is `REGISTER_SEND` (one script instead of three) and a success
 settles with `SETTLE_DONE` (one script instead of `RESULT_PUT`, `ACK` and `FINISH`). A separate
-queue store that fails sends for `LLMQ_QUEUE_FAILOVER_SECS` (5 s) makes calls run direct.
+queue store that fails sends for `LLMQ_QUEUE_STORE_FAILOVER_SECS` (5 s) makes calls run direct.
 
 Store requirements: one primary with replicas (cluster mode is refused at `start()`: scripts
 cross hash tags), Lua, pub/sub and `BLPOP`, and an eviction policy that cannot evict the

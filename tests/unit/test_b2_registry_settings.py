@@ -79,17 +79,17 @@ def _openai_registry() -> str:
 
 def test_openai_account_needs_allowed_hosts_outside_dev() -> None:
     """X6: without an allow-list, a registry edit could point base_url anywhere."""
-    with pytest.raises(ConfigError, match="LLMQ_BASE_URL_ALLOWED_HOSTS is required"):
+    with pytest.raises(ConfigError, match="LLMQ_HTTP_ALLOWED_HOSTS is required"):
         _settings(LLMQ_REGISTRY=_openai_registry())
-    ok = _settings(LLMQ_REGISTRY=_openai_registry(), LLMQ_BASE_URL_ALLOWED_HOSTS="llm.example.com")
-    assert ok.base_url_allowed_hosts == ("llm.example.com",)
+    ok = _settings(LLMQ_REGISTRY=_openai_registry(), LLMQ_HTTP_ALLOWED_HOSTS="llm.example.com")
+    assert ok.http_allowed_hosts == ("llm.example.com",)
 
 
 @pytest.mark.parametrize("environment", ["uat", "staging", "prod", ""])
 def test_debug_capture_refused_outside_dev(environment: str) -> None:
     """X8: only the exact name `prod` refused debug capture (prompt text)."""
-    with pytest.raises(ConfigError, match="DEBUG_CAPTURE_FROM_CONFIG is refused"):
-        _settings(LLMQ_ENVIRONMENT=environment, LLMQ_DEBUG_CAPTURE_FROM_CONFIG="true")
+    with pytest.raises(ConfigError, match="DEBUG_CAPTURE_ENABLED is refused"):
+        _settings(LLMQ_ENVIRONMENT=environment, LLMQ_DEBUG_CAPTURE_ENABLED="true")
 
 
 def test_salt_is_not_in_repr() -> None:

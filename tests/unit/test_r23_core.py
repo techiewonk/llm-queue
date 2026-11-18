@@ -80,7 +80,7 @@ class _Jobs:
 def _queue(engine: _Engine, mode: str = "both", **settings: Any) -> LLMQueue:
     queue = LLMQueue(
         engine,  # type: ignore[arg-type]  # a fake
-        settings=SimpleNamespace(mode=mode, **settings),  # type: ignore[arg-type]
+        settings=SimpleNamespace(role=mode, **settings),  # type: ignore[arg-type]
     )
     queue._jobs = _Jobs()  # type: ignore[assignment]
     return queue

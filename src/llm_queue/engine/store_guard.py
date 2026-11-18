@@ -43,7 +43,7 @@ def store_op[**P, R](fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]
     return wrapper
 
 
-# What `LLMQ_QUEUE_WAIT_REPLICAS` covers (owner Q8 / Q51): call sends, job sends and registry
+# What `LLMQ_REPLICA_WAIT_COUNT` covers (owner Q8 / Q51): call sends, job sends and registry
 # live edits, each switchable, all on by default when replicas are asked for.
 WAIT_SCOPES = ("calls", "jobs", "registry")
 _SHORT_WARN_EVERY_SECS = 60.0
@@ -92,7 +92,7 @@ class ReplicaWait:
 
 
 def parse_scopes(raw: str) -> tuple[frozenset[str], list[str]]:
-    """`LLMQ_QUEUE_WAIT_SCOPES` (comma-separated; `all` or `none`): the scopes and problems."""
+    """`LLMQ_REPLICA_WAIT_SCOPES` (comma-separated; `all` or `none`): the scopes and problems."""
     value = raw.strip().lower()
     if value in ("", "all"):
         return frozenset(WAIT_SCOPES), []
@@ -100,7 +100,7 @@ def parse_scopes(raw: str) -> tuple[frozenset[str], list[str]]:
         return frozenset(), []
     names = {part.strip() for part in value.split(",") if part.strip()}
     problems = [
-        f"LLMQ_QUEUE_WAIT_SCOPES: unknown scope {name!r}"
+        f"LLMQ_REPLICA_WAIT_SCOPES: unknown scope {name!r}"
         for name in sorted(names - set(WAIT_SCOPES))
     ]
     return frozenset(names & set(WAIT_SCOPES)), problems

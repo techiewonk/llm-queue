@@ -23,21 +23,21 @@ DEV = {
 
 def test_new_settings_defaults_and_validation() -> None:
     settings = InfraSettings.from_env(DEV)
-    assert (settings.worker_id, settings.default_tenant, settings.admin_header) == (
+    assert (settings.instance_id, settings.tenant_default, settings.admin_header) == (
         "",
         None,
         "X-LLMQ-Token",
     )
     set_ = InfraSettings.from_env(
-        {**DEV, "LLMQ_WORKER_ID": "api-1:7", "LLMQ_DEFAULT_TENANT": "acme",
+        {**DEV, "LLMQ_INSTANCE_ID": "api-1:7", "LLMQ_TENANT_DEFAULT": "acme",
          "LLMQ_ADMIN_HEADER": "X-Admin-Token"}
     )  # fmt: skip
-    assert (set_.worker_id, set_.default_tenant, set_.admin_header) == (
+    assert (set_.instance_id, set_.tenant_default, set_.admin_header) == (
         "api-1:7",
         "acme",
         "X-Admin-Token",
     )
-    for name, value in (("LLMQ_WORKER_ID", "a b"), ("LLMQ_ADMIN_HEADER", "bad header")):
+    for name, value in (("LLMQ_INSTANCE_ID", "a b"), ("LLMQ_ADMIN_HEADER", "bad header")):
         with pytest.raises(Exception, match=name):
             InfraSettings.from_env({**DEV, name: value})
 
@@ -60,7 +60,7 @@ def test_layers_mapping_reads_secrets_before_env() -> None:
 def test_from_env_worker_id_tenant_admin_and_describe(monkeypatch: pytest.MonkeyPatch) -> None:
     secrets = {"LLMQ_ADMIN_TOKEN": "s3cret", "LLMQ_ADMIN_READ_TOKEN": "r3ad"}
     llmq = LLMQueue.from_env(
-        {**DEV, "LLMQ_WORKER_ID": "pod-a:1", "LLMQ_DEFAULT_TENANT": "acme"},
+        {**DEV, "LLMQ_INSTANCE_ID": "pod-a:1", "LLMQ_TENANT_DEFAULT": "acme"},
         secrets=secrets.get,
     )
     assert llmq._engine.worker_id.startswith("pod-a:1-")
@@ -75,12 +75,12 @@ def test_from_env_worker_id_tenant_admin_and_describe(monkeypatch: pytest.Monkey
     text = repr(described)
     assert described["store"] == "redis://localhost:6379"
     # The hash only (review B-04): the name with LLMQ_TENANT_NAMES_ENABLED alone.
-    assert described["default_tenant_hash"] == llmq._engine.hash_id("acme")
+    assert described["tenant_default_hash"] == llmq._engine.hash_id("acme")
     assert "acme" not in text
     named = LLMQueue.from_env(
-        {**DEV, "LLMQ_DEFAULT_TENANT": "acme", "LLMQ_TENANT_NAMES_ENABLED": "true"}
+        {**DEV, "LLMQ_TENANT_DEFAULT": "acme", "LLMQ_TENANT_NAMES_ENABLED": "true"}
     )
-    assert named.describe()["default_tenant"] == "acme"
+    assert named.describe()["tenant_default"] == "acme"
     assert "rotated" not in text
     assert "s3cret" not in text
     assert "r3ad" not in text

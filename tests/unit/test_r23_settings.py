@@ -74,20 +74,20 @@ def test_r3cf13_allowed_hosts_are_bare_names() -> None:
     """R3CF-13: `https://api.openai.com` never matched, and the error did not name the entry."""
     with pytest.raises(ConfigError, match=r"`https://api.openai.com` must be a bare host"):
         InfraSettings.from_env(
-            {**STRICT, "LLMQ_BASE_URL_ALLOWED_HOSTS": "https://api.openai.com, api.x.com"}
+            {**STRICT, "LLMQ_HTTP_ALLOWED_HOSTS": "https://api.openai.com, api.x.com"}
         )
-    ok = InfraSettings.from_env({**STRICT, "LLMQ_BASE_URL_ALLOWED_HOSTS": "api.x.com, [::1]"})
-    assert ok.base_url_allowed_hosts == ("api.x.com", "[::1]")
+    ok = InfraSettings.from_env({**STRICT, "LLMQ_HTTP_ALLOWED_HOSTS": "api.x.com, [::1]"})
+    assert ok.http_allowed_hosts == ("api.x.com", "[::1]")
 
 
 @pytest.mark.parametrize(
     ("env", "fragment"),
     [
-        ({"LLMQ_CFG_RELOAD_SECS": "1e-9"}, "LLMQ_CFG_RELOAD_SECS must be at least 1"),
+        ({"LLMQ_REGISTRY_RELOAD_SECS": "1e-9"}, "LLMQ_REGISTRY_RELOAD_SECS must be at least 1"),
         ({"LLMQ_RESULT_TTL_SECS": "9" * 23}, "LLMQ_RESULT_TTL_SECS must be at most"),
         ({"LLMQ_STORE_MAX_CONNECTIONS": "1"}, "LLMQ_STORE_MAX_CONNECTIONS must be at least 4"),
         ({"LLMQ_STATUS_TTL_SECS": "0"}, "LLMQ_STATUS_TTL_SECS must be at least 1"),
-        ({"LLMQ_QUEUE_WAIT_REPLICAS": "99"}, "LLMQ_QUEUE_WAIT_REPLICAS must be at most 16"),
+        ({"LLMQ_REPLICA_WAIT_COUNT": "99"}, "LLMQ_REPLICA_WAIT_COUNT must be at most 16"),
         ({"LLMQ_STORE_MAX_CONNECTIONS": "200.0"}, "must be a whole number"),
     ],
 )

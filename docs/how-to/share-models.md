@@ -41,7 +41,7 @@ Each process publishes its registry at `start()` by `registry_version`:
 | Stored one needs a newer library (`min_lib_version`) | Never replaced; this pod keeps its own document and logs `registry_needs_newer_library` |
 
 So during a rolling deploy of one service, its new pods publish the new version and the old pods
-of every service pick it up on their next reload (`LLMQ_CFG_RELOAD_SECS`, 30 s). Raise
+of every service pick it up on their next reload (`LLMQ_REGISTRY_RELOAD_SECS`, 30 s). Raise
 `registry_version` with every deployed change, and ship the new document to every service.
 
 What a service on an older document gets from a newer stored one:

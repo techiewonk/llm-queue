@@ -122,7 +122,7 @@ call was served.
 
 ## 6. Choose a run mode
 
-`LLMQ_MODE` decides what `start()` runs in a process:
+`LLMQ_ROLE` decides what `start()` runs in a process:
 
 | Mode | Runs | Use |
 |---|---|---|

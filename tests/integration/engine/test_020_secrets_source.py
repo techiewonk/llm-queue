@@ -41,7 +41,7 @@ async def test_store_password_from_a_file_source_logs_in(
         "LLMQ_BEDROCK_ENDPOINT_URL": str(server.make_url("")).rstrip("/"),
         "LLMQ_METRICS_SINK": "none",
         "LLMQ_SECRETS_SOURCE": f"file:{volume}",
-        "LLMQ_SECRET_NAMES": json.dumps({"LLMQ_STORE_PASSWORD": "valkey_key"}),
+        "LLMQ_SECRETS_NAMES": json.dumps({"LLMQ_STORE_PASSWORD": "valkey_key"}),
     }
     llmq = LLMQueue.from_env(
         env,

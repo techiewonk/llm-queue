@@ -125,7 +125,7 @@ watcher.start()          # in the app's startup, on its event loop; `await watch
 |---|---|
 | `GET /health/live` | 200 while the library's background loops run and the heartbeat makes progress; **503** when a loop died or the heartbeat stalled for a lease. Once `stop()` begins it stays 200, so a draining pod is not restarted. It reads the process's own state only, never the store |
 | `GET /health/ready` | 200 when the registry is loaded and the process is not draining, else 503. In strict mode a store whose eviction policy can evict the library's keys (`allkeys-*`, or `volatile-*` with native key expiry) also answers 503, with the reason |
-| `await llmq.health()` | `live`, `ready`, `stores` (`state`, `queue`), `eviction_policy`, `key_expiry` (`native` or `swept`), `worker`, `version`, `registry_version`, `held`, `heartbeat_age_secs`, `draining`, `draining_since`; plus `live_reason` when not live, `not_ready_reason` when not ready (`draining` after a pause, else in strict mode an evicting store's policy) and `queue_eviction_policy` with a separate queue store |
+| `await llmq.health()` | `live`, `ready`, `stores` (`state`, `queue`), `eviction_policy`, `key_expiry_mode` (`native` or `swept`), `worker`, `version`, `registry_version`, `held`, `heartbeat_age_secs`, `draining`, `draining_since`; plus `live_reason` when not live, `not_ready_reason` when not ready (`draining` after a pause, else in strict mode an evicting store's policy) and `queue_eviction_policy` with a separate queue store |
 
 A liveness probe on `/health/live` restarts a pod whose loops died (0.1.0b1 always answered
 200): keep its `failureThreshold` at 3 or more so one slow beat does not restart a healthy pod.
@@ -142,7 +142,7 @@ loops died or the heartbeat made no progress for a lease (`LLMQ_LEASE_SECS`).
 
 At `start()` the store's own setup is checked: a cluster-mode store is refused (`ConfigError`),
 and a `maxmemory-policy` that can evict the library's keys (`allkeys-*`, or `volatile-*` with
-`LLMQ_KEY_EXPIRY=native`) logs `store_eviction_policy` with a warning and, when strict, fails
+`LLMQ_KEY_EXPIRY_MODE=native`) logs `store_eviction_policy` with a warning and, when strict, fails
 readiness (see
 [Store requirements](../explanation/storage.md#store-requirements)).
 
@@ -235,13 +235,13 @@ The store is one primary with replicas (cluster mode is not supported).
 - Clients reconnect on `READONLY` after a failover. The failover drill (`scripts/failover.py`)
   loses no call on `failover` and `restart`; with DNS lagging 6 s, at most 5 % of calls in
   flight may fail.
-- `LLMQ_QUEUE_WAIT_REPLICAS` (default 0, off) / `LLMQ_QUEUE_WAIT_MS` (default 100): a write
+- `LLMQ_REPLICA_WAIT_COUNT` (default 0, off) / `LLMQ_REPLICA_WAIT_MS` (default 100): a write
   waits for this many replicas to acknowledge it, for call sends, job sends and registry live
-  edits (each switchable with `LLMQ_QUEUE_WAIT_SCOPES`, default `all`). Too few
+  edits (each switchable with `LLMQ_REPLICA_WAIT_SCOPES`, default `all`). Too few
   acknowledgements never fail a write: it was sent, so it goes on, with a `replicas_short`
   warning at most once a minute and `llmq_send_not_replicated_total`. Also set
   `min-replicas-to-write` on the primary: its `NOREPLICAS` refusal counts as the store down.
-- With a separate queue store (`LLMQ_QUEUE_STORE_URL`), errors for `LLMQ_QUEUE_FAILOVER_SECS`
+- With a separate queue store (`LLMQ_QUEUE_STORE_URL`), errors for `LLMQ_QUEUE_STORE_FAILOVER_SECS`
   (5) make calls run direct under the same budgets. Each send try is bounded by that time (a
   store that never answers fails over then, not after the client's ~21 s budget), and the
   process remembers the outage for a few seconds (cleared by a good store probe): calls in
@@ -273,7 +273,7 @@ named events, for example:
 | `second_llm_queue_started` | A second `LLMQueue` was started in one process |
 | `store_eviction_policy` | The store may evict the library's keys (`allkeys-*`, or `volatile-*` with native key expiry) |
 | `key_expiry_changed` | A store's key expiry mode changed from `native` to `swept` (or was set first): a policy change, or a process set to `swept` |
-| `key_expiry_conflict` | This process's `LLMQ_KEY_EXPIRY` differs from the store's mode; it follows the store (give every process one setting) |
+| `key_expiry_conflict` | This process's `LLMQ_KEY_EXPIRY_MODE` differs from the store's mode; it follows the store (give every process one setting) |
 | `job_no_consumer` | A job was sent to a name no running process consumes |
 | `store_down` | The state store failed before a call was sent; the `store_down` rule applies |
 | `deployment_disabled`, `deployment_recovered` | Health checks turned a deployment off or back on |

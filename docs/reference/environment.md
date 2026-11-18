@@ -14,7 +14,7 @@ llmq = LLMQueue.from_env(environ={"LLMQ_STORE_URL": "..."},   # no environment v
                          secrets=lookup)
 llmq = LLMQueue.from_env(secrets=lookup,                      # the app's own values, lowest
                          defaults={"LLMQ_KEY_PREFIX": "myapp-dev"},
-                         secret_names={"LLMQ_STORE_HOST": "valkey_host"})
+                         secrets_names={"LLMQ_STORE_HOST": "valkey_host"})
 ```
 
 Three layers, highest first: **the secrets**, then **`environ`**, then **`defaults=`**.
@@ -31,14 +31,14 @@ Three layers, highest first: **the secrets**, then **`environ`**, then **`defaul
 - `defaults=` (a mapping of `LLMQ_*` names to values; `True` / `False` read as `true` /
   `false`) is used for a name neither layer above sets: the app's own defaults, kept in code.
   A name without the `LLMQ_` prefix is refused.
-- `secret_names=` maps an `LLMQ_*` setting to the key that holds it in the secrets
+- `secrets_names=` maps an `LLMQ_*` setting to the key that holds it in the secrets
   (`{"LLMQ_STORE_PASSWORD": "valkey_password"}`): that key is asked instead of the `LLMQ_*`
-  name. It is merged over `LLMQ_SECRET_NAMES` (the argument wins per setting). The order of the
+  name. It is merged over `LLMQ_SECRETS_NAMES` (the argument wins per setting). The order of the
   layers stays the same.
 
 The CLI (`llm-queue`) and `AdminServices.from_env` read the same layers, so
 `LLMQ_SECRETS_SOURCE` applies to them too. `AdminServices.from_env` takes `LLMQueue.from_env`'s
-`secrets=`, `defaults=` and `secret_names=` and builds on the same wiring
+`secrets=`, `defaults=` and `secrets_names=` and builds on the same wiring
 (`AdminContext.from_layers`), so an admin worker reproduces an app that configures through
 `defaults=`.
 
@@ -64,7 +64,7 @@ Where the secret layer comes from when no `secrets=` is passed. These settings a
 | Variable | Default | Range | Meaning |
 |---|---|---|---|
 | `LLMQ_SECRETS_SOURCE` | `none` | comma list of `aws-secretsmanager:<secret-id>`, `file:<path>`, `env`, `none` | Sources tried in order for each name; the first that has it wins. `aws-secretsmanager:<id>`: one Secrets Manager secret holding a JSON object (credentials from the default chain, the pod role on EKS). `file:<path>`: a directory with one file per key (a Kubernetes secret volume; one trailing newline stripped), a `.json` file holding an object, or any other file read as `.env` lines (`KEY=VALUE`, `#` comments, optional quotes). `env`: the environment. `none`: no source. `${NAME}` and `${NAME:-default}` are expanded from the environment (`aws-secretsmanager:${ENV}/app/secret`). A source that cannot be read at `from_env` (missing, denied, not JSON) raises `ConfigError` naming it; a key no source has is unset |
-| `LLMQ_SECRET_NAMES` | empty | JSON object of `LLMQ_*` names to keys | The key each setting has in the secrets: `{"LLMQ_STORE_HOST":"valkey_host","LLMQ_STORE_PASSWORD":"valkey_key"}`. Merged with `secret_names=` (the argument wins per setting). Keys must be `LLMQ_*` settings (not these five) and values non-empty |
+| `LLMQ_SECRETS_NAMES` | empty | JSON object of `LLMQ_*` names to keys | The key each setting has in the secrets: `{"LLMQ_STORE_HOST":"valkey_host","LLMQ_STORE_PASSWORD":"valkey_key"}`. Merged with `secrets_names=` (the argument wins per setting). Keys must be `LLMQ_*` settings (not these five) and values non-empty |
 | `LLMQ_SECRETS_REGION` | the AWS default (`AWS_REGION`, then `AWS_DEFAULT_REGION`) | an AWS region | Region of the `aws-secretsmanager` sources |
 | `LLMQ_SECRETS_CACHE_SECS` | 300 | 0 to 86400 | Each source's values are kept this long, then read again (so a rotated value is seen within it). 0: read on every lookup. A lookup on the event loop never waits for a refresh: it gets the last values while a background thread reads the source again. A refresh that fails keeps the last values (`secrets_refresh_failed`) and is tried again after min(this, 30 s) |
 | `LLMQ_SECRETS_TIMEOUT_SECS` | 10 | 1 to 300 | Connect and read timeout of a Secrets Manager request (3 attempts) |
@@ -73,7 +73,7 @@ Where the secret layer comes from when no `secrets=` is passed. These settings a
 
 | Value | Mode | What it means |
 |---|---|---|
-| `dev`, `local`, `test`, `ci` | dev | Plain `redis://` stores allowed, no id salt needed, the default key prefix `llmq`, any `base_url` host, `http` endpoint overrides, `LLMQ_DEBUG_CAPTURE_FROM_CONFIG` allowed |
+| `dev`, `local`, `test`, `ci` | dev | Plain `redis://` stores allowed, no id salt needed, the default key prefix `llmq`, any `base_url` host, `http` endpoint overrides, `LLMQ_DEBUG_CAPTURE_ENABLED` allowed |
 | anything else (`prod`, `staging`, ...) | strict | The checks below |
 | **unset** | **strict** | Same as any other name (since 0.1.0b2; before, unset meant dev) |
 
@@ -87,13 +87,13 @@ Where the secret layer comes from when no `secrets=` is passed. These settings a
   a short key does not stop brute force);
 - an explicit `LLMQ_KEY_PREFIX` (two environments that both kept the default `llmq` on one
   store shared their queues);
-- `LLMQ_BASE_URL_ALLOWED_HOSTS` when the registry has an `openai` account;
+- `LLMQ_HTTP_ALLOWED_HOSTS` when the registry has an `openai` account;
 - `https://` in `LLMQ_BEDROCK_ENDPOINT_URL` and `LLMQ_STS_ENDPOINT_URL` (any host);
-- `LLMQ_DEBUG_CAPTURE_FROM_CONFIG` off (it stores prompt text).
+- `LLMQ_DEBUG_CAPTURE_ENABLED` off (it stores prompt text).
 
 A store whose eviction policy can drop the library's keys fails readiness in strict mode, with
 the reason (the process still starts): `allkeys-*` always, and `volatile-*` when keys expire
-natively (`LLMQ_KEY_EXPIRY=native`). With `auto` (the default) a `volatile-*` store gets
+natively (`LLMQ_KEY_EXPIRY_MODE=native`). With `auto` (the default) a `volatile-*` store gets
 `swept` and stays ready.
 
 ```mermaid
@@ -116,13 +116,13 @@ flowchart LR
 | `LLMQ_QUEUE_STORE_PASSWORD` | none | text | As `LLMQ_STORE_PASSWORD`, for the queue store |
 | `LLMQ_STORE_MAX_CONNECTIONS` | 200 | 4 to 100000 (whole) | Store connection pool per engine (worker slots + callers + 3). `auto`: the sum of `worker_slots` over the boot registry's models plus 10 (`STORE_POOL_MARGIN`), within 4 to 100000, computed once by `from_env` (a live edit does not resize it; `start()` warns when the pool is below the slots). Sync calls without a started queue use at most `LLMQ_SYNC_STORE_MAX_CONNECTIONS` |
 | `LLMQ_SYNC_STORE_MAX_CONNECTIONS` | 20 | 1 to 100000 (whole) | The pool of the private caller-only engine that serves sync calls when no queue is started (Celery workers, scripts); never more than `LLMQ_STORE_MAX_CONNECTIONS` |
-| `LLMQ_QUEUE_FAILOVER_SECS` | 5 | 0 to 3600 | With a separate queue store: send errors this long before calls run direct |
-| `LLMQ_QUEUE_WAIT_REPLICAS` | 0 | 0 to 16 (whole) | A write waits for this many replicas to acknowledge it (0: off). With fewer replicas a write is sent anyway, warned about at most once a minute and counted (`llmq_send_not_replicated_total`); a store with no replica connected skips the wait ... |
-| `LLMQ_QUEUE_WAIT_MS` | 100 | above 0 to 60000 (whole) | ... for at most this long (it must stay below the store read timeout, see [Tune](../how-to/tune.md)) |
-| `LLMQ_QUEUE_WAIT_SCOPES` | `all` | `all`, `none` or a comma list of `calls`, `jobs`, `registry` | Which writes wait for replicas: call sends, job sends, registry live edits. Every scope is on by default when `LLMQ_QUEUE_WAIT_REPLICAS` is set |
-| `LLMQ_KEY_EXPIRY` | `auto` | `auto`, `native`, `swept` | How keys expire. `native`: Valkey TTLs (needs `maxmemory-policy noeviction`). `swept`: no key the library needs has a TTL; expiries live in the index `P:ttl` and the sweeper deletes due keys, so a `volatile-*` store (a shared cache) cannot evict them. `auto`: `native` on a `noeviction` store, else `swept` (`volatile-*`, `allkeys-*` or an unreadable policy). The mode is the store's: a started engine writes it to `P:expiry` at start, every minute and after a store reset, and every script follows that key; a missing key means `native`. `allkeys-*` stays not ready in strict mode either way. See [Key expiry modes](../explanation/storage.md#key-expiry-modes) |
-| `LLMQ_TTL_SWEEP_BATCH` | 500 | 1 to 5000 (whole) | Keys deleted per sweep script run (index `P:ttl`). The sweep runs in both modes |
-| `LLMQ_TTL_SWEEP_ROUNDS` | 100 | 1 to 10000 (whole) | Full batches per sweep (every 10 s), at most: 500 x 100 = 50000 keys per sweep (5000 a second) by default; more wait for the next one. Every process (worker or caller) takes part; one at a time sweeps, under the lock `P:lock:ttlsweep` |
+| `LLMQ_QUEUE_STORE_FAILOVER_SECS` | 5 | 0 to 3600 | With a separate queue store: send errors this long before calls run direct |
+| `LLMQ_REPLICA_WAIT_COUNT` | 0 | 0 to 16 (whole) | A write waits for this many replicas to acknowledge it (0: off). With fewer replicas a write is sent anyway, warned about at most once a minute and counted (`llmq_send_not_replicated_total`); a store with no replica connected skips the wait ... |
+| `LLMQ_REPLICA_WAIT_MS` | 100 | above 0 to 60000 (whole) | ... for at most this long (it must stay below the store read timeout, see [Tune](../how-to/tune.md)) |
+| `LLMQ_REPLICA_WAIT_SCOPES` | `all` | `all`, `none` or a comma list of `calls`, `jobs`, `registry` | Which writes wait for replicas: call sends, job sends, registry live edits. Every scope is on by default when `LLMQ_REPLICA_WAIT_COUNT` is set |
+| `LLMQ_KEY_EXPIRY_MODE` | `auto` | `auto`, `native`, `swept` | How keys expire. `native`: Valkey TTLs (needs `maxmemory-policy noeviction`). `swept`: no key the library needs has a TTL; expiries live in the index `P:ttl` and the sweeper deletes due keys, so a `volatile-*` store (a shared cache) cannot evict them. `auto`: `native` on a `noeviction` store, else `swept` (`volatile-*`, `allkeys-*` or an unreadable policy). The mode is the store's: a started engine writes it to `P:expiry` at start, every minute and after a store reset, and every script follows that key; a missing key means `native`. `allkeys-*` stays not ready in strict mode either way. See [Key expiry modes](../explanation/storage.md#key-expiry-modes) |
+| `LLMQ_KEY_EXPIRY_SWEEP_BATCH` | 500 | 1 to 5000 (whole) | Keys deleted per sweep script run (index `P:ttl`). The sweep runs in both modes |
+| `LLMQ_KEY_EXPIRY_SWEEP_ROUNDS` | 100 | 1 to 10000 (whole) | Full batches per sweep (every 10 s), at most: 500 x 100 = 50000 keys per sweep (5000 a second) by default; more wait for the next one. Every process (worker or caller) takes part; one at a time sweeps, under the lock `P:lock:ttlsweep` |
 
 For a store with replicas, also set `min-replicas-to-write` on the primary: a write it refuses
 (`NOREPLICAS`), like `OOM`, `MISCONF` and `BUSY`, is treated as the store being down.
@@ -139,7 +139,7 @@ How calls run (see [Modes](../how-to/modes.md) for when to switch and how to und
 
 | Variable | Default | Range | Meaning |
 |---|---|---|---|
-| `LLMQ_EXECUTION_MODE` | `queue` | `queue`, `local` | `queue`: calls go through the store's queues and shared budgets. `local`: every call runs in this process straight against the provider, with the same API, classes, LangChain adapters and `install()`; no store client is built (`LLMQ_STORE_URL` is not needed), store-only operations raise `LocalModeRefused` (HTTP 503) and `LLMQ_MODE` does not apply |
+| `LLMQ_EXECUTION_MODE` | `queue` | `queue`, `local` | `queue`: calls go through the store's queues and shared budgets. `local`: every call runs in this process straight against the provider, with the same API, classes, LangChain adapters and `install()`; no store client is built (`LLMQ_STORE_URL` is not needed), store-only operations raise `LocalModeRefused` (HTTP 503) and `LLMQ_ROLE` does not apply |
 | `LLMQ_LOCAL_PROCESS_COUNT` | 1 | above 0 to 100000 (whole) | The local executor's share of each budget: every deployment's (and account's shared) `rpm` / `tpm` is divided by this in each process. Set it to the processes sharing the quota (pods x workers). Used in `local` mode and by `store_down: static_cap`. A fixed ceiling, read at start: it does not follow autoscaling, so set it to the most processes that may run at once (fewer running leave quota unused, more go over it). `local_mode_started` logs the share each process takes per model; queue mode logs `static_cap_process_count_unset` at start when a model uses `static_cap` and this is left at 1 |
 | `LLMQ_LOCAL_CONCURRENCY` | 10 | above 0 to 100000 (whole) | Calls in flight per model and process on the local executor (`local` mode and `store_down: static_cap`; async and sync calls together); priority calls get a free slot first. The one setting for both: the old `LLMQ_LOCAL_LIMIT_CAP` is reported as renamed |
 | `LLMQ_STATIC_CAP_WAIT_SECS` | 5 | 0 to 3600 | The longest a `store_down: static_cap` call waits for a budget or a breaker during a store outage, below its own `max_wait_secs`; then `rate_limited`. Retries and their backoff are not capped |
@@ -170,9 +170,9 @@ renamed and removed settings.
 | `LLMQ_ID_HASH_SALT` | none | 16 or more characters when strict | Key of the user / session id hash (HMAC). Use the same value in every service that shares the store |
 | `LLMQ_KEY_PREFIX` | `llmq` in dev; **required** when strict | 1-64 letters, digits, `_`, `.`, `:` or `-` | Prefix of this environment's store keys: name it per app and environment (`myapp-prod`, `llmq:prod:v3`). No braces or glob characters: it is part of every key |
 | `LLMQ_QUEUE_PREFIX` | empty | 0-64 letters, digits, `_`, `.` or `-` | Prefix of this environment's queue names (no `:`: it goes inside hash tags) |
-| `LLMQ_MODE` | `both` | `both`, `caller`, `worker` | `both` (caller and worker), `caller` (sends and waits only) or `worker` (runs calls only). Does not apply with `LLMQ_EXECUTION_MODE=local` |
-| `LLMQ_WORKER_ID` | empty | letters, digits, `_`, `.`, `:`, `-` | Empty: `POD_NAME` (else the host name) and the pid, e.g. `api-7f9c:12`. This process's id prefix in the store (callers, leases, logs); the engine adds a random tail, so two processes never share one. A `worker_id=` argument wins |
-| `LLMQ_DEFAULT_TENANT` | none | text | The tenant of a call that names none (no `tenant_id=`, none in `request_context`): every call of a single-tenant app carries it, threads included |
+| `LLMQ_ROLE` | `both` | `both`, `caller`, `worker` | `both` (caller and worker), `caller` (sends and waits only) or `worker` (runs calls only). Does not apply with `LLMQ_EXECUTION_MODE=local` |
+| `LLMQ_INSTANCE_ID` | empty | letters, digits, `_`, `.`, `:`, `-` | Empty: `POD_NAME` (else the host name) and the pid, e.g. `api-7f9c:12`. This process's id prefix in the store (callers, leases, logs); the engine adds a random tail, so two processes never share one. A `instance_id=` argument wins |
+| `LLMQ_TENANT_DEFAULT` | none | text | The tenant of a call that names none (no `tenant_id=`, none in `request_context`): every call of a single-tenant app carries it, threads included |
 | `LLMQ_ADMIN_TOKEN` | none | text (a secret) | Guards every admin route except the probes and `/metrics`, reads and writes: the request's `LLMQ_ADMIN_HEADER` must equal it (constant-time). Read on every request, so a rotated secret needs no restart. Unset with no `LLMQ_ADMIN_READ_TOKEN`: only the app's `dependencies` guard the routes; with none of the three the router mounts only the probes and `/metrics` (unless `insecure_reads=True`) |
 | `LLMQ_ADMIN_READ_TOKEN` | none | text (a secret) | Guards the read routes only (GET): the request's `LLMQ_ADMIN_HEADER` must equal it or `LLMQ_ADMIN_TOKEN`. It never allows a write. Read on every request. See [Admin API](admin-api.md) |
 | `LLMQ_ADMIN_HEADER` | `X-LLMQ-Token` | a header name | The header that carries the admin tokens (read and write) |
@@ -180,7 +180,7 @@ renamed and removed settings.
 | `LLMQ_ADMIN_ACTOR_HEADER` | `X-LLMQ-Actor` | a header name | With the token guard and no `actor=`: the header whose value a write is audited under, as `token:<value>` (`token:unknown` without it). A claimed name, not an identity |
 | `LLMQ_ADMIN_CSRF_HEADER` | `X-LLMQ-Admin` | a header name | When the write routes are guarded by `dependencies` only (no `LLMQ_ADMIN_TOKEN`), a write needs this header (any value): no simple cross-site request can carry it |
 | `LLMQ_ADMIN_INDEX_CACHE_SECS` | 2 | 0 to 60 | How long `GET /` (the admin index) reuses its live summary, so a dashboard poll cannot load the store |
-| `LLMQ_ADMIN_DLQ_BODIES_ENABLED` | false | true or false (`on` / `off`) | `GET /dlq/{entry_id}?unsafe=true` may return message bodies (prompts, job payloads); off, it answers 403. The CLI and Python `unsafe=True` do not need it |
+| `LLMQ_ADMIN_DEAD_LETTER_BODIES_ENABLED` | false | true or false (`on` / `off`) | `GET /dlq/{entry_id}?unsafe=true` may return message bodies (prompts, job payloads); off, it answers 403. The CLI and Python `unsafe=True` do not need it |
 | `LLMQ_ADMIN_BODY_MAX_BYTES` | 1048576 | 1024 to 67108864 (whole) | Largest admin POST body; a larger one answers 413 before it is parsed. Each value of a JSON body (a registry edit's `values`) is also capped at 64 KiB serialised (400) |
 | `LLMQ_METRICS_SINK` | `emf` | `emf`, `prometheus`, `none` | `emf` (CloudWatch embedded metrics), `prometheus` (extra `metrics`) or `none`. One sink per process |
 | `LLMQ_METRICS_TENANTS` | empty | at most 50 entries `name` or `name=label`, label `[A-Za-z0-9_.-]{1,64}` (not `other` or `-`) | Tenants that get their own `tenant` label on `llmq_calls_total` and `llmq_wait_seconds` (`globex=t2` shows `globex` as `t2`, so a dashboard need not show the name); every other tenant is `other`, a call with no tenant `-`. The label is always there, so cardinality stays fixed. Names are matched by their keyed hash: no name reaches the store |
@@ -207,11 +207,11 @@ count, cancel, reprioritize and extend one tenant's calls on one model.
 |---|---|---|---|
 | `LLMQ_REGISTRY` | none | JSON | The registry document ([shape](registry.md)) |
 | `LLMQ_REGISTRY_FILE` | none | a path | A file holding it (set one of the two, not both). A repeated JSON key is refused. A path ending `.yaml` / `.yml` is read as YAML (extra `yaml`). Either form may hold `${NAME}` placeholders ([registry](registry.md#placeholders-and-yaml)) |
-| `LLMQ_REGISTRY_LIVE_EDIT` | `safe` | `safe`, `all`, `off` | The live-edit mode when the document has no `live_edit` field (see [Live edits](../how-to/configure.md#live-edits)) |
-| `LLMQ_CFG_RELOAD_SECS` | 30 | 1 to 3600 | How often each process reloads the registry |
+| `LLMQ_REGISTRY_LIVE_EDIT_MODE` | `safe` | `safe`, `all`, `off` | The live-edit mode when the document has no `live_edit` field (see [Live edits](../how-to/configure.md#live-edits)) |
+| `LLMQ_REGISTRY_RELOAD_SECS` | 30 | 1 to 3600 | How often each process reloads the registry |
 | `LLMQ_AUDIT_RETENTION_DAYS` | 90 | above 0 to 3650 (whole) | How long registry audit entries are kept (also capped at about 10,000 entries) |
-| `LLMQ_BASE_URL_ALLOWED_HOSTS` | empty | comma list of bare host names | Hosts an `openai` account's `base_url` may name (no scheme, port or path: `api.openai.com`). Empty: any host in dev; required when strict and the registry has an `openai` account |
-| `LLMQ_DEBUG_CAPTURE_FROM_CONFIG` | false | true or false | Allows a model's `debug_capture` (prompt text in the store for an hour); refused when strict |
+| `LLMQ_HTTP_ALLOWED_HOSTS` | empty | comma list of bare host names | Hosts an `openai` account's `base_url` may name (no scheme, port or path: `api.openai.com`). Empty: any host in dev; required when strict and the registry has an `openai` account |
+| `LLMQ_DEBUG_CAPTURE_ENABLED` | false | true or false | Allows a model's `debug_capture` (prompt text in the store for an hour); refused when strict |
 
 ## Calls and lifecycle
 
@@ -235,12 +235,12 @@ What a purge does by default; each method argument overrides its setting. See
 
 | Variable | Default | Range | Meaning |
 |---|---|---|---|
-| `LLMQ_AUTO_PURGE` | true | true or false (`on` / `off`) | When a registry publish drops a model or deployment, purge its store state after `LLMQ_PURGE_GRACE_SECS` (one worker process does it, never a caller-only one; a rollback within the grace keeps the state; an auto deployment purge does not wait for running calls) |
+| `LLMQ_PURGE_AUTO_ENABLED` | true | true or false (`on` / `off`) | When a registry publish drops a model or deployment, purge its store state after `LLMQ_PURGE_GRACE_SECS` (one worker process does it, never a caller-only one; a rollback within the grace keeps the state; an auto deployment purge does not wait for running calls) |
 | `LLMQ_PURGE_GRACE_SECS` | 900 | 0 to 604800 | How long an auto purge waits after the drop; keep it at least the longest call (`timeout_max_secs`, 900 by default) |
-| `LLMQ_PURGE_WAIT` | true | true or false | A deployment purge waits for the deployment's running calls to end first |
+| `LLMQ_PURGE_WAIT_ENABLED` | true | true or false | A deployment purge waits for the deployment's running calls to end first |
 | `LLMQ_PURGE_WAIT_SECS` | 300 | 0 to 86400 | ... for at most this long; still running then, nothing is deleted and the report says why |
-| `LLMQ_HTTP_PURGE_WAIT_SECS` | 60 | 0 to 3600 | The longest a purge over HTTP (`/purge/deployment`, `/purge/removed`, `/models/{model}/drain`) waits for running calls; a larger or omitted `wait_secs` is capped to it |
-| `LLMQ_TENANT_PURGE_DEFAULT` | `keys` | comma list of `keys`, `queued`, `running` | What a tenant purge removes: its fairness keys, its calls still waiting (cancelled), all its calls (cancelled). `queued` / `running` read the request index of each model; with `LLMQ_REQUEST_INDEX_ENABLED=false` they raise `AdminRefused` |
+| `LLMQ_ADMIN_HTTP_WAIT_SECS` | 60 | 0 to 3600 | The longest a purge over HTTP (`/purge/deployment`, `/purge/removed`, `/models/{model}/drain`) waits for running calls; a larger or omitted `wait_secs` is capped to it |
+| `LLMQ_PURGE_TENANT_REMOVE` | `keys` | comma list of `keys`, `queued`, `running` | What a tenant purge removes: its fairness keys, its calls still waiting (cancelled), all its calls (cancelled). `queued` / `running` read the request index of each model; with `LLMQ_REQUEST_INDEX_ENABLED=false` they raise `AdminRefused` |
 
 ## Endpoint overrides
 

@@ -457,7 +457,9 @@ def status_router(
         elif "wait_secs" in {p.name for p in op.params} and op.id.startswith("purge."):
             kwargs["wait_secs"] = wait_cap_secs  # an omitted wait waited LLMQ_PURGE_WAIT_SECS
         if kwargs.get("unsafe") and not dlq_bodies:
-            return reply((403, {"error": "message bodies need LLMQ_ADMIN_DLQ_BODIES_ENABLED"}))
+            return reply(
+                (403, {"error": "message bodies need LLMQ_ADMIN_DEAD_LETTER_BODIES_ENABLED"})
+            )
         if op.writes:
             kwargs["actor"] = who(request)
         return reply(await call(admin, op, kwargs))

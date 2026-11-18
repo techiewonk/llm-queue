@@ -466,7 +466,7 @@ class RequestsAdmin:
         *,
         secrets: Callable[[str], str | None] | None = None,
         defaults: Mapping[str, Any] | None = None,
-        secret_names: Mapping[str, str] | None = None,
+        secrets_names: Mapping[str, str] | None = None,
     ) -> RequestsAdmin:
         """A standalone service from `LLMQ_*` (CLI, admin worker); close it with `aclose()`.
 
@@ -476,7 +476,7 @@ class RequestsAdmin:
         from llm_queue.engine.admin.context import AdminContext
         from llm_queue.engine.settings import Layers
 
-        ctx = AdminContext.from_layers(Layers(environ, secrets, defaults, secret_names))
+        ctx = AdminContext.from_layers(Layers(environ, secrets, defaults, secrets_names))
         assert ctx.requests is not None  # `from_layers` builds it
         service = ctx.requests
         service._owned = ctx.owned

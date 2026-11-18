@@ -1,4 +1,4 @@
-"""Where secrets come from: `LLMQ_SECRETS_SOURCE` and `LLMQ_SECRET_NAMES` (0.2.0).
+"""Where secrets come from: `LLMQ_SECRETS_SOURCE` and `LLMQ_SECRETS_NAMES` (0.2.0).
 
 A source spec is an ordered, comma-separated list; each name is looked up in each source in
 turn and the first that has it wins:
@@ -49,7 +49,7 @@ ClientFactory = Callable[[str | None, float], Any]
 
 # The settings this module reads (from the environment or `defaults=`, never from a secret).
 SOURCE_VAR = "LLMQ_SECRETS_SOURCE"
-NAMES_VAR = "LLMQ_SECRET_NAMES"
+NAMES_VAR = "LLMQ_SECRETS_NAMES"
 REGION_VAR = "LLMQ_SECRETS_REGION"
 CACHE_VAR = "LLMQ_SECRETS_CACHE_SECS"
 TIMEOUT_VAR = "LLMQ_SECRETS_TIMEOUT_SECS"
@@ -522,7 +522,7 @@ def secrets_from_config(
 
 
 def parse_secret_names(value: Any) -> tuple[dict[str, str], list[str]]:
-    """`LLMQ_SECRET_NAMES` (JSON text or a mapping) and its problems, listed at once."""
+    """`LLMQ_SECRETS_NAMES` (JSON text or a mapping) and its problems, listed at once."""
     if value is None or value == "":
         return {}, []
     repeated: list[str] = []
@@ -539,14 +539,14 @@ def parse_secret_names(value: Any) -> tuple[dict[str, str], list[str]]:
         try:
             value = json.loads(value, object_pairs_hook=pairs)
         except ValueError:
-            return {}, ["LLMQ_SECRET_NAMES must be a JSON object of setting names to secret keys"]
+            return {}, ["LLMQ_SECRETS_NAMES must be a JSON object of setting names to secret keys"]
     if not isinstance(value, Mapping):
-        return {}, ["LLMQ_SECRET_NAMES must be a JSON object of setting names to secret keys"]
+        return {}, ["LLMQ_SECRETS_NAMES must be a JSON object of setting names to secret keys"]
     names: dict[str, str] = {}
-    problems = [f"LLMQ_SECRET_NAMES: {name} is set twice" for name in dict.fromkeys(repeated)]
+    problems = [f"LLMQ_SECRETS_NAMES: {name} is set twice" for name in dict.fromkeys(repeated)]
     for name, secret in value.items():
         if not isinstance(secret, str) or not secret.strip():
-            problems.append(f"LLMQ_SECRET_NAMES: {name} must name a secret key")
+            problems.append(f"LLMQ_SECRETS_NAMES: {name} must name a secret key")
             continue
         names[str(name).strip()] = secret.strip()
     return names, problems

@@ -68,7 +68,7 @@ missing from an OpenAPI schema already served.
 `RequestContextMiddleware` (in `llm_queue.asgi`, pure ASGI: no FastAPI import, works for
 websockets) runs each request inside `request_context(...)`. Each value is a constant or a
 callable of the ASGI scope (sync or async); None leaves the field inherited, so
-`LLMQ_DEFAULT_TENANT` still applies:
+`LLMQ_TENANT_DEFAULT` still applies:
 
 ```python
 from llm_queue import RequestContextMiddleware

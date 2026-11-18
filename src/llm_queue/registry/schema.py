@@ -227,7 +227,7 @@ class Registry:
     models: Mapping[str, ModelEntry]
     residency: tuple[str, ...] | None = None
     min_lib_version: str | None = None
-    live_edit: str | None = None  # None: the process's `LLMQ_REGISTRY_LIVE_EDIT` applies
+    live_edit: str | None = None  # None: the process's `LLMQ_REGISTRY_LIVE_EDIT_MODE` applies
     warnings: tuple[str, ...] = ()
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
     # Provider model id -> alias, built once: `alias_of` scanned every model on each call

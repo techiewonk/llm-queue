@@ -33,7 +33,7 @@ LOCAL = {
     "LLMQ_ENVIRONMENT": "dev",
     "LLMQ_REGISTRY": json.dumps(DOC),
     "LLMQ_ID_HASH_SALT": "salt-value-not-logged",
-    "LLMQ_DEFAULT_TENANT": "acme-corp",
+    "LLMQ_TENANT_DEFAULT": "acme-corp",
     "LLMQ_ADMIN_TOKEN": "token-value-not-logged",
 }
 

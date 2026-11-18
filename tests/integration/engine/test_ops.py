@@ -283,7 +283,7 @@ def test_environment_settings() -> None:
     ok = InfraSettings.from_env(
         {"LLMQ_STORE_URL": "redis://localhost:6379/0", "LLMQ_ENVIRONMENT": "dev"}
     )
-    assert ok.registry_live_edit == "safe"
+    assert ok.registry_live_edit_mode == "safe"
     with pytest.raises(ConfigError) as info:
         InfraSettings.from_env(
             {

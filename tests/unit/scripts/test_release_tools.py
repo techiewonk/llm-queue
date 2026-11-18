@@ -28,7 +28,7 @@ store_keys_page: Any = importlib.import_module("store_keys_page")
     ("heading", "anchor"),
     [
         ("Key expiry modes", "key-expiry-modes"),
-        ("`LLMQ_KEY_EXPIRY` and the index", "llmq_key_expiry-and-the-index"),
+        ("`LLMQ_KEY_EXPIRY_MODE` and the index", "llmq_key_expiry_mode-and-the-index"),
         ("Upgrading from 0.1.0b2", "upgrading-from-010b2"),
         ("[Linked](x.md) title", "linked-title"),
     ],

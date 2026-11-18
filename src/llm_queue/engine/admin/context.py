@@ -66,7 +66,7 @@ class AdminContext:
 
         The one wiring `AdminServices.from_env`, `RequestsAdmin.from_env` and
         `PurgeService.from_env` share (review B-23: three copies drifted, and none took
-        `defaults=` or `secret_names=`). Store passwords are read as `LLMQueue.from_env`
+        `defaults=` or `secrets_names=`). Store passwords are read as `LLMQueue.from_env`
         reads them; the clients it opens are in `owned`.
         """
         from llm_queue.engine.purge import PurgeService, PurgeSettings
@@ -94,8 +94,8 @@ class AdminContext:
             state,
             settings.key_prefix,
             config=config,
-            live_edit=settings.registry_live_edit,
-            allowed_hosts=settings.base_url_allowed_hosts,
+            live_edit=settings.registry_live_edit_mode,
+            allowed_hosts=settings.http_allowed_hosts,
             audit_retention_days=settings.audit_retention_days,
         )
         keys = Keys(settings.key_prefix)

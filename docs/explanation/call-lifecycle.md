@@ -102,7 +102,7 @@ sequenceDiagram
   cover lost wake-ups.
 - **Separate queue store.** The send is three steps: `REGISTER` (state), `SEND` (queue), `CONFIRM`
   (state); the settle is `RESULT_PUT` + `STATUS_SET` (state), `ACK` (queue), `FINISH` (state).
-- **Replica wait.** With `LLMQ_QUEUE_WAIT_REPLICAS`, the send and a `WAIT` go down one pipeline;
+- **Replica wait.** With `LLMQ_REPLICA_WAIT_COUNT`, the send and a `WAIT` go down one pipeline;
   too few acknowledgements never fail the send (it is on the primary): warned at most once a
   minute and counted in `llmq_send_not_replicated_total`.
 - **A refused admission** holds the call; see [Fallback](#5-fallback-across-deployments-and-models)
@@ -215,7 +215,7 @@ the queue send and receive are skipped.
 | Sync calls (`*_sync`) | Always direct (`force_direct`): on the started queue's loop, else on the private loop with a caller-only engine |
 | Kill switch | `routing.kill_switch` in the registry (live): every call direct |
 | `queue_pct` | Below 100: a call whose id hashes outside the percentage runs direct (a canary). Users in `routing.allow_users` (keyed hashes) always queue |
-| Queue store failover | A separate queue store whose sends fail for `LLMQ_QUEUE_FAILOVER_SECS` (5 s): the call runs direct; the next calls skip the queue store while the outage is remembered (`outage_memo_secs`, 3 s, ended early by a store probe that succeeds) |
+| Queue store failover | A separate queue store whose sends fail for `LLMQ_QUEUE_STORE_FAILOVER_SECS` (5 s): the call runs direct; the next calls skip the queue store while the outage is remembered (`outage_memo_secs`, 3 s, ended early by a store probe that succeeds) |
 
 ```mermaid
 sequenceDiagram

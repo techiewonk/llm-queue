@@ -208,7 +208,7 @@ class Health(TypedDict):
     stores: dict[str, str | None]
     eviction_policy: str
     queue_eviction_policy: NotRequired[str]
-    key_expiry: str  # `native` or `swept` (LLMQ_KEY_EXPIRY, engine/expiry.py)
+    key_expiry_mode: str  # `native` or `swept` (LLMQ_KEY_EXPIRY_MODE, engine/expiry.py)
     # Between `pause_receiving()` and `resume_receiving()` (0.2.0 A3); since: Unix seconds.
     draining: NotRequired[bool]
     draining_since: NotRequired[float | None]
@@ -307,9 +307,9 @@ class LLMQueue:
         *,
         secrets: Secrets | None = None,
         defaults: Mapping[str, Any] | None = None,
-        secret_names: Mapping[str, str] | None = None,
+        secrets_names: Mapping[str, str] | None = None,
         metrics: Metrics | None = None,
-        worker_id: str | None = None,
+        instance_id: str | None = None,
         credentials: Callable[[Any], Mapping[str, Any] | None] | None = None,
         offload: ResultOffload | None = None,
         offload_bytes: int | None = None,
@@ -317,26 +317,26 @@ class LLMQueue:
     ) -> LLMQueue:
         """Build from `LLMQ_*`: the secrets first, then `environ`, then `defaults`.
 
-        The secrets are `secrets`, else the sources `LLMQ_SECRETS_SOURCE` names; `secret_names`
+        The secrets are `secrets`, else the sources `LLMQ_SECRETS_SOURCE` names; `secrets_names`
         reads a setting under another key, `tuning` sets timeouts and pools in code (see
         docs/reference/environment.md). `LLMQ_ENABLED=false` returns a `DisabledQueue` (probes
         and the drain file only, every call refused); `ConfigError` lists every problem.
         """
-        layers = Layers(environ, secrets, defaults, secret_names)  # reads a source once
+        layers = Layers(environ, secrets, defaults, secrets_names)  # reads a source once
         settings = InfraSettings.from_layers(layers)
         if not settings.enabled:  # LLMQ_ENABLED=false: the off switch (0.2.0 H1)
             from llm_queue.disabled import DisabledQueue
 
             return DisabledQueue(settings)
         if settings.execution_mode == "local":  # no store client at all (engine/local.py)
-            return cls._from_env_local(settings, layers, metrics, worker_id, credentials, tuning)
+            return cls._from_env_local(settings, layers, metrics, instance_id, credentials, tuning)
         jobs = JobSettings.from_env(layers)  # the same layers as every other setting
-        # This process's id prefix: the argument, LLMQ_WORKER_ID, else pod (or host) and pid; the
+        # This process's id prefix: the argument, LLMQ_INSTANCE_ID, else pod (or host) and pid; the
         # engine adds a random tail, so two processes never share one.
-        worker_id = worker_id or settings.worker_id or _default_worker_id()
+        worker_id = instance_id or settings.instance_id or _default_worker_id()
         tuning = tuning or Tuning()
         problems = tuning.problems(
-            queue_wait_ms=settings.queue_wait_ms, result_ttl_secs=settings.result_ttl_secs
+            replica_wait_ms=settings.replica_wait_ms, result_ttl_secs=settings.result_ttl_secs
         )
         if problems := problems + _transport_problems(settings, tuning):
             raise ConfigError("invalid tuning:\n  " + "\n  ".join(problems))
@@ -377,8 +377,8 @@ class LLMQueue:
                 state,
                 settings.key_prefix,
                 config=orjson.loads(settings.registry_document()),
-                live_edit=settings.registry_live_edit,
-                allowed_hosts=settings.base_url_allowed_hosts,
+                live_edit=settings.registry_live_edit_mode,
+                allowed_hosts=settings.http_allowed_hosts,
                 audit_retention_days=settings.audit_retention_days,
                 history_size=tuning.registry.history_size,
                 edit_retries=tuning.registry.edit_retries,
@@ -411,16 +411,16 @@ class LLMQueue:
                 local_concurrency=settings.local_concurrency,
                 static_cap_wait_secs=settings.static_cap_wait_secs,
                 id_hash_salt=settings.id_hash_salt or "",
-                cfg_reload_secs=settings.cfg_reload_secs,
-                queue_failover_secs=settings.queue_failover_secs,
-                queue_wait_replicas=settings.queue_wait_replicas,
-                queue_wait_ms=settings.queue_wait_ms,
-                queue_wait_scopes=settings.queue_wait_scopes,
-                key_expiry=settings.key_expiry,
-                ttl_sweep_batch=settings.ttl_sweep_batch,
-                ttl_sweep_rounds=settings.ttl_sweep_rounds,
+                registry_reload_secs=settings.registry_reload_secs,
+                queue_store_failover_secs=settings.queue_store_failover_secs,
+                replica_wait_count=settings.replica_wait_count,
+                replica_wait_ms=settings.replica_wait_ms,
+                replica_wait_scopes=settings.replica_wait_scopes,
+                key_expiry_mode=settings.key_expiry_mode,
+                key_expiry_sweep_batch=settings.key_expiry_sweep_batch,
+                key_expiry_sweep_rounds=settings.key_expiry_sweep_rounds,
                 strict=settings.strict,
-                debug_capture_allowed=settings.debug_capture_from_config,
+                debug_capture_allowed=settings.debug_capture_enabled,
                 timings=tuning.engine,
                 purge=PurgeSettings.from_infra(settings),
                 admin=AdminSettings.from_infra(settings),
@@ -467,10 +467,10 @@ class LLMQueue:
         (`LLMQ_LOCAL_PROCESS_COUNT`, `LLMQ_LOCAL_CONCURRENCY`); the sync calls' private engine
         shares them, so the process has one budget.
         """
-        worker_id = worker_id or settings.worker_id or _default_worker_id()
+        worker_id = worker_id or settings.instance_id or _default_worker_id()
         tuning = tuning or Tuning()
         problems = tuning.problems(
-            queue_wait_ms=settings.queue_wait_ms, result_ttl_secs=settings.result_ttl_secs
+            replica_wait_ms=settings.replica_wait_ms, result_ttl_secs=settings.result_ttl_secs
         )
         if problems := problems + _transport_problems(settings, tuning):
             raise ConfigError("invalid tuning:\n  " + "\n  ".join(problems))
@@ -511,7 +511,7 @@ class LLMQueue:
             registry = LocalRegistry(
                 document,
                 prefix=settings.key_prefix,
-                allowed_hosts=settings.base_url_allowed_hosts,
+                allowed_hosts=settings.http_allowed_hosts,
             )
             return LocalEngine(
                 registry,
@@ -624,14 +624,14 @@ class LLMQueue:
                 "second_llm_queue_started",
                 hint="one LLMQueue per process shares clients and stores; this one gets its own",
             )
-        mode = self.settings.mode if self.settings else "both"
+        mode = self.settings.role if self.settings else "both"
         await self._engine.start(
             worker=mode in ("both", "worker"), caller=mode in ("both", "caller")
         )
         self._cross_check()
         if isinstance(self._engine, LocalEngine):
             # One line saying how this process runs: calls go straight to the provider, and
-            # the worker / caller role (LLMQ_MODE) does not apply. `LLMQ_LOCAL_PROCESS_COUNT`
+            # the worker / caller role (LLMQ_ROLE) does not apply. `LLMQ_LOCAL_PROCESS_COUNT`
             # is a fixed ceiling (review Q-10): the share each process takes, logged per
             # model, does not follow autoscaling.
             logger.info(
@@ -908,7 +908,7 @@ class LLMQueue:
             "user_id": kw.pop("user_id", None) or ctx.user_id,
             "tenant_id": kw.pop("tenant_id", None)
             or ctx.tenant_id
-            or getattr(self.settings, "default_tenant", None),
+            or getattr(self.settings, "tenant_default", None),
         }
         out.update({k: v for k, v in kw.items() if v is not None})
         return out
@@ -1108,7 +1108,7 @@ class LLMQueue:
         `timeout_secs` is cancelled and fails. `ConfigError` in `caller` mode (R3JE-6).
         """
         self._refuse_local("jobs")
-        if self.settings is not None and self.settings.mode == "caller":
+        if self.settings is not None and self.settings.role == "caller":
             raise ConfigError(f"job {name}: a process in caller mode runs no jobs")
         self._jobs.register(name, fn, timeout_secs=timeout_secs, concurrency=concurrency)
 
@@ -1210,8 +1210,8 @@ class LLMQueue:
             actor_header=s.admin_actor_header if s else "X-LLMQ-Actor",
             csrf_header=s.admin_csrf_header if s else "X-LLMQ-Admin",
             insecure_reads=insecure_reads,
-            wait_cap_secs=float(s.http_purge_wait_secs) if s else 60.0,
-            dlq_bodies=bool(s.admin_dlq_bodies_enabled) if s else False,
+            wait_cap_secs=float(s.admin_http_wait_secs) if s else 60.0,
+            dlq_bodies=bool(s.admin_dead_letter_bodies_enabled) if s else False,
             index_cache_secs=float(s.admin_index_cache_secs) if s else 2.0,
             strict=bool(s.strict) if s else False,
             body_max_bytes=int(s.admin_body_max_bytes) if s else BODY_MAX_BYTES,

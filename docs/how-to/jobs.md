@@ -31,7 +31,7 @@ job_id = await llmq.send_job("index_documents", {"ids": ids, "texts": texts}, jo
 | Order | Not kept: up to 4 jobs of a name run at once per process, and a retried job goes back in later |
 | Concurrency | 4 per job name per process (`register_job(..., concurrency=N)` or `LLMQ_JOB_CONCURRENCY`), 32 per process over all names (`LLMQ_JOB_PROCESS_CONCURRENCY`) |
 | Waiting | At most 10,000 waiting jobs per name (`CallFailed("queue_full")`, `retry_after_secs` 5); a job waits at most the queue retention (1 day) before it is trimmed |
-| Durability | With `LLMQ_QUEUE_WAIT_REPLICAS` (default 0, off; scope `jobs` in `LLMQ_QUEUE_WAIT_SCOPES`, default `all`), a send waits for the replicas like a call does; with too few it is sent anyway, warned (`replicas_short`) and counted |
+| Durability | With `LLMQ_REPLICA_WAIT_COUNT` (default 0, off; scope `jobs` in `LLMQ_REPLICA_WAIT_SCOPES`, default `all`), a send waits for the replicas like a call does; with too few it is sent anyway, warned (`replicas_short`) and counted |
 | Context | A job's LLM calls run at normal priority with the sender's `user_id` and `tenant_id` (from `request_context` at `send_job`), not with the context of the process that called `start()`. The job message carries only their keyed hashes (`ctx.user_hash`, `ctx.tenant_hash`): inside the job, `request_context` holds the hashes (`llm_queue.ids.HashedId`), which its calls use as they are |
 | LLM budget | Jobs take none of their own; their LLM calls do |
 

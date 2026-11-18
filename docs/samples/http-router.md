@@ -49,7 +49,7 @@ flowchart LR
 ## Output (fakellm, 2026-11-17)
 
 ```text
-GET /health/ready -> 200 {'live': True, 'ready': True, 'draining': False, 'draining_since': None, 'worker': 'api-7f9c:12-9bb228', 'version': '0.1.1', 'registry_version': 1, 'held': 0, 'heartbeat_age_secs': 0.0, 'stores': {'state': 'ok', 'queue': 'ok'}, 'eviction_policy': 'noeviction', 'key_expiry': 'native'}
+GET /health/ready -> 200 {'live': True, 'ready': True, 'draining': False, 'draining_since': None, 'worker': 'api-7f9c:12-9bb228', 'version': '0.1.1', 'registry_version': 1, 'held': 0, 'heartbeat_age_secs': 0.0, 'stores': {'state': 'ok', 'queue': 'ok'}, 'eviction_policy': 'noeviction', 'key_expiry_mode': 'native'}
 GET /status without the admin header -> 401
 GET /requests/{id} -> done
 GET / -> 51 routes, registry v1

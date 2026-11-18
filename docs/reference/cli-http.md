@@ -80,9 +80,9 @@ and with write routes but no actor (`actor=` or the admin token). The read token
 A `GET` takes its arguments from the query string, a `POST` from a JSON object body; path
 parameters are in the route. Unknown or mistyped fields are refused. A write's body takes
 `"dry_run": false` to act; without it the answer is the dry run. Every `wait_secs` an HTTP
-client asks for (purges, `models drain`) is capped at `LLMQ_HTTP_PURGE_WAIT_SECS` (60); an
+client asks for (purges, `models drain`) is capped at `LLMQ_ADMIN_HTTP_WAIT_SECS` (60); an
 omitted one on a purge waits that long at most. Dead-letter bodies (`GET /dlq/{id}?unsafe=true`)
-need `LLMQ_ADMIN_DLQ_BODIES_ENABLED=true`.
+need `LLMQ_ADMIN_DEAD_LETTER_BODIES_ENABLED=true`.
 
 Status codes of the admin routes:
 

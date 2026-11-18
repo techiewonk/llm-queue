@@ -163,7 +163,7 @@ async def callers(env: dict[str, str], count: int = 2) -> list[LLMQueue]:
     queues = []
     for _ in range(count):
         queue = LLMQueue.from_env(
-            {**env, "LLMQ_MODE": "caller"}, credentials=account_keys, tuning=drill_tuning(env)
+            {**env, "LLMQ_ROLE": "caller"}, credentials=account_keys, tuning=drill_tuning(env)
         )
         await queue.start()
         queues.append(queue)
@@ -600,7 +600,7 @@ async def b96() -> bool:
                     procs.append(
                         subprocess.Popen(  # noqa: ASYNC220  # started once, before measuring
                             [PY, str(FLEET), "caller", "500", "chat"],
-                            env={**gate.env, "LLMQ_MODE": "caller"},
+                            env={**gate.env, "LLMQ_ROLE": "caller"},
                             stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE,
                             stderr=log,
@@ -766,7 +766,7 @@ async def b33() -> bool:
     # the last edit (~33 s in, after four restarts) came after the edit-free caller's first
     # reload whenever a restart took a little longer, and the 2 s wait below could not catch it.
     # Reload every second, as the registry scenarios do.
-    async with Gate(doc, LLMQ_CFG_RELOAD_SECS="1") as gate:
+    async with Gate(doc, LLMQ_REGISTRY_RELOAD_SECS="1") as gate:
         await gate.workers(4)
         queues = await gate.callers(2)
         run = Run()
@@ -796,7 +796,7 @@ async def b33() -> bool:
 
         load = paced(50, 40, lambda i: run.call(queues[i % 2], "chat", chat(), priority=i % 4 == 0))
         await asyncio.gather(load, restarts(), sample())
-        await asyncio.sleep(2)  # LLMQ_CFG_RELOAD_SECS 1: every caller has the last edit
+        await asyncio.sleep(2)  # LLMQ_REGISTRY_RELOAD_SECS 1: every caller has the last edit
         final = [q.admin.registry.changes for q in queues]
     start = seen[0][0] if seen[0] else 0
     return verdict(
@@ -886,7 +886,7 @@ async def b34() -> bool:
 
 
 async def b23() -> bool:
-    """Queue store primary killed mid-run, `queue_wait_replicas` off and on.
+    """Queue store primary killed mid-run, `replica_wait_count` off and on.
 
     Pass: lost sends
     and duplicates (a call the provider ran twice: every body is unique) recorded; with it on,
@@ -908,9 +908,9 @@ async def b23() -> bool:
             async with Gate(
                 doc,
                 LLMQ_QUEUE_STORE_URL=f"redis://127.0.0.1:{failover.PROXY_PORT}/0",
-                LLMQ_QUEUE_WAIT_REPLICAS=str(wait),
-                LLMQ_QUEUE_WAIT_MS="200",
-                LLMQ_QUEUE_FAILOVER_SECS="3",
+                LLMQ_REPLICA_WAIT_COUNT=str(wait),
+                LLMQ_REPLICA_WAIT_MS="200",
+                LLMQ_QUEUE_STORE_FAILOVER_SECS="3",
             ) as gate:
                 await gate.workers(2)
                 queues = await gate.callers(2)
@@ -958,7 +958,7 @@ async def b23() -> bool:
         side = "on" if wait else "off"
         failed[side] = sum(1 for r in run.results if not r.ok)
         calls[side] = len(run.results)
-        print(f"  queue_wait_replicas={wait}: {len(run.results)} calls, lost {lost}, "
+        print(f"  replica_wait_count={wait}: {len(run.results)} calls, lost {lost}, "
               f"duplicates {dups[side]}, failures {run.kinds() or 0}")  # fmt: skip
     return verdict(
         "B23",

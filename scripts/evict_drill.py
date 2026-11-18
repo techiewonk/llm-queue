@@ -2,7 +2,7 @@
 
 Starts a throwaway Valkey in Docker with a small `maxmemory`, its own fakellm, and an "app
 cache" filler that keeps writing keys with a TTL until the store is full and beyond. Meanwhile
-it sends `--calls` calls through the queue (`LLMQ_KEY_EXPIRY=auto`).
+it sends `--calls` calls through the queue (`LLMQ_KEY_EXPIRY_MODE=auto`).
 
 - `volatile-lru`: the queue runs `swept`. Pass: every call answers, the store evicted app keys
   (`evicted_keys` > 0) and not one key of the queue's prefix (keyspace `evicted` events).
@@ -71,7 +71,7 @@ def environment(port: int, prefix: str, fake_url: str) -> dict[str, str]:
         "LLMQ_METRICS_SINK": "none",
         "LLMQ_ENVIRONMENT": "test",  # local store without TLS or a salt
         "LLMQ_BEDROCK_ENDPOINT_URL": fake_url,
-        "LLMQ_KEY_EXPIRY": "auto",
+        "LLMQ_KEY_EXPIRY_MODE": "auto",
     }
 
 
@@ -101,7 +101,7 @@ async def run(
         llmq = LLMQueue.from_env(environment(port, prefix, fake.url))
         await llmq.start()
         stack.push_async_callback(llmq.stop, drain_secs=1)
-        mode = (await llmq.health())["key_expiry"]
+        mode = (await llmq.health())["key_expiry_mode"]
 
         evicted_ours: list[str] = []
         evicted_harmless: list[str] = []
@@ -194,7 +194,7 @@ async def run(
             )
         return {
             "policy": policy,
-            "key_expiry": mode,
+            "key_expiry_mode": mode,
             "maxmemory": maxmemory,
             "calls": calls,
             "secs": round(secs, 1),

@@ -699,7 +699,7 @@ class QueueFull(Exception):  # the plan's error kind is `queue_full`
 
 
 class NotReplicated(Exception):  # the plan's error kind is `queue_unavailable`
-    """The send reached the primary but not `queue_wait_replicas` replicas in time.
+    """The send reached the primary but not `replica_wait_count` replicas in time.
 
     `message_id` is the id of the message the primary holds (the send stands): without it the
     call was recorded with no message and an admin reprioritize skipped it as `direct` (RQ-7).

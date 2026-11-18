@@ -1,7 +1,7 @@
 """The fleet `scripts/gates.py` drives: fakellm, worker / caller processes, store measurements.
 
 Workers are separate Python processes (`python scripts/gates_fleet.py worker`), like pods: each
-builds `LLMQueue.from_env()` with `LLMQ_MODE=worker`, counts its metrics into the store, and
+builds `LLMQueue.from_env()` with `LLMQ_ROLE=worker`, counts its metrics into the store, and
 stops cleanly on a `stop` line (or dies at once on `kill()`). Callers can be processes too
 (`caller` mode, for the kill-switch gate) or queues in the driver itself. The store proxy the
 drills fault (`FaultProxy`) is a process too (`proxy` mode).
@@ -252,11 +252,11 @@ class Worker:
     """One worker process (a pod)."""
 
     def __init__(self, env: dict[str, str]) -> None:
-        """Start it (`LLMQ_MODE=worker`); `ready()` waits for its start."""
+        """Start it (`LLMQ_ROLE=worker`); `ready()` waits for its start."""
         log = log_file("worker")  # its warnings and errors, with timestamps
         self.proc = subprocess.Popen(
             [PY, str(Path(__file__)), "worker"],
-            env={**env, "LLMQ_MODE": "worker"},
+            env={**env, "LLMQ_ROLE": "worker"},
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=log,

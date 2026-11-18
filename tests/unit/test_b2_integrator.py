@@ -114,7 +114,7 @@ def test_register_job_takes_a_timeout() -> None:
     """17: `LLMQueue.register_job` could not pass the job runner's `timeout_secs`."""
     engine = SimpleNamespace(
         queues=None,
-        settings=SimpleNamespace(queue_prefix="", queue_wait_replicas=0, queue_wait_ms=100),
+        settings=SimpleNamespace(queue_prefix="", replica_wait_count=0, replica_wait_ms=100),
         metrics=MagicMock(),
         hash_id=str,
     )
@@ -143,7 +143,7 @@ async def test_send_job_at_the_limit_is_queue_full(monkeypatch: pytest.MonkeyPat
 
     engine = SimpleNamespace(
         queues=None,
-        settings=SimpleNamespace(queue_prefix="", queue_wait_replicas=0, queue_wait_ms=100),
+        settings=SimpleNamespace(queue_prefix="", replica_wait_count=0, replica_wait_ms=100),
         metrics=None,
         hash_id=str,
     )

@@ -1824,7 +1824,7 @@ class LocalEngine:
         out["running"] = len(self.executor.running)
         out["stores"] = {}
         out["eviction_policy"] = "none"
-        out["key_expiry"] = "none"
+        out["key_expiry_mode"] = "none"
         return out
 
 

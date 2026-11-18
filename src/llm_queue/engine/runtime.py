@@ -526,18 +526,20 @@ class EngineSettings:
     queue_backfill_enabled: bool = False
     # LLMQ_ID_HASH_SALT: the key of every user / session id hash; never in repr() (X10).
     id_hash_salt: str = field(default="", repr=False)
-    cfg_reload_secs: float = 30.0  # LLMQ_CFG_RELOAD_SECS: how often the registry is re-read
-    queue_failover_secs: float = 5.0  # queue-store errors this long before calls run direct
-    queue_wait_replicas: int = 0  # a send waits for this many replicas (0: off)
-    queue_wait_ms: int = 100  # how long it waits for them
+    registry_reload_secs: float = (
+        30.0  # LLMQ_REGISTRY_RELOAD_SECS: how often the registry is re-read
+    )
+    queue_store_failover_secs: float = 5.0  # queue-store errors this long before calls run direct
+    replica_wait_count: int = 0  # a send waits for this many replicas (0: off)
+    replica_wait_ms: int = 100  # how long it waits for them
     # What the replica wait covers (owner Q8): calls, jobs, registry; all by default.
-    queue_wait_scopes: frozenset[str] = frozenset(WAIT_SCOPES)
+    replica_wait_scopes: frozenset[str] = frozenset(WAIT_SCOPES)
     # Strict mode (outside dev / test): an evicting store fails readiness (owner Q10).
     strict: bool = False
-    debug_capture_allowed: bool = False  # LLMQ_DEBUG_CAPTURE_FROM_CONFIG (never in prod)
-    key_expiry: str = "auto"  # LLMQ_KEY_EXPIRY: auto | native | swept (engine/expiry.py)
-    ttl_sweep_batch: int = 500  # LLMQ_TTL_SWEEP_BATCH
-    ttl_sweep_rounds: int = 100  # LLMQ_TTL_SWEEP_ROUNDS
+    debug_capture_allowed: bool = False  # LLMQ_DEBUG_CAPTURE_ENABLED (never in prod)
+    key_expiry_mode: str = "auto"  # LLMQ_KEY_EXPIRY_MODE: auto | native | swept (engine/expiry.py)
+    key_expiry_sweep_batch: int = 500  # LLMQ_KEY_EXPIRY_SWEEP_BATCH
+    key_expiry_sweep_rounds: int = 100  # LLMQ_KEY_EXPIRY_SWEEP_ROUNDS
     # A store outage seen by a call is remembered this long (owner Q11, R3FM-3): `fail_fast` and
     # `static_cap` then answer at once instead of re-trying the store (1.5-21.5 s per call).
     outage_memo_secs: float = 3.0
@@ -880,9 +882,9 @@ class Engine:
         registry.metrics = self.metrics  # reload failures are counted too (CO-4)
         self.queues = StreamQueues(queue_store or state, self.keys)
         self.replica_wait = ReplicaWait(
-            replicas=self.settings.queue_wait_replicas,
-            wait_ms=self.settings.queue_wait_ms,
-            scopes=self.settings.queue_wait_scopes,
+            replicas=self.settings.replica_wait_count,
+            wait_ms=self.settings.replica_wait_ms,
+            scopes=self.settings.replica_wait_scopes,
         )
         self._planned: dict[tuple[str, str], int] | None = None  # Bedrock pool sizes (Q43)
         self._replid: str | None = None  # the state store's `master_replid` last seen (R3FM-8)
@@ -984,7 +986,9 @@ class Engine:
         # Key expiry of each store (owner K4): native TTLs or the index, set at start.
         # Until a publish succeeds: what the setting asks for, native for `auto` (a process
         # reported `swept` and ready while forced native on a volatile store; rescan B3).
-        first = self.settings.key_expiry if self.settings.key_expiry != "auto" else "native"
+        first = (
+            self.settings.key_expiry_mode if self.settings.key_expiry_mode != "auto" else "native"
+        )
         self.expiry = Expiry(self.keys.prefix, self.clock.now, first)
         self.queue_expiry = self.expiry
         # A store's mode change is announced here; every process's result reader follows it.
@@ -1080,7 +1084,7 @@ class Engine:
             async with asyncio.timeout(START_PROBE_SECS):
                 await self.clock.sync(self.state)
                 # Cluster mode is refused (`ConfigError`); an evicting store is a warning (C4).
-                setting = self.settings.key_expiry
+                setting = self.settings.key_expiry_mode
                 self._eviction["state"] = await check_store(self.state, "state", setting)
                 await self.state.set(self.keys.epoch, str(self.clock.now()), nx=True)
                 self._epoch = text(await self.state.get(self.keys.epoch))
@@ -1097,7 +1101,7 @@ class Engine:
             try:
                 async with asyncio.timeout(START_PROBE_SECS):
                     self._eviction["queue"] = await check_store(
-                        self._queue_store, "queue", self.settings.key_expiry
+                        self._queue_store, "queue", self.settings.key_expiry_mode
                     )
             except (*STORE_ERRORS, RedisError) as exc:
                 logger.error(
@@ -1127,7 +1131,7 @@ class Engine:
         self._loop(self._ttl_sweeper(), "ttl_sweeper")
         self._loop(self._store_prober(), "store_prober")
         self._loop(self.requests.check_lifecycle(), "offload_lifecycle")  # Q23
-        self._loop(self.registry.run(self.settings.cfg_reload_secs), "registry_reload")
+        self._loop(self.registry.run(self.settings.registry_reload_secs), "registry_reload")
         self._own_loop = asyncio.get_running_loop()
         self._started = True
         self.ready = not self._paused  # a pause before the start holds
@@ -1924,7 +1928,7 @@ class Engine:
             "app_id": request_id is not None,
         }
         # Queues in the state store: register, send and confirm are one script (3 round trips
-        # before). Not with `queue_wait_replicas`: that send needs its own WAIT.
+        # before). Not with `replica_wait_count`: that send needs its own WAIT.
         combined = not direct and self.queues_shared and not self.replica_wait.replicas_for("calls")
         index = self._index_entry(envelope, alias, priority, call_secs)
 
@@ -2066,18 +2070,18 @@ class Engine:
     ) -> None:
         """Put the message on its queue and confirm the record; undo the record on failure.
 
-        A queue store failing for `queue_failover_secs` sends the call direct; shorter blips are
-        retried. A send too few replicas acknowledged (`queue_wait_replicas`) stays sent, warned
+        A queue store down for `queue_store_failover_secs` sends the call direct; shorter blips are
+        retried. A send too few replicas acknowledged (`replica_wait_count`) stays sent, warned
         once a minute and counted (owner Q9): running it direct as well left its queued copy
         bouncing as a duplicate every 30 s.
         """
         settings = self._queue_settings(view, alias)  # its own retention_secs (Q27)
         loop = asyncio.get_running_loop()
-        give_up = loop.time() + self.settings.queue_failover_secs
+        give_up = loop.time() + self.settings.queue_store_failover_secs
         body = envelope.dumps()
         tries = 0
         # Each try against a separate queue store is bounded by what is left of
-        # `queue_failover_secs` (with 0, one store probe's time): one send to a blackholed
+        # `queue_store_failover_secs` (with 0, one store probe's time): one send to a blackholed
         # store took the client's whole budget, about 21 s, before the failover (R3FM-3). A
         # shared store keeps the client's own timeouts (the call has no other path).
         floor_secs = self.settings.timings.health_probe_secs
@@ -4806,7 +4810,7 @@ class Engine:
         out["heartbeat_age_secs"] = round(time.monotonic() - self._beat_ran_mono, 1)
         out["stores"] = stores
         out["eviction_policy"] = self._eviction.get("state", UNKNOWN_POLICY)
-        out["key_expiry"] = self.expiry.mode
+        out["key_expiry_mode"] = self.expiry.mode
         if "queue" in self._eviction:
             out["queue_eviction_policy"] = self._eviction["queue"]
         return out
@@ -4888,7 +4892,7 @@ class Engine:
             logger.warning("key_expiry_publish_failed", error=str(exc))
 
     async def _apply_expiry(self) -> None:
-        """Ask each store for the mode `LLMQ_KEY_EXPIRY` and its policy want; follow the store's.
+        """Ask each store for the `LLMQ_KEY_EXPIRY_MODE` mode its policy wants; follow the store's.
 
         The store's mode wins (owner Q-6): an explicit setting that differs logs
         `key_expiry_conflict` once per mode; a change is announced to every process (A-10).
@@ -4898,19 +4902,19 @@ class Engine:
             stores.append(("queue", self._queue_store, self.queue_expiry))
         for name, client, expiry in stores:
             policy = self._eviction.get(name, UNKNOWN_POLICY)
-            wanted = decide(self.settings.key_expiry, policy)
+            wanted = decide(self.settings.key_expiry_mode, policy)
             mode, replaced = await expiry.adopt(client, wanted)
             if replaced:
                 logger.warning(
                     "key_expiry_changed", store=name, policy=policy, before=replaced, mode=mode
                 )
                 await self.state.publish(self._expiry_channel, f"{name}\0{mode}")
-            explicit = self.settings.key_expiry != "auto"
+            explicit = self.settings.key_expiry_mode != "auto"
             if explicit and mode != wanted and self._expiry_conflict.get(name) != mode:
                 logger.warning(
                     "key_expiry_conflict",
                     store=name,
-                    setting=self.settings.key_expiry,
+                    setting=self.settings.key_expiry_mode,
                     mode=mode,
                     hint="the store's mode wins; only swept replaces native by itself",
                 )
@@ -4952,8 +4956,8 @@ class Engine:
             try:
                 deleted = await expiry.sweep(
                     script,
-                    batch=self.settings.ttl_sweep_batch,
-                    rounds=self.settings.ttl_sweep_rounds,
+                    batch=self.settings.key_expiry_sweep_batch,
+                    rounds=self.settings.key_expiry_sweep_rounds,
                 )
             except Exception as exc:
                 logger.warning("ttl_sweep_failed", error=str(exc))

@@ -381,7 +381,7 @@ async def test_the_breaker_opens_after_failures(rig: Rig) -> None:
 
 
 async def test_describe_and_health_say_local(rig: Rig) -> None:
-    llmq = await rig.started(LLMQ_LOCAL_PROCESS_COUNT="4", LLMQ_MODE="worker")
+    llmq = await rig.started(LLMQ_LOCAL_PROCESS_COUNT="4", LLMQ_ROLE="worker")
     described = llmq.describe()
     assert described["execution_mode"] == "local"
     assert described["local_process_count"] == 4
@@ -677,7 +677,7 @@ async def test_local_mode_reads_a_secrets_source_like_queue_mode(rig: Rig, tmp_p
         **rig.env(),
         "LLMQ_REGISTRY": json.dumps(doc),
         "LLMQ_SECRETS_SOURCE": f"file:{volume}",
-        "LLMQ_SECRET_NAMES": json.dumps({"LLMQ_ACCOUNT_VLLM_KEY": "vllm_key"}),
+        "LLMQ_SECRETS_NAMES": json.dumps({"LLMQ_ACCOUNT_VLLM_KEY": "vllm_key"}),
     }
     llmq = LLMQueue.from_env(env)
     rig.queues.append(llmq)

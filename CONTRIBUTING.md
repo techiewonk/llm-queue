@@ -96,7 +96,7 @@ time shows slow leaks and drift (more calls, more growth above the noise). Run
 fills up and evicts, as a shared cache does. It starts a throwaway Valkey in Docker with a small
 `maxmemory` (`--maxmemory`, 64 MB), its own fakellm, and an "app cache" filler that writes keys
 with a TTL until the store is full and beyond, while it sends `--calls` calls (2000) through the
-queue with `LLMQ_KEY_EXPIRY=auto`:
+queue with `LLMQ_KEY_EXPIRY_MODE=auto`:
 
 - `volatile-lru` (the queue runs `swept`): passes when every call answers, the store evicted
   app keys, and not one key of the queue's prefix was evicted (keyspace `evicted` events; the

@@ -33,7 +33,7 @@ class _Engine:
         self.metrics = None
         self.hash_id = str  # the job runner hashes a job's ids with it
         self.settings = SimpleNamespace(
-            queue_prefix="", drain_secs=0, queue_wait_replicas=0, queue_wait_ms=100
+            queue_prefix="", drain_secs=0, replica_wait_count=0, replica_wait_ms=100
         )
         self.release = asyncio.Event()
         self.tasks: list[str] = []
@@ -77,7 +77,7 @@ class _Offload:
 def _queue(engine: _Engine, offload: _Offload | None = None, mode: str = "caller") -> LLMQueue:
     return LLMQueue(
         engine,  # type: ignore[arg-type]  # a fake
-        settings=SimpleNamespace(mode=mode),  # type: ignore[arg-type]
+        settings=SimpleNamespace(role=mode),  # type: ignore[arg-type]
         offload=offload,  # type: ignore[arg-type]
     )
 
@@ -236,7 +236,7 @@ async def test_sync_call_after_stop_builds_no_new_engine() -> None:
 
     queue = LLMQueue(
         _Engine(),  # type: ignore[arg-type]  # a fake
-        settings=SimpleNamespace(mode="caller"),  # type: ignore[arg-type]
+        settings=SimpleNamespace(role="caller"),  # type: ignore[arg-type]
         builder=build,
     )
     await queue.start()

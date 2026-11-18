@@ -378,7 +378,7 @@ class Spec:
     `default` may be a callable taking the model type (`chat` / `embedding`); `merge` objects
     combine key by key across levels instead of the most specific one replacing the rest.
     `deploy_only` settings never change by live edit; `protected` ones only with
-    `registry_live_edit=all` (both read by `registry.store`).
+    `registry_live_edit_mode=all` (both read by `registry.store`).
     """
 
     levels: frozenset[str]

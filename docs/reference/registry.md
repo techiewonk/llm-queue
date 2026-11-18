@@ -137,7 +137,7 @@ What each part does:
 | `residency` | Calls may run only in these three regions |
 | `accounts.aws-main` | The pod's own AWS identity; one 5000 RPM budget shared by all its deployments |
 | `accounts.aws-dr` | A second AWS account, reached by assuming a role; the external id is the secret `LLMQ_ACCOUNT_DR_EXTERNAL_ID` (through `secrets=`, then the environment); its attempts time out after 45 s |
-| `accounts.vllm-dc1` | An OpenAI-compatible server; its key is the secret `LLMQ_ACCOUNT_VLLM_API_KEY`. Outside dev its host must be in `LLMQ_BASE_URL_ALLOWED_HOSTS` |
+| `accounts.vllm-dc1` | An OpenAI-compatible server; its key is the secret `LLMQ_ACCOUNT_VLLM_API_KEY`. Outside dev its host must be in `LLMQ_HTTP_ALLOWED_HOSTS` |
 | `models.gpt120b` | A chat model with 500 RPM and 400,000 TPM per deployment, 64 calls in flight, 20 % kept for priority calls, balanced by free headroom (priority calls in order) |
 | `...inference`, `...inference_limits` | 4096 output tokens unless the call asks for another number; a call asking for more than 8192 is clamped to 8192 |
 | `...fallback` | When the confirmed regions are out of budget or broken for 2 s, the `fallback` entries are used |
@@ -154,7 +154,7 @@ What each part does:
 |---|---|---|
 | `registry_version` | yes | A whole number, 1 to 9007199254740991. Raise it with every deployed change |
 | `min_lib_version` | no | The oldest llm-queue that may use the document, a version such as `0.1.0b2` |
-| `live_edit` | no | `safe`, `all` or `off`; unset, each process's `LLMQ_REGISTRY_LIVE_EDIT` applies (deploy only) |
+| `live_edit` | no | `safe`, `all` or `off`; unset, each process's `LLMQ_REGISTRY_LIVE_EDIT_MODE` applies (deploy only) |
 | `defaults` | no | Setting values for every model (the `defaults` level) |
 | `routing` | no | Live switches, [below](#routing) |
 | `residency` | no | `{"allowed_regions": [...]}` or `{"allowed_regions": "auto"}`: the only regions any deployment may use ([below](#residency)) |

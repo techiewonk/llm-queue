@@ -48,7 +48,7 @@ async def eviction_policy(client: redis.asyncio.Redis) -> str:
     return UNKNOWN
 
 
-def eviction_warning(policy: str, key_expiry: str = "native") -> str | None:
+def eviction_warning(policy: str, key_expiry_mode: str = "native") -> str | None:
     """A warning for a policy that may evict the library's keys; None when it cannot.
 
     `noeviction` and `unknown` never warn; a `volatile-*` policy is safe in `swept` key expiry
@@ -56,12 +56,12 @@ def eviction_warning(policy: str, key_expiry: str = "native") -> str | None:
     """
     if policy in ("noeviction", UNKNOWN):
         return None
-    if key_expiry == "swept" and policy in VOLATILE_POLICIES:
+    if key_expiry_mode == "swept" and policy in VOLATILE_POLICIES:
         return None
     fix = (
-        "set LLMQ_KEY_EXPIRY=swept (or auto), or set noeviction"
+        "set LLMQ_KEY_EXPIRY_MODE=swept (or auto), or set noeviction"
         if policy in VOLATILE_POLICIES
-        else "set noeviction, or a volatile-* policy with LLMQ_KEY_EXPIRY=swept"
+        else "set noeviction, or a volatile-* policy with LLMQ_KEY_EXPIRY_MODE=swept"
     )
     return (
         f"the store's maxmemory-policy is {policy}: when it fills it evicts queue messages, "
@@ -80,7 +80,7 @@ async def cluster_enabled(client: redis.asyncio.Redis) -> bool:
 
 
 async def check_store(
-    client: redis.asyncio.Redis, name: str = "state", key_expiry: str = "native"
+    client: redis.asyncio.Redis, name: str = "state", key_expiry_mode: str = "native"
 ) -> str:
     """Refuse a cluster-mode store (`ConfigError`), warn on an evicting one; return its policy.
 
@@ -93,7 +93,7 @@ async def check_store(
             "call's keys span shards and its scripts fail; use a single primary (with replicas)"
         )
     policy = await eviction_policy(client)
-    warning = eviction_warning(policy, decide(key_expiry, policy))
+    warning = eviction_warning(policy, decide(key_expiry_mode, policy))
     if warning:
         logger.warning("store_eviction_policy", store=name, policy=policy, detail=warning)
     return policy

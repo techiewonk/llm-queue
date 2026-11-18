@@ -20,12 +20,12 @@ TTLs) are evicted as before; llm-queue's are not.
 
 ## 1. Settings
 
-Nothing to set: the default `LLMQ_KEY_EXPIRY=auto` reads the store's policy and picks `swept`
+Nothing to set: the default `LLMQ_KEY_EXPIRY_MODE=auto` reads the store's policy and picks `swept`
 for any policy but `noeviction`. To pin it (so a policy that cannot be read, or a later change,
 never flips it):
 
 ```bash
-LLMQ_KEY_EXPIRY=swept    # or auto (the default)
+LLMQ_KEY_EXPIRY_MODE=swept    # or auto (the default)
 ```
 
 Give every process that shares the key prefix the same value. Do not set `native` here: in
@@ -35,8 +35,8 @@ Two settings tune the sweep that deletes expired keys; the defaults suit most lo
 
 | Setting | Default | What it does |
 |---|---|---|
-| `LLMQ_TTL_SWEEP_BATCH` | 500 | Keys deleted per sweep script run |
-| `LLMQ_TTL_SWEEP_ROUNDS` | 100 | Runs per sweep (every 10 s), at most: 50000 keys per 10 s by default |
+| `LLMQ_KEY_EXPIRY_SWEEP_BATCH` | 500 | Keys deleted per sweep script run |
+| `LLMQ_KEY_EXPIRY_SWEEP_ROUNDS` | 100 | Runs per sweep (every 10 s), at most: 50000 keys per 10 s by default |
 
 Raise them only if `ZCARD P:ttl` keeps growing while the load is steady (see step 4).
 
@@ -59,7 +59,7 @@ holds `llmq:{r:ID}:status` with score "now + 1800 s", and the sweep after that t
 |---|---|---|
 | `GET /health/ready`, `await llmq.health()` | `ready` | `true` |
 | `health()["eviction_policy"]` | the state store's policy | `volatile-lru` |
-| `health()["key_expiry"]` | the state store's mode | `swept` |
+| `health()["key_expiry_mode"]` | the state store's mode | `swept` |
 | `llmq_key_expiry_swept{store}` | 1 in `swept`, 0 in `native` | 1 |
 | `llmq_store_eviction_unsafe{store}` | 1 when the policy can evict llm-queue keys in its mode | 0 |
 | `llmq_ttl_swept_total` | keys the sweep deleted | rising with traffic |
@@ -81,7 +81,7 @@ store refuses writes (`OOM`). llm-queue then fails loudly, never silently: calls
 | Memory high | ElastiCache `DatabaseMemoryUsagePercentage` Maximum > 90 for 5 min | The cache keeps it high by design; a level near 100 with few evictions means non-TTL keys are filling it |
 | Store refusing writes | `llmq_store_up` Minimum < 1; `llmq_store_errors_total` Sum > 0 for 3 periods | An `OOM` refusal reads as the store being down |
 | Calls failing on the store | `llmq_caller_failures_total{outcome="queue_unavailable"}` Sum > 0 | What callers see when writes are refused |
-| Not ready on the policy | `llmq_store_eviction_unsafe` Maximum >= 1 | Someone changed the policy to `allkeys-*`, or set `LLMQ_KEY_EXPIRY=native` |
+| Not ready on the policy | `llmq_store_eviction_unsafe` Maximum >= 1 | Someone changed the policy to `allkeys-*`, or set `LLMQ_KEY_EXPIRY_MODE=native` |
 
 The other alarms in [Monitor](monitor.md) stay as they are.
 
@@ -109,7 +109,7 @@ start. Use a `volatile-*` policy or `noeviction`, or give llm-queue its own stor
 
 ```python
 health = await llmq.health()
-assert health["key_expiry"] == "swept"
+assert health["key_expiry_mode"] == "swept"
 assert health["eviction_policy"].startswith("volatile-")
 assert health["ready"]
 ```
@@ -123,13 +123,13 @@ valkey-cli -u "$LLMQ_STORE_URL" ZRANGE llmq:ttl 0 0 WITHSCORES   # the next one 
 `llmq` is the default `LLMQ_KEY_PREFIX`. `ZCARD llmq:ttl` should go up and down with traffic.
 If it only grows while the load is steady, the sweep is behind: check that `llmq_ttl_swept_total`
 rises (any running process sweeps, worker or caller) and that no `ttl_sweep_failed` warnings are
-logged; then raise `LLMQ_TTL_SWEEP_ROUNDS`.
+logged; then raise `LLMQ_KEY_EXPIRY_SWEEP_ROUNDS`.
 
 ## Moving an existing deployment
 
 1. Upgrade every process to 0.1.0b3 (0.1.0b2 pods do not read the store's mode and set native
    TTLs).
-2. Keep `LLMQ_KEY_EXPIRY=auto` (or set `swept`).
+2. Keep `LLMQ_KEY_EXPIRY_MODE=auto` (or set `swept`).
 3. Point it at the shared store, or change the store's policy to `volatile-lru`.
 
 The switch loses nothing. In `swept` mode, setting an expiry also clears the key's native TTL

@@ -29,7 +29,7 @@ class RequestContextMiddleware:
     """Run each HTTP / WebSocket request inside `request_context(...)` with these values.
 
     Each value (`tenant_id`, `user_id`, `session_id`, `priority`) is a constant or
-    `fn(scope)` (sync or async); None inherits it (`LLMQ_DEFAULT_TENANT` still applies).
+    `fn(scope)` (sync or async); None inherits it (`LLMQ_TENANT_DEFAULT` still applies).
     """
 
     # Lifespan and other scope types pass through untouched.

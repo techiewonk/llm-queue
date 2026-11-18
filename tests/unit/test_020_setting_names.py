@@ -62,15 +62,6 @@ def test_every_documented_setting_is_read(monkeypatch: pytest.MonkeyPatch) -> No
     assert DOCUMENTED - read == set()
 
 
-def test_the_rename_table_is_consistent() -> None:
-    """Old names are current settings, new names are not yet, and no name is listed twice."""
-    old, new = set(st.PENDING_RENAMES), set(st.PENDING_RENAMES.values())
-    assert old <= st.SETTING_NAMES
-    assert not new & st.SETTING_NAMES
-    assert not (old | new) & (set(st.RENAMED) | set(st.RENAMED.values()))
-    assert all(n.startswith("LLMQ_") and n.isupper() for n in old | new)
-
-
 def test_no_setting_is_in_the_account_secret_namespace() -> None:
     assert not [n for n in st.SETTING_NAMES if n.startswith("LLMQ_ACCOUNT_")]
 

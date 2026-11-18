@@ -42,7 +42,7 @@ are process settings, not tuning fields.
 - lower bounds: `engine.budget_key_ms` at least 130000 (a fixed window spans 2 minutes),
   `engine.job_ttl_ms` at least 60000, `engine.slow_stale_ms` at least 1000, the Bedrock and
   OpenAI read timeouts at least 1 s, `registry.history_size` at least 2;
-- `store.read_timeout_secs` at least 1 s above `engine.idle_slow_secs`, `LLMQ_QUEUE_WAIT_MS` and
+- `store.read_timeout_secs` at least 1 s above `engine.idle_slow_secs`, `LLMQ_REPLICA_WAIT_MS` and
   `engine.stream_read_block_ms` (each a blocking command), or that command times out;
 - `LLMQ_RESULT_TTL_SECS` at least `engine.result_recheck_secs`, or a caller that missed its
   wake-up never reads its result;

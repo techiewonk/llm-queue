@@ -80,7 +80,7 @@ async def test_start_warns_when_static_cap_runs_with_one_process(
         "LLMQ_REGISTRY": json.dumps(registry({"small": {"store_down": "static_cap"}})),
         "LLMQ_METRICS_SINK": "none",
         "LLMQ_KEY_PREFIX": key_prefix,
-        "LLMQ_MODE": "caller",
+        "LLMQ_ROLE": "caller",
     }
     try:
         for count, warned in (("1", True), ("4", False)):

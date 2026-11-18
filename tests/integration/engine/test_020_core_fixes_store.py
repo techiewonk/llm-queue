@@ -382,7 +382,7 @@ async def test_g20_a_tenant_at_its_quota_is_not_served_by_the_fallback_model(
 async def test_a12_the_stores_expiry_mode_wins_over_a_differing_setting(
     make: Make, store: redis.asyncio.Redis
 ) -> None:
-    """A-12 (owner Q-6): pods with different explicit `LLMQ_KEY_EXPIRY` flipped the mode.
+    """A-12 (owner Q-6): pods with different explicit `LLMQ_KEY_EXPIRY_MODE` flipped the mode.
 
     Each `native` minute on a `volatile-*` store left evictable keys. Now the store's mode
     wins: an `auto` pod on a volatile store moves it to `swept`; a pod set to `native`
@@ -390,7 +390,7 @@ async def test_a12_the_stores_expiry_mode_wins_over_a_differing_setting(
     """
     first, _ = await make()
     second, _ = await make()
-    second.settings = dataclasses.replace(second.settings, key_expiry="native")
+    second.settings = dataclasses.replace(second.settings, key_expiry_mode="native")
     first._eviction["state"] = "volatile-lru"  # as read from a shared cache store
     await first._apply_expiry()
     mode_key = first.expiry.mode_key
