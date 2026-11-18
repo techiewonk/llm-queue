@@ -394,6 +394,14 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   `call_cancel` only for the calls it cancelled and answers waiting calls in one round trip per
   batch; a reprioritize stopped by a full target counts every call left in `skipped.full`;
   `requests.get` of a call whose model was removed returns its records, not a `KeyError`.
+- Request admin, separate queue store: a reprioritize whose process stopped between `MOVE` and
+  the record write (or whose record write kept failing, `request_records_stale`) left the
+  calls' records on their old message, logged and never repaired: the call was listed in its
+  old class and a later reprioritize skipped it as `gone`. `MOVE` now marks each move in the
+  queue store (`P:{q:NAME}:moved`, kept for the queue's retention) and the next admin read of
+  the model (`list`, `count`, `get`, cancel, reprioritize) writes the records and clears the
+  marks (`request_records_repaired`, audited as `requests_reprioritize_repair`). The write is
+  idempotent and never puts back an older message id (RQ-8).
 - Tenant names in `fairness.weights` / `quotas` are hashed on every registry write path, not
   only when the boot file is read: `registry set fairness.weights.acme=3` stored the raw name,
   which never matched a call. A hashed block is marked `tenant_keys: hashed` (new registry

@@ -101,11 +101,11 @@ async def test_rq8_moved_records_are_written_again_after_a_store_error(
         real = admin._write_moved
         fails = [1]
 
-        async def flaky(moved: Any, cls: str) -> None:
+        async def flaky(moved: Any, cls: str) -> list[str]:
             if fails:
                 fails.pop()
                 raise redis.exceptions.ConnectionError("blip")
-            await real(moved, cls)
+            return await real(moved, cls)
 
         monkeypatch.setattr(admin, "_write_moved", flaky)
         report = await admin.reprioritize(
@@ -116,6 +116,84 @@ async def test_rq8_moved_records_are_written_again_after_a_store_error(
             job = await engine.requests.job(item.request_id)
             assert (job["q"], item.priority) == ("p", True)
             assert job["mid"] == item.message_id
+    finally:
+        await _close(tasks)
+
+
+async def test_rq8_a_move_left_unrecorded_is_repaired_by_the_next_admin_read(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RQ-8: a process that stopped between MOVE and the record write; the marks repair it."""
+    engine, _ = await make(worker=False)
+    tasks: list[asyncio.Task[Any]] = []
+    try:
+        await _send(engine, tasks, 2, A)
+        other = redis.asyncio.Redis(connection_pool=engine.state.connection_pool)
+        crashed = _admin(engine, queue_client=other)
+
+        async def stop(*_: Any) -> list[str]:  # the process dies right after MOVE
+            return []
+
+        monkeypatch.setattr(crashed, "_moved_records", stop)
+        report = await crashed.reprioritize(
+            "small", priority=True, tenant=A, actor="ops", dry_run=False
+        )
+        assert report.changed == 2
+        marks = crashed._queues.moved_key(_queue(engine, priority=True))
+        assert int(await engine.state.hlen(marks)) == 2
+        expiring = int(await engine.state.pttl(marks)) > 0  # native, or swept: in `P:ttl`
+        assert expiring or await engine.state.zscore(f"{engine.keys.prefix}:ttl", marks)
+        rids = [rid.decode() for rid in await engine.state.hkeys(marks)]
+        for rid in rids:  # the records still name the old message
+            assert (await engine.requests.job(rid))["q"] == "n"
+
+        admin = _admin(engine, queue_client=other)  # the next process
+        items = (await admin.list("small", tenant=A)).items
+        assert sorted(i.request_id for i in items) == sorted(rids)
+        for item in items:
+            job = await engine.requests.job(item.request_id)
+            assert (job["q"], item.priority, item.stage) == ("p", True, "queued")
+            assert job["mid"] == item.message_id
+            assert await engine.state.hget(engine.keys.status(item.request_id), "priority") == b"1"
+        assert not await engine.state.exists(marks)
+        entries: Any = await engine.state.xrange(engine.registry.audit_key)
+        repairs = [e[1] for e in entries if e[1][b"op"] == b"requests_reprioritize_repair"]
+        assert len(repairs) == 1
+        assert b"repair@" in repairs[0][b"actor"]
+        # Repaired calls are where their records say: a move back finds every one.
+        back = await admin.reprioritize(
+            "small", priority=False, tenant=A, actor="ops", dry_run=False
+        )
+        assert (back.changed, back.skipped) == (2, {})
+        assert len((await admin.list("small", tenant=A)).items) == 2  # nothing left to repair
+        entries = await engine.state.xrange(engine.registry.audit_key)
+        assert sum(e[1][b"op"] == b"requests_reprioritize_repair" for e in entries) == 1
+    finally:
+        await _close(tasks)
+
+
+async def test_rq8_a_repair_never_puts_back_an_older_message(make: Make) -> None:
+    """RQ-8: a stale mark (a later move recorded a newer id) is cleared, the record kept."""
+    engine, _ = await make(worker=False)
+    tasks: list[asyncio.Task[Any]] = []
+    try:
+        await _send(engine, tasks, 1, A)
+        other = redis.asyncio.Redis(connection_pool=engine.state.connection_pool)
+        admin = _admin(engine, queue_client=other)
+        rid = (await admin.list("small", tenant=A)).items[0].request_id
+        job_key = engine.keys.request(rid, "job")
+        mid = (await engine.requests.job(rid))["mid"]
+        marks = admin._queues.moved_key(_queue(engine, priority=True))
+        await engine.state.hset(marks, rid, "1-0")  # older than the call's own message
+        await engine.state.hset(marks, "gone-call", "9999999999999-0")  # no record: not made
+        detail = await admin.get(rid)
+        assert detail is not None
+        assert detail.summary is not None
+        assert not detail.summary.priority
+        assert (await engine.requests.job(rid))["q"] == "n"
+        assert not await engine.state.exists(marks)
+        assert not await engine.state.exists(engine.keys.request("gone-call", "job"))
+        assert await engine.state.hget(job_key, "mid") == mid.encode()
     finally:
         await _close(tasks)
 

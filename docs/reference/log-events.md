@@ -141,6 +141,7 @@ counts, never a tenant name), purges included (which also write `llmq_purge`); `
 | `replicas_short` | warning | engine/store_guard.py |
 | `request_extended` | info | engine/requests_admin.py |
 | `request_moved` | info | engine/requests_admin.py |
+| `request_records_repaired` | warning | engine/requests_admin.py |
 | `request_records_stale` | error | engine/requests_admin.py |
 | `request_unusable` | error | engine/runtime.py, engine/local.py |
 | `result_drop_skipped` | warning | engine/requests.py |

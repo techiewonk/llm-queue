@@ -35,7 +35,7 @@ from llm_queue.engine.queue import RETENTION_SECS, StreamQueues
 from llm_queue.engine.requests import FINAL_STATES, RequestStore
 from llm_queue.engine.store_guard import store_op
 from llm_queue.errors import AdminRefused, ConfigError
-from llm_queue.registry.store import check_actor
+from llm_queue.registry.store import check_actor, process_actor
 
 if TYPE_CHECKING:
     import redis.asyncio
@@ -58,6 +58,7 @@ SAMPLE_IDS = 20  # ids a change report lists
 _HASH_RE = re.compile(r"^[0-9a-f]{16}\Z")
 # Pauses before the moved calls' records are written again (separate queue store, RQ-8).
 _RECORD_RETRY_SECS = (0.2, 0.5, 1.0)
+_MOVED_CLASSES = (("", "n"), ("-priority", "p"))  # a model's queues: name suffix, class
 _STORE_ERRORS = (StoreConnectionError, StoreTimeoutError, OSError)
 _JOB_FIELDS = ("state", "mid", "q", "direct", "user", "ixh")
 _STATUS_FIELDS = ("state", "model", "priority", "enqueued_at", "served_model")
@@ -171,6 +172,46 @@ for i = 1, #ARGV / 2 do
   out[2 * i] = redis.call('ZSCORE', KEYS[at + 2], ARGV[2 * i])
 end
 return out
+"""
+
+# The records of calls a reprioritize moved, from `MOVE`'s marks (separate queue store, RQ-8).
+# KEYS: job and status of each call. ARGV: the class (`p` / `n`), then each call's new message
+# id. A record is written only when it is there (a finished call's expired record is not made
+# again, with no expiry) and holds an older message id: stream ids grow, so a repair racing a
+# later move never puts back the earlier id. Reply: the 1-based places of the calls written.
+_WRITE_MOVED = """
+local function before(a, b)
+  local am, as = string.match(a, '^(%d+)-(%d+)$')
+  local bm, bs = string.match(b, '^(%d+)-(%d+)$')
+  if not am or not bm then return a ~= b end
+  am, as, bm, bs = tonumber(am), tonumber(as), tonumber(bm), tonumber(bs)
+  return am < bm or (am == bm and as < bs)
+end
+local cls, out = ARGV[1], {}
+for i = 1, #KEYS / 2 do
+  local job, status, new = KEYS[2 * i - 1], KEYS[2 * i], ARGV[i + 1]
+  local cur = redis.call('HGET', job, 'mid')
+  if cur and before(cur, new) then
+    redis.call('HSET', job, 'mid', new, 'q', cls)
+    if redis.call('EXISTS', status) == 1 then
+      redis.call('HSET', status, 'priority', cls == 'p' and '1' or '0')
+    end
+    out[#out + 1] = i
+  end
+end
+return out
+"""
+
+# Clear move marks whose records are written. KEYS: the marks (`StreamQueues.moved_key`).
+# ARGV: request id / message id pairs. A mark a later move replaced (another id) stays.
+_CLEAR_MOVED = """
+local n = 0
+for i = 1, #ARGV, 2 do
+  if redis.call('HGET', KEYS[1], ARGV[i]) == ARGV[i + 1] then
+    n = n + redis.call('HDEL', KEYS[1], ARGV[i])
+  end
+end
+return n
 """
 
 # One field of many hashes (the running calls' grants). KEYS: the hashes. ARGV: the field.
@@ -415,6 +456,8 @@ class RequestsAdmin:
         self._page_script = state.register_script(_PAGE)
         self._read_field = state.register_script(_READ_FIELD)
         self._read_stages = self._queue_client.register_script(_READ_STAGES)
+        self._write_moved_script = state.register_script(_WRITE_MOVED)
+        self._clear_moved = self._queue_client.register_script(_CLEAR_MOVED)
         self._owned: builtins.list[Any] = []
 
     # ---------------------------------------------------------------- construction
@@ -485,6 +528,7 @@ class RequestsAdmin:
             raise ConfigError(f"limit must be 1 to {self.settings.list_max}")
         start, after_rid = _parse_cursor(after)
         self._need_index(state)
+        await self._finish_moves(view, alias)
         items: builtins.list[RequestSummary] = []
         scanned = 0
         last: tuple[float, str] | None = None
@@ -615,6 +659,8 @@ class RequestsAdmin:
         # A model removed since the call was sent has no queues to read: no summary, only
         # the records (its lookup raised a bare KeyError before).
         if view is not None and alias is not None and alias in view.registry.models:
+            if request_id in await self._finish_moves(view, alias):
+                job = _decode(await self._state.hgetall(k.request(request_id, "job")))
             score = None
             if job.get("ix"):
                 score = await self._state.zscore(job["ix"], request_id)
@@ -829,7 +875,7 @@ class RequestsAdmin:
                 prefix=self.keys.prefix if self.queues_shared else "",
             )
             if result.moved and not self.queues_shared:
-                await self._moved_records(result.moved, target)
+                await self._moved_records(result.moved, target, dest)
             for rid, new in result.moved:
                 logger.info("request_moved", request_id=rid, model=alias, to=target, mid=new)
             changed += len(result.moved)
@@ -994,8 +1040,9 @@ class RequestsAdmin:
 
         One tenant: its `tq:H` in chunks. Every tenant: the tenants in `tq`, their entries
         merged by (deadline, id). Entries past their deadline are never read. `stages=False`
-        leaves `stage` unread (None).
+        leaves `stage` unread (None). Moves left unrecorded are written first (`_finish_moves`).
         """
+        await self._finish_moves(view, alias)
         now_ms = (await self._now()) * 1000
         tenants = await self._tenants(alias, h, now_ms)
         cursors = {t: (max(start, now_ms), after_rid if start >= now_ms else "") for t in tenants}
@@ -1086,6 +1133,11 @@ class RequestsAdmin:
             model = row.status.get("model")
             if model and model in view.registry.models:
                 by_model.setdefault(model, []).append(row)
+        fixed: set[str] = set()
+        for alias in by_model:
+            fixed |= await self._finish_moves(view, alias)
+        if fixed:
+            await self._records([row for row in rows if row.rid in fixed])
         for alias, part in by_model.items():
             await self._stages(view, alias, part)
         for row in rows:
@@ -1245,17 +1297,24 @@ class RequestsAdmin:
             return {}
         return _decode(await self._state.hgetall(self.keys.tenant_names(alias)))
 
-    async def _moved_records(self, moved: Sequence[tuple[str, str]], cls: str) -> None:
+    async def _moved_records(
+        self, moved: Sequence[tuple[str, str]], cls: str, queue: str
+    ) -> builtins.list[str]:
         """Separate queue store: the moved calls' job `mid` / `q` and status `priority`.
 
-        Written from `MOVE`'s reply, tried again on a store error (RQ-8): the messages already
-        moved, and a record left on the old message showed the call in the wrong class and made
-        a later reprioritize skip it as `gone`. Still failing, it is logged with the ids.
+        Written from `MOVE`'s reply, tried again on a store error, then the marks `MOVE` left
+        in `queue` are cleared (RQ-8): a record left on the old message showed the call in the
+        wrong class and made a later reprioritize skip it as `gone`. Still failing, it is
+        logged with the ids, and the marks have the next admin read of the model write them
+        (`_finish_moves`). Returns the ids whose records were written.
         """
         for pause in (*_RECORD_RETRY_SECS, None):
             try:
-                await self._write_moved(moved, cls)
-                return
+                written = await self._write_moved(moved, cls)
+                await self._clear_moved(
+                    [self._queues.moved_key(queue)], [v for pair in moved for v in pair]
+                )
+                return written
             except _STORE_ERRORS as exc:
                 if pause is None:
                     logger.error(
@@ -1264,15 +1323,70 @@ class RequestsAdmin:
                         count=len(moved),
                         error_type=type(exc).__name__,
                     )
-                    return
+                    return []
                 await asyncio.sleep(pause)
+        return []  # not reached: the last pass returns
 
-    async def _write_moved(self, moved: Sequence[tuple[str, str]], cls: str) -> None:
-        async with self._state.pipeline(transaction=False) as pipe:
-            for rid, new in moved:
-                pipe.hset(self.keys.request(rid, "job"), mapping={"mid": new, "q": cls})
-                pipe.hset(self.keys.status(rid), "priority", "1" if cls == "p" else "0")
-            await pipe.execute()
+    async def _write_moved(self, moved: Sequence[tuple[str, str]], cls: str) -> builtins.list[str]:
+        """`_WRITE_MOVED` per `LLMQ_ADMIN_BATCH` calls; the ids whose records were written."""
+        written: builtins.list[str] = []
+        step = self.settings.batch
+        for at in range(0, len(moved), step):
+            part = moved[at : at + step]
+            keys = [
+                key
+                for rid, _ in part
+                for key in (self.keys.request(rid, "job"), self.keys.status(rid))
+            ]
+            places = await self._write_moved_script(keys, [cls, *(new for _, new in part)])
+            written += [part[int(i) - 1][0] for i in places]
+        return written
+
+    async def _finish_moves(self, view: ResolvedRegistry, alias: str) -> set[str]:
+        """Write the records of calls a reprioritize moved but did not record (RQ-8).
+
+        Separate queue store only (one store writes them in `MOVE` itself). A process that
+        stopped between `MOVE` and the record write left the moves marked in the queue store
+        (`StreamQueues.moved_key`); every admin read of the model writes them first, so it lists
+        and changes the calls where they are. Idempotent: a record already written, a finished
+        call's and one a later move changed are left (`_WRITE_MOVED`). A repair that wrote a
+        record logs `request_records_repaired` and writes an audit entry
+        (`requests_reprioritize_repair`). Returns the ids whose records were written.
+        """
+        if self.queues_shared or alias not in view.registry.models:
+            return set()
+        base = self.queue_prefix + view.queue_name(alias)
+        queues = [(base + suffix, cls) for suffix, cls in _MOVED_CLASSES]
+        async with self._queue_client.pipeline(transaction=False) as pipe:
+            for queue, _ in queues:
+                pipe.hgetall(self._queues.moved_key(queue))
+            marks = await pipe.execute()
+        fixed: set[str] = set()
+        for (queue, cls), raw in zip(queues, marks, strict=True):
+            moved = sorted((_text(rid), _text(new)) for rid, new in (raw or {}).items())
+            if moved:
+                fixed.update(await self._moved_records(moved, cls, queue))
+        if fixed:
+            ids = sorted(fixed)
+            logger.warning(
+                "request_records_repaired",
+                model=alias,
+                count=len(ids),
+                request_ids=ids[:SAMPLE_IDS],
+            )
+            await self._audit(
+                ChangeReport(
+                    op="requests_reprioritize_repair",
+                    model=alias,
+                    tenant=None,
+                    dry_run=False,
+                    actor=process_actor("repair"),
+                    matched=len(ids),
+                    changed=len(ids),
+                    sample_ids=ids[:SAMPLE_IDS],
+                )
+            )
+        return fixed
 
     async def _audit(self, report: ChangeReport) -> None:
         """One audit entry per real change: counts only, the tenant as its hash."""

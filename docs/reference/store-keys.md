@@ -171,6 +171,7 @@ mode `TTL_SWEEP` deletes every due key in `P:ttl`. Alerts (`P:alert:*`) and debu
 | Queues (streams) | `P:{q:NAME}:st` | hash | queue | No TTL. | no expiry |
 | Queues (streams) | `P:{q:NAME}:dlq` | stream | queue | No TTL. `MINID ~` now minus `queue.dlq_retention_secs` (86400 s for models; jobs `LLMQ_JOB_DEAD_RETENTION_SECS` 7 days, `jobs.py:68`) on each new dead letter, and on a timer: the sweeper every `sweep_secs` (10 s, `runtime.py:5035-5037`) and each job loop's upkeep (`jobs.py:402`). | no expiry |
 | Queues (streams) | `P:{q:NAME}:meta` | hash | queue | No TTL. | no expiry |
+| Queues (streams) | `P:{q:NAME}:moved` | hash | queue | Separate queue store only: the queue's `retention_secs` (86400 s) from the last reprioritize into it; fields go once the records are written. | indexed in `P:ttl` |
 | Queues (streams) | `P:rcv:WORKER:ALIAS` | string | queue | Fixed: the queue's `visibility_secs` (60 s). | indexed in `P:ttl` |
 | Doorbells & wakeups | `P:bell:NAME` | list | queue | Fixed 60 s from the last push. | indexed in `P:ttl` |
 | Doorbells & wakeups | `P:done:CALLER` | pub/sub channel | state | Not stored. | - |
@@ -1077,6 +1078,22 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | If evicted (`volatile-*`, native mode) | Not evictable: the key has no TTL. |
 | If evicted (`allkeys-*`) | The next receive reads the stream from the start and hands out messages other workers hold: duplicate deliveries (admission's claim check refuses most). |
 | Deleted by | a model purge (`purge.py:528-548`) / `StreamQueues.delete`. |
+
+#### `P:{q:NAME}:moved`
+
+| | |
+|---|---|
+| Type | hash |
+| Store | queue |
+| Schema | Only with a separate queue store (`LLMQ_QUEUE_STORE_URL`). Field = request id of a call a reprioritize moved into this queue; value = its new message id. The records (`P:{r:ID}:job` `mid` / `q`, `P:{r:ID}:status` `priority`) live in the state store, so `MOVE` cannot write them: it marks the move here in the same script (RQ-8). |
+| Written by | `MOVE` `queue.py`. |
+| Read by | `RequestsAdmin._finish_moves` (`requests_admin.py`): every admin read of the model (`list`, `count`, `get`, cancel, reprioritize) writes the marked records (`_WRITE_MOVED`: only an existing record holding an older message id) and clears the marks (`_CLEAR_MOVED`: only a mark still naming that id). A reprioritize clears its own marks once it wrote the records; a process that stopped in between leaves them for the next read, which logs `request_records_repaired` and writes a `requests_reprioritize_repair` audit entry. |
+| Lifetime (native) | The queue's `retention_secs` (86400 s), set again by each `MOVE` into the queue (the moved messages are trimmed by then). |
+| Swept mode | Indexed in `P:ttl` with the same expire-at. |
+| Count | Calls moved but not yet recorded: at most one reprioritize batch (`LLMQ_REQUESTS_MOVE_BATCH`) per process that stopped mid-run. |
+| If evicted (`volatile-*`, native mode) | A move left unrecorded stays so: the call is listed in its old class and a later reprioritize skips it as `gone` until it finishes. It is served normally. |
+| If evicted (`allkeys-*`) | As above. |
+| Deleted by | Fields by `_CLEAR_MOVED`; key by expiry, a model purge (`purge.py:528-548`) / `StreamQueues.delete`. |
 
 #### `P:rcv:WORKER:ALIAS`
 
