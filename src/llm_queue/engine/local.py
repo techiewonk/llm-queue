@@ -1251,9 +1251,13 @@ class LocalExecutor:
             settle("throttle" if throttle else "fail", tokens.refund(estimate, "fail"))
             return _Result("stream_failed", "rate_limited" if throttle else "provider_error", exc)
         if throttle:
+            # The tokens go back, the request does not: the provider counted the 429 in its
+            # minute, and a request given back was spent again in that minute, so 4 processes
+            # of 150 sent 640 in one wall-clock minute (gate BL1).
+            back = tokens.refund(estimate, "throttle")
             settle(
                 "throttle",
-                tokens.refund(estimate, "throttle"),
+                tokens.Refund(0, back.tokens),
                 retry_after=info.retry_after_secs,
             )
             return _Result("throttle", "throttled", exc, retry_after=info.retry_after_secs)

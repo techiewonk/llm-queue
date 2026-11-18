@@ -113,7 +113,7 @@ process's memory in place of the store:
 |---|---|
 | `PICK_TAKE` budgets (GCRA / fixed minute) per deployment and account | `_Bucket`s with the same rules, each limit divided by `LLMQ_LOCAL_PROCESS_COUNT` |
 | Worker slots per model and pod | `_PrioritySlots`: `LLMQ_LOCAL_CONCURRENCY` per model, priority waiters first |
-| `FINISH`: refunds, breaker, throttle backoff, latency | `settle()`: the same refund rule and breaker / throttle rules |
+| `FINISH`: refunds, breaker, throttle backoff, latency | `settle()`: the same refund rule (except a throttle keeps its request charged) and breaker / throttle rules |
 | `P:...:health` target errors and auto-disable | `target_error()`: the same `health` settings |
 | Retry budget per model and minute | `retry_allowed()`: the same sliding minute |
 | Sticky map, round robin position | In-memory maps |
