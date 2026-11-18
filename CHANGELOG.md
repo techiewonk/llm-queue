@@ -515,6 +515,11 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   until a worker reached the message (minutes in a deep queue) or their deadline. Its
   `cancelled` count and `llmq_cancels_total` count the calls it marked, not those it
   selected (a call that ended meanwhile was counted).
+- `fair_queue`: a grant out of round order (backfill, a call that can use other
+  deployments, a sticky session) moved the round served to its own, so a newcomer's next
+  call got a round behind every lower round still waiting (FA-6: rounds 2 and 3 held, a
+  grant at 4, the newcomer got 5). The round served now moves no further than the lowest
+  round still waiting (the newcomer gets 3).
 
 ## [0.1.1] - 2026-11-17
 

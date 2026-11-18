@@ -203,7 +203,8 @@ _TENANT = r"""
 --   tf:s:<h>  zset: the tenant's slots in use, scored by lease end (share)
 --   tf:act    zset: active tenants by their last ask; tf:w hash: their weights and `~sum`
 --   tf:need   zset: asks refused while within their share, by waiter expiry (share)
---   tf:fq     hash: `v`, the round of the last grant (fair_queue)
+--   tf:fq     hash: `v`, the round served (fair_queue): the last grant's, at most the
+--             lowest round still waiting
 -- Every step is O(log n) in the tenants: nothing scans them (stale ones leave 16 per ask).
 local function tf_keys(alias, h)
   return mk(alias, 'tf:t:' .. h), mk(alias, 'tf:s:' .. h)
@@ -347,8 +348,15 @@ local function tf_grant(alias, tf, st, entry_key, owner, rid, lease_ms)
     redis.call('HSET', entry_key, 'tf_bud', cjson.encode(st.bud), 'tf_mode', st.mode)
   end
   if st.round then
-    local fq = mk(alias, 'tf:fq')
-    if st.round > hnum(fq, 'v', 0) then redis.call('HSET', fq, 'v', tostring(st.round)) end
+    -- The round served moves to this grant's, never past the lowest round still waiting
+    -- (FA-6): a grant out of round order (backfill, other deployments, a sticky session) moved
+    -- it there, and a newcomer's round then came after every lower round still held.
+    local fq, to = mk(alias, 'tf:fq'), st.round
+    for _, c in ipairs({'n', 'p'}) do
+      local first = redis.call('ZRANGE', mk(alias, 'wait:' .. c), 0, 0, 'WITHSCORES')
+      if first[2] then to = math.min(to, tonumber(first[2])) end
+    end
+    if to > hnum(fq, 'v', 0) then redis.call('HSET', fq, 'v', tostring(to)) end
     slide(fq, DAY_MS)
   end
 end

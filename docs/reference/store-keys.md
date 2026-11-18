@@ -789,7 +789,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 |---|---|
 | Type | hash |
 | Store | state |
-| Schema | Only when the model's `fairness.mode` is not `off` (`fairness.py:63-101`). `fair_queue` mode: `v` = the round of the last grant. |
+| Schema | Only when the model's `fairness.mode` is not `off` (`fairness.py:63-101`). `fair_queue` mode: `v` = the round served: the last grant's round, but never past the lowest round still waiting (a grant out of round order does not move it ahead, FA-6). |
 | Written by | `tf_grant` `_admission_lua.py:348-350`. |
 | Read by | `tf_check` `_admission_lua.py:284`; `tf_grant` `:349`. |
 | Lifetime (native) | Sliding 1 day (`_admission_lua.py:350`). |
