@@ -14,7 +14,7 @@ import pytest
 import redis.asyncio
 from test_admission import Candidate, rig  # type: ignore[import-not-found]  # sibling module
 
-from llm_queue.engine.admission import Admission, Ask
+from llm_queue.engine.admission import Admission, Ask, Class
 from llm_queue.engine.keys import Keys
 
 pytestmark = pytest.mark.integration
@@ -32,11 +32,9 @@ class Clocked:
         self.clock = clock
 
     async def ask(
-        self, rid: str, pos: float, tokens: int, *, cls: str = "n", backfill: bool = False
+        self, rid: str, pos: float, tokens: int, *, cls: Class = "n", backfill: bool = False
     ) -> Any:
-        ask = Ask(
-            "m", rid, "w1", 1, cls, pos, R1, cost_t=tokens, backfill=backfill  # type: ignore[arg-type]
-        )
+        ask = Ask("m", rid, "w1", 1, cls, pos, R1, cost_t=tokens, backfill=backfill)
         return await self.admission.pick_take(ask, self.changes)
 
 

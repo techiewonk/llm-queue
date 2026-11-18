@@ -973,6 +973,135 @@ async def b23() -> bool:
     )
 
 
+# ------------------------------------------------------------------------- F1 backfill (0.2.0)
+
+
+async def _f1_run(backfill: bool) -> dict[str, Any]:
+    """One offered load through the real PICK_TAKE on a simulated store clock.
+
+    Callers re-ask as a held call does (every min(wait, 1 s)); a grant is finished at once with
+    its tokens kept, so only the budget limits the flow. Returns waits by kind and per-minute use.
+    """
+    import heapq
+
+    from gates_fleet import STORE  # here, so the shared import block stays as it was
+
+    from llm_queue.engine.admission import Admission, Ask, Candidate, owner_token
+    from llm_queue.engine.keys import Keys
+    from llm_queue.engine.store_client import store_client
+    from llm_queue.registry.store import RegistryStore
+
+    tpm, minute_ms = 60_000, 60_000
+    start = 28_333_400 * minute_ms  # a clock minute's start, far from the real one
+    doc = {
+        "registry_version": 1,
+        "accounts": {"aws-a": {"kind": "aws"}},
+        "models": {
+            "m": {
+                "type": "chat",
+                "provider": "bedrock",
+                "model_id": "x.model-1:0",
+                "rate_window": "fixed",
+                "rate_limits": "tpm",
+                "tpm": tpm,
+                "max_concurrency": 10_000,
+                "queue": {"backfill": backfill},
+                "deployments": {"aws-a": {"confirmed": ["r1"]}},
+            }
+        },
+    }
+    client = store_client(STORE)
+    prefix = new_prefix()
+    clock = [start]
+    try:
+        reg = RegistryStore(client, prefix, config=doc)
+        await reg.boot()
+        admission = Admission(client, Keys(prefix), clock_ms=lambda: clock[0])
+        # Offered per minute: large normal calls (36,000, one near the minute's end), small
+        # normal calls (18,000) and priority calls (6,000): the whole 60,000 tokens, normal
+        # calls above their 48,000 class share, so a large call often waits for the next minute.
+        calls: list[tuple[int, str, str, int]] = []  # (arrival ms, kind, class, tokens)
+        for m in range(5):
+            base = start + m * minute_ms
+            calls += [(base + at, "large", "n", 12_000) for at in (20_000, 40_000, 55_000)]
+            calls += [(base + 500 + i * 1_000, "small", "n", 300) for i in range(60)]
+            calls += [(base + 3_000 + i * 10_000, "priority", "p", 1_000) for i in range(6)]
+        calls.sort()
+        events = [(t, i) for i, (t, *_rest) in enumerate(calls)]
+        heapq.heapify(events)
+        waits: dict[str, list[float]] = {"large": [], "small": [], "priority": []}
+        used: dict[int, int] = collections.Counter()
+        while events:
+            t, i = heapq.heappop(events)
+            clock[0] = t
+            arrived, kind, cls, tokens = calls[i]
+            rid = f"c{i}"
+            ask = Ask(
+                "m",
+                rid,
+                "w1",
+                1,
+                "p" if cls == "p" else "n",
+                float(i + 1),
+                [Candidate("aws-a/r1")],
+                cost_t=tokens,
+                backfill=backfill,
+            )
+            decision = await admission.pick_take(ask, reg.changes)
+            if decision.kind == "granted":
+                waits[kind].append((t - arrived) / 1000)
+                used[t // minute_ms] += tokens
+                await admission.finish(
+                    "m", owner_token(rid, "w1", 1), rid, refund_r=0, refund_t=0, outcome="ok"
+                )
+            elif decision.kind == "wait":
+                step = int(min(max(decision.wait_secs, 0.01), 1.0) * 1000)
+                heapq.heappush(events, (t + step, i))
+            else:
+                raise RuntimeError(f"F1: unexpected {decision.kind} for {kind}")
+        return {"waits": waits, "used": used, "end": (clock[0] - start) / 1000}
+    finally:
+        keys = [k async for k in client.scan_iter(match=f"{prefix}*", count=500)]
+        if keys:
+            await client.delete(*keys)
+        await client.aclose()
+
+
+async def f1() -> bool:
+    """Size-aware backfill (plan F1): the same offered load with backfill off and on.
+
+    Pass: small-call p95 lower with backfill on; large and priority call p95 not above off's
+    by more than 10 % (+0.1 s); every call done sooner or as soon (throughput); no clock minute
+    over the model's tpm in either run.
+    """
+    off, on = await _f1_run(False), await _f1_run(True)
+    p = {
+        run: {k: p95(v) for k, v in res["waits"].items()} for run, res in (("off", off), ("on", on))
+    }
+
+    def within(kind: str) -> bool:
+        return p["on"][kind] <= p["off"][kind] * 1.1 + 0.1
+
+    return verdict(
+        "F1",
+        {
+            "small-call p95 lower with backfill": p["on"]["small"] < p["off"]["small"],
+            "large-call p95 within 10 % of off": within("large"),
+            "priority p95 within 10 % of off": within("priority"),
+            "all calls done no later with backfill": on["end"] <= off["end"],
+            "no minute over tpm 60,000": max([*off["used"].values(), *on["used"].values()])
+            <= 60_000,
+        },
+        [
+            f"p95 wait (s) off: {p['off']}",
+            f"p95 wait (s) on:  {p['on']}",
+            f"last grant (s): off {off['end']:.1f}, on {on['end']:.1f}",
+            f"most tokens in a minute: off {max(off['used'].values())}, "
+            f"on {max(on['used'].values())}",
+        ],
+    )
+
+
 GATES: dict[str, Callable[[], Coroutine[Any, Any, bool]]] = {
     "B17": b17,
     "B19": b19,
@@ -987,6 +1116,7 @@ GATES: dict[str, Callable[[], Coroutine[Any, Any, bool]]] = {
     "B95": b95,
     "B96": b96,
     "B97": b97,
+    "F1": f1,
 }
 
 
