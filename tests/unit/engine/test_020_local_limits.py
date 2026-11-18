@@ -11,6 +11,8 @@ import pytest
 
 from llm_queue import LLMQueue
 from llm_queue.engine.local import LocalLimits, _Breaker, _Bucket, _Budget
+from llm_queue.registry.resolve import ResolvedRegistry
+from llm_queue.registry.validate import check
 
 DEV = {
     "LLMQ_STORE_URL": "redis://localhost:6379/0",
@@ -80,6 +82,35 @@ def test_fixed_window_at_or_above_one_is_unchanged() -> None:
         bucket.take(1, MINUTE + 1)
     assert bucket.wait(1, MINUTE + 2) == pytest.approx(58)
     assert bucket.wait(1, MINUTE + 61) == 0  # a full minute is not carried
+
+
+def _view(r2: dict[str, object]) -> ResolvedRegistry:
+    doc = {
+        "registry_version": 1,
+        "accounts": {"aws-a": {"kind": "aws"}},
+        "models": {
+            "m": {
+                "type": "chat",
+                "provider": "bedrock",
+                "model_id": "openai.gpt-oss-20b-1:0",
+                "health": {"disable_errors": 1},
+                "deployments": {"aws-a": {"confirmed": ["r1", "r2"], "overrides": {"r2": r2}}},
+            }
+        },
+    }
+    registry, errors, _ = check(doc)
+    assert registry is not None, errors
+    return ResolvedRegistry(registry)
+
+
+def test_the_last_deployment_that_takes_calls_is_never_disabled_in_local_mode() -> None:
+    """FA-3: r2 is disabled in the registry, so r1's target errors must not disable r1.
+
+    Local mode counted every deployment of the model as usable (queue mode's A-3 fix used
+    `_dep_takes_calls`); r1 went for `probe_after_secs` and every call was `model_unavailable`.
+    """
+    assert LocalLimits().target_error(_view({"enabled": False}), "m", "aws-a/r1") is False
+    assert LocalLimits().target_error(_view({}), "m", "aws-a/r1") is True  # r2 takes calls
 
 
 def test_the_half_open_probe_is_claimed_once_per_process() -> None:

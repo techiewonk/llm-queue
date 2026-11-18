@@ -495,7 +495,8 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   elsewhere). This is also `fastapi.install()`'s shutdown.
 - `resume_receiving()` is thread-safe, as `pause_receiving()` is.
 - The health safeguard "never disable a model's last usable deployment" counts only
-  deployments that take calls (enabled, account enabled, not blocked, inside residency).
+  deployments that take calls (enabled, account enabled, not blocked, inside residency), in
+  local mode too (FA-3: local mode's own check counted every deployment of the model).
 - A cancel that lands while a call's admission is in flight gives the grant back at once
   (slot and budget); its slot was held up to a lease and its budget never refunded.
 - A pause also hands back calls waiting between two attempts (retry backoff); they kept the
@@ -522,6 +523,34 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   so every call ended `rate_limited` at `max_wait_secs`. The check now subtracts `now` first
   (exact for an idle bucket), in the admission script, the tenant share clock and local mode.
   Budgets stay exact and a waiting priority call still goes first.
+- `requests list` of a model without a tenant (HTTP `GET /requests`, CLI `requests list`) no
+  longer holds the state store for seconds when the model has many tenants (FA-1): its one
+  script read every tenant's index and scanned every tenant once per row (10,000 tenants, a
+  page of 500: 0.75 to 1.4 s of script, every worker's admission waiting behind it). The merge
+  is a heap, a model with more than 256 tenants is merged from runs of 256 tenants (each reads
+  only entries up to the page's last deadline so far), and the tenant index is read 1,000
+  hashes at a time; each run now takes about 5 ms (12 ms at most). Order and cursors are
+  unchanged.
+- An app request id sent again after an extended call ended runs with its own status (FA-2):
+  the end of a call set its job record's TTL to the status TTL alone, below the status's TTL
+  the extend had grown, so the job expired first and the next registration kept the old
+  final status (the new run's status writes refused; `list`, `count`, cancel and
+  reprioritize took the call for finished). The final write now keeps the job as long as its
+  status, and a registration that finds no job record clears an earlier run's final status,
+  result and stream chunks.
+- A tenant purge (`keys`) removes the tenant's name from `P:{m:ALIAS}:tqn` (FA-5): with
+  `LLMQ_TENANT_NAMES_ENABLED` the raw name stayed until a later call on the model pruned
+  lapsed tenants, which with ongoing traffic could be never.
+- A tenant purge of `queued` (or `running`) calls answers the waiting ones `cancelled` at
+  once, as `requests cancel` does (FA-4): it only set cancel marks, so their callers waited
+  until a worker reached the message (minutes in a deep queue) or their deadline. Its
+  `cancelled` count and `llmq_cancels_total` count the calls it marked, not those it
+  selected (a call that ended meanwhile was counted).
+- `fair_queue`: a grant out of round order (backfill, a call that can use other
+  deployments, a sticky session) moved the round served to its own, so a newcomer's next
+  call got a round behind every lower round still waiting (FA-6: rounds 2 and 3 held, a
+  grant at 4, the newcomer got 5). The round served now moves no further than the lowest
+  round still waiting (the newcomer gets 3).
 
 ## [0.1.1] - 2026-11-17
 

@@ -177,6 +177,28 @@ async def test_tenant_purge_fixes_the_weight_sum(store: redis.asyncio.Redis, pre
     assert not await store.exists(f"{m}tf:w")  # the last tenant: the hash goes
 
 
+async def test_tenant_purge_removes_the_tenant_name(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FA-5: the raw name in `tqn` (`LLMQ_TENANT_NAMES_ENABLED`) goes with the tenant's state.
+
+    It stayed until a later call on the model pruned lapsed tenants, which with ongoing traffic
+    and a growing TTL could be never.
+    """
+    svc = await _service(store, prefix)
+    h, other = keyed_hash(SALT, "acme"), keyed_hash(SALT, "beta")
+    names = f"{prefix}:{{m:big}}:tqn"
+    await store.hset(names, mapping={h: "acme", other: "beta"})
+    plan = await svc.tenant("acme", actor="plan")
+    assert plan.deleted_fields == 1
+    assert await store.hget(names, h) == b"acme"  # a dry run writes nothing
+    done = await svc.tenant("acme", actor="ops", dry_run=False)
+    assert done.deleted_fields == 1
+    assert await store.hgetall(names) == {other.encode(): b"beta"}
+    await svc.tenant("beta", actor="ops", dry_run=False, models=["big"])
+    assert not await store.exists(names)
+
+
 async def test_tenant_calls_come_from_the_request_index(
     store: redis.asyncio.Redis, prefix: str
 ) -> None:
@@ -206,7 +228,10 @@ async def test_tenant_calls_come_from_the_request_index(
     everything = await indexed.tenant(
         "acme", actor="ops", dry_run=False, remove={"running", "keys"}
     )
-    assert everything.cancelled == 2  # every indexed call (the cancel API counts a repeat)
+    # q1 was answered `cancelled` by the first purge (final): only r1 is marked now (FA-4).
+    assert everything.cancelled == 1
+    assert (await store.hgetall(f"{prefix}:{{r:q1}}:status"))[b"state"] == b"cancelled"
+    assert await store.hget(f"{prefix}:{{r:r1}}:job", "state") == b"running"  # its worker's
     assert not await store.exists(f"{prefix}:{{r:b1}}:cancel")  # another tenant: untouched
     assert not await store.exists(f"{prefix}:{{r:lapsed}}:cancel")
 
@@ -326,6 +351,30 @@ async def test_engine_purges_a_tenants_calls_from_the_index(make: Make) -> None:
     with pytest.raises(CallFailed, match="cancelled"):
         await task
     assert await engine.state.zcard(key) == 0  # the cancelled call's final write removed it
+
+
+async def test_a_tenant_purge_answers_its_waiting_callers_at_once(make: Make) -> None:
+    """FA-4: a purge of the tenant's queued calls answers their callers `cancelled` at once.
+
+    It only set cancel marks: with no worker reaching the message, the caller waited for its
+    deadline (60 s here). Now it is answered as the admin cancel answers (`CANCEL_SETTLE`).
+    """
+    engine, _ = await make(worker=False)
+    task = asyncio.create_task(engine.call("small", CHAT, tenant_id="acme", timeout_secs=60))
+    key = engine.keys.request_index("small", engine.hash_id("acme"))
+    for _ in range(100):
+        if await engine.state.zcard(key):
+            break
+        await asyncio.sleep(0.02)
+    rid = (await engine.state.zrange(key, 0, 0))[0].decode()
+    report = await engine.purge.tenant("acme", actor="ops", dry_run=False, remove={"queued"})
+    assert report.cancelled == 1
+    with pytest.raises(CallFailed, match="cancelled"):
+        await asyncio.wait_for(task, 5)
+    assert (await engine.requests.status(rid))["state"] == "cancelled"
+    assert await engine.state.zcard(key) == 0
+    again = await engine.purge.tenant("acme", actor="ops", dry_run=False, remove={"running"})
+    assert again.cancelled == 0  # final: nothing marked, nothing counted
 
 
 async def test_auto_purge_waits_when_the_registry_cannot_be_read(

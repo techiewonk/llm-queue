@@ -57,7 +57,10 @@ holding the class for (a held call stops the worker reading that class of the mo
 **fair_queue.** Each call gets a round on its first admission: one more than the larger of
 the round last served and its tenant's last round. Waiting calls reserve budget in round order
 instead of queue order, so a tenant that sent 100 calls gets one in every round, like anyone
-else. A tenant's lead is capped at 1000 rounds. The round only orders calls that reached
+else. The round last served moves with each grant but never past the lowest round still
+waiting, so a grant out of round order (backfill, a call that can use other deployments, a
+sticky session) does not put a newcomer behind rounds that are still held. A tenant's lead
+is capped at 1000 rounds. The round only orders calls that reached
 admission (one held call per worker and class); calls still in the stream are read in order.
 
 ## Cost and keys

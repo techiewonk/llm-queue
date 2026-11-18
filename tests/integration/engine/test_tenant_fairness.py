@@ -198,6 +198,32 @@ async def test_fair_queue_round_robin(store: redis.asyncio.Redis, prefix: str) -
     assert (await r.ask("b1", candidates=ONE, fairness=again("b1", "hb"))).kind == "granted"
 
 
+async def test_fair_queue_an_out_of_order_grant_keeps_a_newcomer_in_its_round(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FA-6: a grant at round 4 while rounds 2 and 3 still wait does not push newcomers to 5.
+
+    a3 (round 4) is granted on r2, which a1 and a2 (rounds 2, 3, waiting on r1) do not use.
+    The round served (`tf:fq v`) jumped to 4, so a newcomer got round 5 and waited behind
+    every lower round still held. It now advances only to the lowest round still waiting.
+    """
+    r = await rig(store, prefix, model={"max_concurrency": 1})
+    fq = {t: Fairness("fair_queue", t) for t in ("hx", "ha", "hc")}
+    assert (await r.ask("x0", candidates=ONE, fairness=fq["hx"])).kind == "granted"
+    rounds: dict[str, float] = {}
+    for rid in ("a1", "a2", "a3"):
+        d = await r.ask(rid, candidates=ONE, fairness=fq["ha"])
+        assert d.kind == "wait"
+        rounds[rid] = float(d.extra["fr"])
+    assert rounds == {"a1": 2.0, "a2": 3.0, "a3": 4.0}
+    other = [Candidate("aws-a/r2")]
+    late = Fairness("fair_queue", "ha", round=rounds["a3"])
+    assert (await r.ask("a3", candidates=other, fairness=late)).kind == "granted"
+    newcomer = await r.ask("c1", candidates=ONE, fairness=fq["hc"])
+    assert newcomer.kind == "wait"
+    assert float(newcomer.extra["fr"]) == 3.0  # behind round 2 still waiting; it was 5
+
+
 async def test_tenant_slot_renewed_and_freed(store: redis.asyncio.Redis, prefix: str) -> None:
     """RENEW keeps the tenant's slot as long as the grant; FINISH removes it."""
     r = await rig(store, prefix, lease_secs=5)

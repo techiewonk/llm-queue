@@ -22,6 +22,7 @@ import orjson
 from llm_queue._logging import get_logger
 from llm_queue.engine._codec import text as _text
 from llm_queue.engine.audit import Audit
+from llm_queue.engine.envelope import Meta, Reply
 from llm_queue.engine.expiry import native
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import StreamQueues
@@ -45,20 +46,24 @@ AUTO_ACTOR = "auto"
 _LOCK_MS = 120_000  # `P:lock:purge`: one pod schedules and runs due purges at a time
 _POLL_SECS = 1.0  # deployment purge: how often running calls are checked while waiting
 
-# KEYS: tf:t:<h>, tf:s:<h>, tf:act, tf:w, tf:need, P:ttl. ARGV: h, dry ('1'), request ids
+# KEYS: tf:t:<h>, tf:s:<h>, tf:act, tf:w, tf:need, P:ttl, tqn. ARGV: h, dry ('1'), request ids
 # (from the tenant index) to drop from tf:need. Reply: {keys, fields}. `~sum` stays the sum of
-# the remaining weights, so the other tenants' shares are right at once.
+# the remaining weights, so the other tenants' shares are right at once. The tenant's name goes
+# from `tqn` (FA-5: it stayed until a later call on the model pruned lapsed tenants).
 _TENANT_PURGE = """
 local h, dry = ARGV[1], ARGV[2] == '1'
 local keys = redis.call('EXISTS', KEYS[1]) + redis.call('EXISTS', KEYS[2])
 local w = redis.call('HGET', KEYS[4], h)
 local fields = (w and 1 or 0) + (redis.call('ZSCORE', KEYS[3], h) and 1 or 0)
+  + redis.call('HEXISTS', KEYS[7], h)
 local rids = {}
 for i = 3, #ARGV do table.insert(rids, ARGV[i]) end
 if dry then return {keys, fields} end
 redis.call('UNLINK', KEYS[1], KEYS[2])
 redis.call('ZREM', KEYS[6], KEYS[1], KEYS[2])
 redis.call('ZREM', KEYS[3], h)
+redis.call('HDEL', KEYS[7], h)
+if redis.call('EXISTS', KEYS[7]) == 0 then redis.call('ZREM', KEYS[6], KEYS[7]) end
 if w then
   local sum = tonumber(redis.call('HGET', KEYS[4], '~sum') or '0') - tonumber(w)
   redis.call('HDEL', KEYS[4], h)
@@ -592,6 +597,7 @@ class PurgeService:
                         model(alias, "tf:w"),
                         model(alias, "tf:need"),
                         self._ttl_key,
+                        self.keys.tenant_names(alias),
                     ],
                     [h, "1" if dry_run else "0", *rids],
                 )
@@ -623,21 +629,30 @@ class PurgeService:
         if dry_run or not chosen:
             return len(chosen)
         store = RequestStore(self._state, self.keys, status_ttl_secs=self._status_ttl_secs)
-        done = 0
-        for start in range(0, len(chosen), self.settings.batch):
-            batch = chosen[start : start + self.settings.batch]
-            done += await store.cancel(
-                batch,
-                ttl_secs=self._status_ttl_secs,
-                channel=self.keys.cancel_channel,
-                # A call granted between the read and the script stays running (T2 only_state).
-                only_state=None if "running" in parts else "queued",
-            )
-            for rid in batch:
-                logger.info("call_cancel", request_id=rid, source="purge", by=self._owner)
+        # As the admin cancel (FA-4): a call still `queued` once marked is answered `cancelled`
+        # in the same script and its callers woken, not left waiting until a worker reaches its
+        # message (minutes, deep in a queue) or its deadline. A call granted between the read
+        # and the script stays running (T2 only_state); one running is marked for its worker.
+        marked, _, answered = await store.cancel_settle(
+            chosen,
+            ttl_secs=self._status_ttl_secs,
+            channel=self.keys.cancel_channel,
+            only_state=None if "running" in parts else "queued",
+            reply=Reply(
+                request_id="",
+                ok=False,
+                error="cancelled",
+                message="the call was cancelled by a tenant purge",
+                meta=Meta(worker=self._owner),
+            ),
+            batch=self.settings.batch,
+        )
+        for rid in marked:  # only the calls it cancelled
+            logger.info("call_cancel", request_id=rid, source="purge", by=self._owner)
         if self._metrics is not None:
-            self._metrics.count("llmq_cancels_total", float(len(chosen)), source="admin")
-        return done
+            self._metrics.count("llmq_cancels_total", float(len(marked)), source="admin")
+        await store.wake(answered, batch=self.settings.batch)
+        return len(marked)
 
     async def _auto(self, target: str) -> bool:
         """Run one due auto purge (the grace was the wait); False keeps it for the next tick.
