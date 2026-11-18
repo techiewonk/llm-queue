@@ -115,7 +115,7 @@ def test_off_switch_never_builds_or_reads_a_secrets_source(
 def test_a_secret_cannot_switch_the_library(monkeypatch: pytest.MonkeyPatch) -> None:
     secret = {"LLMQ_ENABLED": "false", "LLMQ_CONFIG_ERROR_MODE": "disable"}
     _aws(monkeypatch, {"SecretString": json.dumps(secret)})
-    env = {"LLMQ_SECRETS_SOURCE": AWS, "LLMQ_ENVIRONMENT": "dev"}
+    env = {"LLMQ_SECRETS_SOURCE": AWS, "LLMQ_ENVIRONMENT": "dev", "LLMQ_CONFIG_ERROR_MODE": "raise"}
     with pytest.raises(ConfigError, match="LLMQ_STORE_URL"):  # neither key was taken
         LLMQueue.from_env(env)
     for name in ("LLMQ_ENABLED", "LLMQ_CONFIG_ERROR_MODE"):
@@ -123,19 +123,20 @@ def test_a_secret_cannot_switch_the_library(monkeypatch: pytest.MonkeyPatch) -> 
             LLMQueue.from_env({**env, "LLMQ_SECRETS_NAMES": json.dumps({name: "k"})})
 
 
-# ---------------------------------------------------------------- raise (the default)
+# ---------------------------------------------------------------- disable (the default), raise
 
 
-def test_raise_is_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    with pytest.raises(ConfigError, match="LLMQ_LEASE_SECS"):
-        LLMQueue.from_env({"LLMQ_ENVIRONMENT": "dev", "LLMQ_LEASE_SECS": "x"})
+def test_disable_is_the_default_and_raise_stops_the_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    off = LLMQueue.from_env({"LLMQ_ENVIRONMENT": "dev", "LLMQ_LEASE_SECS": "x"})
+    assert isinstance(off, DisabledQueue)
+    assert off.describe()["disabled_reason"] == "config_error"
     with pytest.raises(ConfigError, match="LLMQ_LEASE_SECS"):
         LLMQueue.from_env(
             {"LLMQ_ENVIRONMENT": "dev", "LLMQ_LEASE_SECS": "x", "LLMQ_CONFIG_ERROR_MODE": "raise"}
         )
     _aws(monkeypatch, _ClientError("AccessDeniedException"))
     with pytest.raises(ConfigError, match="AccessDeniedException"):
-        LLMQueue.from_env({"LLMQ_SECRETS_SOURCE": AWS})
+        LLMQueue.from_env({"LLMQ_SECRETS_SOURCE": AWS, "LLMQ_CONFIG_ERROR_MODE": "raise"})
 
 
 def test_an_invalid_mode_raises_naming_it() -> None:

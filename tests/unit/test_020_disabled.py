@@ -63,7 +63,9 @@ def test_switch_reads_the_environment_and_defaults_never_a_secret() -> None:
 
     # A secret holding LLMQ_ENABLED is ignored: the switch is read before any secret.
     with pytest.raises(ConfigError, match="LLMQ_STORE_URL"):
-        LLMQueue.from_env({"LLMQ_ENVIRONMENT": "dev"}, secrets=secrets)
+        LLMQueue.from_env(
+            {"LLMQ_ENVIRONMENT": "dev", "LLMQ_CONFIG_ERROR_MODE": "raise"}, secrets=secrets
+        )
     assert isinstance(LLMQueue.from_env({}, defaults={"LLMQ_ENABLED": False}), DisabledQueue)
     off = LLMQueue.from_env({"LLMQ_ENABLED": "false"}, defaults={"LLMQ_ENABLED": True})
     assert isinstance(off, DisabledQueue)

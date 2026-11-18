@@ -61,7 +61,7 @@ if TYPE_CHECKING:
     from llm_queue.engine.admin import AdminServices
 
 logger = get_logger(__name__)
-CONFIG_ERROR_MODES = ("raise", "disable")  # LLMQ_CONFIG_ERROR_MODE, the first is the default
+CONFIG_ERROR_MODES = ("disable", "raise")  # LLMQ_CONFIG_ERROR_MODE, the first is the default
 # A sync call on a started queue's loop checks this often that the loop still runs (CO-26).
 _LOOP_CHECK_SECS = 1.0
 # How long closing the private engine of the sync calls may take before it is logged and left.
@@ -1282,11 +1282,11 @@ class LLMQueue:
 def _config_error_mode(
     environ: Mapping[str, str] | None, defaults: Mapping[str, Any] | None
 ) -> tuple[str, str | None]:
-    """`LLMQ_CONFIG_ERROR_MODE` (`raise` or `disable`) and its problem; invalid reads `raise`.
+    """`LLMQ_CONFIG_ERROR_MODE` (`disable` by default, or `raise`) and its problem; invalid: raise.
 
     From `environ` then `defaults` only, never a secret: reading the secret may be what fails.
     """
-    raw = (env_or_default(environ, defaults, "LLMQ_CONFIG_ERROR_MODE") or "raise").strip().lower()
+    raw = (env_or_default(environ, defaults, "LLMQ_CONFIG_ERROR_MODE") or "disable").strip().lower()
     if raw in CONFIG_ERROR_MODES:
         return raw, None
     return "raise", "LLMQ_CONFIG_ERROR_MODE must be raise or disable"

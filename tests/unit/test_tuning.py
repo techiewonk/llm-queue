@@ -93,7 +93,7 @@ def test_from_env_refuses_bad_tuning() -> None:
     """Bad tuning stops start-up with `ConfigError` naming every problem, never a live call."""
     bad = Tuning(store=StoreOptions(read_timeout_secs=0.5, retries=-1))
     with pytest.raises(ConfigError) as info:
-        LLMQueue.from_env(ENV, tuning=bad)
+        LLMQueue.from_env({**ENV, "LLMQ_CONFIG_ERROR_MODE": "raise"}, tuning=bad)
     assert "store.retries" in str(info.value)
     assert "store.read_timeout_secs" in str(info.value)
 
@@ -226,7 +226,7 @@ def test_r3cf10_result_ttl_below_the_recheck_is_refused() -> None:
     assert "LLMQ_RESULT_TTL_SECS (30)" in line
     assert "engine.result_recheck_secs (60)" in line
     with pytest.raises(ConfigError, match="LLMQ_RESULT_TTL_SECS"):
-        LLMQueue.from_env({**ENV, "LLMQ_RESULT_TTL_SECS": "30"})
+        LLMQueue.from_env({**ENV, "LLMQ_RESULT_TTL_SECS": "30", "LLMQ_CONFIG_ERROR_MODE": "raise"})
 
 
 def test_r3cf10_registry_pairs_with_the_process_are_warned() -> None:

@@ -25,7 +25,8 @@ problem. `LLMQ_CONFIG_ERROR_MODE=disable` takes step 5 on its own when `from_env
 `ConfigError` (a bad setting, a secret that cannot be read): it logs `llmq_config_failed` once
 and returns the same disabled queue, with `disabled_reason: config_error` (step 5 by hand says
 `switch`) in `health()` and `describe()`. The pod starts and serves the app's direct path instead
-of crashing; fix the setting and restart. The default, `raise`, stops the start.
+of crashing; fix the setting and restart. `disable` is the default; `raise` stops the start
+instead (a pod that must not run without its queue).
 
 Steps 2 and 3 need the store: they move where a call runs, not where its budget lives. Step 4
 is for when the store itself is the problem (lost, being migrated, not yet provisioned) or for

@@ -23,7 +23,12 @@ BOTOCORE = Tuning(bedrock=BedrockOptions(transport="botocore"))
 
 @pytest.mark.parametrize("local", [False, True])
 def test_strict_refuses_botocore_with_an_endpoint_override(local: bool) -> None:
-    env = {**STRICT, **ENDPOINT, **({"LLMQ_EXECUTION_MODE": "local"} if local else {})}
+    env = {
+        **STRICT,
+        **ENDPOINT,
+        "LLMQ_CONFIG_ERROR_MODE": "raise",
+        **({"LLMQ_EXECUTION_MODE": "local"} if local else {}),
+    }
     with pytest.raises(ConfigError, match="transport=botocore is refused outside dev"):
         LLMQueue.from_env(env, tuning=BOTOCORE)
 

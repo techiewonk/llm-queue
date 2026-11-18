@@ -235,7 +235,7 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   (`enabled: false`), `health()` / `describe()` say so, `llmq_disabled` is logged once at start,
   and the drain file still fails readiness. The fifth step of the switch ladder
   (docs/how-to/modes.md).
-- `LLMQ_CONFIG_ERROR_MODE` (`raise` by default, or `disable`): with `disable`, a `ConfigError`
+- `LLMQ_CONFIG_ERROR_MODE` (`disable` by default, or `raise`): with `disable`, a `ConfigError`
   at `from_env()` (a bad setting, a secrets source that cannot be read) is logged once as
   `llmq_config_failed` (the problems, never a value) and a disabled queue is returned instead
   of raising: `health()` / `describe()` say `enabled: false`, `disabled_reason: config_error`

@@ -611,10 +611,10 @@ class InfraSettings:
     # LLMQ_ENABLED (0.2.0 H1, FU1): false switches the library off (a disabled queue: probes,
     # the drain file and `describe()` only; every other setting is then not read or checked).
     enabled: bool = True
-    # LLMQ_CONFIG_ERROR_MODE: `raise` (a ConfigError stops `from_env`) or `disable` (logged as
-    # `llmq_config_failed`, a disabled queue returned). Environment and defaults only; core.py
+    # LLMQ_CONFIG_ERROR_MODE: `disable` (default: logged as `llmq_config_failed`, a disabled queue
+    # returned) or `raise` (a ConfigError stops `from_env`). Environment and defaults only; core.py
     # reads it before these settings, as building them may be what fails.
-    config_error_mode: str = "raise"
+    config_error_mode: str = "disable"
     queue_store_url: str | None = field(default=None, repr=False)
     store_max_connections: int = 200
     # LLMQ_STORE_MAX_CONNECTIONS=auto (0.2.0 D7): the size above is the boot registry's worker
@@ -759,7 +759,7 @@ class InfraSettings:
             return cls._disabled(layers)
         store = get("STORE_URL")
         execution_mode = str(get("EXECUTION_MODE", "queue")).strip().lower()
-        config_error_mode = str(get("CONFIG_ERROR_MODE", "raise")).strip().lower()
+        config_error_mode = str(get("CONFIG_ERROR_MODE", "disable")).strip().lower()
         if config_error_mode not in ("raise", "disable"):
             problems.append("LLMQ_CONFIG_ERROR_MODE must be raise or disable")
         if execution_mode not in EXECUTION_MODES:
