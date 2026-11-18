@@ -22,6 +22,7 @@ import orjson
 from llm_queue._logging import get_logger
 from llm_queue.engine._codec import text as _text
 from llm_queue.engine.audit import Audit
+from llm_queue.engine.envelope import Meta, Reply
 from llm_queue.engine.expiry import native
 from llm_queue.engine.keys import Keys
 from llm_queue.engine.queue import StreamQueues
@@ -628,21 +629,30 @@ class PurgeService:
         if dry_run or not chosen:
             return len(chosen)
         store = RequestStore(self._state, self.keys, status_ttl_secs=self._status_ttl_secs)
-        done = 0
-        for start in range(0, len(chosen), self.settings.batch):
-            batch = chosen[start : start + self.settings.batch]
-            done += await store.cancel(
-                batch,
-                ttl_secs=self._status_ttl_secs,
-                channel=self.keys.cancel_channel,
-                # A call granted between the read and the script stays running (T2 only_state).
-                only_state=None if "running" in parts else "queued",
-            )
-            for rid in batch:
-                logger.info("call_cancel", request_id=rid, source="purge", by=self._owner)
+        # As the admin cancel (FA-4): a call still `queued` once marked is answered `cancelled`
+        # in the same script and its callers woken, not left waiting until a worker reaches its
+        # message (minutes, deep in a queue) or its deadline. A call granted between the read
+        # and the script stays running (T2 only_state); one running is marked for its worker.
+        marked, _, answered = await store.cancel_settle(
+            chosen,
+            ttl_secs=self._status_ttl_secs,
+            channel=self.keys.cancel_channel,
+            only_state=None if "running" in parts else "queued",
+            reply=Reply(
+                request_id="",
+                ok=False,
+                error="cancelled",
+                message="the call was cancelled by a tenant purge",
+                meta=Meta(worker=self._owner),
+            ),
+            batch=self.settings.batch,
+        )
+        for rid in marked:  # only the calls it cancelled
+            logger.info("call_cancel", request_id=rid, source="purge", by=self._owner)
         if self._metrics is not None:
-            self._metrics.count("llmq_cancels_total", float(len(chosen)), source="admin")
-        return done
+            self._metrics.count("llmq_cancels_total", float(len(marked)), source="admin")
+        await store.wake(answered, batch=self.settings.batch)
+        return len(marked)
 
     async def _auto(self, target: str) -> bool:
         """Run one due auto purge (the grace was the wait); False keeps it for the next tick.

@@ -510,6 +510,11 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
 - A tenant purge (`keys`) removes the tenant's name from `P:{m:ALIAS}:tqn` (FA-5): with
   `LLMQ_TENANT_NAMES_ENABLED` the raw name stayed until a later call on the model pruned
   lapsed tenants, which with ongoing traffic could be never.
+- A tenant purge of `queued` (or `running`) calls answers the waiting ones `cancelled` at
+  once, as `requests cancel` does (FA-4): it only set cancel marks, so their callers waited
+  until a worker reached the message (minutes in a deep queue) or their deadline. Its
+  `cancelled` count and `llmq_cancels_total` count the calls it marked, not those it
+  selected (a call that ended meanwhile was counted).
 
 ## [0.1.1] - 2026-11-17
 
