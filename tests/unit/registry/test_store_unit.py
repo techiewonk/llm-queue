@@ -401,3 +401,34 @@ async def test_conflict_backoff_is_capped(full: dict[str, Any], top_of_range: No
     assert len(sleeps) == 11
     assert max(sleeps) == _CONFLICT_BACKOFF_MAX_SECS == 2.0
     assert sleeps[:3] == [0.04, 0.08, 0.16]
+
+
+async def test_a_reload_overtaken_by_a_later_read_cannot_undo_a_live_edit(
+    full: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3: a reload sent before a live edit, answered after the edit's own read, was kept.
+
+    The pod ran on the old document (kill switch off) until its next reload; one call was
+    queued while every caller had already seen the switch on. A read overtaken is dropped.
+    """
+    store = _store(_Client(None, {}))
+    edited = copy.deepcopy(full)
+    edited.setdefault("routing", {})["kill_switch"] = True
+    slow = asyncio.get_running_loop().create_future()
+    answers = [slow]
+    fast = asyncio.get_running_loop().create_future()
+    fast.set_result((edited, {"changes": "2"}))
+    answers.append(fast)
+
+    async def read() -> tuple[dict[str, Any], dict[str, str]]:
+        result: tuple[dict[str, Any], dict[str, str]] = await answers.pop(0)
+        return result
+
+    monkeypatch.setattr(store, "_read", read)
+    reload = asyncio.create_task(store._load())  # the reload loop's read, sent first
+    await asyncio.sleep(0)
+    assert (await store._load()) is not None  # the edit's own read, answered first
+    assert store.current.registry.routing.kill_switch
+    slow.set_result((full, {"changes": "1"}))
+    await reload
+    assert store.current.registry.routing.kill_switch  # the older read did not put it back

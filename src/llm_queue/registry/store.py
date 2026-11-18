@@ -468,6 +468,9 @@ class RegistryStore:
         self._edit = client.register_script(_lua.EDIT)
         self._current: ResolvedRegistry | None = None
         self._changes = -1
+        # Reads are numbered when sent: one that a later read already overtook is dropped, so a
+        # reload that started before a live edit cannot put the old document back (R3).
+        self._reads_sent = self._read_kept = 0
         # The engine's metrics sink (set by `Engine`): reload failures are counted (CO-4).
         self.metrics: Metrics | None = None
         self._version = 0
@@ -611,11 +614,16 @@ class RegistryStore:
         return await asyncio.shield(pending)
 
     async def _load(self) -> ResolvedRegistry | None:
+        self._reads_sent += 1
+        seq = self._reads_sent
         try:
             doc, meta = await self._read()
         except (RedisError, OSError) as exc:
             logger.warning("registry_unreachable", error=str(exc))
             return self._current
+        if seq < self._read_kept:
+            return self._current  # a read sent after this one already landed: this may predate it
+        self._read_kept = seq
         if doc is None:
             return None
         self._accept(doc, meta)

@@ -7,7 +7,7 @@ public API (see STABILITY.md).
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-11-18
+## [0.2.0] - 2026-11-19
 
 ### Upgrading from 0.1.1
 
@@ -427,6 +427,9 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
 
 ### Fixed
 
+- A registry reload that started before a live edit and was answered after the edit's own
+  read put the old document back until the next reload (scenario R3: one call queued with the
+  kill switch on). Reads are numbered when sent; one overtaken by a later read is dropped.
 - `QueuedChatBedrockConverse` without `model_alias` (only `model_id`) treated every reply as a
   model fallback (C3): the served alias never equals the model id, so each reply paid a
   registry lookup to fill `model_name`. A fallback is now read from the engine's
