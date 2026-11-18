@@ -87,14 +87,15 @@ local function keep_callers()
   local ttl = X.pttl(KEYS[1])
   if ttl > 0 then X.expire(KEYS[2], ttl) end
 end
-local function create()
+-- `status`: the status hash's state as the caller read it (false: no status, as after a DEL).
+local function create(status)
   redis.call('HSET', KEYS[1], 'state', 'queued', 'user', ARGV[1], 'params', ARGV[2],
     'caller', ARGV[3], 'confirmed', '0', 'created', now, 'rn', nonce or '', 'ro', 'new')
   if ARGV[9] == '1' then redis.call('HSET', KEYS[1], 'app', '1') end
   X.expire(KEYS[1], tonumber(ARGV[4]) * 1000)
   redis.call('SADD', KEYS[2], ARGV[3])
   X.expire(KEYS[2], tonumber(ARGV[4]) * 1000)
-  if redis.call('HGET', KEYS[3], 'state') == false then
+  if status == false then
     local t = redis.call('TIME')
     redis.call('HSET', KEYS[3], 'state', 'waiting', 'model', ARGV[6], 'priority', ARGV[7],
       'enqueued_at', t[1] .. '.' .. string.format('%06d', tonumber(t[2])))
@@ -106,12 +107,14 @@ if #job == 0 then
   redis.call('DEL', cancel_key)  -- a cancel left by an earlier run of this id
   -- An earlier run's final status, result and chunks outlived its record (FA-2: expired after
   -- an extend, or the record was lost): the status refused every write of this run, which
-  -- admin reads then took for finished, and the old result would answer it.
+  -- admin reads then took for finished, and the old result would answer it. One read of the
+  -- status serves this check and create's (gate G-T1: every new call pays it).
   local prior = redis.call('HGET', KEYS[3], 'state')
   if prior == 'done' or prior == 'failed' or prior == 'expired' or prior == 'cancelled' then
     redis.call('DEL', KEYS[3], KEYS[4], string.sub(KEYS[1], 1, -4) .. 'chunks')
+    prior = false
   end
-  return create()
+  return create(prior)
 end
 local fields = {}
 for i = 1, #job, 2 do fields[job[i]] = job[i + 1] end
@@ -136,7 +139,7 @@ if state == 'failed' or state == 'expired' or state == 'cancelled' then
   -- after them). The key names of one request share the job key's base.
   local base = string.sub(KEYS[1], 1, -4)
   redis.call('DEL', KEYS[1], KEYS[2], KEYS[3], KEYS[4], base .. 'cancel', base .. 'chunks')
-  return create()
+  return create(false)
 end
 -- A cancel is pending: it wins for every caller of the id (owner Q3), an attach after it too.
 if redis.call('EXISTS', cancel_key) == 1 then return 'cancelled' end
@@ -177,18 +180,22 @@ REGISTER = _REGISTER_FN + "return register(ARGV[10], ARGV[11], ARGV[12])\n"
 # The request index per model and tenant (0.2.0 T1): `P:{m:ALIAS}:tq:H` (request id -> the
 # call's deadline, store ms) and `P:{m:ALIAS}:tq` (tenant hash -> its latest deadline). Written
 # in the script that confirms a call (no extra round trip), removed by the script that writes
-# its final state. Lapsed entries are pruned on each add; the keys live 60 s past their latest
-# deadline (grow-only). The job record keeps where its entry is: `ix` (the `tq:H` key), `ixh`
-# (H), `mid` (the stream message id, '' for a direct run) and `q` (class `p` / `n`). `names`
-# (optional): `P:{m:ALIAS}:tqn`, the tenant's name beside its hash (`LLMQ_TENANT_NAMES_ENABLED`).
+# its final state. Lapsed entries are pruned on each add; the keys live 60-90 s past their
+# latest deadline (grow-only, in 30 s steps). The job record keeps where its entry is: `ix`
+# (the `tq:H` key), `ixh` (H), `mid` (the stream message id, '' for a direct run) and `q`
+# (class `p` / `n`). `names` (optional): `P:{m:ALIAS}:tqn`, the tenant's name beside its hash
+# (`LLMQ_TENANT_NAMES_ENABLED`).
 _INDEX_FN = """
-local function index_add(job, ix, ixs, rid, h, keep_ms, mid, cls, names, name)
+local function index_add(job, ix, ixs, rid, h, keep_ms, mid, cls, names, name, fresh)
   local now = X.now()
   local dl = now + keep_ms
   -- A takeover by a caller of another tenant: the old tenant's entry goes (RQ-9), or the call
-  -- was listed twice and the old tenant's cancel reached it.
-  local old = redis.call('HGET', job, 'ix')
-  if old and old ~= ix then redis.call('ZREM', old, rid) end
+  -- was listed twice and the old tenant's cancel reached it. `fresh`: the record was made in
+  -- this script, so it has no entry yet (REGISTER_SEND's `new`: no read).
+  if not fresh then
+    local old = redis.call('HGET', job, 'ix')
+    if old and old ~= ix then redis.call('ZREM', old, rid) end
+  end
   redis.call('HSET', job, 'ix', ix, 'ixh', h, 'mid', mid, 'q', cls)
   redis.call('ZADD', ix, dl, rid)
   redis.call('ZREMRANGEBYSCORE', ix, '-inf', '(' .. now)
@@ -201,17 +208,15 @@ local function index_add(job, ix, ixs, rid, h, keep_ms, mid, cls, names, name)
     if #lapsed > 0 then redis.call('HDEL', names, unpack(lapsed)) end
   end
   redis.call('ZREMRANGEBYSCORE', ixs, '-inf', '(' .. now)
+  -- At least 60 s past the latest deadline, grown in 30 s steps: setting it on every add was
+  -- an expiry write per key per call (gate G-T1), now one each 30 s.
   local ms = keep_ms + 60000
-  if X.pttl(ix) < ms then X.expire(ix, ms) end
-  if X.pttl(ixs) < ms then X.expire(ixs, ms) end
+  if X.pttl(ix) < ms then X.expire(ix, ms + 30000) end
+  if X.pttl(ixs) < ms then X.expire(ixs, ms + 30000) end
   if has_names and name and name ~= '' then
     redis.call('HSET', names, h, name)
-    if X.pttl(names) < ms then X.expire(names, ms) end
+    if X.pttl(names) < ms then X.expire(names, ms + 30000) end
   end
-end
-local function index_drop(job, rid)
-  local ix = redis.call('HGET', job, 'ix')
-  if ix then redis.call('ZREM', ix, rid) end
 end
 """
 
@@ -251,7 +256,7 @@ X.expire(KEYS[2], tonumber(ARGV[14]) * 1000)
 if #KEYS >= 13 then
   local rid = string.match(KEYS[1], ':{r:(.*)}:job$')
   index_add(KEYS[1], KEYS[12], KEYS[13], rid, ARGV[18], tonumber(ARGV[19]), sent[2], ARGV[20],
-    KEYS[14], ARGV[21])
+    KEYS[14], ARGV[21], outcome == 'new')
 end
 return {outcome, sent[2]}
 """
@@ -319,13 +324,17 @@ end
 # after a success writes nothing), the result is set only if absent, and the claim's state
 # moves only with a result written or from a state not yet final; a late failure or cancel
 # once set `cancelled` over a stored success and the next registration ran it again. Returns
-# 1 written, 2 this same body was already stored (a replay of this write), else 0.
+# 1 written, 2 this same body was already stored (a replay of this write), else 0. The call
+# leaves the request index (T1) on the same read of its record: `rid` is its member.
 _FINAL_FN = """
-local function final_write(res, job, body, ttl_ms, state, keep_ms)
-  local current = redis.call('HGET', job, 'state')
+local function final_write(res, job, body, ttl_ms, state, keep_ms, rid)
+  local rec = redis.call('HMGET', job, 'state', 'ix')
+  local current = rec[1]
+  if rec[2] then redis.call('ZREM', rec[2], rid) end
   local written = false
   if current ~= 'done' then written = X.set(res, body, ttl_ms, true) end
-  if redis.call('EXISTS', job) == 1 then
+  -- A record with a state exists: EXISTS only for one without (gate G-T1: one read fewer).
+  if current or redis.call('EXISTS', job) == 1 then
     local final = current == 'done' or current == 'failed' or current == 'expired'
       or current == 'cancelled'
     if written or not final then redis.call('HSET', job, 'state', state) end
@@ -345,12 +354,10 @@ end
 # was already stored (a replayed write), 0 another result already existed.
 RESULT_PUT = (
     _STATUS_FN
-    + _INDEX_FN
     + _FINAL_FN
     + """
-index_drop(KEYS[2], ARGV[6])
 local written = final_write(KEYS[1], KEYS[2], ARGV[1], tonumber(ARGV[2]) * 1000, ARGV[3],
-  tonumber(ARGV[4]) * 1000)
+  tonumber(ARGV[4]) * 1000, ARGV[6])
 for _, caller in ipairs(redis.call('SMEMBERS', KEYS[3])) do
   redis.call('PUBLISH', ARGV[5] .. caller, ARGV[6])
 end
@@ -374,12 +381,10 @@ SETTLE_DONE = (
     _COMMON
     + _SETTLE
     + _STATUS_FN
-    + _INDEX_FN
     + _FINAL_FN
     + """
-index_drop(KEYS[2], ARGV[9])
 local written = final_write(KEYS[1], KEYS[2], ARGV[4], tonumber(ARGV[5]) * 1000, ARGV[6],
-  tonumber(ARGV[7]) * 1000)
+  tonumber(ARGV[7]) * 1000, ARGV[9])
 for _, caller in ipairs(redis.call('SMEMBERS', KEYS[3])) do
   redis.call('PUBLISH', ARGV[8] .. caller, ARGV[9])
 end
@@ -497,8 +502,8 @@ for i = 1, n do
       redis.call('PUBLISH', ARGV[2], rid)
       table.insert(marked, rid)
       if state == 'queued' then
-        -- RESULT_PUT's `index_drop` and `final_write` for a job known to exist and not final
-        -- (two reads fewer per call): the result only if none, the claim `cancelled`.
+        -- RESULT_PUT's `final_write`, inlined for a job known to exist and not final
+        -- (on the read above): the result only if none, the claim `cancelled`.
         if rec[2] then redis.call('ZREM', rec[2], rid) end
         X.set(KEYS[b + 5], ARGV[6 + n + i], res_ttl, true)
         redis.call('HSET', job, 'state', 'cancelled')
