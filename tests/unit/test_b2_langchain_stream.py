@@ -510,7 +510,7 @@ async def test_c3_a_model_fallback_reports_the_model_that_answered(streaming: bo
 
 # `_stream.py` reads LangChain's private `_StreamingCallbackHandler` (review B-24): checked on
 # these `langchain-core` lines only. A new line fails here until the import is checked on it.
-TESTED_LANGCHAIN_CORE = ("0.3", "1.8")
+TESTED_LANGCHAIN_CORE = ("0.3", "1.7", "1.8")
 
 
 def test_the_private_streaming_handler_import_is_pinned_to_tested_versions() -> None:
