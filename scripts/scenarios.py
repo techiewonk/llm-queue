@@ -1021,15 +1021,36 @@ async def swept_leak_check(ctx: Ctx) -> None:
 # D1 (gap G5): a rolling deploy through the drain file, two pods of three worker processes.
 D1_RATE = 50.0  # calls a second
 D1_HELD_SHARE = 0.3  # of them on a model whose budget makes them wait (held by a worker)
+D1_HELD_EVERY_SECS = 2  # those sent together this often
+D1_HELD_HEADROOM = 4 / 3  # the held model's rate over the rate of calls sent to it
 HELD_ID = "openai.held-1:0"  # D1's waiting calls: their own fakellm keys
 D1_PROCESSES = 3  # per pod
 D1_TERM_AFTER_SECS = 5.0  # the drain file, then SIGTERM this much later
 D1_HANDOFF_SECS = 2.0  # held calls served by pod 2 within this of the pause
+# The drain file this long after a batch of held calls was sent: at the top of the second it
+# raced the batch, and with the backlog drained by then no call was waiting at the pause.
+D1_PAUSE_AFTER_BATCH_SECS = 0.1
 D1_STOP_DRAIN_SECS = 25.0  # LLMQ_DRAIN_SECS' default: stop(drain_secs) after SIGTERM
 D1_GRACE_SECS = 30.0  # Kubernetes' default terminationGracePeriodSeconds
 D1_POLL_SECS = 0.2  # LLMQ_DRAIN_POLL_SECS
 D1_SECS = {"before": 20.0, "after": 15.0}  # load before the drain file and after SIGTERM
 D1_QUICK_SECS = {"before": 6.0, "after": 4.0}
+D1_HELD_MODEL = {
+    "model_id": HELD_ID,
+    # 20 a second for 15 sent: each batch of 30 waits ~1.2 s and is gone before the next. At
+    # exactly the rate sent a batch took the whole 2 s: the hand-off check measured the budget.
+    "rpm": round(D1_RATE * D1_HELD_SHARE * D1_HELD_HEADROOM * 60),
+    # A bucket of 6 calls: 24 of each batch wait. Not 1 call: a start that missed its moment by
+    # the hold's round trip was lost to the rate (12 a second of 15). Not batches of 15 each
+    # second with a bucket of 9: the 6 waiting began within 0.4 s, before pod 1 saw the file.
+    "rate_burst": 0.005,
+    # The whole rate for normal calls. The chat default keeps 20 % for priority ones: normal
+    # calls got 12 a second of the 15 sent, a backlog grew 3 a second from the start (4-5 s
+    # deep at the pause, so the hand-off seemed to take 4-5 s) and calls passed max_wait (8 s)
+    # from 28 s on. The drain itself slowed nothing.
+    "priority_reserve": 0,
+    "worker_slots": 100,
+}
 
 
 def _exit_secs(proc: Any, since: float, cap: float) -> float:
@@ -1044,25 +1065,18 @@ def _exit_secs(proc: Any, since: float, cap: float) -> float:
 async def rolling_deploy(scenario: Scenario, load: str, profile_name: str) -> bool:
     """D1: pod 1 drained by its drain file under load, SIGTERM 5 s later; pod 2 takes over.
 
-    50 calls a second: 70 % on a model with budget to spare, 30 % sent at the top of each second
-    to a model whose budget (that rate, no burst) makes them wait in a worker. Pass: 0 lost;
-    2 s after the pause pod 1 holds no call and every call that was waiting began on pod 2
-    within 2 s of the pause; no call began on pod 1 after the pause; pod 1's processes exit
-    within the grace period; nothing left at the end. `load` is not used (its own rate).
+    50 calls a second: 70 % on a model with budget to spare, 30 % sent together every 2 s to a
+    model whose budget (`D1_HELD_MODEL`) makes them wait in a worker ~1.2 s; the drain file
+    0.1 s after a batch. Pass: 0 lost; 2 s after the pause pod 1 holds no call and every call
+    that was waiting began on pod 2 within 2 s of the pause; no call began on pod 1 after the
+    pause; pod 1's processes exit within the grace period; nothing left at the end. `load` is
+    not used (its own rate).
     """
     profile = PROFILES[profile_name]
-    held_rate = D1_RATE * D1_HELD_SHARE
     doc = registry(
         {
             "chat": {"rpm": 1_000_000, "worker_slots": 100},
-            "held": {
-                "model_id": HELD_ID,
-                "rpm": round(held_rate * 60),
-                # 9 calls: most of each second's batch of 15 waits. Not lower: with a bucket of
-                # 1-2 calls the priority reserve leaves no room and normal calls never start.
-                "rate_burst": 0.01,
-                "worker_slots": 100,
-            },
+            "held": D1_HELD_MODEL,
         },
         accounts=1,
         regions=1,
@@ -1103,7 +1117,9 @@ async def rolling_deploy(scenario: Scenario, load: str, profile_name: str) -> bo
                 for sec in range(math.ceil(total)):
                     top = float(run.t0) + sec
                     await asyncio.sleep(max(0.0, top - time.monotonic()))
-                    tasks += [asyncio.create_task(held_call(k)) for k in range(n_held)]
+                    if sec % D1_HELD_EVERY_SECS == 0:
+                        batch = n_held * D1_HELD_EVERY_SECS
+                        tasks += [asyncio.create_task(held_call(k)) for k in range(batch)]
                     for k in range(n_chat):
                         tasks.append(asyncio.create_task(chat_call(k)))
                         await asyncio.sleep(max(0.0, top + (k + 1) / n_chat - time.monotonic()))
@@ -1112,7 +1128,7 @@ async def rolling_deploy(scenario: Scenario, load: str, profile_name: str) -> bo
             marks: dict[str, Any] = {}
 
             async def deploy() -> None:
-                await _at(run, spans["before"])
+                await _at(run, spans["before"] + D1_PAUSE_AFTER_BATCH_SECS)
                 drain_file.touch()
                 marks["paused"] = time.monotonic() - run.t0
                 await asyncio.sleep(D1_HANDOFF_SECS)

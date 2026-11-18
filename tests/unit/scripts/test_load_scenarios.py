@@ -31,6 +31,26 @@ def test_d1_runs_only_at_its_own_rate() -> None:
     assert scenarios.BY_ID["D1"].runner is scenarios.rolling_deploy
 
 
+def test_d1_held_model_keeps_up_and_waits_at_the_pause() -> None:
+    """D1's held calls wait for budget but never pile up, and some wait when pod 1 pauses.
+
+    The normal class gets `1 - priority_reserve` of the rate (chat default 0.2): at exactly the
+    rate sent, normal calls got 12 a second of 15, the backlog was 4-5 s deep at the pause and
+    the hand-off check failed on the budget, not on the drain.
+    """
+    held = scenarios.D1_HELD_MODEL
+    reserve = held.get("priority_reserve", 0.2)
+    normal_rate = held["rpm"] / 60 * (1 - reserve)
+    sent_rate = scenarios.D1_RATE * scenarios.D1_HELD_SHARE
+    assert normal_rate > sent_rate
+    batch = sent_rate * scenarios.D1_HELD_EVERY_SECS
+    burst = max(1, math.floor(held["rpm"] * (1 - reserve) * held["rate_burst"]))
+    waits = (batch - burst) / normal_rate  # until the batch's last call starts
+    assert scenarios.D1_POLL_SECS + 0.3 < waits < scenarios.D1_HANDOFF_SECS - 0.5
+    for spans in (scenarios.D1_SECS, scenarios.D1_QUICK_SECS):
+        assert spans["before"] % scenarios.D1_HELD_EVERY_SECS == 0  # the pause follows a batch
+
+
 def test_t1_runs_under_every_load_with_swept_expiry() -> None:
     """T1 at scale under every load (burst included), with the swept leak check after it."""
     assert scenarios.plan(["T1"], None, "full") == [("T1", load) for load in scenarios.LOADS]
