@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from typing import Any
 
 import pytest
@@ -81,6 +82,56 @@ async def test_list_pages_follow_deadline_then_byte_order_over_skewed_tenants(
     mid = engine.hash_id("mid")
     one = await admin.list("small", tenant="mid", limit=100)
     assert [i.request_id for i in one.items] == [r.decode() for _, r, h in expected if h == mid]
+
+
+async def test_list_over_10000_tenants_never_holds_the_store_in_one_long_script(
+    make: Make,
+) -> None:
+    """FA-1: 10,000 tenants of one call each, `list(limit=500)`: no page script runs 100 ms.
+
+    One script merged every tenant, scanning all of them per row (seconds, the store serving
+    nothing else). Now each run merges at most 256 tenants; the pages keep deadline-then-id
+    order and their cursor.
+    """
+    engine, _ = await make(worker=False)
+    admin = _admin(engine)
+    secs, _ = await engine.state.time()
+    base = (int(secs) + 600) * 1000
+    expected: list[tuple[int, str]] = []
+    async with engine.state.pipeline(transaction=False) as pipe:
+        for i in range(10_000):
+            h = engine.hash_id(f"tenant-{i}")
+            ix = engine.keys.request_index("small", h)
+            rid = f"r-{(i * 7919) % 10_000:05d}"
+            score = base + (i % 997) * 10
+            expected.append((score, rid))
+            pipe.hset(
+                engine.keys.request(rid, "job"),
+                mapping={"state": "queued", "ix": ix, "ixh": h, "direct": "1"},
+            )
+            pipe.hset(
+                engine.keys.status(rid),
+                mapping={"state": "waiting", "model": "small", "enqueued_at": str(secs)},
+            )
+            pipe.zadd(ix, {rid: score})
+            pipe.zadd(engine.keys.tenant_index("small"), {h: score})
+        await pipe.execute()
+    expected.sort()
+    script = admin._page_script
+    runs: list[float] = []
+
+    async def timed(*args: Any, **kwargs: Any) -> Any:
+        t0 = time.perf_counter()
+        try:
+            return await script(*args, **kwargs)
+        finally:
+            runs.append((time.perf_counter() - t0) * 1000)
+
+    admin._page_script = timed  # type: ignore[assignment]
+    first = await admin.list("small", limit=500)
+    second = await admin.list("small", limit=500, after=first.next)
+    assert [i.request_id for i in first.items + second.items] == [r for _, r in expected[:1000]]
+    assert max(runs) < 100, f"slowest page script {max(runs):.0f} ms over {len(runs)} runs"
 
 
 async def test_cancel_answers_every_waiting_caller_in_batches(make: Make) -> None:

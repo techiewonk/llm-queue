@@ -491,6 +491,14 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   so every call ended `rate_limited` at `max_wait_secs`. The check now subtracts `now` first
   (exact for an idle bucket), in the admission script, the tenant share clock and local mode.
   Budgets stay exact and a waiting priority call still goes first.
+- `requests list` of a model without a tenant (HTTP `GET /requests`, CLI `requests list`) no
+  longer holds the state store for seconds when the model has many tenants (FA-1): its one
+  script read every tenant's index and scanned every tenant once per row (10,000 tenants, a
+  page of 500: 0.75 to 1.4 s of script, every worker's admission waiting behind it). The merge
+  is a heap, a model with more than 256 tenants is merged from runs of 256 tenants (each reads
+  only entries up to the page's last deadline so far), and the tenant index is read 1,000
+  hashes at a time; each run now takes about 5 ms (12 ms at most). Order and cursors are
+  unchanged.
 
 ## [0.1.1] - 2026-11-17
 

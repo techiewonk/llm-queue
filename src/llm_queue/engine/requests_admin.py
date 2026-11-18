@@ -59,6 +59,11 @@ _STORE_ERRORS = (StoreConnectionError, StoreTimeoutError, OSError)
 _JOB_FIELDS = ("state", "mid", "q", "direct", "user", "ixh")
 _STATUS_FIELDS = ("state", "model", "priority", "enqueued_at", "served_model")
 _ROW_WIDTH = len(_JOB_FIELDS) + len(_STATUS_FIELDS) + 1
+# The most tenants one `_PAGE` run merges, and tenant hashes one read of `tq` returns (FA-1):
+# with more, a page is merged here from runs of this many tenants, so no script holds the store
+# for longer than about a millisecond, however many tenants a model has.
+_PAGE_TENANTS = 256
+_TENANT_READ = 1_000
 
 # The records of index rows, one script per batch (gate G-T2): three commands per id in a
 # pipeline cost about 25 us each of client packing and parsing, so a 100-row page took 47 ms.
@@ -91,11 +96,15 @@ return out
 # The next index entries of a model, merged by (deadline, id) over its tenants (gate G-T2: a page
 # of `list` in one round trip, not three). KEYS: the tenant index `tq` (a tenant's own index is
 # `tq:H`, the same hash tag). ARGV: the cursor's deadline ms ('' from the start) and request
-# id, how many entries, the most tenants read (`LLMQ_ADMIN_SCAN_MAX`), one tenant hash ('' for
-# every tenant). Each tenant is read a few entries at a time (more each time it runs out), so a
-# page reads about `count` entries, not `count` of every tenant (2,000 for 20 tenants, sorted:
-# 17 ms of script). Entries past their deadline are never read. Reply: the store's time (ms),
-# then the deadline, request id and tenant hash of each entry. Read-only.
+# id, how many entries, the most tenants this script reads from `tq` itself, the highest
+# deadline wanted ('' none), then the tenant hashes to merge (none: the tenants in `tq`). Each
+# tenant is read a few entries at a time (more each time it runs out), so a page reads about
+# `count` entries, not `count` of every tenant (2,000 for 20 tenants, sorted: 17 ms of script).
+# The merge is a binary heap (FA-1: a scan of every tenant per row held the store for seconds
+# with 20,000 tenants), and no run merges more than `_PAGE_TENANTS` tenants. Entries past their
+# deadline are never read. Reply: the store's time (ms), 1 when `tq` holds more tenants than
+# this run may read (nothing merged: the caller merges them in chunks) else 0, then the
+# deadline, request id and tenant hash of each entry. Read-only.
 _PAGE = """
 -- Byte order, as a sorted set orders members of one score (Lua's `<` follows the locale).
 local function before(x, y)
@@ -111,9 +120,14 @@ local lower, after, count = now, nil, tonumber(ARGV[3])
 if ARGV[1] ~= '' and tonumber(ARGV[1]) >= now then
   lower, after = tonumber(ARGV[1]), ARGV[2]
 end
-local tenants = {ARGV[5]}
-if ARGV[5] == '' then
-  tenants = redis.call('ZRANGEBYSCORE', KEYS[1], now, '+inf', 'LIMIT', 0, tonumber(ARGV[4]))
+local upper = ARGV[5] ~= '' and ARGV[5] or '+inf'
+local tenants = {}
+if #ARGV >= 6 then
+  for i = 6, #ARGV do tenants[#tenants + 1] = ARGV[i] end
+else
+  local most = tonumber(ARGV[4])
+  tenants = redis.call('ZRANGEBYSCORE', KEYS[1], now, '+inf', 'LIMIT', 0, most + 1)
+  if #tenants > most then return {now, 1} end
 end
 local step = math.ceil(count / math.max(1, #tenants)) + 1
 -- The tenant's next entry after the cursor (its `score`), reading more when it ran out.
@@ -121,7 +135,7 @@ local function advance(s)
   while true do
     if s.pos > #s.buf then
       if s.done then return false end
-      s.buf = redis.call('ZRANGEBYSCORE', s.key, lower, '+inf', 'WITHSCORES', 'LIMIT', s.offset,
+      s.buf = redis.call('ZRANGEBYSCORE', s.key, lower, upper, 'WITHSCORES', 'LIMIT', s.offset,
         s.step)
       s.pos, s.offset, s.done = 1, s.offset + s.step, #s.buf < 2 * s.step
       s.step = s.step * 2
@@ -133,26 +147,48 @@ local function advance(s)
     s.pos = s.pos + 2
   end
 end
-local live = {}
+local function less(a, b)
+  return a.score < b.score or (a.score == b.score and before(a.buf[a.pos], b.buf[b.pos]))
+end
+local heap = {}
+local function push(s)
+  local i = #heap + 1
+  heap[i] = s
+  while i > 1 do
+    local p = math.floor(i / 2)
+    if not less(heap[i], heap[p]) then break end
+    heap[i], heap[p] = heap[p], heap[i]
+    i = p
+  end
+end
+local function pop()
+  local top, n = heap[1], #heap
+  heap[1] = heap[n]
+  heap[n] = nil
+  n = n - 1
+  local i = 1
+  while true do
+    local l, r, m = 2 * i, 2 * i + 1, i
+    if l <= n and less(heap[l], heap[m]) then m = l end
+    if r <= n and less(heap[r], heap[m]) then m = r end
+    if m == i then break end
+    heap[i], heap[m] = heap[m], heap[i]
+    i = m
+  end
+  return top
+end
 for _, h in ipairs(tenants) do
   local s = {key = KEYS[1] .. ':' .. h, h = h, buf = {}, pos = 1, offset = 0, step = step}
-  if advance(s) then live[#live + 1] = s end
+  if advance(s) then push(s) end
 end
-local out = {now}
-while #out < 3 * count + 1 and #live > 0 do
-  local at = 1
-  for i = 2, #live do
-    local s, b = live[i], live[at]
-    if s.score < b.score or (s.score == b.score and before(s.buf[s.pos], b.buf[b.pos])) then
-      at = i
-    end
-  end
-  local s = live[at]
+local out = {now, 0}
+while #out < 3 * count + 2 and #heap > 0 do
+  local s = pop()
   out[#out + 1] = s.buf[s.pos + 1]
   out[#out + 1] = s.buf[s.pos]
   out[#out + 1] = s.h
   s.pos = s.pos + 2
-  if not advance(s) then table.remove(live, at) end
+  if advance(s) then push(s) end
 end
 return out
 """
@@ -993,10 +1029,19 @@ class RequestsAdmin:
     async def _tenants(self, alias: str, h: str | None, now_ms: float) -> builtins.list[str]:
         if h is not None:
             return [h]
-        raw = await self._state.zrangebyscore(
-            self.keys.tenant_index(alias), now_ms, "+inf", start=0, num=self.settings.scan_max
-        )
-        return [_text(m) for m in raw]
+        # In reads of `_TENANT_READ` (FA-1: one read of 100,000 hashes held the store); a tenant
+        # whose place moved between reads may come twice, so each is kept once.
+        seen: dict[str, None] = {}
+        offset = 0
+        while len(seen) < self.settings.scan_max:
+            raw = await self._state.zrangebyscore(
+                self.keys.tenant_index(alias), now_ms, "+inf", start=offset, num=_TENANT_READ
+            )
+            seen.update((_text(m), None) for m in raw)
+            offset += len(raw)
+            if len(raw) < _TENANT_READ:
+                break
+        return builtins.list(seen)[: self.settings.scan_max]
 
     async def _indexed(self, alias: str, h: str | None) -> int:
         """Index entries still in time for one tenant (or every tenant of the model)."""
@@ -1098,22 +1143,31 @@ class RequestsAdmin:
 
         One script (`_PAGE`), merged by (deadline, id) over every tenant (or `h`'s alone), as
         `_rows` merges them: a page of `list` read the time, the tenants and each tenant's
-        next entries in three round trips, and parsed `count` entries of every tenant.
+        next entries in three round trips, and parsed `count` entries of every tenant. A model
+        with more than `_PAGE_TENANTS` tenants is merged here from one run per that many
+        tenants (FA-1), each run reading only entries up to the page's last deadline so far.
         """
-        raw = await self._page_script(
-            [self.keys.tenant_index(alias)],
-            [
-                "" if start == float("-inf") else int(start),
-                after_rid,
-                count,
-                self.settings.scan_max,
-                h or "",
-            ],
-        )
-        rows = [
-            _Row(float(raw[i]), _text(raw[i + 1]), _text(raw[i + 2])) for i in range(1, len(raw), 3)
+        head = ["" if start == float("-inf") else int(start), after_rid, count, _PAGE_TENANTS]
+        tq = self.keys.tenant_index(alias)
+        raw = await self._page_script([tq], [*head, "", h] if h else head)
+        now_ms = float(raw[0])
+        if not int(raw[1]):
+            return now_ms, self._page_rows(raw)
+        tenants = await self._tenants(alias, None, now_ms)
+        best: builtins.list[_Row] = []
+        for i in range(0, len(tenants), _PAGE_TENANTS):
+            upper = int(best[-1].score) if len(best) >= count else ""
+            raw = await self._page_script([tq], [*head, upper, *tenants[i : i + _PAGE_TENANTS]])
+            best = heapq.nsmallest(
+                count, [*best, *self._page_rows(raw)], key=lambda r: (r.score, r.rid)
+            )
+        return now_ms, best
+
+    @staticmethod
+    def _page_rows(raw: Sequence[Any]) -> builtins.list[_Row]:
+        return [
+            _Row(float(raw[i]), _text(raw[i + 1]), _text(raw[i + 2])) for i in range(2, len(raw), 3)
         ]
-        return float(raw[0]), rows
 
     async def _rows_by_id(self, ids: Sequence[str]) -> builtins.list[_Row]:
         rows = [_Row(float("nan"), rid, NO_TENANT) for rid in ids]
