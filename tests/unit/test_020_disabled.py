@@ -63,15 +63,16 @@ def test_bad_drain_poll_is_refused_when_off() -> None:
         InfraSettings.from_env({**OFF, "LLMQ_DRAIN_POLL_SECS": "0"})
 
 
-def test_switch_reads_the_environment_and_defaults_never_a_secret() -> None:
-    def secrets(name: str) -> str | None:
-        return "false" if name == "LLMQ_ENABLED" else None
+def test_switch_is_layered_the_secret_wins() -> None:
+    def secret(value: str) -> Callable[[str], str | None]:
+        return lambda name: value if name == "LLMQ_ENABLED" else None
 
-    # A secret holding LLMQ_ENABLED is ignored: the switch is read before any secret.
-    with pytest.raises(ConfigError, match="LLMQ_STORE_URL"):
-        LLMQueue.from_env(
-            {"LLMQ_ENVIRONMENT": "dev", "LLMQ_CONFIG_ERROR_MODE": "raise"}, secrets=secrets
-        )
+    env = {"LLMQ_ENVIRONMENT": "dev", "LLMQ_CONFIG_ERROR_MODE": "raise"}
+    off = LLMQueue.from_env({**env, "LLMQ_ENABLED": "true"}, secrets=secret("false"))
+    assert isinstance(off, DisabledQueue)
+    assert off.disabled_reason == "switch"
+    with pytest.raises(ConfigError, match="LLMQ_STORE_URL"):  # on: the start goes on
+        LLMQueue.from_env({**env, "LLMQ_ENABLED": "false"}, secrets=secret("true"))
     assert isinstance(LLMQueue.from_env({}, defaults={"LLMQ_ENABLED": False}), DisabledQueue)
     off = LLMQueue.from_env({"LLMQ_ENABLED": "false"}, defaults={"LLMQ_ENABLED": True})
     assert isinstance(off, DisabledQueue)

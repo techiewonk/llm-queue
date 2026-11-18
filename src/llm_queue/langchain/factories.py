@@ -9,7 +9,9 @@ imported until an adapter is built.
 Without `registry=`, the factories follow the started queue (`LLMQueue.start()` registers it):
 its off switch (`LLMQ_ENABLED`, `LLMQ_CONFIG_ERROR_MODE=disable`) and the boot registry its
 settings read (secrets, the environment, `defaults=`). Before any queue has started they read
-`LLMQ_ENABLED` and `LLMQ_REGISTRY` / `LLMQ_REGISTRY_FILE` from the environment.
+`LLMQ_ENABLED` and `LLMQ_REGISTRY` / `LLMQ_REGISTRY_FILE` from the environment only (no secret
+is read without a queue): when a secret holds `LLMQ_ENABLED`, a factory called before start
+needs `registry=llmq` to agree with `from_env`.
 
 The boot registry is the document a process starts with (placeholders expanded), read once
 and without a store. A model added later by a live edit stays on the direct path until the
@@ -145,7 +147,7 @@ def aliases(registry: Any = None) -> dict[str, str]:
 
 
 def _disabled(registry: Any) -> bool:
-    """True when the library is switched off: the queue's `enabled`, else `LLMQ_ENABLED`."""
+    """True when the library is switched off: the queue's `enabled`, else environ `LLMQ_ENABLED`."""
     if _is_queue(registry):
         return not getattr(registry, "enabled", True)
     if registry is None:  # no queue started yet: the environment

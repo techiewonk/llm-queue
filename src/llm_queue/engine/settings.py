@@ -161,11 +161,11 @@ _SECRETS_SETTINGS = frozenset(
         "SECRETS_TIMEOUT_SECS",
     )
 )
-# Read from the environment and `defaults=` only, never from a secret: the secrets settings,
-# the off switch (read before any secret, so `LLMQ_ENABLED=false` never touches a source) and
-# `LLMQ_CONFIG_ERROR_MODE` (reading the secret may be what fails). A secret holding one of these
-# names is ignored, and `LLMQ_SECRETS_NAMES` may not map one.
-ENV_ONLY_SETTINGS = _SECRETS_SETTINGS | {PREFIX + "ENABLED", PREFIX + "CONFIG_ERROR_MODE"}
+# Read from the environment and `defaults=` only, never from a secret: the secrets settings
+# (they say where the secret is). A secret holding one of these names is ignored, and
+# `LLMQ_SECRETS_NAMES` may not map one. `LLMQ_ENABLED` and `LLMQ_CONFIG_ERROR_MODE` are layered
+# like every other setting (the secret wins), so one secret switches every pod.
+ENV_ONLY_SETTINGS = _SECRETS_SETTINGS
 
 
 def env_or_default(
@@ -208,8 +208,10 @@ class Layers(Mapping[str, str]):
         """Read `environ` (default `os.environ`, copied now) and the other layers.
 
         A configured secrets source is read once here: `ConfigError` names one that cannot be.
-        `LLMQ_ENABLED` is read first, from `environ` then `defaults` only: when it is false no
-        source is built or read and `secrets` is not used (the off switch touches no secret).
+        With no secrets (no `secrets=`, `LLMQ_SECRETS_SOURCE` unset or `none`) and
+        `LLMQ_ENABLED=false` in `environ` or `defaults`, no other setting is read or checked
+        (`switched_off`). With secrets, the source is read even then: a secret `LLMQ_ENABLED`
+        wins over the environment.
         """
         from llm_queue import secrets as sources
 
@@ -232,10 +234,16 @@ class Layers(Mapping[str, str]):
         self.secrets_region: str | None = None
         self.secrets_cache_secs = sources.CACHE_SECS
         self.secrets_timeout_secs = sources.TIMEOUT_SECS
-        # The off switch before any secret: false here builds and reads no secrets source and
-        # checks no secrets setting (a bad `LLMQ_ENABLED` is reported by `from_layers`).
+        # Switched off with no secret that could switch it on: no secrets setting is checked
+        # (a bad `LLMQ_ENABLED` is reported by `from_layers`). With secrets, the secret's
+        # `LLMQ_ENABLED` wins, so the source is read (once) whatever the environment says.
         switch = _set(setting(PREFIX + "ENABLED"))
-        self.switched_off = switch is not None and switch.strip().lower() in _FALSE
+        self.switched_off = (
+            switch is not None
+            and switch.strip().lower() in _FALSE
+            and secrets is None
+            and self.secrets_source == "none"
+        )
         if self.switched_off:
             if problems:
                 raise ConfigError("invalid LLMQ settings:\n  " + "\n  ".join(problems))
@@ -612,8 +620,8 @@ class InfraSettings:
     # the drain file and `describe()` only; every other setting is then not read or checked).
     enabled: bool = True
     # LLMQ_CONFIG_ERROR_MODE: `disable` (default: logged as `llmq_config_failed`, a disabled queue
-    # returned) or `raise` (a ConfigError stops `from_env`). Environment and defaults only; core.py
-    # reads it before these settings, as building them may be what fails.
+    # returned) or `raise` (a ConfigError stops `from_env`). Layered like LLMQ_ENABLED (the secret
+    # wins); a secrets source that cannot be read is handled by the environment / defaults value.
     config_error_mode: str = "disable"
     queue_store_url: str | None = field(default=None, repr=False)
     store_max_connections: int = 200

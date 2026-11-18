@@ -323,21 +323,23 @@ class LLMQueue:
 
         The secrets are `secrets`, else the sources `LLMQ_SECRETS_SOURCE` names; `secrets_names`
         reads a setting under another key, `tuning` sets timeouts and pools in code (see
-        docs/reference/environment.md). `LLMQ_ENABLED=false` (`environ`, then `defaults`: never
-        a secret) returns a `DisabledQueue` (probes and the drain file only, every call refused)
-        without reading any secrets source. `ConfigError` lists every problem; with
-        `LLMQ_CONFIG_ERROR_MODE=disable` it is logged (`llmq_config_failed`) instead and a
-        `DisabledQueue` with `disabled_reason: config_error` is returned.
+        docs/reference/environment.md). `LLMQ_ENABLED=false` (layered too: a secret wins) returns
+        a `DisabledQueue` (probes and the drain file only, every call refused); with no secrets
+        source nothing else is read. `ConfigError` lists every problem; with
+        `LLMQ_CONFIG_ERROR_MODE=disable` (the default; layered too, but a secrets source that
+        cannot be read is handled by the `environ` / `defaults` value) it is logged
+        (`llmq_config_failed`) instead and a `DisabledQueue` with `disabled_reason:
+        config_error` is returned.
         """
-        mode, mode_problem = _config_error_mode(environ, defaults)
-        if mode_problem:  # an invalid mode reads as `raise`
-            raise ConfigError(f"invalid LLMQ settings:\n  {mode_problem}")
+        # The secret cannot say what to do when reading it fails: the environment / defaults
+        # mode handles that (an invalid one reads as `raise`).
+        mode = _config_error_mode(env_or_default(environ, defaults, "LLMQ_CONFIG_ERROR_MODE"))
         try:
-            return cls._from_env(
-                environ,
-                secrets=secrets,
-                defaults=defaults,
-                secrets_names=secrets_names,
+            layers = Layers(environ, secrets, defaults, secrets_names)  # reads a source once
+            # From here the layered mode (secret, environment, defaults) decides.
+            mode = _config_error_mode(layers.get("LLMQ_CONFIG_ERROR_MODE"))
+            return cls._from_layers(
+                layers,
                 metrics=metrics,
                 instance_id=instance_id,
                 credentials=credentials,
@@ -364,13 +366,10 @@ class LLMQueue:
             return DisabledQueue(settings, reason="config_error")
 
     @classmethod
-    def _from_env(
+    def _from_layers(
         cls,
-        environ: Mapping[str, str] | None,
+        layers: Layers,
         *,
-        secrets: Secrets | None,
-        defaults: Mapping[str, Any] | None,
-        secrets_names: Mapping[str, str] | None,
         metrics: Metrics | None,
         instance_id: str | None,
         credentials: Callable[[Any], Mapping[str, Any] | None] | None,
@@ -378,8 +377,7 @@ class LLMQueue:
         offload_bytes: int | None,
         tuning: Tuning | None,
     ) -> LLMQueue:
-        """`from_env` before `LLMQ_CONFIG_ERROR_MODE`: any problem raises `ConfigError`."""
-        layers = Layers(environ, secrets, defaults, secrets_names)  # reads a source once
+        """`from_env` on built layers: any problem raises `ConfigError` (`from_env` handles it)."""
         settings = InfraSettings.from_layers(layers)
         if not settings.enabled:  # LLMQ_ENABLED=false: the off switch (0.2.0 H1)
             from llm_queue.disabled import DisabledQueue
@@ -1279,17 +1277,13 @@ class LLMQueue:
         return self.admin.describe()
 
 
-def _config_error_mode(
-    environ: Mapping[str, str] | None, defaults: Mapping[str, Any] | None
-) -> tuple[str, str | None]:
-    """`LLMQ_CONFIG_ERROR_MODE` (`disable` by default, or `raise`) and its problem; invalid: raise.
+def _config_error_mode(value: Any) -> str:
+    """An `LLMQ_CONFIG_ERROR_MODE` value as a mode: `disable` when unset, `raise` when invalid.
 
-    From `environ` then `defaults` only, never a secret: reading the secret may be what fails.
+    An invalid value is reported by `InfraSettings.from_layers`, so it raises naming it.
     """
-    raw = (env_or_default(environ, defaults, "LLMQ_CONFIG_ERROR_MODE") or "disable").strip().lower()
-    if raw in CONFIG_ERROR_MODES:
-        return raw, None
-    return "raise", "LLMQ_CONFIG_ERROR_MODE must be raise or disable"
+    raw = str(value or "disable").strip().lower()
+    return raw if raw in CONFIG_ERROR_MODES else "raise"
 
 
 def _transport_problems(settings: InfraSettings, tuning: Tuning) -> list[str]:
