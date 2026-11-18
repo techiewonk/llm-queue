@@ -86,6 +86,9 @@ class Ask:
     chunks: bool = False
     # Per-tenant fairness (engine/fairness.py); None (fairness off) sends nothing extra.
     fairness: Fairness | None = None
+    # Size-aware backfill (plan F1): the call may pass older waiters of its class when they
+    # still fit at their predicted grant after it. False sends nothing (the script as before).
+    backfill: bool = False
 
     @property
     def job_owner(self) -> str:
@@ -218,6 +221,8 @@ class Admission:
             body["chunks"] = True
         if ask.fairness is not None:
             body["tf"] = ask.fairness.body()
+        if ask.backfill:
+            body["bf"] = True
         raw = orjson.loads(await self._call(self._pick, body))
         kind = str(raw.pop("r"))
         return Decision(

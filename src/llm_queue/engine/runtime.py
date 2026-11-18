@@ -507,6 +507,9 @@ class EngineSettings:
     drain_secs: float = 25.0  # k8s grace 30 s: calls still running then are given back (C3)
     # LLMQ_DRAIN_HANDBACK_ENABLED (0.2.0 A1, owner Q2): a pause returns held calls at once.
     drain_handback_enabled: bool = True
+    # LLMQ_QUEUE_BACKFILL_ENABLED (plan F1, owner Q3): size-aware backfill for every model
+    # whose `queue.backfill` is unset; the registry setting wins (live-editable, per model).
+    queue_backfill_enabled: bool = False
     # LLMQ_ID_HASH_SALT: the key of every user / session id hash; never in repr() (X10).
     id_hash_salt: str = field(default="", repr=False)
     cfg_reload_secs: float = 30.0  # LLMQ_CFG_RELOAD_SECS: how often the registry is re-read
@@ -3215,9 +3218,17 @@ class Engine:
             count_first=int(self.clock.now() // 60) if attempt == 1 else None,
             chunks=env.stream and env.op in ("converse", "chat"),
             fairness=self._fairness(view, alias, held),
+            backfill=self._backfill(view, alias),
         )
         held.estimates[(alias, ask.owner)] = estimate
         return ask
+
+    def _backfill(self, view: ResolvedRegistry, alias: str) -> bool:
+        """Size-aware backfill on model `alias`: its `queue.backfill`, else the env default."""
+        setting = (view.value(alias, "queue") or {}).get("backfill")
+        if setting is None:
+            return self.settings.queue_backfill_enabled
+        return bool(setting)
 
     def _fairness(self, view: ResolvedRegistry, alias: str, held: _Held) -> Fairness | None:
         """The call's tenant fairness on model `alias` (None when its `fairness` is off).

@@ -352,9 +352,57 @@ local function tf_grant(alias, tf, st, entry_key, owner, rid, lease_ms)
 end
 """
 
+# Size-aware backfill (plan F1, owner Q3): helpers PICK_TAKE calls only when an ask carries
+# `bf` (the model's `queue.backfill`); with it off none of them runs and no waiter entry changes.
+# A chunk of its own, with no store call, so the admission script changes by a few guarded lines.
+_BACKFILL = r"""
+-- One table, not locals: PICK_TAKE's chunk is close to Lua's 200 locals.
+local BF = {}
+-- A waiter's predicted grant on deployment dep (store ms), recorded with its entry; now (no
+-- slack at all) when it has none.
+function BF.at_of(w, dep)
+  local at = w.at and w.at[dep]
+  if not present(at) then return now end
+  return math.max(now, tonumber(at))
+end
+
+-- Room for cost c now while R units are set aside for older waiters that cannot be granted
+-- before `at` (the earliest of their predicted grants on this deployment). The call passes
+-- them only when they would still fit at `at` after it: `fixed`, they are predicted in a later
+-- minute (this one's rest is theirs to lose); `smooth`, the clock after the call still admits
+-- R by `at`. Otherwise the plain rule. Returns wait, new state, and true when it passed them.
+function BF.room(key, f, L, c, R, bf, mode, at)
+  if R > 0 and at > now then
+    local wait, value = room(key, f, L, c, 0, bf, mode)
+    if wait <= 0 then
+      if mode == 'fixed' then
+        if math.floor(at / 60000) > minute then return 0, value, true end
+      else
+        local burst = math.max(1, math.floor(L * bf))
+        if value + (R - burst) * (60000 / L) <= at then return 0, value, true end
+      end
+    end
+  end
+  local wait, value = room(key, f, L, c, R, bf, mode)
+  return wait, value, false
+end
+
+-- The predicted grant per deployment of a refused call (`at` of its waiter entry): when each
+-- deployment it was refused on would admit it.
+function BF.ats(results)
+  local at = {}
+  for key, res in pairs(results) do
+    if not res.fits then at[key] = now + res.wait end
+  end
+  if next(at) == nil then return nil end
+  return at
+end
+"""
+
 PICK_TAKE = (
     _COMMON
     + _TENANT
+    + _BACKFILL
     + r"""
 local alias = req.alias
 local model, rows, changes = cfg_of(alias)
@@ -484,6 +532,10 @@ local function reserve_from(list, into)
             slot.r = slot.r + num(w.r, 1)
             slot.t = slot.t + num(w.t, 0)
             slot.s = slot.s + 1
+            if req.bf and into == reserved then  -- backfill (F1): same class only
+              local at = BF.at_of(w, dep)
+              if slot.at == nil or at < slot.at then slot.at = at end
+            end
             into[dep] = slot
           end
         end
@@ -565,6 +617,7 @@ local function evaluate(cand)
   local states = {}
   local headroom = nil
   local most = nil
+  local lent = false  -- backfill (F1): passed older waiters that cannot start yet
   local taken = budgets(alias, row, model, cls, true)
   for _, b in ipairs(taken) do
     if b[3] <= 0 then return {wait = (minute + 1) * 60000 - now, reason = 'reserve'} end
@@ -572,7 +625,15 @@ local function evaluate(cand)
     local R = res.r
     if b[4] == 't' then cost, R = cost_t, res.t end
     local mode = row.rate_window
-    local wait, value = room(b[1], b[2], b[3], cost, R, num(row.rate_burst, 0.1), mode)
+    local wait, value, passed
+    -- Not on the account's budget: a waiter may be granted on another deployment of the
+    -- account before its `at` here, and that one shares the account's clock.
+    if res.at and not string.find(b[1], '{a:', 1, true) then
+      wait, value, passed = BF.room(b[1], b[2], b[3], cost, R, num(row.rate_burst, 0.1), mode, res.at)
+      lent = lent or passed
+    else
+      wait, value = room(b[1], b[2], b[3], cost, R, num(row.rate_burst, 0.1), mode)
+    end
     if wait > 0 then
       local reason = (b[4] == 'r') and 'rpm' or 'tpm'
       if string.find(b[1], '{a:', 1, true) then reason = 'account'
@@ -609,7 +670,7 @@ local function evaluate(cand)
   local slot_frac = (limit - in_p - in_n - res.s - 1) / limit
   if headroom == nil or slot_frac < headroom then headroom = slot_frac end
   return {fits = true, states = states, headroom = headroom, most = most or (limit - in_p - in_n),
-    probe = probe, limit = limit, taken = taken}
+    probe = probe, limit = limit, taken = taken, bf = lent}
 end
 
 -- Sticky session: keep the session's deployment while it fits or would wait only briefly.
@@ -745,7 +806,9 @@ if not chosen then
   for _, cand in ipairs(req.candidates) do table.insert(deps, cand.key) end
   local exp = now + num(req.waiter_ms, 2000)
   redis.call('ZADD', wait_keys[cls], pos, rid)
-  redis.call('HSET', info_key, rid, cjson.encode({r = cost_r, t = cost_t, deps = deps, exp = exp}))
+  local entry = {r = cost_r, t = cost_t, deps = deps, exp = exp}
+  if req.bf then entry.at = BF.ats(results) end  -- backfill (F1)
+  redis.call('HSET', info_key, rid, cjson.encode(entry))
   slide(wait_keys[cls], held_ms())
   slide(info_key, held_ms())
   redis.call('ZADD', exp_key, exp, cls .. '|' .. rid)
@@ -818,6 +881,7 @@ if req.strategy == 'round_robin' or next(rot_writes) then slide(mk(alias, 'rot')
 if tf_st then tf_grant(alias, req.tf, tf_st, entry_key, req.owner, rid, lease_ms) end
 local granted = {r = 'granted', dep = chosen.key, minute = minute, limit = res.limit,
   tier = chosen.tier}
+if res.bf then granted.bf = true end  -- backfill (F1): it passed older waiters
 -- A stream's call: how far its chunk stream got (another worker may have begun it, R19); an
 -- XLEN of its own before.
 if req.chunks then granted.streamed = redis.call('XLEN', P .. ':{r:' .. rid .. '}:chunks') end

@@ -543,6 +543,8 @@ class InfraSettings:
     drain_handback_enabled: bool = True  # LLMQ_DRAIN_HANDBACK_ENABLED
     drain_file: str = ""  # LLMQ_DRAIN_FILE
     drain_poll_secs: float = 1.0  # LLMQ_DRAIN_POLL_SECS
+    # Size-aware backfill (plan F1, owner Q3) for every model that leaves `queue.backfill` unset.
+    queue_backfill_enabled: bool = False  # LLMQ_QUEUE_BACKFILL_ENABLED
     # LLMQ_EXECUTION_MODE (0.2.0): `queue` sends calls through the store; `local` runs every
     # call in this process against the provider and never contacts the store (engine/local.py).
     execution_mode: str = "queue"
@@ -734,6 +736,7 @@ class InfraSettings:
             for name in ("ADMIN_WRITES_ENABLED", "ADMIN_DLQ_BODIES_ENABLED")
         }
         hand_back = read_bool(layers, "DRAIN_HANDBACK_ENABLED", True, problems)
+        backfill = read_bool(layers, "QUEUE_BACKFILL_ENABLED", False, problems)
         drain_file = str(get("DRAIN_FILE", "") or "").strip()
         mode = str(get("MODE", "both"))
         if mode not in ("both", "caller", "worker"):
@@ -872,6 +875,7 @@ class InfraSettings:
             drain_handback_enabled=hand_back,
             drain_file=drain_file,
             drain_poll_secs=number("DRAIN_POLL_SECS", 1.0, lo=0.1, hi=60),
+            queue_backfill_enabled=backfill,
             execution_mode=execution_mode,
             local_process_count=number("LOCAL_PROCESS_COUNT", 1, int, hi=100_000),
             local_concurrency=number("LOCAL_CONCURRENCY", 10, int, hi=100_000),
