@@ -7,6 +7,8 @@ public API (see STABILITY.md).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-18
+
 ### Upgrading from 0.1.1
 
 1. **Upgrade the whole fleet; drain 0.1.1 first.** The message format is now version 3:
@@ -1645,7 +1647,8 @@ First beta, for test runs (`pip install --pre llm-queue`).
 - **Docs site** (Zensical on GitHub Pages): tutorial, how-to guides, explanation with
   diagrams, an API reference from the docstrings.
 
-[Unreleased]: https://github.com/techiewonk/llm-queue/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/techiewonk/llm-queue/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/techiewonk/llm-queue/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/techiewonk/llm-queue/compare/v0.1.0b3...v0.1.1
 [0.1.0b3]: https://github.com/techiewonk/llm-queue/compare/v0.1.0b2...v0.1.0b3
 [0.1.0b2]: https://github.com/techiewonk/llm-queue/compare/v0.1.0b1...v0.1.0b2
