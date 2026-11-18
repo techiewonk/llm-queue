@@ -107,8 +107,9 @@ class QueueDisabled(ConfigError):
     Off with `LLMQ_ENABLED=false`, or after a configuration error with
     `LLMQ_CONFIG_ERROR_MODE=disable` (`health()["disabled_reason"]` says which).
 
-    The off switch keeps the app on its own direct path: the factories return None, so only
-    code that calls the queue directly gets this. Category `config_error`, not retryable;
+    The off switch keeps the app on its own direct path: the factories return None once the
+    queue has started (or with `registry=` this queue), so only code that calls the queue
+    directly gets this. Category `config_error`, not retryable;
     HTTP routes answer 503 with `reason: disabled`.
     """
 

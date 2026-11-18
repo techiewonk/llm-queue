@@ -95,7 +95,7 @@ A pause takes a process out of service without stopping it: readiness answers 50
 | Way | Reaches | Use |
 |---|---|---|
 | `LLMQ_DRAIN_FILE` | every process of the pod that shares the file | Multi-process pods (gunicorn / uvicorn workers): a preStop hook runs `touch $LLMQ_DRAIN_FILE; sleep 15`. Each process checks every `LLMQ_DRAIN_POLL_SECS` (1 s). A file older than the queue's construction (minus 1 s) is a leftover and ignored |
-| `POST /drain` (`http_router(drain_routes=True)`) | the one process that answered | Single-process pods, or an operator pausing one process. Guarded like the write routes: an admin token (`LLMQ_ADMIN_TOKEN`) or `dependencies`, plus the `X-LLMQ-Admin` header; `drain_routes=True` without either is a `ConfigError`. `GET /drain` is open and only reads `draining`, `since`, `held` and `running` |
+| `POST /drain` (`http_router(drain_routes=True)`) | the one process that answered | Single-process pods, or an operator pausing one process. Guarded like the write routes: an admin token (`LLMQ_ADMIN_TOKEN`), or `dependencies` plus the `X-LLMQ-Admin` header; `drain_routes=True` without either is a `ConfigError`. `GET /drain` is behind the read guard like every read route and only reads `draining`, `since`, `held` and `running` |
 | `llmq.pause_receiving()` | this process | Sync, from any thread (a signal handler); `await llmq.drain(drain_secs)` also waits for running calls and jobs and returns True when none is left |
 
 **Hand-back.** With `LLMQ_DRAIN_HANDBACK_ENABLED=true` (the default) a pause returns the calls

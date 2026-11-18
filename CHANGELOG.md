@@ -166,7 +166,7 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   thread in a copy of the context; logs `background_thread_failed`). Each keeps the ids and
   drops the priority.
 - `LLMQueue.ready`: sync readiness (started, registry loaded, not draining, and in strict mode
-  no evicting store); `llm_queue.queue_ready(enabled, llmq=None)` for an app's own probe.
+  no evicting store); `llm_queue.queue_ready(llmq=None)` for an app's own probe.
 - `LLMQueue.from_env(defaults=...)` (D1): a third layer below `secrets=` and the environment,
   for the app's own `LLMQ_*` values (`True` / `False` read as switches; a name without
   `LLMQ_` is refused). The secret-then-environment order is unchanged. Conflict groups: the
@@ -226,7 +226,7 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   (also `llm_queue.DrainWatcher`) is the same watcher, standalone (no heavy imports) for apps
   without a queue.
 - `http_router(drain_routes=True)`: `POST /drain`, `POST /resume` (guarded like the write
-  routes: a token or `dependencies`, plus `X-LLMQ-Admin`) and `GET /drain` (the state, behind
+  routes: the admin token, or `dependencies` plus `X-LLMQ-Admin`) and `GET /drain` (the state, behind
   the read guard like every read route). They reach one process; multi-process pods use the
   drain file.
 - `JobRunner.resume()`.

@@ -3,8 +3,9 @@
 `status_router` mounts one route per `engine/admin/ops.py` operation with an `http` entry; path,
 query or JSON body arguments are checked (bad fields: 400) and go to the same `llmq.admin`
 method as the CLI. Errors map in `error_response`; health, readiness and metrics stay open.
-Reads need a read or admin token or the app's `dependencies`; writes also need the
-`X-LLMQ-Admin` header (no simple cross-site request carries it), an actor and `allow_writes`.
+Reads need a read or admin token or the app's `dependencies`; writes need the admin token, or
+`dependencies` plus the `X-LLMQ-Admin` header (no simple cross-site request carries it), an
+actor and `allow_writes`.
 """
 
 from __future__ import annotations
