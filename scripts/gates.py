@@ -654,9 +654,9 @@ B91_ROUNDS = 3  # B91's script p99 is the median of this many rounds
 async def b91() -> bool:
     """20 models, 10 regions x 3 accounts.
 
-    Pass: script p99 <= 4 ms server time (owner, 0.2.0: was 2 ms), the median of three 15 s rounds (one round's p99 of
-    about 1,500 calls on a shared Windows / Docker host ranged 3.0 to 10.2 ms for the same
-    code); status of everything <= 500 KB and <= 200 ms.
+    Pass: script p99 <= 4 ms server time (owner, 0.2.0: was 2 ms), the median of three 15 s
+    rounds (one round's p99 of about 1,500 calls on a shared Windows / Docker host ranged 3.0
+    to 10.2 ms for the same code); status of everything <= 500 KB and <= 200 ms.
     """
     models = {f"m{i:02d}": {"rpm": 100_000, "model_id": f"openai.m{i}-1:0"} for i in range(20)}
     doc = registry(models, accounts=3, regions=10)
