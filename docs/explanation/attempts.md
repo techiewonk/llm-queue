@@ -7,7 +7,7 @@ flowchart TD
   S([Granted]) --> A[Attempt on the deployment<br/>first-response and idle timers]
   A --> O{Outcome}
   O -- success --> OK([FINISH: refund to real usage<br/>RESULT_PUT, ACK])
-  O -- throttle --> T[Refund all, limiter x0.7,<br/>deployment out for every pod<br/>until its throttle window ends]
+  O -- throttle --> T[Tokens back, request kept,<br/>limiter x0.7,<br/>deployment out for every pod<br/>until its throttle window ends]
   T --> T1{throttles > throttle_retry_attempts?}
   T1 -- no --> NX
   T1 -- yes --> RL([rate_limited])
@@ -40,7 +40,7 @@ first-response and idle timers apply and long answers are not cut (see
 | Outcome | Budgets (`FINISH`) | Learning | Next |
 |---|---|---|---|
 | Success | TPM corrected to real usage (input + cache writes + output x `tpm_output_weight`; cache reads only with `tpm_count_cached`); no usage reported: estimate kept | limiter +1/limit, breaker closed, target errors cleared, latency EWMA (0.8 / 0.2) | `RESULT_PUT`, status `done`, `ACK` |
-| Throttle | request and every token back | limiter x0.7, throttle counter, the deployment's shared throttle window; never the breaker | another deployment at once, or wait for the window when none is left; more than `throttle_retry_attempts` (6) ends `rate_limited`; counts in the retry budget, not toward `max_attempts` (see [Throttling](#throttling)) |
+| Throttle | every token back; the request stays charged (the provider counted it) | limiter x0.7, throttle counter, the deployment's shared throttle window; never the breaker | another deployment at once, or wait for the window when none is left; more than `throttle_retry_attempts` (6) ends `rate_limited`; counts in the retry budget, not toward `max_attempts` (see [Throttling](#throttling)) |
 | 5xx, timeout, connection | output part back, input kept | breaker failures +1 (opens at `breaker_threshold` 5 for `breaker_cooldown_secs` 15) | retry after backoff `retry_base_secs x retry_multiplier^(n-1) x U[1, retry_spread]` (1-2.5 s, 4-10 s, 16-30 s), capped at `retry_max_secs` (30) **and the deadline**; at `max_attempts` (4) `provider_error`; above the per-minute retry budget (`retry_budget_pct` 20 % of first attempts, at least `retry_budget_min` 10) `retry_budget_exhausted` |
 | Idle mid-answer | nothing back | as a failure | as a failure |
 | Cut by the call's own deadline | nothing back | none (not counted toward breaker or health) | `deadline_exceeded` |
@@ -80,7 +80,9 @@ sequenceDiagram
   1000 and `throttle_max_ms` 30000).
 - **Calls move or wait.** Admission skips a throttled deployment; with another usable one the
   call moves at once, with none left it waits for the window within its deadline.
-- **Budget.** Every throttle refunds the request and its tokens and cuts the learned
+- **Budget.** Every throttle gives its tokens back but keeps the request charged: the
+  provider counted the 429 in its minute, and a request given back was sent again in that
+  minute (gate BL1 saw 640 calls against rpm 600). It also cuts the learned
   concurrency (x0.7, at most once a second). Throttles count in the retry budget; more than
   `throttle_retry_attempts` (6) on one call ends it `rate_limited` with `retry_after_secs`.
 - **Alert.** `quota_above_observed` turns on when throttles come while the deployment still had

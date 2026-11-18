@@ -234,7 +234,7 @@ Seven scripts hold every budget decision. Details in [Admission](admission.md).
 | Script | Runs | Does |
 |---|---|---|
 | `PICK_TAKE` | Every admission try (receive, hold, direct, fallback ask) | Checks config, settled state, cancel, a duplicate run; caller liveness on the first ask; reserves for older waiters and waiting priority calls; filters candidates (enabled, residency, health, breaker); checks RPM / TPM / account budgets and concurrency slots; chooses by strategy; on grant writes budgets, slot lease, in-progress entry, the claim, sticky and rotation keys; on refusal registers a waiter |
-| `FINISH` | After every attempt outcome | Settles a grant: refund to real usage (or all, on a throttle), release the slot, learn (limiter, breaker, latency, throttle window) |
+| `FINISH` | After every attempt outcome | Settles a grant: refund to real usage (a throttle: every token back, the request kept), release the slot, learn (limiter, breaker, latency, throttle window) |
 | `UNDO`, `RELEASE` | Give-back (shutdown, worker error) | Refund and release the claim to `queued`, so another pod's receive is granted at once |
 | `RENEW` | Heartbeat, every `LLMQ_LEASE_SECS` / 3 | Extends every slot lease and in-progress entry this process owns, the claims of held calls, the caller liveness key; reads the epoch; reports grants the store lost |
 | `SWEEP` | Worker sweeper, one process, every 10 s | Drops slots and in-progress entries whose owner's lease lapsed (no refund: the budget was spent) |

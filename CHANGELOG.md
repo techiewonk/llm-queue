@@ -555,6 +555,12 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   call got a round behind every lower round still waiting (FA-6: rounds 2 and 3 held, a
   grant at 4, the newcomer got 5). The round served now moves no further than the lowest
   round still waiting (the newcomer gets 3).
+- A provider throttle gave its request back to the budget, in queue mode and local mode, so
+  the call was sent again in the same minute although the provider had counted the 429. At a
+  minute boundary (a `fixed` window's new share meeting the provider's sliding window) 4
+  local-mode processes of 150 sent 640 calls in one wall-clock minute against an rpm of 600
+  (gate BL1). A throttled attempt now keeps its request charged and gets its tokens back, in
+  both modes; a call that never reached the provider still gets everything back.
 
 ## [0.1.1] - 2026-11-17
 

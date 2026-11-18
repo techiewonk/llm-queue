@@ -157,6 +157,26 @@ async def test_throttle_keeps_a_deployment_out_for_every_pod(
     assert _n(await store.hget(cb, "thr_n")) == 1
 
 
+@pytest.mark.parametrize(("refund_r", "next_kind"), [(0, "wait"), (1, "granted")])
+async def test_a_throttle_finish_keeps_the_request_in_the_fixed_minute(
+    store: redis.asyncio.Redis, prefix: str, refund_r: int, next_kind: str
+) -> None:
+    """BL1: the worker now FINISHes a 429 with `refund_r=0` (the provider counted it).
+
+    The script applies the refund it is given: kept, the minute stays spent and the next call
+    waits for the next minute; given back (the old rule), the call was sent again at once.
+    """
+    r = await rig(store, prefix, model={"rpm": 1})
+    assert (await r.ask("a", candidates=R1)).kind == "granted"
+    owner = owner_token("a", "w1", 1)
+    assert await r.admission.finish(
+        "m", owner, "a", refund_r=refund_r, refund_t=0, outcome="throttle"
+    )
+    await store.hdel(_m(prefix, "cb:aws-a/r1"), "thr_until")  # the budget alone decides
+    after = await r.ask("b", candidates=R1, worker="w2")
+    assert after.kind == next_kind, after
+
+
 async def test_success_ends_the_throttle_streak(store: redis.asyncio.Redis, prefix: str) -> None:
     """P2: the backoff grows per throttle in a row and a success starts it again."""
     r = await rig(store, prefix)

@@ -19,7 +19,7 @@ from llm_queue.engine.tokens import Estimate, estimate, refund, used_tokens
 PROPS = settings(database=None, deadline=None, max_examples=300)
 tokens = st.integers(min_value=0, max_value=2_000_000)
 weights = st.floats(min_value=0.0, max_value=10.0, allow_nan=False)
-outcomes = st.sampled_from(["ok", "throttle", "fail", "cut"])
+outcomes = st.sampled_from(["ok", "unsent", "throttle", "fail", "cut"])
 
 
 @PROPS
@@ -27,11 +27,11 @@ outcomes = st.sampled_from(["ok", "throttle", "fail", "cut"])
 def test_refund_never_exceeds_the_reservation(
     inputs: int, output: int, outcome: str, used: int | None
 ) -> None:
-    """No outcome gives back more than was taken, and only a throttle returns the request."""
+    """No outcome gives back more than was taken; only a call never sent returns the request."""
     reserved = Estimate(inputs, output)
     back = refund(reserved, outcome, used)
     assert back.tokens <= reserved.total
-    assert back.requests == (1 if outcome == "throttle" else 0)
+    assert back.requests == (1 if outcome == "unsent" else 0)
     charged = reserved.total - back.tokens
     if outcome == "ok" and used is not None:
         assert charged == used  # corrected to the real usage
