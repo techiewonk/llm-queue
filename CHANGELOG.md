@@ -507,6 +507,9 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   reprioritize took the call for finished). The final write now keeps the job as long as its
   status, and a registration that finds no job record clears an earlier run's final status,
   result and stream chunks.
+- A tenant purge (`keys`) removes the tenant's name from `P:{m:ALIAS}:tqn` (FA-5): with
+  `LLMQ_TENANT_NAMES_ENABLED` the raw name stayed until a later call on the model pruned
+  lapsed tenants, which with ongoing traffic could be never.
 
 ## [0.1.1] - 2026-11-17
 

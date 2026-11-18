@@ -913,7 +913,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Count | 1 per model with named tenants in flight. |
 | If evicted (`volatile-*`, native mode) | Names are not shown until the tenant's next call. |
 | If evicted (`allkeys-*`) | Same as volatile. |
-| Deleted by | A model purge; TTL. |
+| Deleted by | A model purge; TTL. A tenant purge (`keys`) removes the tenant's field (`HDEL`, FA-5). |
 
 ### Results & streaming
 

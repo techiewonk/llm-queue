@@ -177,6 +177,28 @@ async def test_tenant_purge_fixes_the_weight_sum(store: redis.asyncio.Redis, pre
     assert not await store.exists(f"{m}tf:w")  # the last tenant: the hash goes
 
 
+async def test_tenant_purge_removes_the_tenant_name(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """FA-5: the raw name in `tqn` (`LLMQ_TENANT_NAMES_ENABLED`) goes with the tenant's state.
+
+    It stayed until a later call on the model pruned lapsed tenants, which with ongoing traffic
+    and a growing TTL could be never.
+    """
+    svc = await _service(store, prefix)
+    h, other = keyed_hash(SALT, "acme"), keyed_hash(SALT, "beta")
+    names = f"{prefix}:{{m:big}}:tqn"
+    await store.hset(names, mapping={h: "acme", other: "beta"})
+    plan = await svc.tenant("acme", actor="plan")
+    assert plan.deleted_fields == 1
+    assert await store.hget(names, h) == b"acme"  # a dry run writes nothing
+    done = await svc.tenant("acme", actor="ops", dry_run=False)
+    assert done.deleted_fields == 1
+    assert await store.hgetall(names) == {other.encode(): b"beta"}
+    await svc.tenant("beta", actor="ops", dry_run=False, models=["big"])
+    assert not await store.exists(names)
+
+
 async def test_tenant_calls_come_from_the_request_index(
     store: redis.asyncio.Redis, prefix: str
 ) -> None:

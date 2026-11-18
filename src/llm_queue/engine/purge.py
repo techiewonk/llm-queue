@@ -45,20 +45,24 @@ AUTO_ACTOR = "auto"
 _LOCK_MS = 120_000  # `P:lock:purge`: one pod schedules and runs due purges at a time
 _POLL_SECS = 1.0  # deployment purge: how often running calls are checked while waiting
 
-# KEYS: tf:t:<h>, tf:s:<h>, tf:act, tf:w, tf:need, P:ttl. ARGV: h, dry ('1'), request ids
+# KEYS: tf:t:<h>, tf:s:<h>, tf:act, tf:w, tf:need, P:ttl, tqn. ARGV: h, dry ('1'), request ids
 # (from the tenant index) to drop from tf:need. Reply: {keys, fields}. `~sum` stays the sum of
-# the remaining weights, so the other tenants' shares are right at once.
+# the remaining weights, so the other tenants' shares are right at once. The tenant's name goes
+# from `tqn` (FA-5: it stayed until a later call on the model pruned lapsed tenants).
 _TENANT_PURGE = """
 local h, dry = ARGV[1], ARGV[2] == '1'
 local keys = redis.call('EXISTS', KEYS[1]) + redis.call('EXISTS', KEYS[2])
 local w = redis.call('HGET', KEYS[4], h)
 local fields = (w and 1 or 0) + (redis.call('ZSCORE', KEYS[3], h) and 1 or 0)
+  + redis.call('HEXISTS', KEYS[7], h)
 local rids = {}
 for i = 3, #ARGV do table.insert(rids, ARGV[i]) end
 if dry then return {keys, fields} end
 redis.call('UNLINK', KEYS[1], KEYS[2])
 redis.call('ZREM', KEYS[6], KEYS[1], KEYS[2])
 redis.call('ZREM', KEYS[3], h)
+redis.call('HDEL', KEYS[7], h)
+if redis.call('EXISTS', KEYS[7]) == 0 then redis.call('ZREM', KEYS[6], KEYS[7]) end
 if w then
   local sum = tonumber(redis.call('HGET', KEYS[4], '~sum') or '0') - tonumber(w)
   redis.call('HDEL', KEYS[4], h)
@@ -592,6 +596,7 @@ class PurgeService:
                         model(alias, "tf:w"),
                         model(alias, "tf:need"),
                         self._ttl_key,
+                        self.keys.tenant_names(alias),
                     ],
                     [h, "1" if dry_run else "0", *rids],
                 )

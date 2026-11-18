@@ -97,7 +97,7 @@ the audit name only the hash.
 
 | `remove` | Does |
 |---|---|
-| `keys` (default, `LLMQ_PURGE_TENANT_REMOVE`) | Deletes the tenant's fairness state. A tenant that calls again starts fresh |
+| `keys` (default, `LLMQ_PURGE_TENANT_REMOVE`) | Deletes the tenant's fairness state and its name beside its hash (`tqn`, kept only with `LLMQ_TENANT_NAMES_ENABLED`). A tenant that calls again starts fresh |
 | `queued` | Cancels the tenant's calls still waiting (not running) |
 | `running` | Cancels every call of the tenant, running ones included |
 
