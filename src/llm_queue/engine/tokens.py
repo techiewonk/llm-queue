@@ -176,14 +176,19 @@ class Refund:
 def refund(reserved: Estimate, outcome: str, used: int | None = None) -> Refund:
     """The refund rule of plan §3.7a.
 
-    `ok`: correct to the real usage (nothing back when usage is missing); `throttle`: the
-    request and every token back; `fail` (timeout, 5xx, cut stream): the output part back, the
-    input kept; `cut` (the client gave up mid-answer): nothing back.
+    `ok`: correct to the real usage (nothing back when usage is missing); `unsent` (it never
+    reached the provider): the request and every token back; `throttle` (a 429): every token
+    back, the request kept, since the provider counted it in its minute (given back, it was
+    sent again in that minute: gate BL1 saw 640 against rpm 600); `fail` (timeout, 5xx, cut
+    stream): the output part back, the input kept; `cut` (the client gave up mid-answer):
+    nothing back.
     """
     if outcome == "ok":
         return Refund(0, 0 if used is None else reserved.total - used)
-    if outcome == "throttle":
+    if outcome == "unsent":
         return Refund(1, reserved.total)
+    if outcome == "throttle":
+        return Refund(0, reserved.total)
     if outcome == "fail":
         return Refund(0, reserved.output)
     return Refund(0, 0)

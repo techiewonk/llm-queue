@@ -555,7 +555,7 @@ sequenceDiagram
   W->>P: attempt
   alt 429 throttle
     P-->>W: ThrottlingException (Retry-After)
-    W->>S: FINISH: refund all, limiter x0.7, D out until max(Retry-After, backoff)
+    W->>S: FINISH: tokens back (request kept), limiter x0.7, D out until max(Retry-After, backoff)
     Note over W: another deployment now, or wait for the window
   else 5xx, timeout, connection
     P-->>W: error
@@ -572,7 +572,7 @@ sequenceDiagram
 
 | Mechanism | Trigger | Effect | Keys |
 |---|---|---|---|
-| Throttle window | A 429 | D out for every pod until `max(Retry-After, jittered backoff 1-2 s doubling to 30 s)`; limiter x0.7 (at most once a second); refund all; more than `throttle_retry_attempts` (6) on one call: `rate_limited` | [`{m}:cb:DEP`][health] (`thr_n`, `thr_until`), [`{m}:ac:DEP`][health], [`{m}:thr:DEP:MINUTE`][health] |
+| Throttle window | A 429 | D out for every pod until `max(Retry-After, jittered backoff 1-2 s doubling to 30 s)`; limiter x0.7 (at most once a second); tokens back, the request kept; more than `throttle_retry_attempts` (6) on one call: `rate_limited` | [`{m}:cb:DEP`][health] (`thr_n`, `thr_until`), [`{m}:ac:DEP`][health], [`{m}:thr:DEP:MINUTE`][health] |
 | Retry backoff | 5xx, timeout, connection | `retry_base_secs x multiplier^(n-1) x U[1, spread]` capped at 30 s and the deadline; `max_attempts` (4); per-model retry budget (20 % of first attempts, at least 10 a minute) | [`{m}:retries:MINUTE`][madm] |
 | Breaker | `breaker_threshold` (5) failures in the window | Open for `breaker_cooldown_secs` (15); then half-open: one trial call, the others wait for its answer | [`{m}:cb:DEP`][health] |
 | Health disable | `disable_errors` (3) distinct requests with target errors in `disable_window_secs` (300), no success between | D disabled (unless it is the model's last healthy one); probed after `probe_after_secs` (900), doubling to `probe_max_secs` (7200) | [`{m}:terr:DEP`, `{m}:health`][health], [`P:lock:probe`][live] |

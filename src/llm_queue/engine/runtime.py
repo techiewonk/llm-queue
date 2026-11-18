@@ -4272,6 +4272,8 @@ class Engine:
                 )
                 return _AttemptResult("retry", "retryable", None, exc)
             if info.kind is ErrorKind.THROTTLE:
+                # The tokens go back, the request stays charged: the provider counted the 429
+                # in its minute, and a request given back was sent again in it (gate BL1).
                 refund = tokens.refund(estimate, "throttle")
                 await settle(
                     refund_r=refund.requests,
@@ -4302,7 +4304,7 @@ class Engine:
                     latency_ms=latency,
                 )
                 return _AttemptResult("retry", "retryable", None, exc)
-            refund = tokens.refund(estimate, "throttle")  # refused before it ran: all back
+            refund = tokens.refund(estimate, "unsent")  # refused before it ran: all back
             await settle(
                 refund_r=refund.requests,
                 refund_t=refund.tokens,

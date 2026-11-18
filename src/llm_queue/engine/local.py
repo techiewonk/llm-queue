@@ -1127,7 +1127,7 @@ class LocalExecutor:
                 if state["sent"]:  # cancelled at the provider (deadline, shutdown): charged
                     self.limits.settle(view, alias, dep.key, "none")
                 else:  # never reached the provider: everything back
-                    settle("none", tokens.refund(estimate, "throttle"))
+                    settle("none", tokens.refund(estimate, "unsent"))
 
     async def _attempt_granted(
         self,
@@ -1143,7 +1143,7 @@ class LocalExecutor:
         try:
             params = self._params(view, alias, env, dep.key)
         except inference.InferenceRejected as exc:
-            settle("none", tokens.refund(estimate, "throttle"))
+            settle("none", tokens.refund(estimate, "unsent"))
             return _Result("invalid", "invalid_request", exc)
         loop = asyncio.get_running_loop()
         remaining = max(0.1, call.deadline - loop.time())
@@ -1251,13 +1251,9 @@ class LocalExecutor:
             settle("throttle" if throttle else "fail", tokens.refund(estimate, "fail"))
             return _Result("stream_failed", "rate_limited" if throttle else "provider_error", exc)
         if throttle:
-            # The tokens go back, the request does not: the provider counted the 429 in its
-            # minute, and a request given back was spent again in that minute, so 4 processes
-            # of 150 sent 640 in one wall-clock minute (gate BL1).
-            back = tokens.refund(estimate, "throttle")
             settle(
                 "throttle",
-                tokens.Refund(0, back.tokens),
+                tokens.refund(estimate, "throttle"),  # the provider counted it: request kept
                 retry_after=info.retry_after_secs,
             )
             return _Result("throttle", "throttled", exc, retry_after=info.retry_after_secs)
@@ -1270,7 +1266,7 @@ class LocalExecutor:
             cut = isinstance(exc, AttemptTimeout) and "chunk" in str(exc)
             settle("fail", tokens.refund(estimate, "cut" if cut else "fail"), latency_ms=latency)
             return _Result("retry", "retryable", exc)
-        settle("none", tokens.refund(estimate, "throttle"))  # refused before it ran: all back
+        settle("none", tokens.refund(estimate, "unsent"))  # refused before it ran: all back
         if is_target_error(exc, info):
             call.target_failed.add((alias, dep.key))
             if len(call.target_failed) >= 2:  # two deployments refuse it: the request

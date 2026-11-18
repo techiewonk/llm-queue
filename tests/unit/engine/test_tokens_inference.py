@@ -60,7 +60,8 @@ def test_used_tokens() -> None:
         ("ok", 300, (0, 400)),  # reserved 700, used 300
         ("ok", 900, (0, -200)),  # used more: charged
         ("ok", None, (0, 0)),  # no usage: the estimate stays
-        ("throttle", None, (1, 700)),  # everything back
+        ("unsent", None, (1, 700)),  # never reached the provider: everything back
+        ("throttle", None, (0, 700)),  # a 429: the tokens back, the request kept (BL1)
         ("fail", None, (0, 500)),  # the output part back, the input kept
         ("cut", None, (0, 0)),  # the client gave up mid-answer: nothing back
     ],
