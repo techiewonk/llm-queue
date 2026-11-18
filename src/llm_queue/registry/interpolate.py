@@ -200,8 +200,10 @@ def load_yaml(text: str) -> Any:
 
     problems: list[str] = []
     # A SafeLoader of its own (built per call, so the constructor below never touches PyYAML's
-    # shared SafeLoader) that records a repeated key instead of keeping the last one.
-    loader_class: Any = type("RegistryLoader", (yaml.SafeLoader,), {})
+    # shared SafeLoader) that records a repeated key instead of keeping the last one. The
+    # libyaml parser when PyYAML was built with it (several times faster), else pure Python.
+    base = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+    loader_class: Any = type("RegistryLoader", (base,), {})
 
     def mapping(loader: Any, node: Any, deep: bool = False) -> dict[Any, Any]:
         loader.flatten_mapping(node)

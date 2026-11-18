@@ -162,7 +162,18 @@ models:
 """
 
 
-def test_yaml_file_is_read_and_expanded(tmp_path: Path) -> None:
+@pytest.fixture(params=["libyaml", "python"])
+def yaml_loader(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Each YAML test runs with the libyaml loader (when built) and the pure-Python one (FB-3)."""
+    yaml = pytest.importorskip("yaml")
+    if request.param == "libyaml" and not hasattr(yaml, "CSafeLoader"):
+        pytest.skip("PyYAML built without libyaml")
+    if request.param == "python":
+        monkeypatch.delattr(yaml, "CSafeLoader", raising=False)
+    return str(request.param)
+
+
+def test_yaml_file_is_read_and_expanded(tmp_path: Path, yaml_loader: str) -> None:
     pytest.importorskip("yaml")
     path = tmp_path / "registry.yaml"
     path.write_text(YAML_DOC, encoding="utf-8")
@@ -173,7 +184,7 @@ def test_yaml_file_is_read_and_expanded(tmp_path: Path) -> None:
     load_registry(loaded)
 
 
-def test_how_to_yaml_example_loads(tmp_path: Path) -> None:
+def test_how_to_yaml_example_loads(tmp_path: Path, yaml_loader: str) -> None:
     """The how-to's placeholder example expands and loads, with defaults and with values."""
     pytest.importorskip("yaml")
     page = (FIXTURES.parents[3] / "docs" / "how-to" / "configure.md").read_text(encoding="utf-8")
@@ -190,7 +201,7 @@ def test_how_to_yaml_example_loads(tmp_path: Path) -> None:
     assert view.registry.residency == ("ap-south-1", "ap-south-2")
 
 
-def test_yaml_repeated_key_is_refused(tmp_path: Path) -> None:
+def test_yaml_repeated_key_is_refused(tmp_path: Path, yaml_loader: str) -> None:
     pytest.importorskip("yaml")
     path = tmp_path / "registry.yml"
     path.write_text("registry_version: 1\nmodels: {}\nregistry_version: 2\n", encoding="utf-8")
@@ -198,7 +209,7 @@ def test_yaml_repeated_key_is_refused(tmp_path: Path) -> None:
         read_document(None, str(path), NO_ENV.get)
 
 
-def test_yaml_non_json_values_are_refused(tmp_path: Path) -> None:
+def test_yaml_non_json_values_are_refused(tmp_path: Path, yaml_loader: str) -> None:
     pytest.importorskip("yaml")
     path = tmp_path / "registry.yaml"
     path.write_text("a: .nan\n", encoding="utf-8")
