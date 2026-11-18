@@ -115,7 +115,7 @@ sees the same budgets with no cross-pod race. See [Admission](admission.md).
 | AD-17 | Budgets edited live (RPM cut to a quarter, then back) | Over-budget calls `rate_limited`; provider calls stay within the cut budget | Registry reload; stale config detected in the scripts | `IE/test_admission.py::test_undo_and_stale_config`; scenario R1, X2, X7 | VR/as, V/drill | covered |
 | AD-18 | An admission script is replayed after its reply was lost | Granted once; a replayed `FINISH` or `UNDO` counts once | Owner-checked, idempotent scripts | `IE/test_audit_engine_store.py::test_en5_replayed_fail_counts_one_failure` | VR/as | covered |
 | AD-19 | Fractional token cost or refund | Rounded, never half applied | Integer budgets | `IE/test_admission.py::test_fl9_a_fractional_cost_or_refund_is_rounded_not_half_applied` | VR/as | covered |
-| AD-20 | Admission cost at scale (20 models x 30 deployments) | Script p99 <= 2 ms; `status()` <= 500 KB and <= 200 ms | Indexed waiters, no scans | gate B91; gate B19 (11.6 scripts per call); gate B22 | V/drill | partial: B91 misses its 2 ms mark on the Windows / Docker dev machine; no Linux or in-VPC run is recorded |
+| AD-20 | Admission cost at scale (20 models x 30 deployments) | Script p99 <= 4 ms (median of three rounds); `status()` <= 500 KB and <= 200 ms | Indexed waiters, no scans | gate B91; gate B19 (11.6 scripts per call); gate B22 | V/drill | covered (0.2.0): mark 4 ms, set by the owner after the 2 ms mark failed equally on 0.1.1-era and 0.2.0 code on the Windows / Docker dev machine (medians 3.95 and 3.2-3.8 ms) |
 | AD-21 | Large calls wait for TPM while small calls could pass without delaying them | Off by default; with the model's backfill flag on, a small call that fits starts ahead of a large waiter without delaying it | Size-aware backfill in `PICK_TAKE`, behind a per-model flag | `U/engine/test_020_backfill.py`; `IE/test_020_backfill_store.py` | none, VR/as | covered (0.2.0) |
 | AD-22 | Throttle pacing and admission timings are tunable | Bad combinations refused at start | `Tuning` validation | `U/test_tuning.py::test_admission_script_timings_are_checked`; `U/test_b2_integrator.py::test_throttle_pacing_is_tunable_and_reaches_the_scripts` | none | covered |
 
@@ -773,6 +773,7 @@ same machine. Counts and pass or fail of behaviour do not depend on the machine.
 |---|---|---|---|
 | B91 script p99, 0.1.0b2 | 3.8-4.3 ms: **fails** the 2 ms mark | Yes; not a regression | The maintainer's release checks (not stored in the repo) |
 | B91 script p99, 0.1.0b3 | 3.0-3.5 ms: **fails** the 2 ms mark | Yes; not a regression | The maintainer's release checks (not stored in the repo) |
+| B91 script p99, 0.2.0 | median of three rounds 2.83 ms (rounds 3.24, 2.83, 2.69): passes the 4 ms mark the owner set for 0.2.0 | Yes | The maintainer's release check, 2026-11-18 |
 | B91 `PICK_TAKE` p99 | 0.94 ms (20 models x 30 deployments) | Yes | [Performance](performance.md) |
 | B91 status | 210 KB in 47 ms, 375 ms cold | Yes | [Performance](performance.md) |
 | Eviction drill, 0.1.0b3, `volatile-lru` | 2,000 of 2,000 calls ok; 103,181 app keys evicted; 0 queue keys evicted | Counts: no | The maintainer's release checks (not stored in the repo) |

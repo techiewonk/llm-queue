@@ -654,7 +654,7 @@ B91_ROUNDS = 3  # B91's script p99 is the median of this many rounds
 async def b91() -> bool:
     """20 models, 10 regions x 3 accounts.
 
-    Pass: script p99 <= 2 ms server time, the median of three 15 s rounds (one round's p99 of
+    Pass: script p99 <= 4 ms server time (owner, 0.2.0: was 2 ms), the median of three 15 s rounds (one round's p99 of
     about 1,500 calls on a shared Windows / Docker host ranged 3.0 to 10.2 ms for the same
     code); status of everything <= 500 KB and <= 200 ms.
     """
@@ -682,7 +682,7 @@ async def b91() -> bool:
         "B91",
         {
             "every call served": all(r.ok for r in run.results),
-            "script p99 <= 2 ms": p99 <= 2.0,
+            "script p99 <= 4 ms": p99 <= 4.0,
             "status <= 500 KB": size_kb <= 500,
             "status <= 200 ms": status_ms <= 200,
         },
