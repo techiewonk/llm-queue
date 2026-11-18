@@ -247,12 +247,16 @@ async def soak(profile: Profile, live: Path | None = None, opts: Options | None 
                         finally:
                             await proxy.set(refuse=False)
                     elif event == "edit":
-                        registry = queues[0].registry
+                        registry = queues[0].admin.registry
                         try:
-                            await registry.set({"rpm": rpm // 2}, model="chat", actor="soak")
+                            await registry.set(
+                                {"rpm": rpm // 2}, model="chat", actor="soak", dry_run=False
+                            )
                             await asyncio.sleep(profile.edit_secs)
                         finally:
-                            await registry.set({"rpm": rpm}, model="chat", actor="soak")
+                            await registry.set(
+                                {"rpm": rpm}, model="chat", actor="soak", dry_run=False
+                            )
                     else:
                         victim = random.choice([w for w in gate.fleet if w.proc.poll() is None])
                         await gate.workers(1)
