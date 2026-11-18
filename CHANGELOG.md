@@ -464,7 +464,8 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   elsewhere). This is also `fastapi.install()`'s shutdown.
 - `resume_receiving()` is thread-safe, as `pause_receiving()` is.
 - The health safeguard "never disable a model's last usable deployment" counts only
-  deployments that take calls (enabled, account enabled, not blocked, inside residency).
+  deployments that take calls (enabled, account enabled, not blocked, inside residency), in
+  local mode too (FA-3: local mode's own check counted every deployment of the model).
 - A cancel that lands while a call's admission is in flight gives the grant back at once
   (slot and budget); its slot was held up to a lease and its budget never refunded.
 - A pause also hands back calls waiting between two attempts (retry backoff); they kept the

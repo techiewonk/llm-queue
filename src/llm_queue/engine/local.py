@@ -37,6 +37,7 @@ from llm_queue.engine.metrics import TENANT_NONE, Metrics, NullSink, TenantLabel
 from llm_queue.engine.runtime import (
     EngineSettings,
     _api_kwargs,
+    _dep_takes_calls,
     _meta_event,
     _served_op,
     _takes_calls,
@@ -430,7 +431,9 @@ class LocalLimits:
         """Count a target error; True when the deployment is now disabled until its probe time.
 
         `health.disable_errors` within `disable_window_secs` disable it for `probe_after_secs`,
-        never the model's last usable deployment.
+        never the model's last usable deployment: usable is queue mode's rule (A-3), one that
+        takes calls (`_dep_takes_calls`) and is not disabled here (FA-3: a registry-disabled,
+        blocked or out-of-residency one counted, and the real last one went).
         """
         settings = view.value(alias, "health", dep)
         now = time.monotonic()
@@ -445,7 +448,9 @@ class LocalLimits:
             others = [
                 d.key
                 for d in view.deployments(alias)
-                if d.key != dep and self.health_of(alias, d.key).disabled_until <= now
+                if d.key != dep
+                and _dep_takes_calls(view, alias, d)
+                and self.health_of(alias, d.key).disabled_until <= now
             ]
             if not others:
                 return False
