@@ -150,13 +150,13 @@ def test_bad_on_start_error_and_a_second_install_are_refused() -> None:
 def test_routes_mount_under_the_prefix_and_options_pass_through() -> None:
     app = FastAPI()
     queue: Any = FakeQueue([])
-    install(app, queue, prefix="/ops/llmq", allow_writes=False, admin_header="X-T")
+    install(app, queue, prefix="/ops/llmq", allow_writes=False, admin_token_header="X-T")
     with TestClient(app) as client:
         assert client.get("/ops/llmq/status").json() == {"ok": True}
         assert client.get("/internal/llm-queue/status").status_code == 404
     assert queue.router_options == {
         "allow_writes": False,
-        "admin_header": "X-T",
+        "admin_token_header": "X-T",
         "drain_routes": False,  # no token, no dependencies: drain by file only
     }
 

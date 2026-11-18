@@ -34,7 +34,7 @@ Its parameters, all optional:
 | `mount_admin` | True | False mounts no routes |
 | `context_middleware` | True | False adds no middleware |
 | `context` | None | Keyword arguments of `RequestContextMiddleware` (`tenant_id`, `user_id`, `session_id`, `priority`) |
-| `**router_options` | | Passed to `llmq.http_router()`: `admin_token`, `admin_read_token`, `admin_header`, `dependencies`, `allow_writes`, `actor`, `metrics_route`, `drain_routes` (an explicit value wins over the rule above), `insecure_reads` |
+| `**router_options` | | Passed to `llmq.http_router()`: `admin_token`, `admin_read_token`, `admin_token_header`, `dependencies`, `allow_writes`, `actor`, `metrics_route`, `drain_routes` (an explicit value wins over the rule above), `insecure_reads` |
 
 A second `install()` on one app raises `ConfigError`. Point the Kubernetes probes at
 `/internal/llm-queue/health/ready` and `/health/live`.

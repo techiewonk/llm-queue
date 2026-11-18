@@ -75,21 +75,18 @@ SETTING_NAMES = frozenset(
         "LLMQ_ADMIN_BODY_MAX_BYTES",
         "LLMQ_ADMIN_CSRF_HEADER",
         "LLMQ_ADMIN_DEAD_LETTER_BODIES_ENABLED",
-        "LLMQ_ADMIN_HEADER",
+        "LLMQ_ADMIN_HTTP_WAIT_SECS",
         "LLMQ_ADMIN_INDEX_CACHE_SECS",
         "LLMQ_ADMIN_READ_TOKEN",
         "LLMQ_ADMIN_SCAN_MAX",
         "LLMQ_ADMIN_TOKEN",
+        "LLMQ_ADMIN_TOKEN_HEADER",
         "LLMQ_ADMIN_WRITES_ENABLED",
         "LLMQ_AUDIT_RETENTION_DAYS",
-        "LLMQ_PURGE_AUTO_ENABLED",
-        "LLMQ_HTTP_ALLOWED_HOSTS",
         "LLMQ_BEDROCK_ENDPOINT_URL",
         "LLMQ_CALLER_TTL_SECS",
         "LLMQ_CONFIG_ERROR_MODE",
-        "LLMQ_REGISTRY_RELOAD_SECS",
         "LLMQ_DEBUG_CAPTURE_ENABLED",
-        "LLMQ_TENANT_DEFAULT",
         "LLMQ_DRAIN_FILE",
         "LLMQ_DRAIN_HANDBACK_ENABLED",
         "LLMQ_DRAIN_POLL_SECS",
@@ -97,41 +94,47 @@ SETTING_NAMES = frozenset(
         "LLMQ_ENABLED",
         "LLMQ_ENVIRONMENT",
         "LLMQ_EXECUTION_MODE",
-        "LLMQ_ADMIN_HTTP_WAIT_SECS",
+        "LLMQ_HTTP_ALLOWED_HOSTS",
         "LLMQ_ID_HASH_SALT",
+        "LLMQ_INSTANCE_ID",
         "LLMQ_KEY_EXPIRY_MODE",
+        "LLMQ_KEY_EXPIRY_SWEEP_BATCH",
+        "LLMQ_KEY_EXPIRY_SWEEP_ROUNDS",
         "LLMQ_KEY_PREFIX",
         "LLMQ_LEASE_SECS",
         "LLMQ_LOCAL_CONCURRENCY",
         "LLMQ_LOCAL_PROCESS_COUNT",
-        "LLMQ_METRICS_SINK",
+        "LLMQ_METRICS_SINK_MODE",
         "LLMQ_METRICS_TENANTS",
-        "LLMQ_ROLE",
+        "LLMQ_PURGE_AUTO_ENABLED",
         "LLMQ_PURGE_GRACE_SECS",
+        "LLMQ_PURGE_TENANT_REMOVE",
         "LLMQ_PURGE_WAIT_ENABLED",
         "LLMQ_PURGE_WAIT_SECS",
         "LLMQ_QUEUE_BACKFILL_ENABLED",
-        "LLMQ_QUEUE_STORE_FAILOVER_SECS",
         "LLMQ_QUEUE_PREFIX",
+        "LLMQ_QUEUE_STORE_FAILOVER_SECS",
         "LLMQ_QUEUE_STORE_PASSWORD",
         "LLMQ_QUEUE_STORE_URL",
-        "LLMQ_REPLICA_WAIT_MS",
-        "LLMQ_REPLICA_WAIT_COUNT",
-        "LLMQ_REPLICA_WAIT_SCOPES",
         "LLMQ_REGISTRY",
         "LLMQ_REGISTRY_FILE",
         "LLMQ_REGISTRY_LIVE_EDIT_MODE",
+        "LLMQ_REGISTRY_RELOAD_SECS",
+        "LLMQ_REPLICA_WAIT_COUNT",
+        "LLMQ_REPLICA_WAIT_MS",
+        "LLMQ_REPLICA_WAIT_SCOPES",
+        "LLMQ_REQUESTS_INDEX_ENABLED",
         "LLMQ_REQUESTS_LIST_MAX",
         "LLMQ_REQUESTS_MOVE_BATCH",
         "LLMQ_REQUESTS_MOVE_BYTES",
-        "LLMQ_REQUEST_INDEX_ENABLED",
         "LLMQ_RESULT_DEDUPE_SECS",
         "LLMQ_RESULT_TTL_SECS",
+        "LLMQ_ROLE_MODE",
         "LLMQ_SECRETS_CACHE_SECS",
+        "LLMQ_SECRETS_NAMES",
         "LLMQ_SECRETS_REGION",
         "LLMQ_SECRETS_SOURCE",
         "LLMQ_SECRETS_TIMEOUT_SECS",
-        "LLMQ_SECRETS_NAMES",
         "LLMQ_STATIC_CAP_WAIT_SECS",
         "LLMQ_STATUS_TTL_SECS",
         "LLMQ_STORE_DB",
@@ -143,11 +146,8 @@ SETTING_NAMES = frozenset(
         "LLMQ_STORE_URL",
         "LLMQ_STS_ENDPOINT_URL",
         "LLMQ_SYNC_STORE_MAX_CONNECTIONS",
+        "LLMQ_TENANT_DEFAULT",
         "LLMQ_TENANT_NAMES_ENABLED",
-        "LLMQ_PURGE_TENANT_REMOVE",
-        "LLMQ_KEY_EXPIRY_SWEEP_BATCH",
-        "LLMQ_KEY_EXPIRY_SWEEP_ROUNDS",
-        "LLMQ_INSTANCE_ID",
     }
 )
 # Where secrets come from is never itself read from a secret (llm_queue.secrets.SETTINGS).
@@ -559,7 +559,7 @@ def _admin_settings(
     tenants, found = parse_metrics_tenants(str(get("METRICS_TENANTS", "") or ""))
     problems.extend(found)
     return {
-        "request_index_enabled": read_bool(layers, "REQUEST_INDEX_ENABLED", True, problems),
+        "requests_index_enabled": read_bool(layers, "REQUESTS_INDEX_ENABLED", True, problems),
         "tenant_names_enabled": read_bool(layers, "TENANT_NAMES_ENABLED", False, problems),
         "admin_batch": number("ADMIN_BATCH", 500, int, lo=1, hi=10_000),
         "admin_scan_max": number("ADMIN_SCAN_MAX", 100_000, int, lo=1_000, hi=10_000_000),
@@ -658,8 +658,8 @@ class InfraSettings:
     local_process_count: int = 1  # LLMQ_LOCAL_PROCESS_COUNT
     local_concurrency: int = 10  # LLMQ_LOCAL_CONCURRENCY
     static_cap_wait_secs: float = 5.0  # LLMQ_STATIC_CAP_WAIT_SECS: a `static_cap` budget wait
-    metrics_sink: str = "emf"
-    role: str = "both"
+    metrics_sink_mode: str = "emf"
+    role_mode: str = "both"
     bedrock_endpoint_url: str | None = None
     sts_endpoint_url: str | None = None
     id_hash_salt: str | None = field(default=None, repr=False)
@@ -672,7 +672,7 @@ class InfraSettings:
     debug_capture_enabled: bool = False
     instance_id: str = ""  # LLMQ_INSTANCE_ID: this process's id prefix (default pod:pid)
     tenant_default: str | None = None  # LLMQ_TENANT_DEFAULT: when a call names none
-    admin_header: str = "X-LLMQ-Token"  # LLMQ_ADMIN_HEADER: the admin tokens' header
+    admin_token_header: str = "X-LLMQ-Token"  # LLMQ_ADMIN_TOKEN_HEADER: the admin tokens' header
     # Admin surfaces (0.2.0 R): write routes mounted by default, the claimed-actor header of a
     # token guard (audited `token:<value>`), the `GET /` summary cache, dead-letter bodies.
     admin_writes_enabled: bool = False  # LLMQ_ADMIN_WRITES_ENABLED
@@ -696,7 +696,7 @@ class InfraSettings:
     admin_http_wait_secs: float = 60.0  # LLMQ_ADMIN_HTTP_WAIT_SECS
     purge_tenant_remove: str = "keys"  # comma list of TENANT_PURGE_PARTS
     # The request index and admin operations (0.2.0 T): see `AdminSettings` (requests_admin.py).
-    request_index_enabled: bool = True  # LLMQ_REQUEST_INDEX_ENABLED
+    requests_index_enabled: bool = True  # LLMQ_REQUESTS_INDEX_ENABLED
     tenant_names_enabled: bool = False  # LLMQ_TENANT_NAMES_ENABLED: names stored beside hashes
     admin_batch: int = 500  # LLMQ_ADMIN_BATCH: ids per pipeline / script in admin ops and purges
     admin_scan_max: int = 100_000  # LLMQ_ADMIN_SCAN_MAX
@@ -833,9 +833,9 @@ class InfraSettings:
                 f"LLMQ_DEBUG_CAPTURE_ENABLED is refused outside dev ({environment}): it "
                 "stores prompt text"
             )
-        sink = str(get("METRICS_SINK", "emf"))
+        sink = str(get("METRICS_SINK_MODE", "emf"))
         if sink not in METRICS_SINKS:
-            problems.append("LLMQ_METRICS_SINK must be emf, prometheus or none")
+            problems.append("LLMQ_METRICS_SINK_MODE must be emf, prometheus or none")
         live_edit = str(get("REGISTRY_LIVE_EDIT_MODE", "safe"))
         if live_edit not in ("safe", "all", "off"):
             problems.append("LLMQ_REGISTRY_LIVE_EDIT_MODE must be safe, all or off")
@@ -843,11 +843,11 @@ class InfraSettings:
         if worker_id and not _PREFIX_RE.match(worker_id.replace(":", "_")):
             problems.append("LLMQ_INSTANCE_ID must be letters, digits, `_`, `.`, `:` or `-`")
         tenant_default = str(get("TENANT_DEFAULT", "") or "").strip() or None
-        admin_header = str(get("ADMIN_HEADER", "X-LLMQ-Token") or "").strip()
+        admin_token_header = str(get("ADMIN_TOKEN_HEADER", "X-LLMQ-Token") or "").strip()
         actor_header = str(get("ADMIN_ACTOR_HEADER", "X-LLMQ-Actor") or "").strip()
         csrf_header = str(get("ADMIN_CSRF_HEADER", "X-LLMQ-Admin") or "").strip()
         for name, header in (
-            ("ADMIN_HEADER", admin_header),
+            ("ADMIN_TOKEN_HEADER", admin_token_header),
             ("ADMIN_ACTOR_HEADER", actor_header),
             ("ADMIN_CSRF_HEADER", csrf_header),
         ):
@@ -860,9 +860,9 @@ class InfraSettings:
         hand_back = read_bool(layers, "DRAIN_HANDBACK_ENABLED", True, problems)
         backfill = read_bool(layers, "QUEUE_BACKFILL_ENABLED", False, problems)
         drain_file = str(get("DRAIN_FILE", "") or "").strip()
-        mode = str(get("ROLE", "both"))
+        mode = str(get("ROLE_MODE", "both"))
         if mode not in ("both", "caller", "worker"):
-            problems.append("LLMQ_ROLE must be both, caller or worker")
+            problems.append("LLMQ_ROLE_MODE must be both, caller or worker")
         key_expiry_mode = str(get("KEY_EXPIRY_MODE", "auto")).strip().lower()
         if key_expiry_mode not in KEY_EXPIRY_MODES:
             problems.append("LLMQ_KEY_EXPIRY_MODE must be auto, native or swept")
@@ -1006,8 +1006,8 @@ class InfraSettings:
             local_process_count=number("LOCAL_PROCESS_COUNT", 1, int, hi=100_000),
             local_concurrency=number("LOCAL_CONCURRENCY", 10, int, hi=100_000),
             static_cap_wait_secs=number("STATIC_CAP_WAIT_SECS", 5.0, zero=True, hi=3600),
-            metrics_sink=sink,
-            role=mode,
+            metrics_sink_mode=sink,
+            role_mode=mode,
             bedrock_endpoint_url=endpoints["BEDROCK_ENDPOINT_URL"],
             sts_endpoint_url=endpoints["STS_ENDPOINT_URL"],
             id_hash_salt=salt,
@@ -1019,7 +1019,7 @@ class InfraSettings:
             debug_capture_enabled=capture,
             instance_id=worker_id,
             tenant_default=tenant_default,
-            admin_header=admin_header,
+            admin_token_header=admin_token_header,
             admin_writes_enabled=switches["ADMIN_WRITES_ENABLED"],
             admin_actor_header=actor_header,
             admin_csrf_header=csrf_header,

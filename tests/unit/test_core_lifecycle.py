@@ -77,7 +77,7 @@ class _Offload:
 def _queue(engine: _Engine, offload: _Offload | None = None, mode: str = "caller") -> LLMQueue:
     return LLMQueue(
         engine,  # type: ignore[arg-type]  # a fake
-        settings=SimpleNamespace(role=mode),  # type: ignore[arg-type]
+        settings=SimpleNamespace(role_mode=mode),  # type: ignore[arg-type]
         offload=offload,  # type: ignore[arg-type]
     )
 
@@ -236,7 +236,7 @@ async def test_sync_call_after_stop_builds_no_new_engine() -> None:
 
     queue = LLMQueue(
         _Engine(),  # type: ignore[arg-type]  # a fake
-        settings=SimpleNamespace(role="caller"),  # type: ignore[arg-type]
+        settings=SimpleNamespace(role_mode="caller"),  # type: ignore[arg-type]
         builder=build,
     )
     await queue.start()

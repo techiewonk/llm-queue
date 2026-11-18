@@ -1186,7 +1186,7 @@ async def caller_dies(ctx: Ctx) -> None:
     try:
         proc = subprocess.Popen(  # noqa: ASYNC220  # one process, started once
             [PY, str(Path(__file__).parent / "gates_fleet.py"), "caller", "100", "orphan"],
-            env={**ctx.gate.env, "LLMQ_ROLE": "caller"},
+            env={**ctx.gate.env, "LLMQ_ROLE_MODE": "caller"},
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=log,
@@ -1283,12 +1283,12 @@ class Client:
     """A client pod: its own process (`gates_fleet.py client`), its own engine and calls."""
 
     def __init__(self, ctx: Ctx, spec: dict[str, Any], **env: str) -> None:
-        """Start it (`LLMQ_ROLE=caller` unless `env` says otherwise)."""
+        """Start it (`LLMQ_ROLE_MODE=caller` unless `env` says otherwise)."""
         log = log_file("client")
         self.spec = spec
         self.proc = subprocess.Popen(
             [PY, str(Path(__file__).parent / "gates_fleet.py"), "client", json.dumps(spec)],
-            env={**ctx.gate.env, "LLMQ_ROLE": "caller", **env},
+            env={**ctx.gate.env, "LLMQ_ROLE_MODE": "caller", **env},
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=log,

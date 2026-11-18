@@ -91,7 +91,7 @@ counts, never a tenant name), purges included (which also write `llmq_purge`); `
 | `llmq_registry_audit` | info | registry/store.py |
 | `llmq_start_failed` | error | fastapi.py (`on_start_error="log"`: the app stays up, not ready) |
 | `local_attempt_failed` | warning | engine/local.py (one provider attempt on the local executor: `local` mode or `store_down: static_cap`, field `path`) |
-| `local_mode_started` | info | core.py (`LLMQ_EXECUTION_MODE=local`: process count, concurrency, `budgets` (per model the rpm / tpm this process may use), an `LLMQ_ROLE` that does not apply) |
+| `local_mode_started` | info | core.py (`LLMQ_EXECUTION_MODE=local`: process count, concurrency, `budgets` (per model the rpm / tpm this process may use), an `LLMQ_ROLE_MODE` that does not apply) |
 | `message_needs_newer_library` | warning | engine/runtime.py |
 | `metric_dropped` | warning | engine/metrics.py |
 | `model_loop_died` | error | engine/runtime.py |

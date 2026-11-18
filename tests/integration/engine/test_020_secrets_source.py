@@ -39,7 +39,7 @@ async def test_store_password_from_a_file_source_logs_in(
         "LLMQ_KEY_PREFIX": key_prefix,
         "LLMQ_REGISTRY": json.dumps(registry()),
         "LLMQ_BEDROCK_ENDPOINT_URL": str(server.make_url("")).rstrip("/"),
-        "LLMQ_METRICS_SINK": "none",
+        "LLMQ_METRICS_SINK_MODE": "none",
         "LLMQ_SECRETS_SOURCE": f"file:{volume}",
         "LLMQ_SECRETS_NAMES": json.dumps({"LLMQ_STORE_PASSWORD": "valkey_key"}),
     }

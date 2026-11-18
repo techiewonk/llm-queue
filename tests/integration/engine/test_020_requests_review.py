@@ -223,7 +223,7 @@ async def test_rq10_count_with_the_index_off_refuses(make: Make) -> None:
     """RQ-10 / G25: zeros would read as "nothing waiting" during an incident."""
     engine, _ = await make(worker=False)
     admin = _admin(engine, settings=AdminSettings(request_index=False))
-    with pytest.raises(AdminRefused, match="LLMQ_REQUEST_INDEX_ENABLED"):
+    with pytest.raises(AdminRefused, match="LLMQ_REQUESTS_INDEX_ENABLED"):
         await admin.count("small", tenant=A)
 
 

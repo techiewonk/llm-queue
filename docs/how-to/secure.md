@@ -100,7 +100,7 @@ app.include_router(
 ```
 
 - Two tokens, both optional and read on every request (rotation needs no restart), carried in
-  `LLMQ_ADMIN_HEADER` (`X-LLMQ-Token`): `LLMQ_ADMIN_READ_TOKEN` opens the read routes only;
+  `LLMQ_ADMIN_TOKEN_HEADER` (`X-LLMQ-Token`): `LLMQ_ADMIN_READ_TOKEN` opens the read routes only;
   `LLMQ_ADMIN_TOKEN` opens reads and writes. The app's `dependencies` apply on top of them.
   When strict, each token must be at least 32 characters (a shared token can be guessed
   online, and nothing rate-limits the 403s): `http_router()` / `install()` read each token once

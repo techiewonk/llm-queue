@@ -40,7 +40,7 @@ REGISTRY = {
 ENV = {
     "LLMQ_STORE_URL": "redis://127.0.0.1:6379/0",
     "LLMQ_REGISTRY": json.dumps(REGISTRY),
-    "LLMQ_METRICS_SINK": "none",
+    "LLMQ_METRICS_SINK_MODE": "none",
     "LLMQ_ENVIRONMENT": "test",
 }
 

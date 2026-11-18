@@ -111,7 +111,7 @@ need the file ([Drain a pod](operate.md#drain-a-pod)).
 
 - `GET /internal/llm-queue/` with the read token: every route this pod serves and a live
   summary (models, waiting, in progress, dead letters, usable deployments, scheduled purges).
-- A metrics sink: `LLMQ_METRICS_SINK=emf` (CloudWatch) or `prometheus` with `metrics_route=True`.
+- A metrics sink: `LLMQ_METRICS_SINK_MODE=emf` (CloudWatch) or `prometheus` with `metrics_route=True`.
 - `describe()` is safe to log at start (no password, salt, token or registry body).
 - Incidents: cancel calls (`requests cancel`), purge what a tenant or a removed model left
   (`purge`), redrive or delete dead letters (`dlq`), block a region or account (`blocks`), turn

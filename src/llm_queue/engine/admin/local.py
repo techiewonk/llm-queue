@@ -211,7 +211,7 @@ class LocalOpsAdmin:
             "library": {
                 "version": __version__,
                 "instance": engine.worker_id if engine is not None else None,
-                "role": settings.role if settings else None,
+                "role_mode": settings.role_mode if settings else None,
                 "execution_mode": "local",
                 "environment": settings.environment if settings else None,
             },

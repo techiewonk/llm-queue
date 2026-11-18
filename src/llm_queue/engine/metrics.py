@@ -662,7 +662,7 @@ def sink_for(
     static: Mapping[str, str] | None = None,
     properties: Mapping[str, str] | None = None,
 ) -> Metrics:
-    """The process's sink named by the `metrics_sink` setting: `emf`, `prometheus` or `none`.
+    """The process's sink named by the `metrics_sink_mode` setting: `emf`, `prometheus` or `none`.
 
     One per name (and EMF dimensions) per process: every engine (async queue, sync calls, a
     second queue) shares it. `static` (EMF only): dimensions on every point, such as the

@@ -74,7 +74,7 @@ fakellm:
 export LLMQ_ENVIRONMENT="dev"                              # relaxed checks for a laptop
 export LLMQ_STORE_URL="redis://:localdev@127.0.0.1:6379/0"
 export LLMQ_REGISTRY_FILE="registry.json"
-export LLMQ_METRICS_SINK="none"
+export LLMQ_METRICS_SINK_MODE="none"
 export LLMQ_BEDROCK_ENDPOINT_URL="http://127.0.0.1:8080"   # fakellm; tests only
 export AWS_ACCESS_KEY_ID="aws-main" AWS_SECRET_ACCESS_KEY="fake"
 ```
@@ -122,7 +122,7 @@ call was served.
 
 ## 6. Choose a run mode
 
-`LLMQ_ROLE` decides what `start()` runs in a process:
+`LLMQ_ROLE_MODE` decides what `start()` runs in a process:
 
 | Mode | Runs | Use |
 |---|---|---|

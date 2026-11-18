@@ -60,7 +60,7 @@ mistyped fields are a 400.
 | `ops.index` | read | `await llmq.admin.ops.index()` | `llm-queue ops` | `GET /` | read |  |  |
 | `health.live` | read | `await llmq.health()` | process-local | `GET /health/live` | open |  |  |
 | `health.ready` | read | `await llmq.health()` | process-local | `GET /health/ready` | open |  |  |
-| `metrics.get` | read | the metrics sink (`LLMQ_METRICS_SINK`) | process-local | `GET /metrics` | open |  |  |
+| `metrics.get` | read | the metrics sink (`LLMQ_METRICS_SINK_MODE`) | process-local | `GET /metrics` | open |  |  |
 | `process.describe` | read | `llmq.admin.describe()` | `llm-queue describe` | `GET /describe` | read |  |  |
 | `drain.get` | read | `llmq.admin.drain.get()` | process-local | `GET /drain` | read |  |  |
 | `drain.start` | update | `await llmq.admin.drain.start(actor="ann", dry_run=False)` | process-local (pods use `LLMQ_DRAIN_FILE`) | `POST /drain` | write | `drain` | yes |
@@ -119,7 +119,7 @@ settings (`registry.set`); jobs are sent by the app (`llmq.send_job`), their dea
 
 | Op | Parameters (default) | Answer |
 |---|---|---|
-| `process.describe` | | `{version, worker_id, enabled, execution_mode, secrets, mode, environment, store, separate_queue_store, key_prefix, queue_prefix, key_expiry_mode, store_max_connections, metrics_sink, tenant_default_hash, admin_writes_enabled, registry_version, models}` (no password, salt, token or registry body; `tenant_default` too only with `LLMQ_TENANT_NAMES_ENABLED`); logged once at start as `llmq_configured`. Off: `{version, enabled: false, environment, drain_file}` |
+| `process.describe` | | `{version, worker_id, enabled, execution_mode, secrets, mode, environment, store, separate_queue_store, key_prefix, queue_prefix, key_expiry_mode, store_max_connections, metrics_sink_mode, tenant_default_hash, admin_writes_enabled, registry_version, models}` (no password, salt, token or registry body; `tenant_default` too only with `LLMQ_TENANT_NAMES_ENABLED`); logged once at start as `llmq_configured`. Off: `{version, enabled: false, environment, drain_file}` |
 | `status.get` | `model` (all), `tenant` / `tenant_hash` (with a model) | `StatusReport`, or `ModelStatus` of one model (with `tenants` and `request_index`); with a tenant also `tenant: {tenant, waiting, running, by_stage, oldest_wait_secs, fairness}` |
 | `status.health` | `model` (all) | `{health, registry_version, models: [{model, state, reasons, budget_used_pct, waiting, oldest_waiting_secs, usable_deployments, deployments}]}`; `state` is `healthy`, `warning` or `critical` (`health` the worst), against the model's `health_summary` thresholds. Critical: `no_usable_deployment` (an enabled model), `budget_used`, `waiting`, `oldest_wait` at their critical mark; warning: those at their warning mark, `breaker_open`, `deployment_disabled`, `dead_letters` (`alerts.dlq_messages`), `kill_switch`, `model_disabled`. Local mode: this process's view and budget shares. The same summary is each model's `health` in `status.get` and `GET /` |
 | `registry.get` | `model` (whole document) | `{registry, changes, live_edits}`, secrets shown as `[redacted]` |
@@ -165,7 +165,7 @@ under `AdminServices.from_env()` and the CLI. A tenant is given by name (`tenant
 tenant). `GET` routes take `tenant_hash` only (`?tenant=` is a 400: a name in a URL reaches
 access logs); run `llm-queue tenants hash NAME` first. `describe()` shows
 `tenant_default_hash`, and the name of `LLMQ_TENANT_DEFAULT` only with
-`LLMQ_TENANT_NAMES_ENABLED`. With `LLMQ_REQUEST_INDEX_ENABLED=false`, looking calls up by model and tenant answers
+`LLMQ_TENANT_NAMES_ENABLED`. With `LLMQ_REQUESTS_INDEX_ENABLED=false`, looking calls up by model and tenant answers
 `AdminRefused` (HTTP 409, CLI exit 1), `requests.count` and `requests.extend` included (a count
 of zeros would read as "nothing waiting"); `requests.get` and `requests.cancel` by request ids
 still work. A cancel logs `call_cancel` only for the calls it cancelled, and answers the waiting

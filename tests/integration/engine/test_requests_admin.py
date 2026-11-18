@@ -316,7 +316,7 @@ async def test_cancelled_waiting_calls_fail_cancelled_at_once(make: Make) -> Non
 async def test_index_off_refuses(caller: tuple[Engine, _Calls]) -> None:
     engine, _ = caller
     admin = _admin(engine, settings=AdminSettings(request_index=False))
-    with pytest.raises(AdminRefused, match="LLMQ_REQUEST_INDEX_ENABLED"):
+    with pytest.raises(AdminRefused, match="LLMQ_REQUESTS_INDEX_ENABLED"):
         await admin.list("small", tenant=A)
     with pytest.raises(AdminRefused):
         await admin.cancel("small", tenant=A, state="running", actor="ops")

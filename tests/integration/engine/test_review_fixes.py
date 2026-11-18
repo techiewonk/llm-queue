@@ -147,7 +147,7 @@ def test_role_session_name_is_valid_for_aws() -> None:
             {"LLMQ_ENVIRONMENT": "prod", "LLMQ_STORE_URL": "redis://c.aws:6379/0#@localhost"},
             "must use TLS",
         ),
-        ({"LLMQ_METRICS_SINK": "prometeus"}, "LLMQ_METRICS_SINK"),
+        ({"LLMQ_METRICS_SINK_MODE": "prometeus"}, "LLMQ_METRICS_SINK_MODE"),
         ({"LLMQ_LEASE_SECS": "nan"}, "finite"),
         ({"LLMQ_QUEUE_STORE_URL": "http://x"}, "LLMQ_QUEUE_STORE_URL must be a redis"),
     ],
@@ -183,7 +183,7 @@ async def test_start_twice_and_restart(make: Make, store: Any, prefix: str) -> N
         "LLMQ_ENVIRONMENT": "test",
         "LLMQ_KEY_PREFIX": prefix,
         "LLMQ_REGISTRY": json.dumps(dict(engine.registry.current.registry.raw)),
-        "LLMQ_METRICS_SINK": "none",
+        "LLMQ_METRICS_SINK_MODE": "none",
     }
     queue = LLMQueue.from_env(env)
     await queue.start()
@@ -209,7 +209,7 @@ async def test_first_sync_calls_from_many_threads_build_one_runner(
         "LLMQ_ENVIRONMENT": "test",
         "LLMQ_KEY_PREFIX": prefix,
         "LLMQ_REGISTRY": json.dumps(dict(engine.registry.current.registry.raw)),
-        "LLMQ_METRICS_SINK": "none",
+        "LLMQ_METRICS_SINK_MODE": "none",
     }
     queue = LLMQueue.from_env(env)
     runners = []

@@ -38,7 +38,7 @@ async def env(store: redis.asyncio.Redis, prefix: str) -> AsyncIterator[dict[str
         "LLMQ_KEY_PREFIX": key_prefix,
         "LLMQ_REGISTRY": json.dumps(registry_doc()),
         "LLMQ_BEDROCK_ENDPOINT_URL": str(server.make_url("")).rstrip("/"),
-        "LLMQ_METRICS_SINK": "none",
+        "LLMQ_METRICS_SINK_MODE": "none",
     }
     await server.close()
     keys = [k async for k in store.scan_iter(match=f"{key_prefix}:*", count=500)]

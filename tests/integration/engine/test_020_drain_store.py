@@ -315,7 +315,7 @@ async def queues(
             "LLMQ_KEY_PREFIX": key_prefix,
             "LLMQ_REGISTRY": json.dumps(registry_doc()),
             "LLMQ_BEDROCK_ENDPOINT_URL": url,
-            "LLMQ_METRICS_SINK": "none",
+            "LLMQ_METRICS_SINK_MODE": "none",
             **(extra or {}),
         }
         queue = LLMQueue.from_env(

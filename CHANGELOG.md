@@ -48,6 +48,7 @@ public API (see STABILITY.md).
 | Old name | New name |
 |---|---|
 | `LLMQ_LOCAL_LIMIT_CAP` | `LLMQ_LOCAL_CONCURRENCY` |
+| `LLMQ_METRICS_SINK` | `LLMQ_METRICS_SINK_MODE` |
 | `LLMQ_PURGE_BATCH` | `LLMQ_ADMIN_BATCH` |
 | `LLMQ_AUTO_PURGE` | `LLMQ_PURGE_AUTO_ENABLED` |
 | `LLMQ_PURGE_WAIT` | `LLMQ_PURGE_WAIT_ENABLED` |
@@ -64,7 +65,7 @@ public API (see STABILITY.md).
 | `LLMQ_REGISTRY_LIVE_EDIT` | `LLMQ_REGISTRY_LIVE_EDIT_MODE` |
 | `LLMQ_DEBUG_CAPTURE_FROM_CONFIG` | `LLMQ_DEBUG_CAPTURE_ENABLED` |
 | `LLMQ_BASE_URL_ALLOWED_HOSTS` | `LLMQ_HTTP_ALLOWED_HOSTS` |
-| `LLMQ_MODE` | `LLMQ_ROLE` |
+| `LLMQ_MODE` | `LLMQ_ROLE_MODE` |
 | `LLMQ_WORKER_ID` | `LLMQ_INSTANCE_ID` |
 | `LLMQ_DEFAULT_TENANT` | `LLMQ_TENANT_DEFAULT` |
 | `LLMQ_ADMIN_DLQ_BODIES_ENABLED` | `LLMQ_ADMIN_DEAD_LETTER_BODIES_ENABLED` |
@@ -202,7 +203,7 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
 - `LLMQueue.embed_one(model, text, **kw)` and `embed_one_sync(...)` (H8): one text's vector.
 - Requests by model and tenant (T): every call in flight is indexed under its model and tenant
   hash (`P:{m:ALIAS}:tq:H`, `P:{m:ALIAS}:tq`) by the scripts that send and end it (no extra
-  round trip; `LLMQ_REQUEST_INDEX_ENABLED`, on). `RequestsAdmin` (`Engine.requests_admin`,
+  round trip; `LLMQ_REQUESTS_INDEX_ENABLED`, on). `RequestsAdmin` (`Engine.requests_admin`,
   `engine/requests_admin.py`) lists, counts and gets calls by model and tenant, and cancels,
   reprioritizes and extends them: dry run by default, audited with counts and the tenant hash
   only. Cancel defaults to waiting calls and answers them `cancelled` at once; reprioritize

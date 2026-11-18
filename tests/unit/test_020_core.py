@@ -23,21 +23,21 @@ DEV = {
 
 def test_new_settings_defaults_and_validation() -> None:
     settings = InfraSettings.from_env(DEV)
-    assert (settings.instance_id, settings.tenant_default, settings.admin_header) == (
+    assert (settings.instance_id, settings.tenant_default, settings.admin_token_header) == (
         "",
         None,
         "X-LLMQ-Token",
     )
     set_ = InfraSettings.from_env(
         {**DEV, "LLMQ_INSTANCE_ID": "api-1:7", "LLMQ_TENANT_DEFAULT": "acme",
-         "LLMQ_ADMIN_HEADER": "X-Admin-Token"}
+         "LLMQ_ADMIN_TOKEN_HEADER": "X-Admin-Token"}
     )  # fmt: skip
-    assert (set_.instance_id, set_.tenant_default, set_.admin_header) == (
+    assert (set_.instance_id, set_.tenant_default, set_.admin_token_header) == (
         "api-1:7",
         "acme",
         "X-Admin-Token",
     )
-    for name, value in (("LLMQ_INSTANCE_ID", "a b"), ("LLMQ_ADMIN_HEADER", "bad header")):
+    for name, value in (("LLMQ_INSTANCE_ID", "a b"), ("LLMQ_ADMIN_TOKEN_HEADER", "bad header")):
         with pytest.raises(Exception, match=name):
             InfraSettings.from_env({**DEV, name: value})
 
@@ -111,7 +111,7 @@ def test_env_tokens_and_settings_reach_the_router() -> None:
     from fastapi.testclient import TestClient
 
     secrets = {"LLMQ_ADMIN_TOKEN": "w", "LLMQ_ADMIN_READ_TOKEN": "r"}
-    env = {**DEV, "LLMQ_ADMIN_WRITES_ENABLED": "true", "LLMQ_ADMIN_HEADER": "X-Admin-Token"}
+    env = {**DEV, "LLMQ_ADMIN_WRITES_ENABLED": "true", "LLMQ_ADMIN_TOKEN_HEADER": "X-Admin-Token"}
     llmq = LLMQueue.from_env(env, secrets=secrets.get)
     app = FastAPI()
     app.include_router(llmq.http_router())

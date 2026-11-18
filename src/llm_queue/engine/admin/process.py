@@ -104,7 +104,7 @@ def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> 
             environment=s.environment,
             local_process_count=s.local_process_count,
             local_concurrency=s.local_concurrency,
-            metrics_sink=s.metrics_sink,
+            metrics_sink_mode=s.metrics_sink_mode,
             **_default_tenant(s),
             admin_writes_enabled=s.admin_writes_enabled,
             registry_version=doc.get("registry_version"),
@@ -113,7 +113,7 @@ def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> 
         return out
     store = urlsplit(s.store_url)
     out.update(
-        role=s.role,
+        role_mode=s.role_mode,
         environment=s.environment,
         store=f"{store.scheme}://{store.hostname}:{store.port or 6379}",
         separate_queue_store=s.queue_store_url is not None,
@@ -121,7 +121,7 @@ def describe_settings(settings: InfraSettings | None, worker_id: str | None) -> 
         queue_prefix=s.queue_prefix,
         key_expiry_mode=s.key_expiry_mode,
         store_max_connections=s.store_max_connections,
-        metrics_sink=s.metrics_sink,
+        metrics_sink_mode=s.metrics_sink_mode,
         **_default_tenant(s),
         admin_writes_enabled=s.admin_writes_enabled,
         registry_version=doc.get("registry_version"),
@@ -157,7 +157,7 @@ class OpsAdmin:
             "library": {
                 "version": __version__,
                 "instance": engine.worker_id if engine is not None else None,
-                "role": settings.role if settings else None,
+                "role_mode": settings.role_mode if settings else None,
                 "execution_mode": "queue",
                 "environment": settings.environment if settings else None,
             },

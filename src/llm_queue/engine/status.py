@@ -83,7 +83,7 @@ class StatusReader:
 
         `requests` (the engine's `RequestsAdmin`) counts one tenant's calls for
         `model(..., tenant_hash=...)`; `request_index` says whether calls are indexed
-        (`LLMQ_REQUEST_INDEX_ENABLED`); `scan_max` caps the tenants read per model.
+        (`LLMQ_REQUESTS_INDEX_ENABLED`); `scan_max` caps the tenants read per model.
         """
         self._client = client
         self.keys = keys

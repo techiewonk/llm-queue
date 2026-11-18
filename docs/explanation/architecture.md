@@ -49,21 +49,21 @@ deployment health, and reports status.
 
 ## Topology
 
-Every process runs the same code. By default (`LLMQ_ROLE=both`) the worker side runs inside the
+Every process runs the same code. By default (`LLMQ_ROLE_MODE=both`) the worker side runs inside the
 app's own pods, so there is no separate worker fleet. A fleet may also split: web pods as
 callers only, worker pods that only serve.
 
 ```mermaid
 flowchart TB
-  subgraph app["App pods: LLMQ_ROLE=both (default)"]
+  subgraph app["App pods: LLMQ_ROLE_MODE=both (default)"]
     direction LR
     p1["Pod 1<br/>caller + worker"]
     p2["Pod 2<br/>caller + worker"]
   end
   subgraph split["Optional split fleet"]
     direction LR
-    c1["Web pod<br/>LLMQ_ROLE=caller"]
-    w1["Worker pod<br/>LLMQ_ROLE=worker"]
+    c1["Web pod<br/>LLMQ_ROLE_MODE=caller"]
+    w1["Worker pod<br/>LLMQ_ROLE_MODE=worker"]
   end
   subgraph ss["State store: LLMQ_STORE_URL, one primary + replicas"]
     direction LR
@@ -124,7 +124,7 @@ model fallback, `max_message_bytes`, timeout, `admission` hook), `request_params
 shares the process's `LocalLimits`, so a process has one budget. Store-only operations of a
 `LocalEngine` (and its `LocalRegistry`) raise `LocalModeRefused`; the HTTP handlers answer 503.
 
-## Roles: `LLMQ_ROLE`
+## Roles: `LLMQ_ROLE_MODE`
 
 `LLMQueue.start()` starts the engine with `worker = mode in (both, worker)` and
 `caller = mode in (both, caller)` (`core.py`). The role decides which background loops run.

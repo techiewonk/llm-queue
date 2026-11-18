@@ -279,7 +279,7 @@ class _FakeEngine:
 
 
 def _queue() -> LLMQueue:
-    return LLMQueue(_FakeEngine(), settings=SimpleNamespace(role="caller"))  # type: ignore[arg-type]
+    return LLMQueue(_FakeEngine(), settings=SimpleNamespace(role_mode="caller"))  # type: ignore[arg-type]
 
 
 @pytest.fixture

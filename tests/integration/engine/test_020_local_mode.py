@@ -59,7 +59,7 @@ class Rig:
             "LLMQ_ENVIRONMENT": "test",
             "LLMQ_REGISTRY": json.dumps(registry_doc(models)),
             "LLMQ_BEDROCK_ENDPOINT_URL": str(self.server.make_url("")).rstrip("/"),
-            "LLMQ_METRICS_SINK": "none",
+            "LLMQ_METRICS_SINK_MODE": "none",
             **extra,
         }
 
@@ -381,7 +381,7 @@ async def test_the_breaker_opens_after_failures(rig: Rig) -> None:
 
 
 async def test_describe_and_health_say_local(rig: Rig) -> None:
-    llmq = await rig.started(LLMQ_LOCAL_PROCESS_COUNT="4", LLMQ_ROLE="worker")
+    llmq = await rig.started(LLMQ_LOCAL_PROCESS_COUNT="4", LLMQ_ROLE_MODE="worker")
     described = llmq.describe()
     assert described["execution_mode"] == "local"
     assert described["local_process_count"] == 4

@@ -28,7 +28,7 @@ def test_defaults_match_the_code() -> None:
 def test_each_setting_is_read() -> None:
     env = {
         **DEV,
-        "LLMQ_REQUEST_INDEX_ENABLED": "off",
+        "LLMQ_REQUESTS_INDEX_ENABLED": "off",
         "LLMQ_TENANT_NAMES_ENABLED": "on",
         "LLMQ_ADMIN_BATCH": "7",
         "LLMQ_ADMIN_SCAN_MAX": "2000",
@@ -53,7 +53,7 @@ def test_each_setting_is_read() -> None:
 @pytest.mark.parametrize(
     ("name", "value"),
     [
-        ("LLMQ_REQUEST_INDEX_ENABLED", "maybe"),
+        ("LLMQ_REQUESTS_INDEX_ENABLED", "maybe"),
         ("LLMQ_TENANT_NAMES_ENABLED", "2"),
         ("LLMQ_ADMIN_SCAN_MAX", "999"),
         ("LLMQ_REQUESTS_MOVE_BATCH", "501"),

@@ -190,5 +190,5 @@ def _off() -> AdminServices:
     ],
 )
 async def test_index_off_refuses_lookups_by_model_and_tenant(call: Any) -> None:
-    with pytest.raises(AdminRefused, match="LLMQ_REQUEST_INDEX_ENABLED"):
+    with pytest.raises(AdminRefused, match="LLMQ_REQUESTS_INDEX_ENABLED"):
         await call(_off())

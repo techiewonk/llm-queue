@@ -287,7 +287,7 @@ named events, for example:
 | `store_down` | The state store failed before a call was sent; the `store_down` rule applies |
 | `deployment_disabled`, `deployment_recovered` | Health checks turned a deployment off or back on |
 
-Metrics go to `LLMQ_METRICS_SINK`: `emf` (CloudWatch embedded metrics, default, with the
+Metrics go to `LLMQ_METRICS_SINK_MODE`: `emf` (CloudWatch embedded metrics, default, with the
 `environment` dimension), `prometheus` (needs the `metrics` extra;
 `llmq.http_router(metrics_route=True)` serves `GET /metrics`) or `none`; one sink per process. Per call: calls by
 outcome and by caller-seen failure, attempts by result, tokens, and histograms of the queue

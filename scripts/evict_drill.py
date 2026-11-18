@@ -68,7 +68,7 @@ def environment(port: int, prefix: str, fake_url: str) -> dict[str, str]:
         "LLMQ_KEY_PREFIX": prefix,
         "LLMQ_QUEUE_PREFIX": prefix.replace(":", "-") + "-",
         "LLMQ_REGISTRY": json.dumps(doc),
-        "LLMQ_METRICS_SINK": "none",
+        "LLMQ_METRICS_SINK_MODE": "none",
         "LLMQ_ENVIRONMENT": "test",  # local store without TLS or a salt
         "LLMQ_BEDROCK_ENDPOINT_URL": fake_url,
         "LLMQ_KEY_EXPIRY_MODE": "auto",

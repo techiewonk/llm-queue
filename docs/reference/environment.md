@@ -140,7 +140,7 @@ How calls run (see [Modes](../how-to/modes.md) for when to switch and how to und
 
 | Variable | Default | Range | Meaning |
 |---|---|---|---|
-| `LLMQ_EXECUTION_MODE` | `queue` | `queue`, `local` | `queue`: calls go through the store's queues and shared budgets. `local`: every call runs in this process straight against the provider, with the same API, classes, LangChain adapters and `install()`; no store client is built (`LLMQ_STORE_URL` is not needed), store-only operations raise `LocalModeRefused` (HTTP 503) and `LLMQ_ROLE` does not apply |
+| `LLMQ_EXECUTION_MODE` | `queue` | `queue`, `local` | `queue`: calls go through the store's queues and shared budgets. `local`: every call runs in this process straight against the provider, with the same API, classes, LangChain adapters and `install()`; no store client is built (`LLMQ_STORE_URL` is not needed), store-only operations raise `LocalModeRefused` (HTTP 503) and `LLMQ_ROLE_MODE` does not apply |
 | `LLMQ_LOCAL_PROCESS_COUNT` | 1 | above 0 to 100000 (whole) | The local executor's share of each budget: every deployment's (and account's shared) `rpm` / `tpm` is divided by this in each process. Set it to the processes sharing the quota (pods x workers). Used in `local` mode and by `store_down: static_cap`. A fixed ceiling, read at start: it does not follow autoscaling, so set it to the most processes that may run at once (fewer running leave quota unused, more go over it). `local_mode_started` logs the share each process takes per model; queue mode logs `static_cap_process_count_unset` at start when a model uses `static_cap` and this is left at 1 |
 | `LLMQ_LOCAL_CONCURRENCY` | 10 | above 0 to 100000 (whole) | Calls in flight per model and process on the local executor (`local` mode and `store_down: static_cap`; async and sync calls together); priority calls get a free slot first. The one setting for both: the old `LLMQ_LOCAL_LIMIT_CAP` is reported as an unknown setting (renamed in 0.2.0) |
 | `LLMQ_STATIC_CAP_WAIT_SECS` | 5 | 0 to 3600 | The longest a `store_down: static_cap` call waits for a budget or a breaker during a store outage, below its own `max_wait_secs`; then `rate_limited`. Retries and their backoff are not capped |
@@ -149,8 +149,9 @@ How calls run (see [Modes](../how-to/modes.md) for when to switch and how to und
 
 Every setting is `LLMQ_<AREA>_<THING>[_<UNIT>]`: units in the name (`_SECS`, `_MS`, `_BYTES`,
 `_DAYS`), switches end in `_ENABLED`, and `_MODE` marks a setting that picks one of several
-behaviours of the same thing (`LLMQ_EXECUTION_MODE`). A setting that names a sink, a source
-list or a role is not a mode: `LLMQ_METRICS_SINK` and `LLMQ_SECRETS_SOURCE` keep their names.
+behaviours of the same thing (`LLMQ_EXECUTION_MODE`, `LLMQ_ROLE_MODE`, `LLMQ_METRICS_SINK_MODE`).
+`LLMQ_SECRETS_SOURCE` holds a source address, not a choice, so it is not a mode. Counts carry
+no unit (`LLMQ_ADMIN_BATCH`).
 `TTL` (time to live) is a defined term, not an abbreviation (`LLMQ_RESULT_TTL_SECS`).
 `LLMQ_ENABLED` is the one setting without an area: the switch of the whole library.
 
@@ -171,19 +172,19 @@ renamed and removed settings.
 | `LLMQ_ID_HASH_SALT` | none | 16 or more characters when strict | Key of the user / session id hash (HMAC). Use the same value in every service that shares the store |
 | `LLMQ_KEY_PREFIX` | `llmq` in dev; **required** when strict | 1-64 letters, digits, `_`, `.`, `:` or `-` | Prefix of this environment's store keys: name it per app and environment (`myapp-prod`, `llmq:prod:v3`). No braces or glob characters: it is part of every key |
 | `LLMQ_QUEUE_PREFIX` | empty | 0-64 letters, digits, `_`, `.` or `-` | Prefix of this environment's queue names (no `:`: it goes inside hash tags) |
-| `LLMQ_ROLE` | `both` | `both`, `caller`, `worker` | `both` (caller and worker), `caller` (sends and waits only) or `worker` (runs calls only). Does not apply with `LLMQ_EXECUTION_MODE=local` |
+| `LLMQ_ROLE_MODE` | `both` | `both`, `caller`, `worker` | `both` (caller and worker), `caller` (sends and waits only) or `worker` (runs calls only). Does not apply with `LLMQ_EXECUTION_MODE=local` |
 | `LLMQ_INSTANCE_ID` | empty | letters, digits, `_`, `.`, `:`, `-` | Empty: `POD_NAME` (else the host name) and the pid, e.g. `api-7f9c:12`. This process's id prefix in the store (callers, leases, logs); the engine adds a random tail, so two processes never share one. A `instance_id=` argument wins |
 | `LLMQ_TENANT_DEFAULT` | none | text | The tenant of a call that names none (no `tenant_id=`, none in `request_context`): every call of a single-tenant app carries it, threads included |
-| `LLMQ_ADMIN_TOKEN` | none | text (a secret) | Guards every admin route except the probes and `/metrics`, reads and writes: the request's `LLMQ_ADMIN_HEADER` must equal it (constant-time). Read on every request, so a rotated secret needs no restart. Unset with no `LLMQ_ADMIN_READ_TOKEN`: only the app's `dependencies` guard the routes; with none of the three the router mounts only the probes and `/metrics` (unless `insecure_reads=True`) |
-| `LLMQ_ADMIN_READ_TOKEN` | none | text (a secret) | Guards the read routes only (GET): the request's `LLMQ_ADMIN_HEADER` must equal it or `LLMQ_ADMIN_TOKEN`. It never allows a write. Read on every request. See [Admin API](admin-api.md) |
-| `LLMQ_ADMIN_HEADER` | `X-LLMQ-Token` | a header name | The header that carries the admin tokens (read and write) |
+| `LLMQ_ADMIN_TOKEN` | none | text (a secret) | Guards every admin route except the probes and `/metrics`, reads and writes: the request's `LLMQ_ADMIN_TOKEN_HEADER` must equal it (constant-time). Read on every request, so a rotated secret needs no restart. Unset with no `LLMQ_ADMIN_READ_TOKEN`: only the app's `dependencies` guard the routes; with none of the three the router mounts only the probes and `/metrics` (unless `insecure_reads=True`) |
+| `LLMQ_ADMIN_READ_TOKEN` | none | text (a secret) | Guards the read routes only (GET): the request's `LLMQ_ADMIN_TOKEN_HEADER` must equal it or `LLMQ_ADMIN_TOKEN`. It never allows a write. Read on every request. See [Admin API](admin-api.md) |
+| `LLMQ_ADMIN_TOKEN_HEADER` | `X-LLMQ-Token` | a header name | The header that carries the admin tokens (read and write) |
 | `LLMQ_ADMIN_WRITES_ENABLED` | false | true or false (`on` / `off`) | Default of `http_router(allow_writes=)`: mount the admin write routes (registry edits, blocks, purges, dead letters, cancels). Each write is still a dry run unless its body says `"dry_run": false` |
 | `LLMQ_ADMIN_ACTOR_HEADER` | `X-LLMQ-Actor` | a header name | With the token guard and no `actor=`: the header whose value a write is audited under, as `token:<value>` (`token:unknown` without it). A claimed name, not an identity |
 | `LLMQ_ADMIN_CSRF_HEADER` | `X-LLMQ-Admin` | a header name | When the write routes are guarded by `dependencies` only (no `LLMQ_ADMIN_TOKEN`), a write needs this header (any value): no simple cross-site request can carry it |
 | `LLMQ_ADMIN_INDEX_CACHE_SECS` | 2 | 0 to 60 | How long `GET /` (the admin index) reuses its live summary, so a dashboard poll cannot load the store |
 | `LLMQ_ADMIN_DEAD_LETTER_BODIES_ENABLED` | false | true or false (`on` / `off`) | `GET /dlq/{entry_id}?unsafe=true` may return message bodies (prompts, job payloads); off, it answers 403. The CLI and Python `unsafe=True` do not need it |
 | `LLMQ_ADMIN_BODY_MAX_BYTES` | 1048576 | 1024 to 67108864 (whole) | Largest admin POST body; a larger one answers 413 before it is parsed. Each value of a JSON body (a registry edit's `values`) is also capped at 64 KiB serialised (400) |
-| `LLMQ_METRICS_SINK` | `emf` | `emf`, `prometheus`, `none` | `emf` (CloudWatch embedded metrics), `prometheus` (extra `metrics`) or `none`. One sink per process |
+| `LLMQ_METRICS_SINK_MODE` | `emf` | `emf`, `prometheus`, `none` | `emf` (CloudWatch embedded metrics), `prometheus` (extra `metrics`) or `none`. One sink per process |
 | `LLMQ_METRICS_TENANTS` | empty | at most 50 entries `name` or `name=label`, label `[A-Za-z0-9_.-]{1,64}` (not `other` or `-`) | Tenants that get their own `tenant` label on `llmq_calls_total` and `llmq_wait_seconds` (`globex=t2` shows `globex` as `t2`, so a dashboard need not show the name); every other tenant is `other`, a call with no tenant `-`. The label is always there, so cardinality stays fixed. Names are matched by their keyed hash: no name reaches the store |
 
 ## Requests by model and tenant
@@ -194,7 +195,7 @@ count, cancel, reprioritize and extend one tenant's calls on one model.
 
 | Variable | Default | Range | Meaning |
 |---|---|---|---|
-| `LLMQ_REQUEST_INDEX_ENABLED` | true | true or false (`on` / `off`) | Index each in-flight call under its model and tenant hash so admins can list, count, cancel, reprioritize and extend by tenant, and a tenant purge can cancel its calls; off saves about 30 us of store time per call and no admin operation can find calls by tenant |
+| `LLMQ_REQUESTS_INDEX_ENABLED` | true | true or false (`on` / `off`) | Index each in-flight call under its model and tenant hash so admins can list, count, cancel, reprioritize and extend by tenant, and a tenant purge can cancel its calls; off saves about 30 us of store time per call and no admin operation can find calls by tenant |
 | `LLMQ_TENANT_NAMES_ENABLED` | false | true or false (`on` / `off`) | Also store each tenant's name beside its hash (`P:{m:ALIAS}:tqn`) so admin lists and status can show it; off, the store holds hashes only (messages always carry only the hashes) |
 | `LLMQ_ADMIN_BATCH` | 500 | 1 to 10000 (whole) | Ids per pipeline or cancel script in admin operations, and keys per pipelined `UNLINK` batch of a purge |
 | `LLMQ_ADMIN_SCAN_MAX` | 100000 | 1000 to 10000000 (whole) | Most index entries one admin operation reads; above it a write is refused and a count is truncated |
@@ -241,7 +242,7 @@ What a purge does by default; each method argument overrides its setting. See
 | `LLMQ_PURGE_WAIT_ENABLED` | true | true or false | A deployment purge waits for the deployment's running calls to end first |
 | `LLMQ_PURGE_WAIT_SECS` | 300 | 0 to 86400 | ... for at most this long; still running then, nothing is deleted and the report says why |
 | `LLMQ_ADMIN_HTTP_WAIT_SECS` | 60 | 0 to 3600 | The longest a purge over HTTP (`/purge/deployment`, `/purge/removed`, `/models/{model}/drain`) waits for running calls; a larger or omitted `wait_secs` is capped to it |
-| `LLMQ_PURGE_TENANT_REMOVE` | `keys` | comma list of `keys`, `queued`, `running` | What a tenant purge removes: its fairness keys, its calls still waiting (cancelled), all its calls (cancelled). `queued` / `running` read the request index of each model; with `LLMQ_REQUEST_INDEX_ENABLED=false` they raise `AdminRefused` |
+| `LLMQ_PURGE_TENANT_REMOVE` | `keys` | comma list of `keys`, `queued`, `running` | What a tenant purge removes: its fairness keys, its calls still waiting (cancelled), all its calls (cancelled). `queued` / `running` read the request index of each model; with `LLMQ_REQUESTS_INDEX_ENABLED=false` they raise `AdminRefused` |
 
 ## Endpoint overrides
 

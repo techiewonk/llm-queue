@@ -23,7 +23,7 @@ def test_purge_settings_defaults_and_validation() -> None:
         {
             **DEV,
             "LLMQ_PURGE_AUTO_ENABLED": "off",
-            "LLMQ_REQUEST_INDEX_ENABLED": "off",
+            "LLMQ_REQUESTS_INDEX_ENABLED": "off",
             "LLMQ_PURGE_TENANT_REMOVE": "running, keys",
             "LLMQ_ADMIN_BATCH": "50",
         }
@@ -65,7 +65,7 @@ def test_key_expiry_and_purge_switches_are_validated() -> None:
         ("LLMQ_KEY_EXPIRY_MODE", "sometimes"),
         ("LLMQ_ADMIN_HTTP_WAIT_SECS", "4000"),
         ("LLMQ_PURGE_WAIT_ENABLED", "maybe"),
-        ("LLMQ_REQUEST_INDEX_ENABLED", "maybe"),
+        ("LLMQ_REQUESTS_INDEX_ENABLED", "maybe"),
         ("LLMQ_KEY_EXPIRY_SWEEP_BATCH", "6000"),
     ):
         with pytest.raises(ConfigError, match=name):

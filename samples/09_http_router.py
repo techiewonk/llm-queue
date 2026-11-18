@@ -41,7 +41,7 @@ def admin_only(x_admin_token: str = Header(default="")) -> None:
 
 
 app = FastAPI()
-# Prometheus metrics for /metrics; in an app `LLMQ_METRICS_SINK=prometheus` does the same.
+# Prometheus metrics for /metrics; in an app `LLMQ_METRICS_SINK_MODE=prometheus` does the same.
 llmq = install(
     app,
     LLMQueue.from_env(metrics=PrometheusSink()),

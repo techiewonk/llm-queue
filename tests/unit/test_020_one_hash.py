@@ -36,7 +36,7 @@ def test_the_boot_registry_hashes_with_keyed_hash() -> None:
     assert _h("acme") in settings.registry_document()
 
 
-@pytest.mark.parametrize("name", ["LLMQ_REQUEST_INDEX_ENABLED", "LLMQ_TENANT_NAMES_ENABLED"])
+@pytest.mark.parametrize("name", ["LLMQ_REQUESTS_INDEX_ENABLED", "LLMQ_TENANT_NAMES_ENABLED"])
 def test_admin_switches_use_the_one_bool_reader(name: str) -> None:
     InfraSettings.from_env({**STORE, name: "yes"})  # `yes` is true, as for every switch
     with pytest.raises(ConfigError, match=name):

@@ -104,7 +104,7 @@ class PurgeSettings:
     `auto` / `grace_secs`: auto purge after a registry drop; `wait` / `wait_secs`: a deployment
     purge waits for its running calls; `batch`: keys per UNLINK pipeline (`LLMQ_ADMIN_BATCH`);
     `tenant_default`: what a tenant purge removes; `request_index`: calls are indexed per model
-    and tenant (`LLMQ_REQUEST_INDEX_ENABLED`), which a purge of queued or running calls reads.
+    and tenant (`LLMQ_REQUESTS_INDEX_ENABLED`), which a purge of queued or running calls reads.
     """
 
     auto: bool = True
@@ -127,7 +127,7 @@ class PurgeSettings:
             http_wait_secs=float(settings.admin_http_wait_secs),
             batch=int(settings.admin_batch),
             tenant_default=frozenset(settings.purge_tenant_remove.split(",")),
-            request_index=settings.request_index_enabled,
+            request_index=settings.requests_index_enabled,
         )
 
 
@@ -305,7 +305,7 @@ class PurgeService:
         `tenant_id` is the raw id (hashed as admission hashes it). `remove` (default
         `LLMQ_PURGE_TENANT_REMOVE`): `keys`, `queued` (cancel calls still waiting), `running`
         (cancel every call); the last two read the request index of each model (T3), so they
-        need `LLMQ_REQUEST_INDEX_ENABLED` (on by default), else `AdminRefused`.
+        need `LLMQ_REQUESTS_INDEX_ENABLED` (on by default), else `AdminRefused`.
         """
         check_actor(actor)
         parts = self.settings.tenant_default if remove is None else frozenset(remove)
@@ -317,7 +317,7 @@ class PurgeService:
         if parts & {"queued", "running"} and not self.settings.request_index:
             raise AdminRefused(
                 "removing a tenant's queued or running calls reads the request index: it is off "
-                "(LLMQ_REQUEST_INDEX_ENABLED=false)"
+                "(LLMQ_REQUESTS_INDEX_ENABLED=false)"
             )
         view = await self._view()
         aliases = list(models) if models is not None else sorted(view.registry.models)

@@ -50,12 +50,12 @@ options. A route built by hand over a disabled queue's `llmq.admin` answers 503
 |---|---|---|
 | `admin_token` | `LLMQ_ADMIN_TOKEN` | Guards writes, and reads too. A value or a callable read on every request (a rotated secret needs no restart) |
 | `admin_read_token` | `LLMQ_ADMIN_READ_TOKEN` | Guards reads only (`GET` routes) |
-| `admin_header` | `LLMQ_ADMIN_HEADER` (`X-LLMQ-Token`) | The header that carries either token, compared in constant time. Outside dev each token must be at least 32 characters: a shorter one is a `ConfigError` at mount (a callable is read once to check), and one rotated shorter is refused per request |
+| `admin_token_header` | `LLMQ_ADMIN_TOKEN_HEADER` (`X-LLMQ-Token`) | The header that carries either token, compared in constant time. Outside dev each token must be at least 32 characters: a shorter one is a `ConfigError` at mount (a callable is read once to check), and one rotated shorter is refused per request |
 | `dependencies` | none | The app's own admin check (FastAPI dependencies), on every route but the probes and `/metrics`, with or without tokens |
 | `allow_writes` | `LLMQ_ADMIN_WRITES_ENABLED` (false) | Mount the write routes |
 | `actor` | none | `actor(request) -> str`: the authenticated name a write is audited under (`http:<name>`). Without it, the token guard audits `token:<X-LLMQ-Actor>` (`LLMQ_ADMIN_ACTOR_HEADER`), `token:unknown` without the header |
 | `drain_routes` | false | `GET /drain`, `POST /drain`, `POST /resume` for this process (writes: a dry run unless the body is `{"dry_run": false}`; a pod with several processes drains through `LLMQ_DRAIN_FILE`, see [Drain a pod](../how-to/operate.md#drain-a-pod)) |
-| `metrics_route` | false | An open `GET /metrics`: the Prometheus exposition of a `LLMQ_METRICS_SINK=prometheus` process (extra `metrics`) |
+| `metrics_route` | false | An open `GET /metrics`: the Prometheus exposition of a `LLMQ_METRICS_SINK_MODE=prometheus` process (extra `metrics`) |
 | `insecure_reads` | false | Mount the read routes with no token and no `dependencies` (local development only) |
 
 A tenant is named by its hash on every `GET` route (`?tenant_hash=H`, `-` for calls with no
@@ -68,7 +68,7 @@ Guards:
 | Guard | Routes | Needs |
 |---|---|---|
 | open | `GET /health/live`, `GET /health/ready`, `GET /metrics` | nothing |
-| read | every other `GET` route | the read token or the admin token in `admin_header`, or `dependencies` (both when both are set) |
+| read | every other `GET` route | the read token or the admin token in `admin_token_header`, or `dependencies` (both when both are set) |
 | write | every other `POST` route, `POST /tenants/hash` (it writes nothing, but with the hashes the read routes show it would tell a read token which tenant a hash is; it is never mounted without a write guard) | the admin token, or `dependencies` plus the `X-LLMQ-Admin` header (a browser cannot send either cross-site without a CORS preflight, so a page an admin visits cannot post with the admin's cookies); `allow_writes=True`; an actor |
 
 With no token and no `dependencies` the router mounts only the probes and `/metrics` and logs

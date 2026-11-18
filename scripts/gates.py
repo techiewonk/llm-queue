@@ -163,7 +163,7 @@ async def callers(env: dict[str, str], count: int = 2) -> list[LLMQueue]:
     queues = []
     for _ in range(count):
         queue = LLMQueue.from_env(
-            {**env, "LLMQ_ROLE": "caller"}, credentials=account_keys, tuning=drill_tuning(env)
+            {**env, "LLMQ_ROLE_MODE": "caller"}, credentials=account_keys, tuning=drill_tuning(env)
         )
         await queue.start()
         queues.append(queue)
@@ -600,7 +600,7 @@ async def b96() -> bool:
                     procs.append(
                         subprocess.Popen(  # noqa: ASYNC220  # started once, before measuring
                             [PY, str(FLEET), "caller", "500", "chat"],
-                            env={**gate.env, "LLMQ_ROLE": "caller"},
+                            env={**gate.env, "LLMQ_ROLE_MODE": "caller"},
                             stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE,
                             stderr=log,
@@ -1176,7 +1176,7 @@ async def _index_cost(index: bool, calls: int) -> tuple[float, dict[str, float],
     from llm_queue.engine.requests import REGISTER_SEND, SETTLE_DONE
 
     doc = registry({"chat": {"rpm": 1_000_000, "worker_slots": 100}}, accounts=1, regions=1)
-    async with Gate(doc, LLMQ_REQUEST_INDEX_ENABLED="true" if index else "false") as gate:
+    async with Gate(doc, LLMQ_REQUESTS_INDEX_ENABLED="true" if index else "false") as gate:
         await gate.workers(4)
         queues = await gate.callers(2)
         warm = Run()

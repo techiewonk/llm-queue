@@ -145,8 +145,8 @@ The settings you set in most deployments:
 | `LLMQ_ID_HASH_SALT` | Key of the user / session id hash (HMAC); required when strict |
 | `LLMQ_KEY_PREFIX`, `LLMQ_QUEUE_PREFIX` | Names of this environment's keys and queues. The key prefix defaults to `llmq` in dev and is **required** in strict mode (name it per app and environment); the queue prefix defaults to empty |
 | `LLMQ_REGISTRY` or `LLMQ_REGISTRY_FILE` | The registry document, inline or as a file (set one, not both) |
-| `LLMQ_ROLE` | `both` (default), `caller`, `worker` |
-| `LLMQ_METRICS_SINK` | `emf` (CloudWatch, default), `prometheus`, `none` |
+| `LLMQ_ROLE_MODE` | `both` (default), `caller`, `worker` |
+| `LLMQ_METRICS_SINK_MODE` | `emf` (CloudWatch, default), `prometheus`, `none` |
 
 !!! warning "Unset `LLMQ_ENVIRONMENT` is strict"
     Since 0.1.0b2 a process with no `LLMQ_ENVIRONMENT` gets the production checks. On a laptop

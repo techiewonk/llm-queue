@@ -204,7 +204,7 @@ async def test_tenant_calls_come_from_the_request_index(
 ) -> None:
     """T3: a tenant purge of queued / running calls reads the T1 index of each model."""
     off = await _service(store, prefix, request_index=False)
-    with pytest.raises(AdminRefused, match="LLMQ_REQUEST_INDEX_ENABLED"):
+    with pytest.raises(AdminRefused, match="LLMQ_REQUESTS_INDEX_ENABLED"):
         await off.tenant("acme", actor="ops", dry_run=False, remove={"keys", "queued"})
     indexed = await _service(store, prefix)
     h = keyed_hash(SALT, "acme")
@@ -328,7 +328,7 @@ async def test_cli_purge_dry_run_and_refusal(store: redis.asyncio.Redis, prefix:
     dry = await amain(["purge", "model", "ghost"], env)
     assert (dry["deleted_keys"], dry["dry_run"]) == (1, True)
     assert await store.exists(f"{prefix}:{{m:ghost}}:cfg")
-    off = {**env, "LLMQ_REQUEST_INDEX_ENABLED": "false"}
+    off = {**env, "LLMQ_REQUESTS_INDEX_ENABLED": "false"}
     with pytest.raises(AdminRefused):
         await amain(["purge", "tenant", "acme", "--remove", "queued"], off)
     done = await amain(["--actor", "ops", "purge", "removed", "--yes"], env)

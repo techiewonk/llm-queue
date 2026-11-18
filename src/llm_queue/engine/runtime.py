@@ -545,7 +545,7 @@ class EngineSettings:
     outage_memo_secs: float = 3.0
     timings: EngineTimings = field(default_factory=EngineTimings)  # `Tuning.engine`
     purge: PurgeSettings = field(default_factory=PurgeSettings)  # LLMQ_*PURGE*
-    # The request index and admin operations (LLMQ_REQUEST_INDEX_ENABLED, LLMQ_ADMIN_*, ...).
+    # The request index and admin operations (LLMQ_REQUESTS_INDEX_ENABLED, LLMQ_ADMIN_*, ...).
     admin: AdminSettings = field(default_factory=AdminSettings)
 
 

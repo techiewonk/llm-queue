@@ -94,7 +94,7 @@ def environment(live: bool, env_file: Path, prefix: str, store: str) -> dict[str
             "LLMQ_KEY_PREFIX": prefix,
             "LLMQ_QUEUE_PREFIX": prefix.replace(":", "-") + "-",
             "LLMQ_REGISTRY": registry(region),
-            "LLMQ_METRICS_SINK": "none",
+            "LLMQ_METRICS_SINK_MODE": "none",
             "PYTHONIOENCODING": "utf-8",
             # This checkout's library, even when the venv's editable install points elsewhere.
             "PYTHONPATH": os.pathsep.join(filter(None, [str(ROOT / "src"), env.get("PYTHONPATH")])),

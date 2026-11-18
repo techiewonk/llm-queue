@@ -277,7 +277,7 @@ gets `swept`.
 | `LLMQ_KEY_EXPIRY_MODE` | `auto` (`settings.py:281`) | how every expiry is kept: native TTLs or the index `P:ttl` (`auto`: native on `noeviction`, else swept). Lifetimes stay the same |
 | `LLMQ_KEY_EXPIRY_SWEEP_BATCH` / `LLMQ_KEY_EXPIRY_SWEEP_ROUNDS` | 500 / 100 (`settings.py:392-393`; 1-5000 / 1-10000) | how many due keys one sweep deletes (at most 500 x 100 = 50000 per 10 s by default); a bigger backlog waits for the next sweep |
 | `LLMQ_PURGE_GRACE_SECS` | 900 s | `P:purge` due times |
-| `LLMQ_REQUEST_INDEX_ENABLED` | true | writes `tq:H`, `tq` and the job's `ix` / `ixh` / `mid` / `q` at all |
+| `LLMQ_REQUESTS_INDEX_ENABLED` | true | writes `tq:H`, `tq` and the job's `ix` / `ixh` / `mid` / `q` at all |
 | `LLMQ_TENANT_NAMES_ENABLED` | false | writes `tqn` at all |
 
 Fixed in code (no setting): `DAY_MS` 1 day (`rot`, `ac`, `cb`, `health`, `tf:fq`); 180 s

@@ -317,7 +317,7 @@ def test_r3je6_register_job_in_caller_mode_is_refused() -> None:
         metrics=None,
         hash_id=_hash,
     )
-    queue = LLMQueue(engine, settings=SimpleNamespace(role="caller"))  # type: ignore[arg-type]
+    queue = LLMQueue(engine, settings=SimpleNamespace(role_mode="caller"))  # type: ignore[arg-type]
     with pytest.raises(ConfigError, match="caller mode"):
         queue.register_job("j", _noop)
 

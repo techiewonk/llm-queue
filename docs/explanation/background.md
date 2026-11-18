@@ -6,12 +6,12 @@ what each loop touches in the store, is in
 
 ```mermaid
 flowchart TB
-  subgraph caller["Caller side (LLMQ_ROLE both / caller; result reader and sweep in every role)"]
+  subgraph caller["Caller side (LLMQ_ROLE_MODE both / caller; result reader and sweep in every role)"]
     c1["_result_reader: pub/sub wake-ups"]
     c2["_result_sweep: every 5 s"]
     c3["ChunkReader: open streams"]
   end
-  subgraph worker["Worker side (LLMQ_ROLE both / worker)"]
+  subgraph worker["Worker side (LLMQ_ROLE_MODE both / worker)"]
     w1["_model_loop: one per model"]
     w2["_hold: one per held call"]
     w3["_cancel_reader: cancels"]

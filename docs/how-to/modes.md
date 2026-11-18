@@ -53,7 +53,7 @@ LLMQ_LOCAL_CONCURRENCY=10      # calls in flight per model in each process
 LLMQ_REGISTRY_FILE=/etc/app/registry.yaml
 ```
 
-`LLMQ_STORE_URL` is not needed (when set it is neither checked nor contacted), and `LLMQ_ROLE`
+`LLMQ_STORE_URL` is not needed (when set it is neither checked nor contacted), and `LLMQ_ROLE_MODE`
 does not apply (`local_mode_started` logs it once when set). What a call gets, per process:
 
 - **Budgets.** Each deployment's `rpm` / `tpm` (and an account's `shared_rpm` / `shared_tpm`)

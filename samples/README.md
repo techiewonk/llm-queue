@@ -59,7 +59,7 @@ An app sets the same environment the runner sets, from its secrets:
 | `LLMQ_STORE_URL` | `redis://:localdev@127.0.0.1:6379/0` | `rediss://...` of the ElastiCache Valkey |
 | `LLMQ_KEY_PREFIX`, `LLMQ_QUEUE_PREFIX` | per run | per environment, e.g. `llmq:prod` |
 | `LLMQ_REGISTRY` | `samples/registry.json`, region set | the app's registry document |
-| `LLMQ_METRICS_SINK` | `none` | `emf` (CloudWatch) or `prometheus` |
+| `LLMQ_METRICS_SINK_MODE` | `none` | `emf` (CloudWatch) or `prometheus` |
 | AWS credentials | from `.env` (or fake for fakellm) | the pod's role; `role_arn` accounts assume roles |
 
 Start the queue once per process, in the app's startup hook, and stop it on shutdown:

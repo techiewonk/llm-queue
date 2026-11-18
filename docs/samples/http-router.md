@@ -28,7 +28,7 @@ flowchart LR
   audited under the `actor` you return. Every route is listed in
   [Admin API](../reference/admin-api.md).
 - `metrics_route=True` adds `GET /metrics`: the Prometheus exposition of a Prometheus sink
-  (`LLMQ_METRICS_SINK=prometheus`, or `metrics=PrometheusSink()` as in the sample; install the
+  (`LLMQ_METRICS_SINK_MODE=prometheus`, or `metrics=PrometheusSink()` as in the sample; install the
   `metrics` extra). It is open like the probes, so a scraper needs no admin credentials.
 - Draining: with `dependencies` and `actor`, `install()` mounts the guarded drain routes.
   `POST /drain` with `{"dry_run": false}` fails readiness and hands held calls back while

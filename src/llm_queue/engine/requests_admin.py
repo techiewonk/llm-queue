@@ -259,7 +259,7 @@ class AdminSettings:
     """The request index and admin operation settings (`LLMQ_*`, design 0.2.0 section 7).
 
     Attributes:
-        request_index: Index calls per model and tenant (`LLMQ_REQUEST_INDEX_ENABLED`).
+        request_index: Index calls per model and tenant (`LLMQ_REQUESTS_INDEX_ENABLED`).
         tenant_names: Store tenant names beside their hashes (`LLMQ_TENANT_NAMES_ENABLED`).
         batch: Ids per pipeline or cancel script (`LLMQ_ADMIN_BATCH`).
         scan_max: Index entries or messages one operation reads (`LLMQ_ADMIN_SCAN_MAX`).
@@ -282,7 +282,7 @@ class AdminSettings:
     def from_infra(cls, settings: InfraSettings) -> AdminSettings:
         """The admin part of the process settings."""
         return cls(
-            request_index=settings.request_index_enabled,
+            request_index=settings.requests_index_enabled,
             tenant_names=settings.tenant_names_enabled,
             batch=int(settings.admin_batch),
             scan_max=int(settings.admin_scan_max),
@@ -1019,7 +1019,7 @@ class RequestsAdmin:
         if not self.settings.request_index:
             raise AdminRefused(
                 f"finding {state} calls by model and tenant needs the request index "
-                "(LLMQ_REQUEST_INDEX_ENABLED is off)"
+                "(LLMQ_REQUESTS_INDEX_ENABLED is off)"
             )
 
     async def _now(self) -> float:

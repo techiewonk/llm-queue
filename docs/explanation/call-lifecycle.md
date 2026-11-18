@@ -611,7 +611,7 @@ flowchart LR
 Cost: server time per admission script +9 % (`fair_queue`), +13 % (`quota`), +23 % (`share`)
 over off (measured 2026-11-15, local Valkey 8.1). Each call is also in the request index of
 its model and tenant (`P:{m:ALIAS}:tq:H`, written on confirm and removed by its final write,
-`LLMQ_REQUEST_INDEX_ENABLED`), which admin operations and a tenant purge read. See
+`LLMQ_REQUESTS_INDEX_ENABLED`), which admin operations and a tenant purge read. See
 [Tenant fairness](fairness.md).
 
 ## 15. Purge

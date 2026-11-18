@@ -6,7 +6,7 @@ metric the library emits is in the [table at the end](#every-metric); the names 
 
 ## Where metrics go
 
-`LLMQ_METRICS_SINK` picks the sink, one per process:
+`LLMQ_METRICS_SINK_MODE` picks the sink, one per process:
 
 - `emf` (default): CloudWatch embedded metric format on stdout, namespace `llm-queue`. Points
   are added up per label set and written as one line per label set about once a second

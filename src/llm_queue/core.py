@@ -400,7 +400,7 @@ class LLMQueue:
         # One sink for both engines (O5). EMF: the environment is a dimension, so two
         # environments in one account are not summed; pod and version are plain fields (R3OB-12).
         sink = metrics or sink_for(
-            settings.metrics_sink,
+            settings.metrics_sink_mode,
             static={"environment": settings.environment},
             properties={"pod": worker_id or socket.gethostname(), "version": __version__},
         )
@@ -532,7 +532,7 @@ class LLMQueue:
         if problems := problems + _transport_problems(settings, tuning):
             raise ConfigError("invalid tuning:\n  " + "\n  ".join(problems))
         sink = metrics or sink_for(
-            settings.metrics_sink,
+            settings.metrics_sink_mode,
             static={"environment": settings.environment},
             properties={"pod": worker_id, "version": __version__},
         )
@@ -681,14 +681,14 @@ class LLMQueue:
                 "second_llm_queue_started",
                 hint="one LLMQueue per process shares clients and stores; this one gets its own",
             )
-        mode = self.settings.role if self.settings else "both"
+        mode = self.settings.role_mode if self.settings else "both"
         await self._engine.start(
             worker=mode in ("both", "worker"), caller=mode in ("both", "caller")
         )
         self._cross_check()
         if isinstance(self._engine, LocalEngine):
             # One line saying how this process runs: calls go straight to the provider, and
-            # the worker / caller role (LLMQ_ROLE) does not apply. `LLMQ_LOCAL_PROCESS_COUNT`
+            # the worker / caller role (LLMQ_ROLE_MODE) does not apply. `LLMQ_LOCAL_PROCESS_COUNT`
             # is a fixed ceiling (review Q-10): the share each process takes, logged per
             # model, does not follow autoscaling.
             logger.info(
@@ -1165,7 +1165,7 @@ class LLMQueue:
         `timeout_secs` is cancelled and fails. `ConfigError` in `caller` mode (R3JE-6).
         """
         self._refuse_local("jobs")
-        if self.settings is not None and self.settings.role == "caller":
+        if self.settings is not None and self.settings.role_mode == "caller":
             raise ConfigError(f"job {name}: a process in caller mode runs no jobs")
         self._jobs.register(name, fn, timeout_secs=timeout_secs, concurrency=concurrency)
 
@@ -1237,7 +1237,7 @@ class LLMQueue:
         metrics_route: bool = False,
         admin_token: str | Callable[[], str | None] | None = None,
         admin_read_token: str | Callable[[], str | None] | None = None,
-        admin_header: str | None = None,
+        admin_token_header: str | None = None,
         drain_routes: bool = False,
         insecure_reads: bool = False,
     ) -> Any:
@@ -1263,7 +1263,7 @@ class LLMQueue:
             drain_routes=drain_routes,
             admin_token=admin_token if admin_token is not None else env_token,
             read_token=admin_read_token if admin_read_token is not None else env_read,
-            token_header=admin_header or (s.admin_header if s else "X-LLMQ-Token"),
+            token_header=admin_token_header or (s.admin_token_header if s else "X-LLMQ-Token"),
             actor_header=s.admin_actor_header if s else "X-LLMQ-Actor",
             csrf_header=s.admin_csrf_header if s else "X-LLMQ-Admin",
             insecure_reads=insecure_reads,
