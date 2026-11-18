@@ -1,18 +1,10 @@
 """The admin HTTP routes (extra `http`), generated from the operations table (0.2.0 R).
 
-`status_router(admin, ...)` mounts one route per operation of `engine/admin/ops.py` with an
-`http` entry: arguments come from the path, the query (GET) or a JSON object body (POST),
-are checked against the operation's parameters (unknown or mistyped fields are a 400), and go
-to the same `llmq.admin` method the CLI and Python call. Errors map to status codes in one
-place (`error_response`). Health, readiness and metrics keep small handlers of their own and
-are open; `GET /` lists every mounted route with a live summary.
-
-Guards: reads need the read token (`LLMQ_ADMIN_READ_TOKEN`), the admin token
-(`LLMQ_ADMIN_TOKEN`, which may read too) or the app's `dependencies`; writes need the admin
-token or `dependencies` plus the `X-LLMQ-Admin` header (no simple cross-site request carries
-either), an actor (the app's `actor(request)`, else `token:<X-LLMQ-Actor>` with the token),
-and `allow_writes`. With no guard at all only the open routes are mounted, unless
-`insecure_reads=True`.
+`status_router` mounts one route per `engine/admin/ops.py` operation with an `http` entry; path,
+query or JSON body arguments are checked (bad fields: 400) and go to the same `llmq.admin`
+method as the CLI. Errors map in `error_response`; health, readiness and metrics stay open.
+Reads need a read or admin token or the app's `dependencies`; writes also need the
+`X-LLMQ-Admin` header (no simple cross-site request carries it), an actor and `allow_writes`.
 """
 
 from __future__ import annotations
@@ -73,12 +65,11 @@ Token = str | Callable[[], str | None] | None
 def error_response(exc: BaseException) -> Response:
     """The status code and body of an admin error (design 2.8); re-raises a non-admin error.
 
-    `UnknownModel` 404; `RegistryConflict` 409 retryable; `AdminRefused` 409; a missing
-    registry or a store outage 503; a store-only operation of a local-mode queue
-    (`LocalModeRefused`) 503 with `reason: local_mode`; with the library off (`QueueDisabled`)
-    503 with `reason: disabled`; any other `ConfigError` (bad input, refused edit) 400; another
-    `LLMQueueError` (a stopped queue) 409; a store refusal of the request itself (redis
-    `ResponseError`, B-07) 400, of writes for a while 503.
+    Returns:
+        404 `UnknownModel`; 409 `RegistryConflict` (retryable), `AdminRefused` or another
+        `LLMQueueError`; 503 no registry, store outage, `LocalModeRefused` (`reason:
+        local_mode`) or `QueueDisabled` (`reason: disabled`); 400 other `ConfigError`; a store
+        `ResponseError` (B-07) 400 for the request itself, 503 for refused writes.
     """
     if isinstance(exc, UnknownModel):
         return 404, {"error": str(exc)}
@@ -234,11 +225,9 @@ def admin_token_dependency(
 ) -> Any:
     """A FastAPI dependency: the request's `header` must equal `token` or `read_token`.
 
-    Compared in constant time. A callable is read on every request (a rotated secret needs no
-    restart), on a worker thread: it may reach a secrets source (`LLMQ_SECRETS_SOURCE`), whose
-    refresh must not block the event loop. With neither configured (empty or None) every
-    request is refused (fail closed), and so is a token shorter than `min_chars` (a rotation
-    to a short token after the mount check).
+    Constant-time compare. A callable is read per request (rotation needs no restart) on a
+    worker thread, so a secrets-source refresh never blocks the loop. Fails closed with no
+    token configured, or one shorter than `min_chars` (a rotation after the mount check).
     """
     import asyncio
     import hmac
@@ -321,16 +310,28 @@ def status_router(
 ) -> Any:
     """A FastAPI `APIRouter` of the admin operations (`pip install 'llm-queue[http]'`).
 
-    `admin_token` (writes, and reads) and `read_token` (reads only) are values or callables
-    read per request, carried in `token_header`. `dependencies` (the app's admin check) guard
-    every route but the probes and `/metrics`, with or without tokens. `allow_writes` mounts
-    the write routes; `drain_routes` the drain routes (`GET /drain`, `POST /drain`, `POST
-    /resume`); `metrics_route` `GET /metrics`. A write's actor is `http:<actor(request)>`, or
-    with the token guard and no `actor`, `token:<actor_header value>` (`token:unknown` without
-    it). `wait_cap_secs` caps any `wait_secs` an HTTP client asks for; `dlq_bodies` lets
-    `GET /dlq/{id}?unsafe=true` return message bodies; `GET /` reuses its summary for
-    `index_cache_secs`. `strict` (outside dev) refuses to mount with a token (resolved, when a
-    callable) shorter than `MIN_TOKEN_CHARS`, and later refuses requests against one.
+    With no guard only the open routes mount, unless `insecure_reads=True`.
+
+    Args:
+        admin: The admin services the routes call.
+        dependencies: The app's admin check; guards every route but probes and `/metrics`.
+        allow_writes: Mount the write routes.
+        actor: Names a write's actor as `http:<actor(request)>`.
+        metrics_route: Mount `GET /metrics`.
+        drain_routes: Mount `GET /drain`, `POST /drain` and `POST /resume`.
+        admin_token: Write and read token, a value or a callable read per request.
+        read_token: Read-only token, a value or a callable read per request.
+        token_header: The header carrying either token.
+        actor_header: Without `actor`, the token guard's actor is `token:<value>` (or
+            `token:unknown`).
+        csrf_header: The header every write must carry.
+        insecure_reads: Mount the read routes with no guard.
+        wait_cap_secs: Cap on any `wait_secs` an HTTP client asks for.
+        dlq_bodies: Let `GET /dlq/{id}?unsafe=true` return message bodies.
+        index_cache_secs: How long `GET /` reuses its summary.
+        strict: Refuse to mount, and later refuse requests, with a token shorter than
+            `MIN_TOKEN_CHARS` (outside dev).
+        body_max_bytes: The largest JSON body accepted.
     """
     try:
         from fastapi import APIRouter, Depends, Request
