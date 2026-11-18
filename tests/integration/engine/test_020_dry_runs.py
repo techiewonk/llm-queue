@@ -55,7 +55,11 @@ ARGS: dict[str, dict[str, Any]] = {
     "purge.removed": {},
     "purge.unschedule": {"target": "small"},
 }
-DRY = sorted(op.id for op in OPERATIONS if op.dry_run_default is not None)
+# Drain is process-local (it pauses an LLMQueue, writes nothing to the store); its dry run is
+# covered by test_020_drain.py and test_020_drain_store.py.
+DRY = sorted(
+    op.id for op in OPERATIONS if op.dry_run_default is not None and not op.id.startswith("drain.")
+)
 
 
 def test_every_dry_run_operation_is_covered() -> None:

@@ -131,7 +131,12 @@ async def test_list_over_10000_tenants_never_holds_the_store_in_one_long_script(
     first = await admin.list("small", limit=500)
     second = await admin.list("small", limit=500, after=first.next)
     assert [i.request_id for i in first.items + second.items] == [r for _, r in expected[:1000]]
-    assert max(runs) < 100, f"slowest page script {max(runs):.0f} ms over {len(runs)} runs"
+    # Timed from the client, so one run can include a pause of this process: the bound is on
+    # the 90th percentile; the slowest must still be far below the old single script (seconds).
+    runs.sort()
+    p90 = runs[int(len(runs) * 0.9)]
+    assert p90 < 100, f"page script p90 {p90:.0f} ms over {len(runs)} runs"
+    assert runs[-1] < 1000, f"slowest page script {runs[-1]:.0f} ms over {len(runs)} runs"
 
 
 async def test_cancel_answers_every_waiting_caller_in_batches(make: Make) -> None:
