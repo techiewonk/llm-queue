@@ -158,8 +158,8 @@ mode `TTL_SWEEP` deletes every due key in `P:ttl`. Alerts (`P:alert:*`) and debu
 | Request records | `P:{r:ID}:callers` | set | state | Same as `job` (set with it on every write). | indexed in `P:ttl` |
 | Request records | `P:{r:ID}:status` | hash | state | `LLMQ_STATUS_TTL_SECS` (1800 s); a write never shortens it (`requests.py:231`). A final state is never replaced (`:218-222`). | indexed in `P:ttl` |
 | Request records | `P:{r:ID}:cancel` | string | state | `LLMQ_STATUS_TTL_SECS` (1800 s). | indexed in `P:ttl` |
-| Request index | `P:{m:ALIAS}:tq:H` | zset | state | 60 s past its latest entry's deadline; a write only lengthens it (`index_add`, `requests.py`). | indexed in `P:ttl` |
-| Request index | `P:{m:ALIAS}:tq` | zset | state | 60 s past its latest tenant's deadline; a write only lengthens it. | indexed in `P:ttl` |
+| Request index | `P:{m:ALIAS}:tq:H` | zset | state | 60-90 s past its latest entry's deadline: a write that finds less than 60 s left sets 90 s, and never shortens it (`index_add`, `requests.py`). | indexed in `P:ttl` |
+| Request index | `P:{m:ALIAS}:tq` | zset | state | 60-90 s past its latest tenant's deadline, as `tq:H`. | indexed in `P:ttl` |
 | Request index | `P:{m:ALIAS}:tqn` | hash | state | Only with `LLMQ_TENANT_NAMES_ENABLED`: as `tq`. | indexed in `P:ttl` |
 | Results & streaming | `P:{r:ID}:res` | string | state | `LLMQ_RESULT_TTL_SECS` (300 s), fixed from the write. After the first read of a library-made id: `LLMQ_RESULT_DEDUPE_SECS` when above 0, else 2 s (`TAKE_GRACE_MS`, `requests.py:324,329-334`). An app-supplied id keeps 300 s. An offloaded marker is dropped after the offload read (`RESULT_DROP`, `requests.py:301-312,337`). | indexed in `P:ttl` |
 | Results & streaming | `P:{r:ID}:chunks` | stream | state | `LLMQ_RESULT_TTL_SECS` + the call's timeout (`runtime.py:3617`), set again on each write. After `end`: `END_TTL_SECS` (30 s, `streaming.py:29,194`). | indexed in `P:ttl` |
@@ -876,12 +876,12 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Schema | The calls in flight of tenant `H` on model `ALIAS` (0.2.0 T1): member = request id, score = the call's deadline (store ms: now + call time + `caller_margin_secs`; an extend raises it). `H` = the keyed hash of the call's tenant (`LLMQ_TENANT_DEFAULT` included), `-` for no tenant; the user id is never a fallback here. `ALIAS` = the model whose queue holds the call (after the disabled-model fallback). |
 | Written by | `index_add` (`_INDEX_FN`, `requests.py`) in `REGISTER_SEND` (queued, shared store) and `CONFIRM` (separate queue store or replica wait; direct runs; takeovers update the score, and a takeover under another tenant `ZREM`s the call from the old tenant's key): `ZADD`, then entries past their deadline are pruned (`ZREMRANGEBYSCORE`). `EXTEND` (`ZADD XX`). |
 | Read by | `RequestsAdmin` (`requests_admin.py`: list, count, cancel, reprioritize); tenant purge `queued` / `running` (`purge.py`); `status(model, tenant=...)` (`status.py`). Readers count only scores in the future and drop ids whose job is final or gone. |
-| Lifetime (native) | 60 s past the latest deadline in it; a write only lengthens it (`X.pttl` check). |
+| Lifetime (native) | 60-90 s past the latest deadline in it: a write that finds under 60 s left sets 90 s (`X.pttl` check); never shortened. |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable. |
 | Count | 1 per model and tenant with calls in flight; one member (~60 B) per call until its final write. |
 | If evicted (`volatile-*`, native mode) | Admin operations and tenant purges miss the calls made before until they end; new calls are indexed again. |
 | If evicted (`allkeys-*`) | Same as volatile. |
-| Deleted by | `index_drop` in `RESULT_PUT` / `SETTLE_DONE` (`ZREM` of the call, every final state); a model purge (SCAN `{m:ALIAS}:*`); TTL. |
+| Deleted by | `final_write` in `RESULT_PUT` / `SETTLE_DONE` (`ZREM` of the call, every final state); a model purge (SCAN `{m:ALIAS}:*`); TTL. |
 
 #### `P:{m:ALIAS}:tq`
 
@@ -892,7 +892,7 @@ settings). The full shape is in [Registry document](registry.md) and its JSON Sc
 | Schema | The tenants with calls in flight on model `ALIAS`: member = tenant hash `H` (or `-`), score = the latest deadline of any of its calls (`ZADD GT`). |
 | Written by | `index_add` (as `tq:H`), entries past their deadline pruned on each add; `EXTEND` (`ZADD GT`). |
 | Read by | `RequestsAdmin.list` / `count` without a tenant; `status()` `tenants.active`. A status of the no-tenant block (`-`) reads fairness under the hash of the shared no-tenant name, as fairness writes it. |
-| Lifetime (native) | 60 s past its latest deadline; a write only lengthens it. |
+| Lifetime (native) | 60-90 s past its latest deadline: a write that finds under 60 s left sets 90 s; never shortened. |
 | Swept mode | Indexed in `P:ttl`: no TTL, the same lifetime. Never evictable. |
 | Count | 1 per model with calls in flight; one member per tenant. |
 | If evicted (`volatile-*`, native mode) | All-tenant lists and the active tenant count miss tenants until their next call. |

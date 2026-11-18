@@ -487,12 +487,12 @@
     "schema": "The calls in flight of tenant `H` on model `ALIAS` (0.2.0 T1): member = request id, score = the call's deadline (store ms: now + call time + `caller_margin_secs`; an extend raises it). `H` = the keyed hash of the call's tenant, `-` for no tenant (never the user id).",
     "written_by": "`index_add` (`_INDEX_FN`, `requests.py`) in `REGISTER_SEND` and `CONFIRM` (separate queue store, replica wait, direct runs, takeovers); lapsed entries pruned. `EXTEND` (`ZADD XX`).",
     "read_by": "`RequestsAdmin` (`requests_admin.py`); tenant purge `queued` / `running` (`purge.py`); `status(model, tenant=...)` (`status.py`).",
-    "lifetime": "60 s past the latest deadline in it; a write only lengthens it.",
+    "lifetime": "60-90 s past the latest deadline in it: a write that finds under 60 s left sets 90 s; never shortened.",
     "swept": "Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable.",
     "count": "1 per model and tenant with calls in flight; one member per call.",
     "evicted_volatile": "Admin operations and tenant purges miss the calls made before until they end.",
     "evicted_allkeys": "Same as volatile.",
-    "deleted_by": "`index_drop` in `RESULT_PUT` / `SETTLE_DONE` (every final state); a model purge; TTL."
+    "deleted_by": "`final_write` in `RESULT_PUT` / `SETTLE_DONE` (every final state); a model purge; TTL."
   },
   {
     "group": "Request index",
@@ -502,7 +502,7 @@
     "schema": "The tenants with calls in flight on model `ALIAS`: member = tenant hash `H` (or `-`), score = the latest deadline of its calls (`ZADD GT`).",
     "written_by": "`index_add` (as `tq:H`); `EXTEND` (`ZADD GT`).",
     "read_by": "`RequestsAdmin.list` / `count` without a tenant; `status()` `tenants.active`.",
-    "lifetime": "60 s past its latest deadline; a write only lengthens it.",
+    "lifetime": "60-90 s past its latest deadline: a write that finds under 60 s left sets 90 s; never shortened.",
     "swept": "Indexed in `P:ttl`: no TTL, the same lifetime; the sweeper deletes it up to `sweep_secs` (10 s) late. Never evictable.",
     "count": "1 per model with calls in flight; one member per tenant.",
     "evicted_volatile": "All-tenant lists miss tenants until their next call.",

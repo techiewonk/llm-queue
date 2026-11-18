@@ -191,7 +191,7 @@ async def test_lapsed_entries_are_pruned_and_ttl_only_grows(
     assert set(await _members(engine.state, keys.request_index("m", "h1"))) == {"long", "short"}
     assert set(await _members(engine.state, keys.tenant_index("m"))) == {"h1"}
     left = await ttl_of(engine, keys.request_index("m", "h1"))
-    assert 600 < left <= 660  # the longest call + 60 s, not shortened by the short one
+    assert 660 <= left <= 690  # the longest call + 60-90 s, not shortened by the short one
 
 
 @pytest.fixture
