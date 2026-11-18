@@ -370,6 +370,38 @@ async def test_queue_drain_waits_for_running_calls_and_resume_after_stop_is_refu
         llmq.resume_receiving()
 
 
+async def test_admin_drain_is_a_dry_run_by_default_and_audits_only_real_runs(
+    queues: Callable[..., Awaitable[LLMQueue]],
+) -> None:
+    """Admin writes are dry runs unless told (D3): drain and resume too (0.2.0)."""
+    llmq = await queues()
+    admin = llmq.admin
+
+    async def entries(op: str) -> list[dict[str, Any]]:
+        return list((await admin.audit.list(50, op=op))["entries"])
+
+    planned = await admin.drain.start(actor="ann")
+    assert (planned["draining"], planned["dry_run"], planned["would_change"]) == (False, True, True)
+    assert llmq.draining is False
+    assert (await llmq.health())["ready"] is True
+    assert await entries("drain") == []
+
+    done = await admin.drain.start(actor="ann", dry_run=False)
+    assert (done["draining"], done["dry_run"]) == (True, False)
+    assert llmq.draining is True
+    assert [e["actor"] for e in await entries("drain")] == ["ann"]
+
+    planned = await admin.drain.resume(actor="ann")
+    assert (planned["draining"], planned["would_change"]) == (True, True)
+    assert llmq.draining is True
+    assert await entries("resume") == []
+
+    done = await admin.drain.resume(actor="ann", dry_run=False)
+    assert (done["draining"], done["dry_run"]) == (False, False)
+    assert (await llmq.health())["ready"] is True
+    assert [e["actor"] for e in await entries("resume")] == ["ann"]
+
+
 async def test_the_drain_file_pauses_every_queue_and_ignores_an_old_file(
     queues: Callable[..., Awaitable[LLMQueue]], tmp_path: Path
 ) -> None:

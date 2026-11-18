@@ -54,7 +54,7 @@ options. A route built by hand over a disabled queue's `llmq.admin` answers 503
 | `dependencies` | none | The app's own admin check (FastAPI dependencies), on every route but the probes and `/metrics`, with or without tokens |
 | `allow_writes` | `LLMQ_ADMIN_WRITES_ENABLED` (false) | Mount the write routes |
 | `actor` | none | `actor(request) -> str`: the authenticated name a write is audited under (`http:<name>`). Without it, the token guard audits `token:<X-LLMQ-Actor>` (`LLMQ_ADMIN_ACTOR_HEADER`), `token:unknown` without the header |
-| `drain_routes` | false | `GET /drain`, `POST /drain`, `POST /resume` for this process (a pod with several processes drains through `LLMQ_DRAIN_FILE`, see [Drain a pod](../how-to/operate.md#drain-a-pod)) |
+| `drain_routes` | false | `GET /drain`, `POST /drain`, `POST /resume` for this process (writes: a dry run unless the body is `{"dry_run": false}`; a pod with several processes drains through `LLMQ_DRAIN_FILE`, see [Drain a pod](../how-to/operate.md#drain-a-pod)) |
 | `metrics_route` | false | An open `GET /metrics`: the Prometheus exposition of a `LLMQ_METRICS_SINK=prometheus` process (extra `metrics`) |
 | `insecure_reads` | false | Mount the read routes with no token and no `dependencies` (local development only) |
 

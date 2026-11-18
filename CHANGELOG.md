@@ -263,6 +263,13 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
 
 ### Changed
 
+- The admin drain writes follow the dry-run rule of every admin write:
+  `llmq.admin.drain.start()` / `resume()` take `dry_run=True` by default, and `POST /drain` /
+  `POST /resume` need the body `{"dry_run": false}` to act. A dry run changes nothing and writes
+  no audit entry; it returns the current `drain_status()` with `dry_run: true` and
+  `would_change`. A preStop hook that posts to `POST /drain` must send `{"dry_run": false}`.
+  Unchanged: `LLMQ_DRAIN_FILE` and `LLMQueue.pause_receiving()` / `resume_receiving()` /
+  `drain()` (the process API, not admin writes) act at once.
 - In a strict environment with `LLMQ_BEDROCK_ENDPOINT_URL` set, the `botocore` Bedrock transport
   (`Tuning(bedrock=BedrockOptions(transport="botocore"))`) is refused at `from_env`: it follows
   redirects with the signed request (see [Secure](docs/how-to/secure.md)).

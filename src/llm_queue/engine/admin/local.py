@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from llm_queue._version import __version__
-from llm_queue.engine.admin.ops import OPERATIONS, op_row
+from llm_queue.engine.admin.ops import OPERATIONS, drain_plan, op_row
 from llm_queue.engine.admin.registry import redacted
 from llm_queue.errors import ConfigError, LocalModeRefused
 
@@ -171,17 +171,21 @@ class LocalDrainAdmin:
         """`draining`, `since`, `held`, `running`."""
         return dict(self._ctx.needs_process("drain").drain_status())
 
-    async def start(self, *, actor: str) -> dict[str, Any]:
+    async def start(self, *, actor: str, dry_run: bool = True) -> dict[str, Any]:
         """Stop taking calls here (readiness fails)."""
         process = self._ctx.needs_process("drain")
+        if dry_run:  # the default: the status now and `would_change`
+            return drain_plan(process, draining=True)
         process.pause_receiving()
-        return dict(process.drain_status())
+        return {**process.drain_status(), "dry_run": False}
 
-    async def resume(self, *, actor: str) -> dict[str, Any]:
+    async def resume(self, *, actor: str, dry_run: bool = True) -> dict[str, Any]:
         """Take calls again."""
         process = self._ctx.needs_process("resume")
+        if dry_run:  # the default: the status now and `would_change`
+            return drain_plan(process, draining=False)
         process.resume_receiving()
-        return dict(process.drain_status())
+        return {**process.drain_status(), "dry_run": False}
 
 
 class LocalOpsAdmin:

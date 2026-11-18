@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -221,12 +222,59 @@ def test_drain_routes_are_post_guarded_and_get_is_status_only() -> None:
     assert status.json() == {"draining": False, "since": None, "held": 0, "running": 0}
     assert client.post("/drain").status_code == 403  # no token
     assert llmq.draining is False
-    paused = client.post("/drain", headers=both)
+    planned = client.post("/drain", headers=both)  # a dry run by default: changes nothing
+    assert planned.status_code == 200
+    assert planned.json() == {
+        "draining": False, "since": None, "held": 0, "running": 0, "dry_run": True,
+        "would_change": True,
+    }  # fmt: skip
+    assert llmq.draining is False
+    paused = client.post("/drain", headers=both, json={"dry_run": False})
     assert paused.status_code == 200
     assert paused.json()["draining"] is True
+    assert paused.json()["dry_run"] is False
     assert llmq.draining is True
     assert client.get("/drain", headers=token).json()["since"] == llmq.draining_since
-    resumed = client.post("/resume", headers=both)
+    planned = client.post("/resume", headers=both)
+    assert planned.json()["dry_run"] is True
+    assert planned.json()["would_change"] is True
+    assert llmq.draining is True
+    resumed = client.post("/resume", headers=both, json={"dry_run": False})
     assert resumed.status_code == 200
     assert resumed.json()["draining"] is False
     assert llmq.draining is False
+
+
+# ---------------------------------------------------------------- admin: dry run by default
+
+
+async def test_admin_drain_and_resume_are_dry_runs_unless_told_and_audit_only_real_runs() -> None:
+    """Admin writes are dry runs by default (D3); drain and resume follow (0.2.0)."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from llm_queue.engine.admin.process import DrainAdmin
+
+    state: dict[str, Any] = {"draining": False, "since": None, "held": 0, "running": 0}
+    process = MagicMock()
+    process.drain_status.side_effect = lambda: dict(state)
+    process.pause_receiving.side_effect = lambda: state.update(draining=True, since=1.0)
+    process.resume_receiving.side_effect = lambda: state.update(draining=False, since=None)
+    ctx = MagicMock()
+    ctx.needs_process.return_value = process
+    ctx.audit.write = AsyncMock()
+    ctx.engine.worker_id = "w1"
+    admin = DrainAdmin(ctx)
+
+    assert await admin.start(actor="ann") == {**state, "dry_run": True, "would_change": True}
+    assert (await admin.resume(actor="ann"))["would_change"] is False  # not draining
+    process.pause_receiving.assert_not_called()
+    process.resume_receiving.assert_not_called()
+    ctx.audit.write.assert_not_awaited()
+
+    assert (await admin.start(actor="ann", dry_run=False))["draining"] is True
+    assert (await admin.start(actor="ann"))["would_change"] is False  # draining already
+    assert (await admin.resume(actor="ann"))["would_change"] is True
+    resumed = await admin.resume(actor="ann", dry_run=False)
+    assert (resumed["draining"], resumed["dry_run"]) == (False, False)
+    assert [c.kwargs["op"] for c in ctx.audit.write.await_args_list] == ["drain", "resume"]
+    assert {c.kwargs["actor"] for c in ctx.audit.write.await_args_list} == {"ann"}
