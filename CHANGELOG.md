@@ -517,8 +517,11 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
   stage scripts in one round trip, and a cancel marks its calls and answers the waiting ones
   (result, status `cancelled`) in one script per `LLMQ_ADMIN_BATCH` ids, all in one round
   trip (it was a mark, a re-read and one result script per id), then writes its audit entry
-  and wakes the callers last: cancelling 10,000 took 9.6 s, now 1.3 s; reprioritizing 1,000
-  1.9 s, now 0.8 s. Gate G-T2 waits out its callers' first result reads before it measures
+  and wakes the callers last, in a task it does not wait for (woken callers in its own process
+  read their results on its event loop first; `RequestsAdmin.wait_wakes`, `aclose` and a stop
+  wait for it, a failed wake logs `request_wake_failed`). The record, cancel and wake scripts
+  build their keys from the ids (five keys per id cost more to pack than to run): cancelling
+  10,000 took 9.6 s, now 0.9 s; reprioritizing 1,000 1.9 s, now 0.8 s. Gate G-T2 waits out its callers' first result reads before it measures
   and times with `perf_counter` (Windows' `monotonic` ticks every 15.6 ms).
 - A smooth window whose bucket holds one call (`rpm x rate_burst` below 2: rpm 9 to 19 at the
   default `rate_burst` 0.1, rpm 900 at 0.001) granted nothing for about half of all limits:

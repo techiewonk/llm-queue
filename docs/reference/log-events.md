@@ -144,6 +144,7 @@ counts, never a tenant name), purges included (which also write `llmq_purge`); `
 | `request_moved` | info | engine/requests_admin.py |
 | `request_records_repaired` | warning | engine/requests_admin.py |
 | `request_records_stale` | error | engine/requests_admin.py |
+| `request_wake_failed` | warning | engine/requests_admin.py |
 | `request_unusable` | error | engine/runtime.py, engine/local.py |
 | `result_drop_skipped` | warning | engine/requests.py |
 | `result_reader_error` | warning | engine/runtime.py |

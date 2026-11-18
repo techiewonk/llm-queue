@@ -293,9 +293,10 @@ return 0
 """
 
 # A status write: state, ttl, field / value pairs from ARGV[from]. A final state is never
-# replaced; the TTL only grows; every write stamps the store's time as `<state>_at`.
+# replaced; the TTL only grows; every write stamps the store's time as `<state>_at`. `pttl`:
+# the key's PTTL when the caller already read it (CANCEL_SETTLE), else it is read here.
 _STATUS_FN = """
-local function set_status(key, state, ttl, from)
+local function set_status(key, state, ttl, from, pttl)
   local current = redis.call('HGET', key, 'state')
   if current == 'done' or current == 'failed' or current == 'expired'
     or current == 'cancelled' then
@@ -309,7 +310,7 @@ local function set_status(key, state, ttl, from)
     table.insert(args, ARGV[i + 1])
   end
   redis.call(unpack(args))
-  if X.pttl(key) < ttl * 1000 then X.expire(key, ttl * 1000) end
+  if (pttl or X.pttl(key)) < ttl * 1000 then X.expire(key, ttl * 1000) end
   return 1
 end
 -- A final write's TTL of a call's job record: `keep_ms`, or as long as its status lives when
@@ -478,38 +479,43 @@ return {marked, started}
 # mark is set no worker can start the call, so answering it here is the reply a worker would
 # write (its message is acked by the worker that takes it: PICK_TAKE answers `done`); a call
 # that started is left to its worker. Its callers are woken by WAKE, the admin's last step.
-# KEYS: job, cancel, callers, status, result of each call. ARGV: cancel ttl secs, cancel
-# channel, only state (as CANCEL), result ttl secs, keep secs (records and status), n, the n
-# request ids, the n reply bodies, then status field / value pairs. Reply: {the ids marked, how
-# many started (only state), the ids answered}.
+# The keys are built here from the key prefix and each id, as RESULTS_EXIST does: five keys per
+# id cost the client more to pack than the script took to run (gate G-T2). The status's PTTL is
+# read once, for the job's final TTL and the status write (FA-2's `keep_final`).
+# ARGV: cancel ttl secs, cancel channel, only state (as CANCEL), result ttl secs, keep secs
+# (records and status), key prefix, n, the n request ids, the n reply bodies, then status field /
+# value pairs. Reply: {the ids marked, how many started (only state), the ids answered}.
 CANCEL_SETTLE = (
     _STATUS_FN
     + """
-local n = tonumber(ARGV[6])
+local n = tonumber(ARGV[7])
 local ttl, res_ttl = tonumber(ARGV[1]) * 1000, tonumber(ARGV[4]) * 1000
 local keep = tonumber(ARGV[5])
 local marked, started, answered = {}, 0, {}
 for i = 1, n do
-  local b, rid = 5 * (i - 1), ARGV[6 + i]
-  local job = KEYS[b + 1]
+  local rid = ARGV[7 + i]
+  local base = ARGV[6] .. ':{r:' .. rid .. '}:'
+  local job = base .. 'job'
   local rec = redis.call('HMGET', job, 'state', 'ix')
   local state = rec[1]
   if state ~= 'done' and state ~= 'failed' and state ~= 'expired' and state ~= 'cancelled' then
     if ARGV[3] ~= '' and state ~= ARGV[3] then
       started = started + 1
     else
-      X.set(KEYS[b + 2], '1', ttl)
+      X.set(base .. 'cancel', '1', ttl)
       redis.call('PUBLISH', ARGV[2], rid)
       table.insert(marked, rid)
       if state == 'queued' then
         -- RESULT_PUT's `final_write`, inlined for a job known to exist and not final
         -- (on the read above): the result only if none, the claim `cancelled`.
         if rec[2] then redis.call('ZREM', rec[2], rid) end
-        X.set(KEYS[b + 5], ARGV[6 + n + i], res_ttl, true)
+        X.set(base .. 'res', ARGV[7 + n + i], res_ttl, true)
         redis.call('HSET', job, 'state', 'cancelled')
-        keep_final(job, keep * 1000)
-        X.expire(KEYS[b + 3], keep * 1000)
-        set_status(KEYS[b + 4], 'cancelled', keep, 7 + 2 * n)
+        local status = base .. 'status'
+        local sp = X.pttl(status)
+        X.expire(job, math.max(keep * 1000, sp))  -- keep_final with the PTTL read once
+        X.expire(base .. 'callers', keep * 1000)
+        set_status(status, 'cancelled', keep, 8 + 2 * n, sp)
         table.insert(answered, rid)
       end
     end
@@ -520,14 +526,15 @@ return {marked, started, answered}
 )
 
 # Wake the callers of answered calls, as RESULT_PUT does (each caller's done channel gets the
-# request id). KEYS: the callers set of each call. ARGV: done-channel prefix, the request ids.
+# request id). ARGV: done-channel prefix, key prefix, the request ids (each callers set is built
+# from them, as CANCEL_SETTLE's keys).
 WAKE = """
-for i = 1, #KEYS do
-  for _, caller in ipairs(redis.call('SMEMBERS', KEYS[i])) do
-    redis.call('PUBLISH', ARGV[1] .. caller, ARGV[1 + i])
+for i = 3, #ARGV do
+  for _, caller in ipairs(redis.call('SMEMBERS', ARGV[2] .. ':{r:' .. ARGV[i] .. '}:callers')) do
+    redis.call('PUBLISH', ARGV[1] .. caller, ARGV[i])
   end
 end
-return #KEYS
+return #ARGV - 2
 """
 
 # Extend a call's deadline (0.2.0 T2, owner D6). KEYS: job, callers, status. ARGV: the new
@@ -1147,18 +1154,15 @@ class RequestStore:
         async with self._client.pipeline(transaction=False) as pipe:
             for start in range(0, len(request_ids), batch):
                 part = request_ids[start : start + batch]
-                keys: list[str] = []
-                for rid in part:
-                    job, callers, status, result = self._req(rid)
-                    keys += [job, self.keys.request(rid, "cancel"), callers, status, result]
                 await self._cancel_settle(
-                    keys,
+                    [],
                     [
                         ttl_secs,
                         channel,
                         only_state or "",
                         self.result_ttl_secs,
                         self.status_ttl_secs,
+                        self.keys.prefix,
                         len(part),
                         *part,
                         *(head + orjson.dumps(rid) + tail for rid in part),
@@ -1186,9 +1190,7 @@ class RequestStore:
             for start in range(0, len(request_ids), batch):
                 part = request_ids[start : start + batch]
                 await self._wake(
-                    [self.keys.request(rid, "callers") for rid in part],
-                    [f"{self.keys.prefix}:done:", *part],
-                    client=pipe,
+                    [], [f"{self.keys.prefix}:done:", self.keys.prefix, *part], client=pipe
                 )
             await pipe.execute()
 
