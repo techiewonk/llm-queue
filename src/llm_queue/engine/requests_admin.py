@@ -67,28 +67,26 @@ _TENANT_READ = 1_000
 
 # The records of index rows, one script per batch (gate G-T2): three commands per id in a
 # pipeline cost about 25 us each of client packing and parsing, so a 100-row page took 47 ms.
-# KEYS: job, status, cancel of each call. ARGV: how many job fields, the job fields, then the
-# status fields. Reply, flat: per call its job fields, its status fields, then 1 / 0 for its
-# cancel mark (false: no such field). Read-only.
+# The keys are built here from the key prefix and each id (as RESULTS_EXIST): three keys per id
+# cost the client more to pack than the script took. ARGV: key prefix, how many job fields, how
+# many status fields, the job fields, the status fields, then the request ids. Reply, flat: per
+# call its job fields, its status fields, then 1 / 0 for its cancel mark (false: no such field).
+# Read-only.
 _READ_ROWS = """
-local nj = tonumber(ARGV[1])
+local nj, ns = tonumber(ARGV[2]), tonumber(ARGV[3])
 local job_fields, status_fields = {}, {}
-for i = 2, #ARGV do
-  if i <= nj + 1 then
-    table.insert(job_fields, ARGV[i])
-  else
-    table.insert(status_fields, ARGV[i])
-  end
-end
+for i = 4, 3 + nj do table.insert(job_fields, ARGV[i]) end
+for i = 4 + nj, 3 + nj + ns do table.insert(status_fields, ARGV[i]) end
 local out = {}
-for i = 1, #KEYS / 3 do
-  for _, v in ipairs(redis.call('HMGET', KEYS[3 * i - 2], unpack(job_fields))) do
+for i = 4 + nj + ns, #ARGV do
+  local base = ARGV[1] .. ':{r:' .. ARGV[i] .. '}:'
+  for _, v in ipairs(redis.call('HMGET', base .. 'job', unpack(job_fields))) do
     out[#out + 1] = v
   end
-  for _, v in ipairs(redis.call('HMGET', KEYS[3 * i - 1], unpack(status_fields))) do
+  for _, v in ipairs(redis.call('HMGET', base .. 'status', unpack(status_fields))) do
     out[#out + 1] = v
   end
-  out[#out + 1] = redis.call('EXISTS', KEYS[3 * i])
+  out[#out + 1] = redis.call('EXISTS', base .. 'cancel')
 end
 return out
 """
@@ -492,6 +490,7 @@ class RequestsAdmin:
         self._write_moved_script = state.register_script(_WRITE_MOVED)
         self._clear_moved = self._queue_client.register_script(_CLEAR_MOVED)
         self._owned: builtins.list[Any] = []
+        self._waking: set[asyncio.Task[None]] = set()  # cancels' wakes still running
 
     # ---------------------------------------------------------------- construction
 
@@ -519,7 +518,8 @@ class RequestsAdmin:
         return service
 
     async def aclose(self) -> None:
-        """Close the clients `from_env` made (none otherwise)."""
+        """Finish the cancels' wakes, then close the clients `from_env` made (none otherwise)."""
+        await self.wait_wakes()
         async with contextlib.AsyncExitStack() as stack:
             for client in self._owned:
                 stack.push_async_callback(client.aclose)
@@ -825,11 +825,39 @@ class RequestsAdmin:
         try:
             await self._audit(report)
         finally:
-            # Last, after the audit: callers woken in this process (an admin beside an app)
-            # run their result reads on this loop, and the audit waited behind 10,000 of them.
-            # Not woken (a store error here), they find their results by the result sweep.
-            await self._requests.wake(answered, batch=self.settings.batch)
+            self._wake_later(answered)
         return report
+
+    def _wake_later(self, request_ids: Sequence[str]) -> None:
+        """Wake the answered calls' callers in a task: the cancel returns without waiting.
+
+        Last, after the audit, and not awaited (gate G-T2): callers woken in this process (an
+        admin beside an app) ran their result reads on this loop before the wake's own reply
+        was read, 2,000 of 10,000 reads, 0.5 to 2 s of a cancel. The results and the audit are
+        written; `wait_wakes` (and `aclose`) waits for the wakes. One that fails (a store error)
+        is logged, and its callers find their results by the result sweep.
+        """
+        if not request_ids:
+            return
+        task = asyncio.create_task(self._wake(request_ids), name="llmq-admin-wake")
+        self._waking.add(task)
+        task.add_done_callback(self._waking.discard)
+
+    async def _wake(self, request_ids: Sequence[str]) -> None:
+        try:
+            await self._requests.wake(request_ids, batch=self.settings.batch)
+        except Exception as exc:  # the callers' result sweep finds them
+            logger.warning(
+                "request_wake_failed",
+                count=len(request_ids),
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+
+    async def wait_wakes(self) -> None:
+        """Wait for the wakes of earlier cancels (each logs its own failure)."""
+        while self._waking:
+            await asyncio.gather(*self._waking)
 
     @store_op
     async def reprioritize(
@@ -1217,21 +1245,13 @@ class RequestsAdmin:
 
     async def _records(self, rows: Sequence[_Row]) -> None:
         """Fill each row's job, status and cancel mark (`_READ_ROWS`, one round trip)."""
-        k = self.keys
+        head = [self.keys.prefix, len(_JOB_FIELDS), len(_STATUS_FIELDS)]
         flat = await self._scripted(
             self._state,
             self._read_rows,
             rows,
-            lambda part: [
-                key
-                for row in part
-                for key in (
-                    k.request(row.rid, "job"),
-                    k.status(row.rid),
-                    k.request(row.rid, "cancel"),
-                )
-            ],
-            lambda _: [len(_JOB_FIELDS), *_JOB_FIELDS, *_STATUS_FIELDS],
+            lambda _: [],
+            lambda part: [*head, *_JOB_FIELDS, *_STATUS_FIELDS, *(row.rid for row in part)],
         )
         nj = len(_JOB_FIELDS)
         for i, row in enumerate(rows):

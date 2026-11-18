@@ -648,11 +648,15 @@ async def b96() -> bool:
     )
 
 
+B91_ROUNDS = 3  # B91's script p99 is the median of this many rounds
+
+
 async def b91() -> bool:
     """20 models, 10 regions x 3 accounts.
 
-    Pass: script p99 <= 2 ms server time; status of
-    everything <= 500 KB and <= 200 ms.
+    Pass: script p99 <= 2 ms server time, the median of three 15 s rounds (one round's p99 of
+    about 1,500 calls on a shared Windows / Docker host ranged 3.0 to 10.2 ms for the same
+    code); status of everything <= 500 KB and <= 200 ms.
     """
     models = {f"m{i:02d}": {"rpm": 100_000, "model_id": f"openai.m{i}-1:0"} for i in range(20)}
     doc = registry(models, accounts=3, regions=10)
@@ -660,10 +664,13 @@ async def b91() -> bool:
         await gate.workers(4)
         queues = await gate.callers(2)
         await asyncio.sleep(2)
-        gate.store.reset_latency()
         run = Run()
-        await paced(100, 15, lambda i: run.call(queues[i % 2], f"m{i % 20:02d}", chat()))
-        p99 = gate.store.script_p99_ms()
+        rounds = []
+        for _ in range(B91_ROUNDS):
+            gate.store.reset_latency()
+            await paced(100, 15, lambda i: run.call(queues[i % 2], f"m{i % 20:02d}", chat()))
+            rounds.append(gate.store.script_p99_ms())
+        p99 = statistics.median(rounds)
         times = []
         for _ in range(6):
             t0 = time.monotonic()
@@ -680,7 +687,8 @@ async def b91() -> bool:
             "status <= 200 ms": status_ms <= 200,
         },
         [f"{len(run.results)} calls over 20 models x 30 deployments; script p99 {p99:.2f} ms "
-         f"(exact); status {size_kb:.0f} KB in {status_ms:.0f} ms (first call {cold_ms:.0f} ms)"],
+         f"(exact, median of rounds {', '.join(f'{r:.2f}' for r in rounds)}); "
+         f"status {size_kb:.0f} KB in {status_ms:.0f} ms (first call {cold_ms:.0f} ms)"],
     )  # fmt: skip
 
 

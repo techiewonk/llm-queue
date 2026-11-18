@@ -607,7 +607,7 @@ whole run takes about 20 minutes (about 14 with `--quick`).
 | B33 | 50 calls a second for 40 s (25 % priority); 4 workers restarted one by one, each with a live registry edit mid-restart | Calls lost; the registry change counter each caller sees | 0 lost (priority included); the counter never goes back; every caller ends on the last edit | DR-12 |
 | B34 | 30 s of alternating queued and direct calls at 5 a second (fakellm fixed at 100 ms); then three ramps of 50, 100 ... 400, 500, 600, 800 calls a second, 8 s each, until a call fails or wait p95 > 1 s | Queued and direct p95; ceiling (median of the three ramps) | Queue path adds <= 20 ms at p95; queued p95 <= baseline x 1.25 + 10 ms; ceiling >= 0.8 x baseline; fails when `scripts/baselines/perf.json` is missing | see [Performance](performance.md) |
 | B56 / B93 | 2,400 normal calls sent 5 ms apart to one 1,200 RPM deployment, 8 workers; 20 priority calls after 20 s | Starts in a full minute; start order; priority wait; store scripts a second with > 1,500 waiting and with 100-600 waiting | Starts per minute >= 0.95 x the normal-class quota (80 % of 1,200); after warm-up no older call starts more than 1 s after a newer one; priority calls start within 2 s; store calls with the big backlog <= 1.25 x with the small one; every call served | AD-07, AD-08 |
-| B91 | 100 calls a second for 15 s over 20 models x 30 deployments (10 regions x 3 accounts) | Store script p99 (server time); size and time of a full `status()` | Every call served; script p99 <= 2 ms; status <= 500 KB and <= 200 ms (median of 5 after a cold one) | AD-20, OB-15 |
+| B91 | 100 calls a second for 3 x 15 s over 20 models x 30 deployments (10 regions x 3 accounts) | Store script p99 (server time); size and time of a full `status()` | Every call served; script p99 <= 2 ms (the median of three 15 s rounds' p99); status <= 500 KB and <= 200 ms (median of 5 after a cold one) | AD-20, OB-15 |
 | B92 | 3 minutes idle, then one priority call and 50 calls a second for 60 s across 3 regions | First-call overhead (minus fakellm's 250 ms p95); priority wait p95 | 0 errors; first-call overhead <= 500 ms; priority wait p95 <= 2 s | see [Performance](performance.md) |
 | B94 | 60 calls waiting on one deployment (smooth 60 RPM, then fixed 30 RPM); after 8 s the pod holding waiters is killed | Gap to the next grant after the kill | Smooth: no gap between grants over 2 s plus one rate interval (1 s); fixed: the first grant within 2.5 s of the next minute; every call served | WP-08 |
 | B95 | 500 calls waiting (timeout 300 s); after 5 s the state store is blocked for 45 s | Failure kinds | 0 calls dropped as `caller_gone`; all served | ST-02 |
@@ -794,7 +794,10 @@ same machine. Counts and pass or fail of behaviour do not depend on the machine.
 !!! note "B91 on the dev machine"
     Gate B91 holds store script time at p99 to 2 ms. On the Windows / Docker dev machine it
     fails for 0.1.0b2 and 0.1.0b3 alike, and 0.1.0b3 measures lower than 0.1.0b2, so the
-    failure comes from the machine, not from a regression. No B91 run on a Linux host or an
+    failure comes from the machine, not from a regression. On 2026-11-18 one round's p99 of
+    about 1,500 calls ranged 3.0 to 10.2 ms for d8bfb8a and 3.1 to 3.8 ms for the release
+    candidate, run alternately on one private store: noise, not code. The gate now takes the
+    median of three rounds' p99 against the same 2 ms mark. No B91 run on a Linux host or an
     in-VPC store is recorded in the repo, so the gate there is unverified.
 
 Also unverified: no soak result (`soak3`, `soak10` or `soak20`) and no nightly result is stored

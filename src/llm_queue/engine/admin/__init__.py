@@ -214,7 +214,10 @@ class AdminServices:
         return admin
 
     async def aclose(self) -> None:
-        """Close the clients `from_env` made (none otherwise)."""
+        """Finish the request cancels' wakes, then close the clients `from_env` made."""
+        requests = getattr(self.context, "requests", None)  # none in a disabled context
+        if requests is not None:
+            await requests.wait_wakes()
         async with contextlib.AsyncExitStack() as stack:
             for client in self._owned:
                 stack.push_async_callback(client.aclose)
