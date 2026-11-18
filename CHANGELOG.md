@@ -190,6 +190,12 @@ index (below).
   `LLMQ_METRICS_TENANTS`. New settings: `LLMQ_TENANT_NAMES_ENABLED`, `LLMQ_ADMIN_BATCH`,
   `LLMQ_ADMIN_SCAN_MAX`, `LLMQ_REQUESTS_LIST_MAX`, `LLMQ_REQUESTS_MOVE_BATCH`,
   `LLMQ_REQUESTS_MOVE_BYTES`, `LLMQ_METRICS_TENANTS`.
+- Size-aware backfill (plan F1), off by default: registry `queue.backfill` per model
+  (live-editable), else `LLMQ_QUEUE_BACKFILL_ENABLED`. A call may pass older waiters of its
+  class when they would still be granted at their predicted time, so the rest of a `fixed`
+  minute that a large waiting call cannot use serves smaller calls. Never past a waiting
+  priority call, never over a budget, account budgets unchanged; off, admission is unchanged.
+  Gate F1 in `scripts/gates.py`.
 
 ### Removed
 
