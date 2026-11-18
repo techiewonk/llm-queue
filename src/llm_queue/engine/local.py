@@ -1166,7 +1166,7 @@ class LocalExecutor:
                 await out(event)
 
         where = (alias, dep.key)
-        api = _api_kwargs(provider, view, alias)
+        api = _api_kwargs(view, alias)
         with self.limits.lock:
             self.limits.in_flight[where] = self.limits.in_flight.get(where, 0) + 1
         state["sent"] = True

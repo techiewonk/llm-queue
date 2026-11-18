@@ -1152,7 +1152,7 @@ for _, dep in ipairs(req.deps or {}) do
       '-inf', now)
   end
 end
--- Waiters that expired with no `waitexp` member (written by an older library): a batch per
+-- Waiters that expired with no `waitexp` member (evicted, or expired before them): a batch per
 -- sweep, so the waiter sets never keep them for good.
 local info_key = mk(req.alias, 'waitinfo')
 for _, c in ipairs({'p', 'n'}) do

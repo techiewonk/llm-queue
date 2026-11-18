@@ -27,9 +27,9 @@ public API (see STABILITY.md).
    `llmq.admin.registry`, or `AdminServices.from_env()` without a queue); the 0.1.0b1 alert
    names `quota_used_mins`, `spill_pct`, `spill_window_secs` and `waiting_age_secs` (now unknown
    fields); the settings `LLMQ_TENANT_INDEX`, `LLMQ_PURGE_BATCH` (`LLMQ_ADMIN_BATCH`) and
-   `LLMQ_LOCAL_LIMIT_CAP` (`LLMQ_LOCAL_CONCURRENCY`). A renamed or removed setting still set
-   stops a strict start with a `ConfigError` naming the new one; the renamed settings are in
-   the table below.
+   `LLMQ_LOCAL_LIMIT_CAP` (`LLMQ_LOCAL_CONCURRENCY`). Any `LLMQ_*` name no setting reads
+   (renamed, removed or misspelt) stops a strict start with a `ConfigError` naming it; the
+   renamed settings are in the table below.
 4. **New refusals in strict mode** (any `LLMQ_ENVIRONMENT` but `dev`, `local`, `test`, `ci`):
    admin tokens shorter than 32 characters (`LLMQ_ADMIN_TOKEN`, `LLMQ_ADMIN_READ_TOKEN`, or
    the tokens given to `http_router()`); the `botocore` Bedrock transport together with
@@ -355,10 +355,11 @@ See [Upgrade](docs/how-to/upgrade.md#from-011-to-020).
 - `LLMQ_TENANT_INDEX` and its cross-model index `P:tenant:H:reqs` (with
   `PurgeService.index_call`): a tenant purge of `queued` / `running` calls reads the request
   index of each model. `LLMQ_PURGE_BATCH` (now `LLMQ_ADMIN_BATCH`).
-- A renamed or removed setting still set (`LLMQ_LOCAL_LIMIT_CAP`, `LLMQ_PURGE_BATCH`,
-  `LLMQ_TENANT_INDEX`) is reported at start: a `ConfigError` naming the new setting when
-  strict, the `setting_renamed` / `setting_removed` warning in dev (`RENAMED` / `REMOVED` in
-  `llm_queue.engine.settings`). Before, the old name was ignored and the default used.
+- An `LLMQ_*` name no setting reads (a typo, or a renamed or removed setting such as
+  `LLMQ_LOCAL_LIMIT_CAP`) is reported at start: a `ConfigError` naming it when strict, the
+  `setting_unknown` warning in dev. Before, it was ignored and the default used.
+- Support for custom providers without `converse_api`: `Provider.call` must take it (the
+  documented contract); the worker no longer inspects each provider's signature.
 - `LLMQueue.engine` and `LLMQueue.jobs` (deprecated since 0.1.0b2): see "Upgrading from 0.1.1".
 - `PurgeService` and `RegistryStore` from `llm_queue.__all__`: `llmq.admin` is the one write
   path; `PurgeReport` and `PublishResult` stay as return types.

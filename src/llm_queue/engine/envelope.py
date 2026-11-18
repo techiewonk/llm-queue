@@ -1,8 +1,9 @@
-"""Message format version 2 (plan E80) and the reply stored for the caller.
+"""Message format version 3 (plan E80) and the reply stored for the caller.
 
 A call's deadline is not an absolute pod time: the message carries `timeout_secs` and the
 worker measures it from the queue position (the store's clock), so pod clock skew does not
-matter (plan §3.18). Version 2 only: a newer message is returned to the queue, never dropped.
+matter (plan §3.18). Version 3 only: a newer message is returned to the queue, never dropped,
+and an older one is refused.
 Bytes (Converse images, documents, redacted reasoning) travel as `{"__llmq_b64__": "..."}` and
 are decoded back to bytes on read, so botocore gets the bytes it expects (plan C1).
 """
@@ -19,8 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from llm_queue.errors import UnsupportedEnvelopeError
 
-# 3 (0.2.0): `tenant_id` and `user_id` carry keyed hashes, not raw ids (D1). A 0.1.1 worker
-# returns a v3 message (newer); this release refuses a v2 one: drain 0.1.1 first (review B-02).
+# 3 (0.2.0): `tenant_id` and `user_id` carry keyed hashes, not raw ids (D1).
 VERSION = 3
 Op = Literal["converse", "invoke_model", "chat", "embeddings"]
 AllowFallback = Literal["all", "regions", "none"]
@@ -118,8 +118,7 @@ class Envelope(BaseModel):
     tenant_id: str | None = None
     app_request_id: bool = False
     stream: bool = False
-    # Sent by `embed()`: an embedding reply may be stored as its packed vectors (B97). An older
-    # worker ignores it (`extra="ignore"`) and stores the raw body, which the caller still reads.
+    # Sent by `embed()`: the worker stores an embedding reply as its packed vectors (B97).
     vectors: bool = False
     # `encode_params(params)` when the caller already ran it (the size cap): reused by `dumps`.
     _params_json: tuple[bytes, bool] | None = PrivateAttr(default=None)

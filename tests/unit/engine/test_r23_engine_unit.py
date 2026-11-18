@@ -1,4 +1,4 @@
-"""Round 3 engine findings that need no store (R3RC-7, R3FM-10, Q8 / Q9, Q33, R3FM-5).
+"""Round 3 engine findings that need no store (R3RC-7, R3FM-10, Q8 / Q9, R3FM-5).
 
 Each test names its finding and what used to happen. Fakes stand in for the store client.
 """
@@ -14,7 +14,7 @@ import pytest
 from llm_queue.engine.expiry import native
 from llm_queue.engine.jobs import JobRunner
 from llm_queue.engine.queue import NotReplicated
-from llm_queue.engine.runtime import StoreClock, _api_kwargs, _by_deployment, _call_timeout_secs
+from llm_queue.engine.runtime import StoreClock, _by_deployment, _call_timeout_secs
 from llm_queue.engine.store_guard import ReplicaWait, parse_scopes
 from llm_queue.ids import keyed_hash
 from llm_queue.registry import load_registry
@@ -95,23 +95,6 @@ def test_q9_a_short_send_is_counted_and_warned_once_a_minute(
     wait.short("calls", sink)
     assert len(sink.counts) == 2
     assert caplog.text.count("replicas_short") == 1
-
-
-def test_q33_converse_api_only_for_providers_that_take_it() -> None:
-    """Owner Q33: a 0.1.0b1 custom provider without `converse_api` got a TypeError per call."""
-
-    class Old:
-        async def call(self, op: str, params: Any, route: Any, timing: Any) -> None: ...
-
-    class New:
-        async def call(self, *args: Any, converse_api: str = "converse") -> None: ...
-
-    class View:
-        def value(self, alias: str, name: str) -> str:
-            return "stream"
-
-    assert _api_kwargs(Old(), View(), "m") == {}  # type: ignore[arg-type]  # a fake view
-    assert _api_kwargs(New(), View(), "m") == {"converse_api": "stream"}  # type: ignore[arg-type]
 
 
 class _Queues:

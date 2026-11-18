@@ -10,7 +10,7 @@ import math
 import os
 import re
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
@@ -66,18 +66,12 @@ CONFLICT_GROUPS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("REGISTRY",), ("REGISTRY_FILE",)),
 )
 _TRUE, _FALSE = ("true", "1", "yes", "on"), ("false", "0", "no", "off")
-# Settings that no longer exist (review B-15, owner RV4). One still set in the environment or
-# `defaults=` is reported at start: a `ConfigError` when strict, else a `setting_renamed` /
-# `setting_removed` warning, so an old manifest never silently gets the default. Old name ->
-# what to do instead.
-REMOVED: dict[str, str] = {
-    "LLMQ_TENANT_INDEX": "tenant purges read each model's request index "
-    "(LLMQ_REQUEST_INDEX_ENABLED)",
-}
-# Old name -> new name: `RENAMED` is reported as above. `PENDING_RENAMES` is the names standard
+# `RENAMED` (old name -> new name) and `PENDING_RENAMES` are the input of
+# `scripts/rename_settings.py`, never read by the library: an old name is refused at start like
+# any other unknown `LLMQ_*` name (`unknown_names`). `PENDING_RENAMES` is the names standard
 # (`LLMQ_<AREA>_<THING>[_<UNIT>]`, environment.md "Names") not applied yet: the code still reads
-# its old names. `scripts/rename_settings.py` rewrites every read, doc, test, sample and manifest
-# from it and moves it into `RENAMED`; it rewrites this block, so keep it plain.
+# its old names. The script rewrites every read, doc, test, sample and manifest from it and
+# moves it into `RENAMED`; it rewrites this block, so keep it plain.
 # rename-table: begin
 RENAMED: dict[str, str] = {
     "LLMQ_LOCAL_LIMIT_CAP": "LLMQ_LOCAL_CONCURRENCY",
@@ -402,26 +396,26 @@ class Layers(Mapping[str, str]):
         return len(dict.fromkeys([*self._env, *self._defaults]))
 
 
-def old_names(layers: Layers, *, strict: bool) -> list[str]:
-    """Renamed or removed settings still set (`RENAMED`, `REMOVED`): problems when strict.
+def unknown_names(layers: Layers, *, strict: bool) -> list[str]:
+    """`LLMQ_*` names set that no setting reads (a typo, a renamed or removed setting).
 
-    Outside strict mode each is logged (`setting_renamed` / `setting_removed`) and `[]` is
-    returned. Only the environment and `defaults=` are looked at (secrets cannot be listed).
+    Problems when strict; outside strict mode each is logged (`setting_unknown`, the name, never
+    the value) and `[]` is returned. Only the environment and `defaults=` are looked at (secrets
+    cannot be listed); `LLMQ_ACCOUNT_*` are account secrets, read by name from the registry.
     """
+    from llm_queue.engine.jobs import JobSettings
+
+    known = SETTING_NAMES | {f"{PREFIX}JOB_{f.name.upper()}" for f in fields(JobSettings)}
     problems: list[str] = []
     for name in sorted(set(layers)):
-        if name in RENAMED:
-            event, text = "setting_renamed", f"{name} was renamed {RENAMED[name]}: set that instead"
-        elif name in REMOVED:
-            event, text = "setting_removed", f"{name} was removed: {REMOVED[name]}"
-        else:
+        if not name.startswith(PREFIX) or name in known or name.startswith(f"{PREFIX}ACCOUNT_"):
             continue
         if layers.get(name) is None:
             continue
         if strict:
-            problems.append(text)
+            problems.append(f"{name} is not a setting (see environment.md)")
         else:
-            logger.warning(event, setting=name, use=RENAMED.get(name), hint=text)
+            logger.warning("setting_unknown", setting=name)
     return problems
 
 
@@ -768,7 +762,7 @@ class InfraSettings:
         if environment == "production":
             environment = "prod"
         strict = environment not in DEV_ENVIRONMENTS
-        problems += old_names(layers, strict=strict)
+        problems += unknown_names(layers, strict=strict)
         host = str(get("STORE_HOST", "") or "").strip() or None
         if store and "STORE_URL" in layers.conflicts():
             problems.append(

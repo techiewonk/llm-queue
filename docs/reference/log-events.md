@@ -149,8 +149,7 @@ counts, never a tenant name), purges included (which also write `llmq_purge`); `
 | `return_failed` | warning | engine/runtime.py |
 | `second_llm_queue_started` | warning | core.py |
 | `secrets_refresh_failed` | warning | secrets.py (the last values are kept) |
-| `setting_removed` | warning | engine/settings.py (a removed setting is still set, outside strict mode: `setting`, `hint`) |
-| `setting_renamed` | warning | engine/settings.py (a renamed setting is still set, outside strict mode: `setting`, `use`) |
+| `setting_unknown` | warning | engine/settings.py (an `LLMQ_*` name no setting reads is set, outside strict mode: `setting`) |
 | `settle_replayed` | info | engine/runtime.py (the end-of-call script ran again after a lost reply: not a double run) |
 | `shutdown_give_back_failed` | warning | engine/runtime.py |
 | `start_rollback_failed` | warning | core.py |

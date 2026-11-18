@@ -53,8 +53,8 @@ def request_for(
 def vectors_of(provider: str, codec: EmbeddingCodec, response: dict[str, Any]) -> list[list[float]]:
     """The vectors of one reply in the order of its texts (an InvokeModel body decoded first).
 
-    A reply the worker packed (`pack_reply`) is unpacked instead; an older worker's raw body
-    is read as before.
+    A reply the worker packed (`pack_reply`) is unpacked instead; a body `pack_reply` could not
+    read is stored raw and parsed here (its parse error names the problem).
     """
     packed = response.get(PACKED)
     if packed is not None:

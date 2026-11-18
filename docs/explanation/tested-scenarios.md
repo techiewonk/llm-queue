@@ -384,7 +384,7 @@ Where settings and secrets come from, in which order, and what is refused. See
 | SS-17 | Corporate network | Proxies and CA bundles honoured; `verify=False` warned | Transport | `U/clients/test_r23_transport.py` (4) | none | covered |
 | SS-18 | An optional extra is missing | A clear error naming the extra | Lazy imports | `U/clients/test_r23_missing_extra.py` (5); `U/test_contracts.py::test_import_has_no_heavy_side_effects` | none | covered |
 | SS-19 | `LLMQ_ENABLED=false` (the off switch) | Probes only; direct calls refused as `config_error`; factories return None; the drain file still works | Off switch in settings and the front door | `TODO(test)` | none | covered (0.2.0) |
-| SS-20 | An environment variable set under a name that was renamed | Reported at start as renamed | | none | | not covered: an old name is ignored without a message |
+| SS-20 | An `LLMQ_*` variable no setting reads (a typo, a renamed or removed name) | Refused at a strict start; `setting_unknown` in dev | Settings | `U/test_020_unknown_settings.py` (4) | none | covered (0.2.0) |
 
 ## Streaming
 
