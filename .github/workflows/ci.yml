@@ -135,7 +135,7 @@ jobs:
       - run: uv run python scripts/samples.py --out reports/samples-ci
       # Every sample's output and a summary, kept with the run (Actions > run > Artifacts).
       - if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: samples-${{ matrix.python }}
           path: reports/samples-ci/
