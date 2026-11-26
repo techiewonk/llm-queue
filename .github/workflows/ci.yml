@@ -157,6 +157,6 @@ jobs:
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
         with:
           enable-cache: false
-      - run: uvx zizmor==1.32.0 --format=github .github/workflows
+      - run: uvx zizmor==1.33.1 --format=github .github/workflows
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
